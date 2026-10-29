@@ -229,6 +229,73 @@ async fn multipart_upload_reads_form_fields_and_enforces_caps() {
 }
 
 #[tokio::test]
+async fn malformed_multipart_body_returns_400_without_url() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+
+    let request = common::request(
+        "POST",
+        "/upload?format=json",
+        &[("content-type", "multipart/form-data".to_string())],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("invalid multipart body"), "got: {text}");
+    assert!(!text.contains("/v1/pastes"), "no URL on failure: {text}");
+    assert!(fake.requests().is_empty());
+
+    let request = common::request(
+        "POST",
+        "/ui/upload",
+        &[("content-type", "multipart/form-data".to_string())],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!String::from_utf8_lossy(&body).contains("/v1/pastes"));
+    assert!(fake.requests().is_empty());
+
+    let broken = b"--xyz\r\nBroken header\r\n\r\nx\r\n--xyz--\r\n".to_vec();
+    let request = common::request(
+        "POST",
+        "/upload?format=json",
+        &[
+            (
+                "content-type",
+                "multipart/form-data; boundary=xyz".to_string(),
+            ),
+            ("content-length", broken.len().to_string()),
+        ],
+        broken.clone(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("invalid multipart body"), "got: {text}");
+    assert!(!text.contains("/v1/pastes"));
+    assert!(fake.requests().is_empty());
+
+    let request = common::request(
+        "POST",
+        "/ui/upload",
+        &[
+            (
+                "content-type",
+                "multipart/form-data; boundary=xyz".to_string(),
+            ),
+            ("content-length", broken.len().to_string()),
+        ],
+        broken,
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body).contains("invalid multipart body"));
+    assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
 async fn bearer_auth_is_required_and_accepted_on_api_and_ui() {
     let fake = FakeS3::start().await;
     let config = common::config_with_token(fake.config(), "secret-token");
