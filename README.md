@@ -155,7 +155,8 @@ rejects an empty file.
 Credentials are never logged. `Config` has no `Debug` that prints
 secrets; startup logs only bucket, endpoint scheme, region, and limits.
 A credential file read error names the path only, not the file
-contents.
+contents. A credential file permission warning names the path and the
+mode, not the file contents.
 
 ## Running the MCP server
 
@@ -193,7 +194,9 @@ only, not key material:
 
 Create the files outside the repository. The directory must have mode
 `0700`, and each file must have mode `0600`. The account that runs
-`dayfly` must own the directory and the files. For example:
+`dayfly` must own the directory and the files. On Unix, the binary
+warns on stderr when a credential file is group or world readable, or
+owned by another user. Startup continues. For example:
 
 ```sh
 install -d -m 0700 ~/.config/dayfly
