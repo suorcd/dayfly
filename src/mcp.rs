@@ -19,7 +19,7 @@ use rmcp::{tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::store::Store;
+use crate::store::{Store, StoreError};
 
 #[derive(Clone)]
 pub struct Pastebin {
@@ -32,8 +32,38 @@ fn result_json(value: serde_json::Value) -> Result<CallToolResult, rmcp::ErrorDa
     )]))
 }
 
-fn err_json(e: crate::store::StoreError) -> rmcp::ErrorData {
-    rmcp::ErrorData::new(rmcp::model::ErrorCode::INTERNAL_ERROR, e.to_string(), None)
+/// Map a store error to the value that a tool method returns.
+///
+/// A routine domain result is a tool result with `isError` set, so a
+/// missing or expired paste does not look like a transport fault. A bad
+/// argument is a JSON-RPC `-32602` error. Only an internal fault is a
+/// `-32603` error.
+fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> {
+    match e {
+        StoreError::NotFound(_)
+        | StoreError::Expired(_)
+        | StoreError::TooLarge { .. }
+        | StoreError::RangeNotSatisfiable => Ok(CallToolResult::error(vec![ContentBlock::text(
+            e.to_string(),
+        )])),
+        StoreError::InvalidId(_) | StoreError::InvalidDate(_) | StoreError::InvalidRange(_) => {
+            Err(rmcp::ErrorData::invalid_params(e.to_string(), None))
+        }
+        StoreError::Io(_) | StoreError::S3(_) | StoreError::BucketUnavailable(_) => {
+            Err(rmcp::ErrorData::internal_error(e.to_string(), None))
+        }
+    }
+}
+
+/// Await a store call. If the call fails, return the mapped value to the
+/// client from the tool method.
+macro_rules! try_store {
+    ($call:expr) => {
+        match $call {
+            Ok(value) => value,
+            Err(e) => return store_error_result(e),
+        }
+    };
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -97,16 +127,16 @@ impl Pastebin {
         &self,
         Parameters(params): Parameters<StoreTextParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let stored = self
-            .store
-            .store_text(
-                params.text.as_bytes(),
-                params.filename.as_deref(),
-                params.content_type.as_deref(),
-                params.ttl_days,
-            )
-            .await
-            .map_err(err_json)?;
+        let stored = try_store!(
+            self.store
+                .store_text(
+                    params.text.as_bytes(),
+                    params.filename.as_deref(),
+                    params.content_type.as_deref(),
+                    params.ttl_days,
+                )
+                .await
+        );
         result_json(serde_json::json!({
             "id": stored.id,
             "key": stored.key,
@@ -127,16 +157,16 @@ impl Pastebin {
         &self,
         Parameters(params): Parameters<StoreFileParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let stored = self
-            .store
-            .store_file_path(
-                PathBuf::from(&params.path).as_path(),
-                params.filename.as_deref(),
-                params.content_type.as_deref(),
-                params.ttl_days,
-            )
-            .await
-            .map_err(err_json)?;
+        let stored = try_store!(
+            self.store
+                .store_file_path(
+                    PathBuf::from(&params.path).as_path(),
+                    params.filename.as_deref(),
+                    params.content_type.as_deref(),
+                    params.ttl_days,
+                )
+                .await
+        );
         result_json(serde_json::json!({
             "id": stored.id,
             "key": stored.key,
@@ -157,11 +187,11 @@ impl Pastebin {
         &self,
         Parameters(params): Parameters<FetchTextParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let slice = self
-            .store
-            .fetch_text(&params.id, params.offset.unwrap_or(0), params.limit)
-            .await
-            .map_err(err_json)?;
+        let slice = try_store!(
+            self.store
+                .fetch_text(&params.id, params.offset.unwrap_or(0), params.limit)
+                .await
+        );
         result_json(serde_json::json!({
             "text": slice.text,
             "total_bytes": slice.total_bytes,
@@ -182,15 +212,15 @@ impl Pastebin {
             (Some(s), None) => Some((s, u64::MAX)),
             _ => None,
         };
-        let meta = self
-            .store
-            .download_file(
-                &params.id,
-                PathBuf::from(&params.dest_path).as_path(),
-                range,
-            )
-            .await
-            .map_err(err_json)?;
+        let meta = try_store!(
+            self.store
+                .download_file(
+                    &params.id,
+                    PathBuf::from(&params.dest_path).as_path(),
+                    range,
+                )
+                .await
+        );
         result_json(serde_json::json!({
             "dest_path": params.dest_path,
             "id": meta.id,
@@ -211,11 +241,7 @@ impl Pastebin {
         &self,
         Parameters(params): Parameters<IdParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let meta = self
-            .store
-            .head_metadata(&params.id)
-            .await
-            .map_err(err_json)?;
+        let meta = try_store!(self.store.head_metadata(&params.id).await);
         result_json(serde_json::json!({
             "id": meta.id,
             "key": meta.key,
@@ -236,7 +262,7 @@ impl Pastebin {
         &self,
         Parameters(params): Parameters<IdParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.store.delete(&params.id).await.map_err(err_json)?;
+        try_store!(self.store.delete(&params.id).await);
         result_json(serde_json::json!({"deleted": params.id}))
     }
 
@@ -247,11 +273,11 @@ impl Pastebin {
         &self,
         Parameters(params): Parameters<ListRecentParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let items = self
-            .store
-            .list_recent(params.date.as_deref(), params.limit.unwrap_or(100))
-            .await
-            .map_err(err_json)?;
+        let items = try_store!(
+            self.store
+                .list_recent(params.date.as_deref(), params.limit.unwrap_or(100))
+                .await
+        );
         result_json(serde_json::json!({
             "date": params.date,
             "items": items.iter().map(|i| serde_json::json!({
@@ -279,5 +305,59 @@ impl rmcp::handler::server::ServerHandler for Pastebin {
                  credentials and no presigned URL is issued. Expiry is \
                  day-granular and enforced on read.",
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::model::ErrorCode;
+
+    fn assert_tool_error(e: StoreError) {
+        let result =
+            store_error_result(e).expect("a routine result must not become a protocol error");
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(result.content.len(), 1);
+        assert!(matches!(
+            &result.content[0],
+            ContentBlock::Text(t) if !t.text.is_empty()
+        ));
+    }
+
+    #[test]
+    fn missing_paste_returns_tool_error_result() {
+        assert_tool_error(StoreError::NotFound("2026-10-28/missing".into()));
+    }
+
+    #[test]
+    fn routine_domain_errors_return_tool_error_results() {
+        assert_tool_error(StoreError::Expired("2026-10-28/old".into()));
+        assert_tool_error(StoreError::TooLarge { limit: 1024 });
+        assert_tool_error(StoreError::RangeNotSatisfiable);
+    }
+
+    #[test]
+    fn bad_arguments_return_invalid_params() {
+        for e in [
+            StoreError::InvalidId("bad id".into()),
+            StoreError::InvalidDate("2026-13-01".into()),
+            StoreError::InvalidRange("end before start".into()),
+        ] {
+            let err = store_error_result(e).expect_err("a bad argument must be a protocol error");
+            assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    #[test]
+    fn internal_faults_return_internal_errors() {
+        for e in [
+            StoreError::Io("disk full".into()),
+            StoreError::S3("s3 failure".into()),
+            StoreError::BucketUnavailable("bucket missing".into()),
+        ] {
+            let err =
+                store_error_result(e).expect_err("an internal fault must be a protocol error");
+            assert_eq!(err.code, ErrorCode::INTERNAL_ERROR);
+        }
     }
 }
