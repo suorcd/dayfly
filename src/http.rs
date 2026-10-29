@@ -29,7 +29,8 @@ use subtle::ConstantTimeEq;
 
 use crate::content_type::content_disposition;
 use crate::store::{
-    parse_range_header, Store, StoreError, Ttl, TtlParseError, MULTIPART_CHUNK_BYTES,
+    parse_list_window_request, parse_range_header, ListWindowRequest, Store, StoreError, Ttl,
+    TtlParseError, MULTIPART_CHUNK_BYTES,
 };
 
 #[derive(Clone)]
@@ -565,6 +566,16 @@ async fn download_inner(
     (status, resp_headers, Body::from_stream(body_stream)).into_response()
 }
 
+/// Parse the listing query. `date` takes precedence over `start` and `end`.
+/// A range must supply both dates, and the range must not be inverted.
+fn parse_list_query(query: &HashMap<String, String>) -> Result<ListWindowRequest, StoreError> {
+    parse_list_window_request(
+        query.get("date").map(String::as_str),
+        query.get("start").map(String::as_str),
+        query.get("end").map(String::as_str),
+    )
+}
+
 async fn list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -573,14 +584,26 @@ async fn list_handler(
     if let Err(resp) = check_auth(&state, &headers) {
         return resp;
     }
-    let date = query.get("date").map(|s| s.as_str());
+    let window = match parse_list_query(&query) {
+        Ok(window) => window,
+        Err(e) => return error_response(e),
+    };
     let limit = query
         .get("limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(100);
-    match state.store.list_recent(date, limit).await {
+    let result = match &window {
+        ListWindowRequest::Date(date) => state.store.list_recent(Some(date), limit).await,
+        ListWindowRequest::Range { start, end } => {
+            state.store.list_window(Some(start), Some(end), limit).await
+        }
+        ListWindowRequest::Default => state.store.list_window(None, None, limit).await,
+    };
+    match result {
         Ok(items) => Json(serde_json::json!({
-            "date": date,
+            "date": query.get("date"),
+            "start": query.get("start"),
+            "end": query.get("end"),
             "items": items.iter().map(|i| serde_json::json!({
                 "id": i.id,
                 "key": i.key,
@@ -999,6 +1022,90 @@ mod tests {
                 .expect("mock S3 server must run");
         });
         (format!("http://{addr}"), captured)
+    }
+
+    fn query(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn list_query_keeps_date_as_one_day() {
+        assert_eq!(
+            parse_list_query(&query(&[("date", "2026-10-28")])).unwrap(),
+            ListWindowRequest::Date("2026-10-28".to_string())
+        );
+    }
+
+    #[test]
+    fn list_query_accepts_an_inclusive_range() {
+        assert_eq!(
+            parse_list_query(&query(&[("start", "2026-10-28"), ("end", "2026-10-29"),])).unwrap(),
+            ListWindowRequest::Range {
+                start: "2026-10-28".to_string(),
+                end: "2026-10-29".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn list_query_rejects_a_one_sided_range() {
+        assert!(matches!(
+            parse_list_query(&query(&[("start", "2026-10-28")])),
+            Err(StoreError::InvalidDate(_))
+        ));
+        assert!(matches!(
+            parse_list_query(&query(&[("end", "2026-10-28")])),
+            Err(StoreError::InvalidDate(_))
+        ));
+    }
+
+    #[test]
+    fn list_query_rejects_an_inverted_range() {
+        assert!(matches!(
+            parse_list_query(&query(&[("start", "2026-10-29"), ("end", "2026-10-28"),])),
+            Err(StoreError::InvalidDate(_))
+        ));
+    }
+
+    #[test]
+    fn list_query_rejects_a_malformed_range() {
+        assert!(matches!(
+            parse_list_query(&query(&[("start", "2026-13-01"), ("end", "2026-12-01"),])),
+            Err(StoreError::InvalidDate(_))
+        ));
+    }
+
+    /// An invalid listing window must fail at the HTTP boundary. The parse
+    /// happens before the store call, so this test does not reach S3.
+    #[tokio::test]
+    async fn list_endpoint_rejects_invalid_ranges_with_400() {
+        let state = test_state(10 * 1024 * 1024, 1024 * 1024 * 1024).await;
+        let app = api_router().with_state(state);
+
+        for uri in [
+            "/v1/pastes?start=2026-10-28",
+            "/v1/pastes?end=2026-10-28",
+            "/v1/pastes?start=2026-10-29&end=2026-10-28",
+            "/v1/pastes?start=2026-13-01&end=2026-12-01",
+        ] {
+            let req = Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request must build");
+            let resp = app
+                .clone()
+                .oneshot(req)
+                .await
+                .expect("router call must complete");
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{uri} must be a 400"
+            );
+        }
     }
 
     /// The mirror image of the rejection test: a filename must select the

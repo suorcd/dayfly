@@ -19,7 +19,7 @@ use rmcp::{tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::store::{Store, StoreError, Ttl};
+use crate::store::{parse_list_window_request, ListWindowRequest, Store, StoreError, Ttl};
 
 #[derive(Clone)]
 pub struct Pastebin {
@@ -32,38 +32,8 @@ fn result_json(value: serde_json::Value) -> Result<CallToolResult, rmcp::ErrorDa
     )]))
 }
 
-/// Map a store error to the value that a tool method returns.
-///
-/// A routine domain result is a tool result with `isError` set, so a
-/// missing or expired paste does not look like a transport fault. A bad
-/// argument is a JSON-RPC `-32602` error. Only an internal fault is a
-/// `-32603` error.
-fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> {
-    match e {
-        StoreError::NotFound(_)
-        | StoreError::Expired(_)
-        | StoreError::TooLarge { .. }
-        | StoreError::RangeNotSatisfiable => Ok(CallToolResult::error(vec![ContentBlock::text(
-            e.to_string(),
-        )])),
-        StoreError::InvalidId(_) | StoreError::InvalidDate(_) | StoreError::InvalidRange(_) => {
-            Err(rmcp::ErrorData::invalid_params(e.to_string(), None))
-        }
-        StoreError::Io(_) | StoreError::S3(_) | StoreError::BucketUnavailable(_) => {
-            Err(rmcp::ErrorData::internal_error(e.to_string(), None))
-        }
-    }
-}
-
-/// Await a store call. If the call fails, return the mapped value to the
-/// client from the tool method.
-macro_rules! try_store {
-    ($call:expr) => {
-        match $call {
-            Ok(value) => value,
-            Err(e) => return store_error_result(e),
-        }
-    };
+fn err_json(e: StoreError) -> rmcp::ErrorData {
+    rmcp::ErrorData::new(rmcp::model::ErrorCode::INTERNAL_ERROR, e.to_string(), None)
 }
 
 fn invalid_ttl(message: impl Into<String>) -> rmcp::ErrorData {
@@ -138,9 +108,22 @@ pub struct IdParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListRecentParams {
-    /// Date prefix, YYYY-MM-DD. Defaults to today (UTC).
+    /// Single date, YYYY-MM-DD. Takes precedence over start and end.
     pub date: Option<String>,
+    /// Inclusive window start, YYYY-MM-DD. Requires end.
+    pub start: Option<String>,
+    /// Inclusive window end, YYYY-MM-DD. Requires start.
+    pub end: Option<String>,
     pub limit: Option<usize>,
+}
+
+/// Parse the MCP listing parameters. `date` takes precedence over the range.
+fn list_request(params: &ListRecentParams) -> Result<ListWindowRequest, StoreError> {
+    parse_list_window_request(
+        params.date.as_deref(),
+        params.start.as_deref(),
+        params.end.as_deref(),
+    )
 }
 
 #[tool_router]
@@ -300,19 +283,29 @@ impl Pastebin {
     }
 
     #[tool(
-        description = "List recent pastes for one date prefix only (YYYY-MM-DD, default today UTC). This scans the bucket directly (ListObjectsV2 + HeadObject per key) and filters expired objects; it is prefix listing, not search or sort, and is O(n) in objects scanned."
+        description = "List current pastes for one date or an inclusive date range. date=YYYY-MM-DD takes precedence over start and end. A range needs both start and end (YYYY-MM-DD), and start must be <= end. With no dates, the window is yesterday and today in UTC. This scans the bucket directly (ListObjectsV2 + HeadObject per key) and filters expired objects; it is prefix listing, not search or sort, and is O(n) in objects scanned."
     )]
     async fn list_recent(
         &self,
         Parameters(params): Parameters<ListRecentParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let items = try_store!(
-            self.store
-                .list_recent(params.date.as_deref(), params.limit.unwrap_or(100))
-                .await
-        );
+        let request = try_store!(list_request(&params));
+        let limit = params.limit.unwrap_or(100);
+        let items = match &request {
+            ListWindowRequest::Date(date) => {
+                try_store!(self.store.list_recent(Some(date), limit).await)
+            }
+            ListWindowRequest::Range { start, end } => {
+                try_store!(self.store.list_window(Some(start), Some(end), limit).await)
+            }
+            ListWindowRequest::Default => {
+                try_store!(self.store.list_window(None, None, limit).await)
+            }
+        };
         result_json(serde_json::json!({
             "date": params.date,
+            "start": params.start,
+            "end": params.end,
             "items": items.iter().map(|i| serde_json::json!({
                 "id": i.id,
                 "key": i.key,
@@ -434,5 +427,69 @@ mod tests {
     fn malformed_ttl_parameter_is_invalid_params() {
         let err = resolve_ttl(Some("1x"), None).expect_err("a bad ttl must fail");
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    fn params(date: Option<&str>, start: Option<&str>, end: Option<&str>) -> ListRecentParams {
+        ListRecentParams {
+            date: date.map(str::to_string),
+            start: start.map(str::to_string),
+            end: end.map(str::to_string),
+            limit: None,
+        }
+    }
+
+    #[test]
+    fn list_params_keep_date_as_one_day() {
+        assert_eq!(
+            list_request(&params(Some("2026-10-28"), None, None)).unwrap(),
+            ListWindowRequest::Date("2026-10-28".to_string())
+        );
+    }
+
+    #[test]
+    fn list_params_accept_an_inclusive_range() {
+        assert_eq!(
+            list_request(&params(None, Some("2026-10-28"), Some("2026-10-29"))).unwrap(),
+            ListWindowRequest::Range {
+                start: "2026-10-28".to_string(),
+                end: "2026-10-29".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn list_params_reject_a_one_sided_range() {
+        assert!(matches!(
+            list_request(&params(None, Some("2026-10-28"), None)),
+            Err(StoreError::InvalidDate(_))
+        ));
+        assert!(matches!(
+            list_request(&params(None, None, Some("2026-10-28"))),
+            Err(StoreError::InvalidDate(_))
+        ));
+    }
+
+    #[test]
+    fn list_params_reject_an_inverted_range() {
+        assert!(matches!(
+            list_request(&params(None, Some("2026-10-29"), Some("2026-10-28"))),
+            Err(StoreError::InvalidDate(_))
+        ));
+    }
+
+    #[test]
+    fn list_params_reject_a_malformed_date() {
+        assert!(matches!(
+            list_request(&params(None, Some("2026-13-01"), Some("2026-12-01"))),
+            Err(StoreError::InvalidDate(_))
+        ));
+    }
+
+    #[test]
+    fn list_params_use_the_default_window_with_no_dates() {
+        assert_eq!(
+            list_request(&params(None, None, None)).unwrap(),
+            ListWindowRequest::Default
+        );
     }
 }
