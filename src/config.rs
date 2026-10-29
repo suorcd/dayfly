@@ -49,25 +49,34 @@ pub enum ConfigError {
     BadEndpoint,
 }
 
-fn required(name: &str) -> Result<String, ConfigError> {
-    match env::var(name) {
-        Ok(v) if !v.trim().is_empty() => Ok(v.trim().to_string()),
+fn required<F>(lookup: &F, name: &str) -> Result<String, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match lookup(name) {
+        Some(v) if !v.trim().is_empty() => Ok(v.trim().to_string()),
         _ => Err(ConfigError::Missing(name.to_string())),
     }
 }
 
-fn optional_u64(name: &str, default: u64) -> Result<u64, ConfigError> {
-    match env::var(name) {
-        Ok(v) if !v.trim().is_empty() => v.trim().parse::<u64>().map_err(|_| {
+fn optional_u64<F>(lookup: &F, name: &str, default: u64) -> Result<u64, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match lookup(name) {
+        Some(v) if !v.trim().is_empty() => v.trim().parse::<u64>().map_err(|_| {
             ConfigError::Invalid(name.to_string(), "expected a non-negative integer".into())
         }),
         _ => Ok(default),
     }
 }
 
-fn optional_u32(name: &str, default: u32) -> Result<u32, ConfigError> {
-    match env::var(name) {
-        Ok(v) if !v.trim().is_empty() => v.trim().parse::<u32>().map_err(|_| {
+fn optional_u32<F>(lookup: &F, name: &str, default: u32) -> Result<u32, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match lookup(name) {
+        Some(v) if !v.trim().is_empty() => v.trim().parse::<u32>().map_err(|_| {
             ConfigError::Invalid(name.to_string(), "expected a non-negative integer".into())
         }),
         _ => Ok(default),
@@ -76,11 +85,22 @@ fn optional_u32(name: &str, default: u32) -> Result<u32, ConfigError> {
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let endpoint = required("S3_ENDPOINT")?;
+        Self::from_lookup(|name| env::var(name).ok())
+    }
+
+    /// Build a configuration from a name-to-value lookup.
+    ///
+    /// `from_env` passes the process environment. Unit tests pass a plain
+    /// map, so they do not change global process state.
+    fn from_lookup<F>(lookup: F) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let endpoint = required(&lookup, "S3_ENDPOINT")?;
         if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
             return Err(ConfigError::BadEndpoint);
         }
-        let bucket = required("S3_BUCKET")?;
+        let bucket = required(&lookup, "S3_BUCKET")?;
         if bucket.is_empty() {
             return Err(ConfigError::EmptyBucket);
         }
@@ -89,16 +109,15 @@ impl Config {
             bucket,
             // Region is a signing placeholder for S3-compatible stores such
             // as Garage. It is not hardcoded: the operator supplies it.
-            region: env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
-            access_key_id: required("S3_ACCESS_KEY_ID")?,
-            secret_access_key: required("S3_SECRET_ACCESS_KEY")?,
-            max_text_bytes: optional_u64("DAYFLY_MAX_TEXT_BYTES", 10 * 1024 * 1024)?,
-            max_file_bytes: optional_u64("DAYFLY_MAX_FILE_BYTES", 1024 * 1024 * 1024)?,
-            default_ttl_days: optional_u32("DAYFLY_DEFAULT_TTL_DAYS", 7)?,
-            http_bind: env::var("DAYFLY_HTTP_BIND")
-                .unwrap_or_else(|_| "127.0.0.1:8080".to_string()),
-            http_bearer_token: match env::var("DAYFLY_HTTP_BEARER_TOKEN") {
-                Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+            region: lookup("S3_REGION").unwrap_or_else(|| "us-east-1".to_string()),
+            access_key_id: required(&lookup, "S3_ACCESS_KEY_ID")?,
+            secret_access_key: required(&lookup, "S3_SECRET_ACCESS_KEY")?,
+            max_text_bytes: optional_u64(&lookup, "DAYFLY_MAX_TEXT_BYTES", 10 * 1024 * 1024)?,
+            max_file_bytes: optional_u64(&lookup, "DAYFLY_MAX_FILE_BYTES", 1024 * 1024 * 1024)?,
+            default_ttl_days: optional_u32(&lookup, "DAYFLY_DEFAULT_TTL_DAYS", 7)?,
+            http_bind: lookup("DAYFLY_HTTP_BIND").unwrap_or_else(|| "127.0.0.1:8080".to_string()),
+            http_bearer_token: match lookup("DAYFLY_HTTP_BEARER_TOKEN") {
+                Some(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
                 _ => None,
             },
         })
@@ -141,7 +160,33 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+
+    fn lookup_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        move |name| map.get(name).cloned()
+    }
+
+    fn base_env() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("S3_ENDPOINT", "http://127.0.0.1:3900"),
+            ("S3_BUCKET", "test-bucket"),
+            ("S3_ACCESS_KEY_ID", "test-access-key"),
+            ("S3_SECRET_ACCESS_KEY", "test-secret-key"),
+        ]
+    }
+
+    fn expect_error(result: Result<Config, ConfigError>) -> ConfigError {
+        match result {
+            Ok(_) => panic!("expected a configuration error"),
+            Err(error) => error,
+        }
+    }
 
     fn test_config(max_text_bytes: u64, max_file_bytes: u64) -> Config {
         Config {
@@ -169,10 +214,16 @@ mod tests {
 
     #[test]
     fn endpoint_must_be_http_url() {
-        // from_env reads the real process environment, so only test the
-        // validation rule indirectly via a helper-free check: a non-URL
-        // endpoint is rejected by construction in from_env, and this test
-        // documents that contract. See README for the env contract.
-        assert!(ConfigError::BadEndpoint.to_string().contains("http"));
+        let mut pairs = base_env();
+        pairs[0].1 = "ftp://127.0.0.1:3900";
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        assert!(matches!(error, ConfigError::BadEndpoint));
+    }
+
+    #[test]
+    fn direct_credentials_still_work() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("direct config");
+        assert_eq!(config.access_key_id, "test-access-key");
+        assert_eq!(config.secret_access_key, "test-secret-key");
     }
 }
