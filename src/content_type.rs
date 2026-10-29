@@ -7,10 +7,12 @@
 //!    generic `application/octet-stream`, which are treated as unspecified.
 //! 2. Magic-byte sniffing of the first bytes (the `infer` crate) for
 //!    images, PDF, ZIP, video/audio containers, and other signatures.
+//!    A ZIP signature alone cannot name an Office, OpenDocument, or
+//!    EPUB document, so a known zip-based extension refines the type.
 //!    If sniffing finds a well-known signature and the client said
-//!    something different, the sniffed type wins and the conflict is
+//!    something different, the detected type wins and the conflict is
 //!    recorded in metadata.
-//! 3. Filename extension via `mime_guess`, when a filename is supplied
+//! 3. Filename extension via `mime_guess`, when no signature was found
 //!    (and the extension maps to something more specific than octet-stream).
 //! 4. Plain-text detection: valid UTF-8 with no NUL bytes.
 //! 5. Fallback: `application/octet-stream`.
@@ -67,9 +69,13 @@ fn normalise_explicit(explicit: Option<&str>) -> Option<String> {
     }
 }
 
-fn extension_type(filename: Option<&str>) -> Option<String> {
+fn extension_of(filename: Option<&str>) -> Option<String> {
     let name = filename?;
-    let ext = Path::new(name).extension()?.to_str()?.to_ascii_lowercase();
+    Some(Path::new(name).extension()?.to_str()?.to_ascii_lowercase())
+}
+
+fn extension_type(filename: Option<&str>) -> Option<String> {
+    let ext = extension_of(filename)?;
     let mime = mime_guess::from_ext(&ext).first()?;
     let s = mime.to_string();
     if s == "application/octet-stream" {
@@ -77,6 +83,39 @@ fn extension_type(filename: Option<&str>) -> Option<String> {
     } else {
         Some(s)
     }
+}
+
+/// Zip-based document extensions. `infer` sees only the ZIP signature,
+/// and the filename names the specific type inside the container.
+/// `mime_guess` returns the exact type for these; the
+/// `zip_document_extensions_map_to_specific_types` test checks that.
+const MIME_GUESS_ZIP_DOCUMENTS: &[&str] =
+    &["docx", "epub", "odg", "odp", "ods", "odt", "pptx", "xlsx"];
+
+/// Zip-based macro-enabled document extensions. `mime_guess` lowercases
+/// the `macroEnabled` segment, so it does not return the exact type.
+const MACRO_ZIP_DOCUMENTS: &[(&str, &str)] = &[
+    ("docm", "application/vnd.ms-word.document.macroEnabled.12"),
+    (
+        "pptm",
+        "application/vnd.ms-powerpoint.presentation.macroEnabled.12",
+    ),
+    ("xlsm", "application/vnd.ms-excel.sheet.macroEnabled.12"),
+];
+
+/// The specific type of a zip-based document, if the filename names one.
+fn zip_document_type(filename: Option<&str>) -> Option<String> {
+    let ext = extension_of(filename)?;
+    if let Some((_, mime)) = MACRO_ZIP_DOCUMENTS
+        .iter()
+        .find(|(name, _)| *name == ext.as_str())
+    {
+        return Some((*mime).to_string());
+    }
+    if MIME_GUESS_ZIP_DOCUMENTS.contains(&ext.as_str()) {
+        return extension_type(filename);
+    }
+    None
 }
 
 fn is_text(prefix: &[u8]) -> bool {
@@ -96,24 +135,34 @@ pub fn detect_content_type(
 
     // 2. Magic-byte sniffing. `infer` only returns specific signatures.
     if let Some(kind) = infer::get(peek) {
-        let sniffed = kind.mime_type().to_string();
+        let mut sniffed = kind.mime_type().to_string();
+        let mut source: &'static str = "sniffed";
+        // The ZIP signature alone cannot name an Office, OpenDocument,
+        // or EPUB document. A known zip-based extension supplies the
+        // exact type.
+        if sniffed == "application/zip" {
+            if let Some(container) = zip_document_type(filename) {
+                sniffed = container;
+                source = "extension";
+            }
+        }
         if let Some(exp) = &explicit_specific {
             if *exp == sniffed {
                 return Detection {
                     content_type: sniffed,
-                    source: "sniffed",
+                    source,
                     conflict: None,
                 };
             }
             return Detection {
                 content_type: sniffed.clone(),
-                source: "sniffed",
+                source,
                 conflict: Some(format!("{exp} -> {sniffed}")),
             };
         }
         return Detection {
             content_type: sniffed,
-            source: "sniffed",
+            source,
             conflict: None,
         };
     }
@@ -344,6 +393,84 @@ mod tests {
     fn zip_detected() {
         let d = detect_content_type(None, None, &zip());
         assert_eq!(d.content_type, "application/zip");
+    }
+
+    const OOXML_DOCX: &str =
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    const OOXML_XLSX: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    const OOXML_PPTX: &str =
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+    const ODF_TEXT: &str = "application/vnd.oasis.opendocument.text";
+
+    #[test]
+    fn docx_detected_as_wordprocessingml() {
+        let d = detect_content_type(None, Some("report.docx"), &zip());
+        assert_eq!(d.content_type, OOXML_DOCX);
+        assert_eq!(d.source, "extension");
+    }
+
+    #[test]
+    fn odt_detected_as_opendocument_text() {
+        let d = detect_content_type(None, Some("notes.odt"), &zip());
+        assert_eq!(d.content_type, ODF_TEXT);
+        assert_eq!(d.source, "extension");
+    }
+
+    #[test]
+    fn zip_extension_stays_application_zip() {
+        let d = detect_content_type(None, Some("archive.zip"), &zip());
+        assert_eq!(d.content_type, "application/zip");
+        assert_eq!(d.source, "sniffed");
+    }
+
+    #[test]
+    fn docx_explicit_conflicting_type_records_conflict() {
+        let d = detect_content_type(Some("text/plain"), Some("report.docx"), &zip());
+        assert_eq!(d.content_type, OOXML_DOCX);
+        assert_eq!(d.source, "extension");
+        assert_eq!(d.conflict, Some(format!("text/plain -> {OOXML_DOCX}")));
+    }
+
+    #[test]
+    fn docx_explicit_matching_type_has_no_conflict() {
+        let d = detect_content_type(Some(OOXML_DOCX), Some("report.docx"), &zip());
+        assert_eq!(d.content_type, OOXML_DOCX);
+        assert_eq!(d.source, "extension");
+        assert!(d.conflict.is_none());
+    }
+
+    #[test]
+    fn docx_filename_without_zip_bytes_uses_extension_path() {
+        let d = detect_content_type(None, Some("report.docx"), &[0x00, 0xff, 0x01, 0x02]);
+        assert_eq!(d.content_type, OOXML_DOCX);
+        assert_eq!(d.source, "extension");
+        assert!(d.conflict.is_none());
+    }
+
+    #[test]
+    fn zip_document_extensions_map_to_specific_types() {
+        let cases = [
+            ("docm", "application/vnd.ms-word.document.macroEnabled.12"),
+            ("docx", OOXML_DOCX),
+            ("epub", "application/epub+zip"),
+            ("odg", "application/vnd.oasis.opendocument.graphics"),
+            ("odp", "application/vnd.oasis.opendocument.presentation"),
+            ("ods", "application/vnd.oasis.opendocument.spreadsheet"),
+            ("odt", ODF_TEXT),
+            (
+                "pptm",
+                "application/vnd.ms-powerpoint.presentation.macroEnabled.12",
+            ),
+            ("pptx", OOXML_PPTX),
+            ("xlsm", "application/vnd.ms-excel.sheet.macroEnabled.12"),
+            ("xlsx", OOXML_XLSX),
+        ];
+        for (ext, expected) in cases {
+            let name = format!("document.{ext}");
+            let d = detect_content_type(None, Some(&name), &zip());
+            assert_eq!(d.content_type, expected, "extension {ext}");
+            assert_eq!(d.source, "extension", "extension {ext}");
+        }
     }
 
     #[test]
