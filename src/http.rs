@@ -28,7 +28,9 @@ use serde::Serialize;
 use subtle::ConstantTimeEq;
 
 use crate::content_type::content_disposition;
-use crate::store::{parse_range_header, Store, StoreError, MULTIPART_CHUNK_BYTES};
+use crate::store::{
+    parse_range_header, Store, StoreError, Ttl, TtlParseError, MULTIPART_CHUNK_BYTES,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -165,10 +167,93 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn parse_ttl(headers: &HeaderMap, query: &HashMap<String, String>) -> Option<u32> {
-    header_str(headers, "x-ttl-days")
-        .or_else(|| query.get("ttl_days").cloned())
-        .and_then(|s| s.trim().parse::<u32>().ok())
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TtlSource {
+    /// `X-TTL`, `ttl`, or a `ttl` form field. Prefer this form.
+    Duration,
+    /// `X-TTL-Days`, `ttl_days`, or a `ttl_days` form field.
+    Days,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TtlInput {
+    ttl: Ttl,
+    source: TtlSource,
+}
+
+impl TtlInput {
+    fn duration(ttl: Ttl) -> Self {
+        Self {
+            ttl,
+            source: TtlSource::Duration,
+        }
+    }
+
+    fn days(ttl: Ttl) -> Self {
+        Self {
+            ttl,
+            source: TtlSource::Days,
+        }
+    }
+}
+
+fn ttl_error_response(e: TtlParseError) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": e.to_string()})),
+    )
+        .into_response()
+}
+
+fn parse_days(value: &str) -> Result<Ttl, TtlParseError> {
+    value
+        .trim()
+        .parse::<u32>()
+        .map(Ttl::days)
+        .map_err(|_| TtlParseError::invalid_days(value))
+}
+
+/// Apply a multipart `ttl` or `ttl_days` field.
+///
+/// A duration always wins over a day count, regardless of field order.
+/// A later `ttl_days` field cannot replace a duration that is already set.
+fn apply_ttl_field(
+    current: Option<TtlInput>,
+    name: &str,
+    value: &str,
+) -> Result<Option<TtlInput>, TtlParseError> {
+    match name {
+        "ttl" => Ttl::parse(value).map(|ttl| Some(TtlInput::duration(ttl))),
+        "ttl_days" => {
+            let parsed = parse_days(value)?;
+            if current.is_some_and(|input| input.source == TtlSource::Duration) {
+                Ok(current)
+            } else {
+                Ok(Some(TtlInput::days(parsed)))
+            }
+        }
+        _ => Ok(current),
+    }
+}
+
+/// Read a TTL from headers and query parameters.
+///
+/// A duration from `X-TTL` or `ttl` wins over a day count from
+/// `X-TTL-Days` or `ttl_days`. A header wins over the query parameter of
+/// the same form. An invalid value is an error, not a fallback.
+fn parse_ttl(
+    headers: &HeaderMap,
+    query: &HashMap<String, String>,
+) -> Result<Option<TtlInput>, TtlParseError> {
+    if let Some(value) = header_str(headers, "x-ttl").or_else(|| query.get("ttl").cloned()) {
+        return Ttl::parse(&value).map(|ttl| Some(TtlInput::duration(ttl)));
+    }
+    if let Some(value) =
+        header_str(headers, "x-ttl-days").or_else(|| query.get("ttl_days").cloned())
+    {
+        return parse_days(&value).map(|ttl| Some(TtlInput::days(ttl)));
+    }
+    Ok(None)
 }
 
 fn wants_json(headers: &HeaderMap, query: &HashMap<String, String>) -> bool {
@@ -245,7 +330,10 @@ async fn upload_dispatch(
     } else {
         let filename =
             header_str(&headers, "x-filename").or_else(|| query.get("filename").cloned());
-        let ttl = parse_ttl(&headers, &query);
+        let ttl = match parse_ttl(&headers, &query) {
+            Ok(ttl) => ttl.map(|input| input.ttl),
+            Err(e) => return ttl_error_response(e),
+        };
         let known_length = header_str(&headers, CONTENT_LENGTH.as_str())
             .and_then(|s| s.trim().parse::<u64>().ok());
         // A filename means a file upload; no filename means a text paste,
@@ -291,7 +379,10 @@ async fn multipart_inner(
 ) -> Response {
     let mut filename: Option<String> =
         header_str(&headers, "x-filename").or_else(|| query.get("filename").cloned());
-    let mut ttl = parse_ttl(&headers, &query);
+    let mut ttl = match parse_ttl(&headers, &query) {
+        Ok(ttl) => ttl,
+        Err(e) => return ttl_error_response(e),
+    };
     // The file field is streamed inside the loop, not moved out of it:
     // an axum Field borrows its Multipart, so holding it across a
     // next_field call does not compile. Streaming inside the iteration
@@ -324,7 +415,7 @@ async fn multipart_inner(
                     Box::pin(stream),
                     filename.as_deref(),
                     field_content_type.as_deref(),
-                    ttl,
+                    ttl.map(|input| input.ttl),
                     None,
                     max_bytes,
                 )
@@ -340,9 +431,12 @@ async fn multipart_inner(
                     filename = Some(text.trim().to_string());
                 }
             }
-        } else if name == "ttl_days" {
+        } else if name == "ttl" || name == "ttl_days" {
             if let Ok(text) = field.text().await {
-                ttl = text.trim().parse::<u32>().ok().or(ttl);
+                match apply_ttl_field(ttl, &name, &text) {
+                    Ok(next) => ttl = next,
+                    Err(e) => return ttl_error_response(e),
+                }
             }
         }
     }
@@ -650,6 +744,8 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
+    type CapturedMetadata = Arc<std::sync::Mutex<Option<HashMap<String, String>>>>;
+
     fn test_config(max_text_bytes: u64, max_file_bytes: u64) -> Config {
         Config {
             endpoint: "http://127.0.0.1:1".to_string(),
@@ -893,6 +989,44 @@ mod tests {
         );
     }
 
+    /// A mock S3 endpoint that records the user metadata of the last
+    /// PutObject request and accepts it.
+    async fn mock_s3() -> (String, CapturedMetadata) {
+        async fn capture_put(
+            State(captured): State<CapturedMetadata>,
+            headers: HeaderMap,
+            _body: axum::body::Bytes,
+        ) -> impl IntoResponse {
+            let mut meta = HashMap::new();
+            for (name, value) in headers.iter() {
+                if let Some(key) = name.as_str().strip_prefix("x-amz-meta-") {
+                    if let Ok(value) = value.to_str() {
+                        meta.insert(key.to_string(), value.to_string());
+                    }
+                }
+            }
+            *captured.lock().expect("metadata lock must not be poisoned") = Some(meta);
+            (
+                StatusCode::OK,
+                [(axum::http::header::ETAG, "\"test-etag\"")],
+            )
+        }
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let app = Router::new()
+            .fallback(capture_put)
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock S3 listener must bind");
+        let addr = listener.local_addr().expect("mock S3 address must exist");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock S3 server must run");
+        });
+        (format!("http://{addr}"), captured)
+    }
+
     /// The mirror image of the rejection test: a filename must select the
     /// file cap. The request reaches the unreachable test S3 endpoint and
     /// returns 502; if the cap selection regressed to the text cap it would
@@ -916,5 +1050,251 @@ mod tests {
             StatusCode::BAD_GATEWAY,
             "X-Filename must select the file cap and reach the S3 sink"
         );
+    }
+
+    /// A sub-day TTL must reach S3 as an exact duration. The mock S3
+    /// endpoint records the stored user metadata, so this test observes
+    /// what the object would carry, not only the HTTP status.
+    #[tokio::test]
+    async fn x_ttl_header_stores_exact_hour_expiry() {
+        let (endpoint, captured) = mock_s3().await;
+        let mut config = test_config(10 * 1024 * 1024, 1024 * 1024 * 1024);
+        config.endpoint = endpoint;
+        let state = AppState {
+            store: Store::from_config(config)
+                .await
+                .expect("test S3 config must build without network access"),
+        };
+        let app = api_router().with_state(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .header(CONTENT_TYPE, "text/plain")
+            .header(CONTENT_LENGTH, "5")
+            .header("x-ttl", "1h")
+            .body(Body::from("hello"))
+            .expect("request must build");
+        let resp = app.oneshot(req).await.expect("router call must complete");
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a valid X-TTL header must be accepted"
+        );
+
+        let meta = captured
+            .lock()
+            .expect("metadata lock must not be poisoned")
+            .take()
+            .expect("the upload must reach S3");
+        assert_eq!(
+            meta.get("ttl-seconds").map(String::as_str),
+            Some("3600"),
+            "ttl-seconds must hold the exact sub-day duration"
+        );
+        let created = meta
+            .get("created-at")
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .expect("created-at must be stored");
+        let expires = meta
+            .get("expires-at")
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .expect("expires-at must be stored");
+        assert_eq!(
+            expires - created,
+            chrono::Duration::hours(1),
+            "expires-at must be exactly one hour after created-at"
+        );
+    }
+
+    #[tokio::test]
+    async fn x_ttl_takes_precedence_over_x_ttl_days_at_the_http_boundary() {
+        let (endpoint, captured) = mock_s3().await;
+        let mut config = test_config(10 * 1024 * 1024, 1024 * 1024 * 1024);
+        config.endpoint = endpoint;
+        let state = AppState {
+            store: Store::from_config(config)
+                .await
+                .expect("test S3 config must build without network access"),
+        };
+        let app = api_router().with_state(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .header(CONTENT_TYPE, "text/plain")
+            .header(CONTENT_LENGTH, "5")
+            .header("x-ttl", "1h30m")
+            .header("x-ttl-days", "7")
+            .body(Body::from("hello"))
+            .expect("request must build");
+        let resp = app.oneshot(req).await.expect("router call must complete");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let meta = captured
+            .lock()
+            .expect("metadata lock must not be poisoned")
+            .take()
+            .expect("the upload must reach S3");
+        assert_eq!(
+            meta.get("ttl-seconds").map(String::as_str),
+            Some("5400"),
+            "X-TTL must win when both TTL forms are present"
+        );
+        assert!(
+            !meta.contains_key("ttl-days"),
+            "a compound TTL must not store a rounded ttl-days value"
+        );
+    }
+
+    #[tokio::test]
+    async fn x_ttl_days_still_stores_whole_day_expiry() {
+        let (endpoint, captured) = mock_s3().await;
+        let mut config = test_config(10 * 1024 * 1024, 1024 * 1024 * 1024);
+        config.endpoint = endpoint;
+        let state = AppState {
+            store: Store::from_config(config)
+                .await
+                .expect("test S3 config must build without network access"),
+        };
+        let app = api_router().with_state(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .header(CONTENT_TYPE, "text/plain")
+            .header(CONTENT_LENGTH, "5")
+            .header("x-ttl-days", "7")
+            .body(Body::from("hello"))
+            .expect("request must build");
+        let resp = app.oneshot(req).await.expect("router call must complete");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let meta = captured
+            .lock()
+            .expect("metadata lock must not be poisoned")
+            .take()
+            .expect("the upload must reach S3");
+        assert_eq!(meta.get("ttl-seconds").map(String::as_str), Some("604800"));
+        assert_eq!(meta.get("ttl-days").map(String::as_str), Some("7"));
+        let created = meta
+            .get("created-at")
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .expect("created-at must be stored");
+        let expires = meta
+            .get("expires-at")
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .expect("expires-at must be stored");
+        assert_eq!(expires - created, chrono::Duration::days(7));
+    }
+
+    #[tokio::test]
+    async fn malformed_x_ttl_is_rejected_with_json_400() {
+        let state = test_state(10 * 1024 * 1024, 1024 * 1024 * 1024).await;
+        let app = api_router().with_state(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .header(CONTENT_TYPE, "text/plain")
+            .header(CONTENT_LENGTH, "5")
+            .header("x-ttl", "1x")
+            .body(Body::from("hello"))
+            .expect("request must build");
+        let resp = app.oneshot(req).await.expect("router call must complete");
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("error body must be readable");
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a malformed X-TTL must be a bad argument, not a default: {body}"
+        );
+        assert!(
+            body.contains("invalid TTL"),
+            "the 400 body must name the TTL error, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_x_ttl_days_is_rejected_with_json_400() {
+        let state = test_state(10 * 1024 * 1024, 1024 * 1024 * 1024).await;
+        let app = api_router().with_state(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .header(CONTENT_TYPE, "text/plain")
+            .header(CONTENT_LENGTH, "5")
+            .header("x-ttl-days", "soon")
+            .body(Body::from("hello"))
+            .expect("request must build");
+        let resp = app.oneshot(req).await.expect("router call must complete");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn ttl_query_duration_wins_over_day_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ttl-days", HeaderValue::from_static("7"));
+        let query = HashMap::from([("ttl".to_string(), "90m".to_string())]);
+        let input = parse_ttl(&headers, &query)
+            .expect("a valid query TTL must parse")
+            .expect("the query TTL must be present");
+        assert_eq!(input.ttl.num_seconds(), 5_400);
+        assert_eq!(input.source, TtlSource::Duration);
+    }
+
+    #[test]
+    fn ttl_query_days_still_selects_whole_days() {
+        let query = HashMap::from([("ttl_days".to_string(), "3".to_string())]);
+        let input = parse_ttl(&HeaderMap::new(), &query)
+            .expect("a valid day TTL must parse")
+            .expect("the day TTL must be present");
+        assert_eq!(input.ttl.num_seconds(), 3 * 86_400);
+        assert_eq!(input.source, TtlSource::Days);
+    }
+
+    #[test]
+    fn multipart_ttl_field_sets_subday_duration() {
+        let input = apply_ttl_field(None, "ttl", "1h30m")
+            .expect("a valid ttl field must parse")
+            .expect("a ttl must be present");
+        assert_eq!(input.ttl.num_seconds(), 5_400);
+        assert_eq!(input.source, TtlSource::Duration);
+    }
+
+    #[test]
+    fn multipart_ttl_days_field_still_sets_whole_days() {
+        let input = apply_ttl_field(None, "ttl_days", "3")
+            .expect("a valid ttl_days field must parse")
+            .expect("a ttl must be present");
+        assert_eq!(input.ttl.num_seconds(), 3 * 86_400);
+        assert_eq!(input.source, TtlSource::Days);
+    }
+
+    #[test]
+    fn multipart_duration_field_wins_over_day_field_in_either_order() {
+        let days_first =
+            apply_ttl_field(None, "ttl_days", "7").expect("a valid ttl_days field must parse");
+        let duration_wins = apply_ttl_field(days_first, "ttl", "1h")
+            .expect("a valid ttl field must parse")
+            .expect("a ttl must be present");
+        assert_eq!(duration_wins.ttl.num_seconds(), 3_600);
+        assert_eq!(duration_wins.source, TtlSource::Duration);
+
+        let days_cannot_replace = apply_ttl_field(Some(duration_wins), "ttl_days", "7")
+            .expect("a valid ttl_days field must parse")
+            .expect("a ttl must be present");
+        assert_eq!(days_cannot_replace.ttl.num_seconds(), 3_600);
+        assert_eq!(days_cannot_replace.source, TtlSource::Duration);
+    }
+
+    #[test]
+    fn multipart_malformed_ttl_field_is_an_error() {
+        assert!(apply_ttl_field(None, "ttl", "1x").is_err());
+        assert!(apply_ttl_field(None, "ttl_days", "soon").is_err());
     }
 }
