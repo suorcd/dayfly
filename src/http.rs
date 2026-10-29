@@ -699,7 +699,17 @@ async fn delete_bare(
     }
 }
 
-/// API routes, without state attached. `main` merges these with the
+/// Compose the complete HTTP app from one [`AppState`].
+///
+/// The API routes, the human UI routes, and any other HTTP surface share
+/// the same store and configuration. Do not build a second store here.
+pub fn app_router(state: AppState) -> Router {
+    api_router()
+        .merge(crate::web::ui_router())
+        .with_state(state)
+}
+
+/// API routes, without state attached. [`app_router`] merges these with the
 /// human UI routes and attaches a single shared [`AppState`].
 pub fn api_router() -> Router<AppState> {
     // Uploads are streamed and capped by the store while they are read.

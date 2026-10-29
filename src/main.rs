@@ -72,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Serve { bind }) => {
             let bind_addr = bind.unwrap_or(config.http_bind.clone());
             let state = AppState { store };
-            let app = http::api_router().merge(web::ui_router()).with_state(state);
+            let app = http::app_router(state);
             let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
             tracing::info!("HTTP listening on {bind_addr}");
             axum::serve(listener, app).await?;
