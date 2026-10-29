@@ -331,7 +331,6 @@ impl rmcp::handler::server::ServerHandler for Pastebin {
 #[cfg(test)]
 mod tests {
     use super::*;
-<<<<<<< HEAD
     use rmcp::model::ErrorCode;
 
     fn assert_tool_error(e: StoreError) {

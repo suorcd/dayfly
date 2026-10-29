@@ -28,17 +28,20 @@ metadata is needed. See "No database in v1" below.
   `pastes/<yyyy-mm-dd>/<random-id>`, where the random ID has at least
   128 bits of entropy (base62). A user-supplied filename is never put
   in the key.
-- Filename, content-type, created date, and TTL in days are stored in
-  object metadata. The S3 `Content-Length` gives the size. A `sha256`
-  value is stored when the hash is known before the object is created.
-  A multipart stream cannot know the hash in advance, so it omits the
-  value. No separate metadata sidecar in v1.
-- Expiry is **day-granular only**. `ttl_days` on store (default 7,
-  configurable via `DAYFLY_DEFAULT_TTL_DAYS`). Expiry is enforced on
-  read in the API/MCP layer by comparing stored `expires-at` metadata
-  with now. S3 lifecycle deletion is a separate, asynchronous sweeper
-  (see `docs/lifecycle-example.json`): it is day-rounded and may run
-  after the TTL day. **Exact-day deletion is not promised.**
+- Filename, content-type, created date, and TTL are stored in object
+  metadata. The S3 `Content-Length` gives the size. A `sha256` value is
+  stored when the hash is known before the object is created. A
+  multipart stream cannot know the hash in advance, so it omits the
+  value. The TTL is stored as exact seconds and as whole days when the
+  duration has no smaller part. No separate metadata sidecar in v1.
+- Expiry uses a read-time TTL. The TTL accepts seconds or a duration
+  such as `90m` or `1h30m`. `ttl_days` remains as a day-based form. The
+  default is 7 days, configurable via `DAYFLY_DEFAULT_TTL_DAYS`. The
+  API and MCP layer compare stored `expires-at` metadata with now and
+  enforce expiry on read. S3 lifecycle deletion is a separate,
+  asynchronous sweeper (see `docs/lifecycle-example.json`): it is
+  day-rounded and may run after the TTL. **Exact-time deletion from the
+  bucket is not promised.**
 - Streaming upload and download. A returned URL can itself be streamed
   back without downloading the whole object first.
 
@@ -143,7 +146,7 @@ placeholder values replaced by your own Garage values.
 | `S3_REGION` | no | `us-east-1` | Signing placeholder for Garage; supply your own, do not rely on the default being "yours" |
 | `DAYFLY_MAX_TEXT_BYTES` | no | 10485760 (10 MiB) | Max text paste size for MCP `store_text`, the human text form, and `POST /upload` without a filename; oversize → 413. A filename (including a multipart filename) uses `DAYFLY_MAX_FILE_BYTES` instead |
 | `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error |
-| `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in whole days |
+| `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in whole days when a request does not set a TTL. The name and meaning are unchanged |
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
 | `DAYFLY_HTTP_BEARER_TOKEN` | no | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model) |
 
@@ -247,6 +250,31 @@ curl --data-binary @- -H 'Accept: application/json' \
 
 `POST /v1/pastes` is an alias for `POST /upload`.
 
+### TTL forms
+
+Send `X-TTL` (or `?ttl=`) with seconds or a duration. The accepted
+forms are a bare integer as seconds (`3600`) and number and unit pairs
+with `s`, `m`, `h`, and `d` (`90m`, `1h30m`, `2d`, `1d12h`).
+`X-TTL-Days` and `ttl_days` still accept a whole number of days. When
+both forms are present, `X-TTL` or `ttl` wins. A header wins over the
+query parameter of the same form.
+
+A malformed TTL returns 400 with a JSON error. It does not fall back
+to the default. `DAYFLY_DEFAULT_TTL_DAYS` sets the default in whole
+days when no TTL is given; its name and meaning are unchanged.
+
+```sh
+# Sub-day TTL: one hour and thirty minutes.
+cat scratch.txt | curl --data-binary @- \
+  -H 'X-TTL: 1h30m' \
+  http://127.0.0.1:8080/upload
+
+# The legacy day form still works.
+cat notes.txt | curl --data-binary @- \
+  -H 'X-TTL-Days: 7' \
+  http://127.0.0.1:8080/upload
+```
+
 ### Streaming upload (curl piping, 0x0.st style)
 
 ```sh
@@ -268,6 +296,7 @@ cat report.csv | curl --data-binary @- \
   http://127.0.0.1:8080/upload
 
 # Multipart form upload (also streamed, not buffered whole):
+curl -F file=@photo.png -F ttl=90m http://127.0.0.1:8080/upload
 curl -F file=@photo.png -F ttl_days=30 http://127.0.0.1:8080/upload
 ```
 
@@ -289,11 +318,11 @@ EOF, `AbortMultipartUpload` on client disconnect or any error.
 any error, no URL is returned and any multipart upload is aborted.**
 An empty upload becomes a single empty PutObject.
 
-Note on multipart forms: text fields (`filename`, `ttl_days`) must
-come before the `file` field if you want them honoured; fields after
-the file field are not read. Use headers (`X-Filename`,
-`X-TTL-Days`) or query parameters (`?filename=…&ttl_days=…`) if in
-doubt.
+Note on multipart forms: text fields (`filename`, `ttl`, `ttl_days`)
+must come before the `file` field if you want them honored; fields
+after the file field are not read. Use headers (`X-Filename`,
+`X-TTL`, `X-TTL-Days`) or query parameters (`?filename=…&ttl=…` or
+`?filename=…&ttl_days=…`) if in doubt.
 
 ### Fetch, range, metadata, delete, list
 
@@ -411,9 +440,9 @@ binary-auth model as the API, no public sharing, accounts, or
 comments.
 
 - `GET /` — new paste/upload: paste text directly, or upload a file,
-  with a TTL-in-days selector (1, 3, 7, 14, 30, 90 days; day
-  granularity, same as the API). On success it shows the resulting
-  URL as a clickable link, plus the paste/file ID.
+  with a TTL selector in whole days (1, 3, 7, 14, 30, 90 days; the API
+  also accepts sub-day TTLs). On success it shows the resulting URL as
+  a clickable link, plus the paste/file ID.
 - `GET /pastes` — current pastes, built from the bucket scan (no
   database): link/ID, filename if any, content type, size, created
   date, expiry date plus days remaining, and a delete action per
@@ -595,6 +624,9 @@ Use the same checklist for a real Garage instance:
 - [ ] Verify day TTL: store with `ttl_days=1`, confirm the paste is
       readable before expiry and returns 410 / expired after the
       stored `expires-at` passes.
+- [ ] Verify sub-day TTL: store with `X-TTL: 1h`, confirm the stored
+      `expires-at` is one hour after `created-at` and that the paste
+      returns 410 / expired after that time.
 - [ ] Verify a buffered text paste: pipe 20 KiB of text with
       `cat text | curl --data-binary @- <base>/upload`, confirm
       `text/plain; charset=utf-8` and an inline download.
@@ -616,7 +648,7 @@ Use the same checklist for a real Garage instance:
       renders text / an image inline, and delete removes it.
 - [ ] Apply `docs/lifecycle-example.json` manually if desired (it is
       **not** applied automatically), and confirm it only ever
-      deletes objects past their TTL day, plus aborts incomplete
+      deletes objects past their TTL, plus aborts incomplete
       multipart uploads.
 
 ## Lifecycle example
@@ -628,12 +660,12 @@ Garage lifecycle support is partial and version-dependent. Verify
 build before production use.
 
 The rule expires objects after 90 days. 90 days is the longest TTL
-the human frontend offers, so the rule is a backstop only. Do not set
-the rule below the longest TTL you use. Otherwise, the sweeper can
+the human frontend offers. API clients can set a longer TTL, so do not
+set the rule below the longest TTL you use. Otherwise, the sweeper can
 delete an object that the API still serves. Deletion is day-rounded
-and asynchronous, and it can run after the TTL day. Objects are
-already unreadable through the API when `expires-at` passes,
-regardless of when the sweeper runs.
+and asynchronous, and it can run after the TTL. Objects are already
+unreadable through the API when `expires-at` passes, regardless of
+when the sweeper runs.
 
 ## Known limitations (v1)
 
