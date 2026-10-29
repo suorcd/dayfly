@@ -94,6 +94,8 @@ pub trait UploadSink {
 pub struct UploadOutcome {
     pub total_bytes: u64,
     pub sha256: String,
+    /// Read by the unit tests only; the write path no longer uses it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub used_multipart: bool,
     /// Read by the unit tests only; the binary reports total_bytes instead.
     #[cfg_attr(not(test), allow(dead_code))]
