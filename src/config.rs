@@ -358,13 +358,16 @@ mod tests {
             file.path(),
         );
         let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
-        let message = error.to_string();
-        assert!(
-            message.contains("S3_ACCESS_KEY_ID_FILE"),
-            "message: {message}"
-        );
-        assert!(message.contains("empty"), "message: {message}");
-        assert!(message.contains(file.path()), "message: {message}");
+        match &error {
+            ConfigError::EmptyCredentialFile {
+                file_variable,
+                path,
+            } => {
+                assert_eq!(file_variable, "S3_ACCESS_KEY_ID_FILE");
+                assert_eq!(path, file.path());
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]
@@ -379,9 +382,18 @@ mod tests {
             path,
         );
         let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
-        let message = error.to_string();
-        assert!(message.contains("cannot read"), "message: {message}");
-        assert!(message.contains(path), "message: {message}");
+        match &error {
+            ConfigError::CredentialFileRead {
+                file_variable,
+                path: error_path,
+                source,
+            } => {
+                assert_eq!(file_variable, "S3_SECRET_ACCESS_KEY_FILE");
+                assert_eq!(error_path, path);
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]
@@ -390,9 +402,19 @@ mod tests {
         let mut pairs = base_env();
         pairs.push(("S3_ACCESS_KEY_ID_FILE".to_string(), file.path().to_string()));
         let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
-        let message = error.to_string();
-        assert!(message.contains("S3_ACCESS_KEY_ID"), "message: {message}");
-        assert!(message.contains("both"), "message: {message}");
-        assert!(!message.contains("test-access-key"), "message: {message}");
+        match &error {
+            ConfigError::ConflictingCredentialSources {
+                variable,
+                file_variable,
+            } => {
+                assert_eq!(variable, "S3_ACCESS_KEY_ID");
+                assert_eq!(file_variable, "S3_ACCESS_KEY_ID_FILE");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert!(
+            !error.to_string().contains("test-access-key"),
+            "message: {error}"
+        );
     }
 }
