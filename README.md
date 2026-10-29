@@ -352,9 +352,10 @@ Detection precedence, in order:
 3. **Filename extension** (`mime_guess`), when an `X-Filename` /
    multipart filename is supplied.
 4. **Plain-text detection**: valid UTF-8 with no NUL bytes in the
-   sniffed prefix → `text/plain; charset=utf-8`. This inspects the
-   first 8 KiB only, so a file that is ASCII at the start and binary
-   later is classified as text and served inline.
+   whole payload → `text/plain; charset=utf-8`. A buffered upload
+   checks every byte. A streamed upload checks only the 8 KiB sample,
+   so a truncated sample cannot prove that the whole body is text;
+   see the streaming constraint below.
 5. **Fallback**: `application/octet-stream`.
 
 If sniffing and an explicit type disagree on a well-known signature
@@ -365,7 +366,12 @@ sniffed type wins and the conflict is recorded in object metadata as
 **Streaming constraint:** sniffing peeks at only the first chunk (up
 to 8 KiB) and then forwards those same bytes into the S3 upload
 stream. It does not buffer the whole file to detect its type, and the
-peeked bytes are neither lost nor duplicated.
+peeked bytes are neither lost nor duplicated. If the peek is a
+truncated sample, a plain-text candidate becomes
+`application/octet-stream`, because the sample cannot prove that the
+rest of the body is text. A specific client type or filename
+extension still wins. If a known length is at or below 8 KiB, the
+whole body was seen, so text detection still applies.
 
 Stored in S3 object metadata: the final `content-type`, the
 detection source (`client` | `sniffed` | `extension` | `text` |
@@ -542,8 +548,9 @@ no longer true and is corrected here rather than left standing.
 Unit tests cover: key generation, ID validation (including
 traversal rejection), range parsing, offset/limit windows, UTF-8
 prefix truncation, metadata/expiry round-trip, content-type
-detection (PNG, JPEG, GIF, WebP, PDF, ZIP, UTF-8 text, binary
-fallback, curl's `x-www-form-urlencoded` default ignored, explicit
+detection (PNG, JPEG, GIF, WebP, PDF, ZIP, whole-payload UTF-8
+text, truncated-sample fallback, binary fallback, curl's
+`x-www-form-urlencoded` default ignored, explicit
 type overriding a generic one, sniffed-signature conflict, extension
 fallback), peeked-byte forwarding (neither lost nor duplicated),
 streaming part buffering, chunked and multi-part-sized uploads,
