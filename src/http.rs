@@ -25,6 +25,7 @@ use axum::{Json, Router};
 use bytes::Bytes;
 use futures::StreamExt;
 use serde::Serialize;
+use subtle::ConstantTimeEq;
 
 use crate::content_type::content_disposition;
 use crate::store::{parse_range_header, Store, StoreError, MULTIPART_CHUNK_BYTES};
@@ -41,12 +42,15 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
     let Some(token) = state.store.config.http_bearer_token.as_deref() else {
         return Ok(());
     };
-    let expected = format!("Bearer {token}");
+    // Compare the credential in constant time. A byte-by-byte comparison
+    // stops at the first difference, so response timing would reveal how
+    // many leading bytes of the token are correct. The credential length
+    // is still visible through the timing, which is accepted.
+    // A non-UTF-8 header value is rejected here.
     let ok = headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v == expected)
-        .unwrap_or(false);
+        .is_some_and(|v| bearer_matches(v, token));
     if ok {
         Ok(())
     } else {
@@ -56,6 +60,26 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
         )
             .into_response())
     }
+}
+
+/// Return true when an `Authorization` header value carries the expected
+/// bearer token. The scheme is case-insensitive. The credential is compared
+/// with `subtle::ConstantTimeEq`, so the comparison time does not depend on
+/// the number of matching leading bytes. A credential length difference
+/// still leaks through the timing, which is accepted.
+fn bearer_matches(header_value: &str, token: &str) -> bool {
+    let Some((scheme, credential)) = header_value.split_once(' ') else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return false;
+    }
+    // Reject an empty credential and any extra whitespace. Only one ASCII
+    // space separates the scheme from the credential.
+    if credential.is_empty() || credential.contains(|c: char| c.is_ascii_whitespace()) {
+        return false;
+    }
+    credential.as_bytes().ct_eq(token.as_bytes()).into()
 }
 
 fn status_for(e: &StoreError) -> StatusCode {
@@ -624,6 +648,183 @@ mod tests {
                 .await
                 .expect("test S3 config must build without network access"),
         }
+    }
+
+    async fn test_state_with_token(token: &str) -> AppState {
+        let mut config = test_config(10 * 1024 * 1024, 1024 * 1024 * 1024);
+        config.http_bearer_token = Some(token.to_string());
+        AppState {
+            store: Store::from_config(config)
+                .await
+                .expect("test S3 config must build without network access"),
+        }
+    }
+
+    /// HTTP auth schemes are case-insensitive. A `bearer` scheme with the
+    /// right credential must pass authentication. The request then reaches
+    /// the unreachable test S3 endpoint and returns 502; a 401 means the
+    /// auth check rejected it.
+    #[tokio::test]
+    async fn lowercase_bearer_scheme_is_accepted() {
+        let state = test_state_with_token("correct-horse").await;
+        let app = api_router().with_state(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/pastes")
+            .header(AUTHORIZATION, "bearer correct-horse")
+            .body(Body::empty())
+            .expect("request must build");
+        let resp = app.oneshot(req).await.expect("router call must complete");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "a lowercase bearer scheme must pass auth and reach the S3 sink"
+        );
+    }
+
+    const TEST_TOKEN: &str = "correct-horse-battery-staple";
+
+    #[test]
+    fn bearer_matches_accepts_the_expected_credential() {
+        assert!(bearer_matches(&format!("Bearer {TEST_TOKEN}"), TEST_TOKEN));
+    }
+
+    #[test]
+    fn bearer_matches_accepts_any_scheme_case() {
+        assert!(bearer_matches(&format!("bearer {TEST_TOKEN}"), TEST_TOKEN));
+        assert!(bearer_matches(&format!("BEARER {TEST_TOKEN}"), TEST_TOKEN));
+        assert!(bearer_matches(&format!("BeArEr {TEST_TOKEN}"), TEST_TOKEN));
+    }
+
+    #[test]
+    fn bearer_matches_rejects_a_wrong_credential_of_equal_length() {
+        let wrong = "x".repeat(TEST_TOKEN.len());
+        assert!(!bearer_matches(&format!("Bearer {wrong}"), TEST_TOKEN));
+    }
+
+    #[test]
+    fn bearer_matches_rejects_a_wrong_credential_of_different_length() {
+        assert!(!bearer_matches("Bearer short", TEST_TOKEN));
+        assert!(!bearer_matches(
+            &format!("Bearer {TEST_TOKEN}extra"),
+            TEST_TOKEN
+        ));
+        assert!(!bearer_matches("Bearer ", TEST_TOKEN));
+    }
+
+    #[test]
+    fn bearer_matches_rejects_a_wrong_scheme() {
+        assert!(!bearer_matches(&format!("Basic {TEST_TOKEN}"), TEST_TOKEN));
+        assert!(!bearer_matches(&format!("Token {TEST_TOKEN}"), TEST_TOKEN));
+        assert!(!bearer_matches(TEST_TOKEN, TEST_TOKEN));
+        assert!(!bearer_matches(
+            &format!("Bearerx {TEST_TOKEN}"),
+            TEST_TOKEN
+        ));
+    }
+
+    #[test]
+    fn bearer_matches_rejects_malformed_values() {
+        for value in [
+            "",
+            "Bearer",
+            "Bearer ",
+            " Bearer correct-horse-battery-staple",
+            "Bearer  correct-horse-battery-staple",
+            "Bearer correct-horse-battery-staple ",
+            "Bearer correct-horse-battery-staple extra",
+            "Bearer\tcorrect-horse-battery-staple",
+        ] {
+            assert!(
+                !bearer_matches(value, TEST_TOKEN),
+                "malformed value must be rejected: {value:?}"
+            );
+        }
+    }
+
+    async fn status_for_auth_request(state: AppState, auth: Option<HeaderValue>) -> StatusCode {
+        let app = api_router().with_state(state);
+        let mut builder = Request::builder().method("GET").uri("/v1/pastes");
+        if let Some(value) = auth {
+            builder = builder.header(AUTHORIZATION, value);
+        }
+        let req = builder.body(Body::empty()).expect("request must build");
+        app.oneshot(req)
+            .await
+            .expect("router call must complete")
+            .status()
+    }
+
+    /// A wrong credential must be rejected with the documented 401 JSON
+    /// error before any store call.
+    #[tokio::test]
+    async fn wrong_bearer_token_returns_401() {
+        let state = test_state_with_token(TEST_TOKEN).await;
+        let app = api_router().with_state(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/pastes")
+            .header(AUTHORIZATION, "Bearer wrong-horse-battery-staple")
+            .body(Body::empty())
+            .expect("request must build");
+        let resp = app.oneshot(req).await.expect("router call must complete");
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1024)
+            .await
+            .expect("error body must be readable");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            r#"{"error":"unauthorized"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_authorization_header_returns_401() {
+        let state = test_state_with_token(TEST_TOKEN).await;
+        assert_eq!(
+            status_for_auth_request(state, None).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn non_utf8_authorization_header_returns_401() {
+        let state = test_state_with_token(TEST_TOKEN).await;
+        let value = HeaderValue::from_bytes(b"Bearer \xff\xfe").expect("opaque value must build");
+        assert_eq!(
+            status_for_auth_request(state, Some(value)).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// The right credential must pass auth. The request reaches the
+    /// unreachable test S3 endpoint and returns 502. A full 200 needs a real
+    /// S3 service.
+    #[tokio::test]
+    async fn right_bearer_token_passes_auth() {
+        let state = test_state_with_token(TEST_TOKEN).await;
+        assert_eq!(
+            status_for_auth_request(
+                state,
+                Some(
+                    HeaderValue::from_str(&format!("Bearer {TEST_TOKEN}"))
+                        .expect("header value must build")
+                )
+            )
+            .await,
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    /// An unset token keeps the endpoint open, as before.
+    #[tokio::test]
+    async fn request_without_token_configured_passes_auth() {
+        let state = test_state(10 * 1024 * 1024, 1024 * 1024 * 1024).await;
+        assert_eq!(
+            status_for_auth_request(state, None).await,
+            StatusCode::BAD_GATEWAY
+        );
     }
 
     /// A raw body with no filename is a text paste. Its declared length is
