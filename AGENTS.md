@@ -1,0 +1,113 @@
+# AGENTS.md — dayfly
+
+How agents (including future LLM agents working on this repo) should
+build, test, and change this project. This file is about the repo's
+conventions, not about the user.
+
+## What this project is
+
+Internal pastebin / file-share for LLM agents and one human, backed
+by a **private Garage bucket**. One small Rust binary, two transports
+sharing one S3 core: MCP server over stdio (default) and HTTP mode
+(`serve`, curl API plus a server-rendered human frontend). Full
+specification is in `README.md`; do not re-litigate settled decisions
+there (Garage first, no database in v1, day-granular expiry, no
+presigned URLs, no `If-None-Match` reliance) without new user input.
+
+## Build and test (Cargo — the primary path)
+
+```sh
+cargo fmt
+cargo clippy --all-targets
+cargo test
+cargo build
+cargo build --release
+```
+
+- Cargo must keep working standalone. The flake is an additional
+  build path, not a replacement.
+- Run `cargo fmt` before handing code over; fix clippy warnings
+  rather than leaving them, or say plainly why one is left.
+- Tests live in the modules they cover (`src/store.rs`,
+  `src/stream.rs`, `src/content_type.rs`, `src/web.rs`). Add a test
+  for any new detection, range, expiry, or streaming behaviour —
+  especially: a failed upload must return no URL material, and peeked
+  bytes must be forwarded exactly once.
+- Never fake a build/test result. Report the real command output,
+  including failures.
+
+## Build and test (Nix — additional path)
+
+```sh
+nix develop   # shell with cargo, rustc, rust-analyzer, clippy, rustfmt
+nix build     # builds packages.default
+nix flake check
+```
+
+What a pass looks like, on a machine with Nix:
+
+- `nix flake check` exits 0 with no errors.
+- `nix build` exits 0 and creates a `./result` symlink pointing into
+  the Nix store; `./result/bin/dayfly --help` prints the CLI
+  usage (subcommands `mcp` and `serve`).
+- `nix develop` drops into a shell where `cargo --version`,
+  `rustc --version`, and `rust-analyzer --version` all succeed.
+
+## Nix build status (read this before claiming anything)
+
+The flake builds and its unit tests pass on `x86_64-linux` against
+`nixos-unstable`, 36 of 36. That is a real result from a real run,
+not an assumption.
+
+It does **not** build on the `nixos-25.11` stable branch. The AWS SDK
+crates pinned in `Cargo.lock` require rustc 1.94.1 and 25.11 ships
+1.91.1, so the build fails before compilation with a rustc-too-old
+error naming 23 AWS crates. That is why the flake tracks unstable.
+Move back to a stable channel once one carries rustc 1.94.1 or newer.
+
+Do not claim a nix build succeeded if it did not run. When working on
+a machine with Nix, run the three commands above. The flake uses
+nixpkgs' rustPlatform (`buildRustPackage`, `Cargo.lock` in the repo)
+over crane / naersk, see `flake.nix` for the justification, and
+pins nixpkgs via the `nixos-unstable` input. After the first
+`nix flake update`, commit the generated `flake.lock`.
+
+## Key constraints (do not break these silently)
+
+- **Local only until the user says otherwise.** Do not publish to
+  GitHub, push, create a remote, or contact the user's real Garage
+  instance from a VM where it is out of reach. Do not use or invent
+  real S3 credentials. `.env.example` holds placeholders only; a
+  real `.env` is gitignored and must never be committed.
+- **The binary is the sole S3 credential holder.** Agents/clients
+  never get S3 credentials and never talk to S3 directly. No
+  presigned URLs in v1. The bucket stays private, not open, not
+  anonymous. No public bucket policy.
+- **No database in v1, no SQLite placeholder, no invented schema.**
+  Listing/info scan the bucket directly (ListObjectsV2 by date
+  prefix + HeadObject per key) and filter expired objects. Document
+  the O(n) tradeoff honestly; its slowdown is the trigger for a
+  database later.
+- **Garage first, expansion later.** Keep the code S3-shaped, but do
+  not spend v1 effort on generic AWS/MinIO tuning or multi-backend
+  abstraction.
+- **Logging to stderr only** in both modes, so MCP JSON-RPC on
+  stdout is never corrupted. Never log credentials.
+- **No panics on bad input.** Validate IDs (reject traversal),
+  enforce size limits with a clear 413 / machine-readable error,
+  and never return a URL for a failed or incomplete upload
+  (abort multipart on disconnect/error).
+- **Content-Type detection** follows the precedence in README
+  (specific client type, except curl's `--data-binary` default, then
+  magic-byte sniffing, then extension, then text, then fallback).
+  Sniffed HTML/SVG are always served as attachments, never inline.
+- **Human frontend** is server-rendered HTML, no JavaScript
+  framework, no build step. Its theme adapts the base look of
+  suorcd.us/style.css, palette `cyberpunkNeon`; the site's fonts are
+  referenced but not bundled (system monospace fallback). Do not
+  copy the whole stylesheet, and do not use the file's other
+  palettes (`green-dark`, `neon-dark01`).
+- **License / placeholders.** MIT. `LICENSE` and `Cargo.toml` use
+  `suorcd` and `github.com/suorcd/dayfly` as placeholders;
+  the copyright holder line and final repository name/URL must be
+  confirmed before any publish. Do not invent a full legal name.

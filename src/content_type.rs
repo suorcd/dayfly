@@ -1,0 +1,446 @@
+//! Content-Type detection for uploads.
+//!
+//! Precedence, in order:
+//!
+//! 1. A specific client-supplied Content-Type — except curl's
+//!    `--data-binary` default, `application/x-www-form-urlencoded`, and the
+//!    generic `application/octet-stream`, which are treated as unspecified.
+//! 2. Magic-byte sniffing of the first bytes (the `infer` crate) for
+//!    images, PDF, ZIP, video/audio containers, and other signatures.
+//!    If sniffing finds a well-known signature and the client said
+//!    something different, the sniffed type wins and the conflict is
+//!    recorded in metadata.
+//! 3. Filename extension via `mime_guess`, when a filename is supplied
+//!    (and the extension maps to something more specific than octet-stream).
+//! 4. Plain-text detection: valid UTF-8 with no NUL bytes.
+//! 5. Fallback: `application/octet-stream`.
+//!
+//! Sniffing peeks at only the first chunk (up to 8 KiB, see
+//! [`detect_and_wrap`]) and forwards those same bytes into the upload
+//! stream. It never buffers a whole file to detect its type.
+
+use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use bytes::Bytes;
+use futures::Stream;
+use futures::StreamExt;
+
+use crate::store::StoreError;
+
+/// How many bytes are peeked for sniffing. The peek buffer may hold one
+/// whole incoming chunk if that chunk is larger than this (chunk sizes
+/// from HTTP bodies are bounded), but detection only looks at the first
+/// [`PEEK_BYTES`] of it.
+pub const PEEK_BYTES: usize = 8 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Detection {
+    pub content_type: String,
+    /// One of: "client" | "sniffed" | "extension" | "text" | "fallback".
+    pub source: &'static str,
+    /// `Some("explicit -> sniffed")` when a specific client type was
+    /// overridden by a well-known sniffed signature.
+    pub conflict: Option<String>,
+}
+
+/// Values that mean "the client did not really choose a type".
+fn is_generic_type(normalised: &str) -> bool {
+    matches!(
+        normalised,
+        "application/x-www-form-urlencoded" | "application/octet-stream" | ""
+    )
+}
+
+/// Normalise a client Content-Type: lowercase, strip parameters, trim.
+fn normalise_explicit(explicit: Option<&str>) -> Option<String> {
+    let raw = explicit?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let main = raw.split(';').next()?.trim().to_ascii_lowercase();
+    if main.is_empty() {
+        None
+    } else {
+        Some(main)
+    }
+}
+
+fn extension_type(filename: Option<&str>) -> Option<String> {
+    let name = filename?;
+    let ext = Path::new(name).extension()?.to_str()?.to_ascii_lowercase();
+    let mime = mime_guess::from_ext(&ext).first()?;
+    let s = mime.to_string();
+    if s == "application/octet-stream" {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn is_text(prefix: &[u8]) -> bool {
+    !prefix.contains(&0) && std::str::from_utf8(prefix).is_ok()
+}
+
+/// Pure detection function: given an explicit type, a filename, and the
+/// first bytes of the payload, decide the final Content-Type.
+pub fn detect_content_type(
+    explicit: Option<&str>,
+    filename: Option<&str>,
+    prefix: &[u8],
+) -> Detection {
+    let explicit_norm = normalise_explicit(explicit);
+    let explicit_specific = explicit_norm.clone().filter(|e| !is_generic_type(e));
+    let peek = &prefix[..prefix.len().min(PEEK_BYTES)];
+
+    // 2. Magic-byte sniffing. `infer` only returns specific signatures.
+    if let Some(kind) = infer::get(peek) {
+        let sniffed = kind.mime_type().to_string();
+        if let Some(exp) = &explicit_specific {
+            if *exp == sniffed {
+                return Detection {
+                    content_type: sniffed,
+                    source: "sniffed",
+                    conflict: None,
+                };
+            }
+            return Detection {
+                content_type: sniffed.clone(),
+                source: "sniffed",
+                conflict: Some(format!("{exp} -> {sniffed}")),
+            };
+        }
+        return Detection {
+            content_type: sniffed,
+            source: "sniffed",
+            conflict: None,
+        };
+    }
+
+    // 1. Specific client type (when sniffing did not find a signature).
+    if let Some(exp) = explicit_specific {
+        return Detection {
+            content_type: exp,
+            source: "client",
+            conflict: None,
+        };
+    }
+
+    // 3. Filename extension.
+    if let Some(ext_type) = extension_type(filename) {
+        return Detection {
+            content_type: ext_type,
+            source: "extension",
+            conflict: None,
+        };
+    }
+
+    // 4. Plain text.
+    if is_text(peek) {
+        return Detection {
+            content_type: "text/plain; charset=utf-8".to_string(),
+            source: "text",
+            conflict: None,
+        };
+    }
+
+    // 5. Fallback.
+    Detection {
+        content_type: "application/octet-stream".to_string(),
+        source: "fallback",
+        conflict: None,
+    }
+}
+
+/// Content-Disposition for serving an object back.
+///
+/// Safe inline types are served inline so a web frontend can render an
+/// image or show text. Everything else, and specifically `text/html` and
+/// `image/svg+xml`, is served as an attachment. This is a deliberate v1
+/// choice, not a sandbox: see README. Serving sniffed HTML/SVG inline on
+/// a trusted origin would let an uploaded file run script in that
+/// origin's context.
+pub fn content_disposition(content_type: &str, filename: Option<&str>) -> String {
+    let main = content_type.split(';').next().unwrap_or("").trim();
+    let safe_inline = matches!(
+        main,
+        "text/plain"
+            | "text/csv"
+            | "text/markdown"
+            | "image/png"
+            | "image/jpeg"
+            | "image/gif"
+            | "image/webp"
+            | "application/pdf"
+    );
+    let disposition = if safe_inline { "inline" } else { "attachment" };
+    match filename {
+        Some(f) if !f.is_empty() => {
+            let safe: String = f
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            format!("{disposition}; filename=\"{safe}\"")
+        }
+        _ => disposition.to_string(),
+    }
+}
+
+/// A stream that first yields a buffered peek, then the inner stream.
+/// Used by [`detect_and_wrap`] so peeked bytes are neither lost nor
+/// duplicated.
+struct PeekedStream<S> {
+    peek: Option<Bytes>,
+    inner: S,
+}
+
+impl<S> Stream for PeekedStream<S>
+where
+    S: Stream<Item = Result<Bytes, StoreError>> + Unpin,
+{
+    type Item = Result<Bytes, StoreError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(peek) = self.peek.take() {
+            return Poll::Ready(Some(Ok(peek)));
+        }
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+/// Peek at the start of a stream, detect its Content-Type, and return a
+/// stream that yields exactly the same bytes (peek first, then the rest).
+///
+/// The peek accumulates chunks until it holds at least [`PEEK_BYTES`]
+/// bytes or the stream ends. If the very first chunk is larger than
+/// [`PEEK_BYTES`], the whole chunk is buffered and forwarded — detection
+/// still only looks at its first [`PEEK_BYTES`] bytes.
+pub async fn detect_and_wrap<'a, S>(
+    mut stream: S,
+    explicit: Option<&str>,
+    filename: Option<&str>,
+) -> (
+    Detection,
+    Pin<Box<dyn Stream<Item = Result<Bytes, StoreError>> + Send + 'a>>,
+)
+where
+    S: Stream<Item = Result<Bytes, StoreError>> + Send + Unpin + 'a,
+{
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut first_error: Option<StoreError> = None;
+    while buffer.len() < PEEK_BYTES {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                if chunk.is_empty() {
+                    continue;
+                }
+                buffer.extend_from_slice(&chunk);
+            }
+            Some(Err(e)) => {
+                first_error = Some(e);
+                break;
+            }
+            None => break,
+        }
+    }
+    if let Some(e) = first_error {
+        // Detection cannot run; forward the error as the first item so
+        // the upload fails (and is aborted upstream) rather than
+        // silently succeeding with a wrong type.
+        let err_stream = futures::stream::iter(vec![Err(e)]).chain(stream);
+        return (
+            Detection {
+                content_type: "application/octet-stream".to_string(),
+                source: "fallback",
+                conflict: None,
+            },
+            Box::pin(err_stream),
+        );
+    }
+    let detection = detect_content_type(explicit, filename, &buffer);
+    let peek = if buffer.is_empty() {
+        None
+    } else {
+        Some(Bytes::from(buffer))
+    };
+    let wrapped = PeekedStream {
+        peek,
+        inner: stream,
+    };
+    (detection, Box::pin(wrapped))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+
+    fn png() -> Vec<u8> {
+        let mut v = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        v.extend_from_slice(b"fake-png-body");
+        v
+    }
+    fn jpeg() -> Vec<u8> {
+        vec![
+            0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00,
+        ]
+    }
+    fn gif() -> Vec<u8> {
+        b"GIF89a".to_vec()
+    }
+    fn webp() -> Vec<u8> {
+        let mut v = b"RIFF".to_vec();
+        v.extend_from_slice(&[0x10, 0x00, 0x00, 0x00]);
+        v.extend_from_slice(b"WEBP");
+        v
+    }
+    fn pdf() -> Vec<u8> {
+        b"%PDF-1.7 fake".to_vec()
+    }
+    fn zip() -> Vec<u8> {
+        vec![b'P', b'K', 0x03, 0x04, 0x14, 0x00]
+    }
+
+    #[test]
+    fn png_detected() {
+        let d = detect_content_type(None, None, &png());
+        assert_eq!(d.content_type, "image/png");
+        assert_eq!(d.source, "sniffed");
+    }
+
+    #[test]
+    fn jpeg_detected() {
+        let d = detect_content_type(None, None, &jpeg());
+        assert_eq!(d.content_type, "image/jpeg");
+        assert_eq!(d.source, "sniffed");
+    }
+
+    #[test]
+    fn gif_detected() {
+        let d = detect_content_type(None, None, &gif());
+        assert_eq!(d.content_type, "image/gif");
+    }
+
+    #[test]
+    fn webp_detected() {
+        let d = detect_content_type(None, None, &webp());
+        assert_eq!(d.content_type, "image/webp");
+    }
+
+    #[test]
+    fn pdf_detected() {
+        let d = detect_content_type(None, None, &pdf());
+        assert_eq!(d.content_type, "application/pdf");
+    }
+
+    #[test]
+    fn zip_detected() {
+        let d = detect_content_type(None, None, &zip());
+        assert_eq!(d.content_type, "application/zip");
+    }
+
+    #[test]
+    fn utf8_text_detected() {
+        let d = detect_content_type(None, None, b"hello, world\nsecond line\n");
+        assert_eq!(d.content_type, "text/plain; charset=utf-8");
+        assert_eq!(d.source, "text");
+    }
+
+    #[test]
+    fn arbitrary_binary_falls_back() {
+        let d = detect_content_type(None, None, &[0x00, 0xff, 0x01, 0x02, 0xfe, 0x00]);
+        assert_eq!(d.content_type, "application/octet-stream");
+        assert_eq!(d.source, "fallback");
+    }
+
+    #[test]
+    fn curl_form_urlencoded_default_is_ignored_in_favour_of_sniffing() {
+        let d = detect_content_type(Some("application/x-www-form-urlencoded"), None, &png());
+        assert_eq!(d.content_type, "image/png");
+        assert_eq!(d.source, "sniffed");
+        assert!(d.conflict.is_none(), "a default is not a conflict");
+    }
+
+    #[test]
+    fn explicit_type_overrides_generic_text() {
+        let d = detect_content_type(Some("text/csv"), None, b"a,b\n1,2\n");
+        assert_eq!(d.content_type, "text/csv");
+        assert_eq!(d.source, "client");
+        let d2 = detect_content_type(Some("application/json"), None, b"{\"a\": 1}");
+        assert_eq!(d2.content_type, "application/json");
+        assert_eq!(d2.source, "client");
+    }
+
+    #[test]
+    fn explicit_type_overrides_extension() {
+        let d = detect_content_type(Some("text/csv"), Some("data.txt"), b"a,b\n");
+        assert_eq!(d.content_type, "text/csv");
+        assert_eq!(d.source, "client");
+    }
+
+    #[test]
+    fn extension_used_when_no_explicit_type() {
+        let d = detect_content_type(None, Some("data.csv"), b"a,b\n1,2\n");
+        assert_eq!(d.content_type, "text/csv");
+        assert_eq!(d.source, "extension");
+    }
+
+    #[test]
+    fn sniffed_signature_wins_over_wrong_explicit_type_and_records_conflict() {
+        let d = detect_content_type(Some("text/plain"), None, &png());
+        assert_eq!(d.content_type, "image/png");
+        assert_eq!(d.source, "sniffed");
+        assert_eq!(d.conflict.as_deref(), Some("text/plain -> image/png"));
+    }
+
+    #[test]
+    fn content_disposition_html_and_svg_are_attachments() {
+        assert!(content_disposition("text/html", Some("x.html")).starts_with("attachment"));
+        assert!(content_disposition("image/svg+xml", Some("x.svg")).starts_with("attachment"));
+        assert!(content_disposition("image/png", Some("x.png")).starts_with("inline"));
+        assert!(content_disposition("text/plain", None).starts_with("inline"));
+        assert!(content_disposition("application/octet-stream", None).starts_with("attachment"));
+    }
+
+    #[tokio::test]
+    async fn peeked_bytes_are_neither_lost_nor_duplicated() {
+        // Input delivered as many small chunks, including a first chunk
+        // smaller than the peek window, followed by a large chunk.
+        let mut input: Vec<u8> = png();
+        input.extend_from_slice(&vec![b'z'; 20_000]);
+        let chunks: Vec<Result<Bytes, StoreError>> = vec![
+            Ok(Bytes::from(input[..100].to_vec())),
+            Ok(Bytes::from(input[100..5000].to_vec())),
+            Ok(Bytes::from(input[5000..].to_vec())),
+        ];
+        let (detection, wrapped) = detect_and_wrap(stream::iter(chunks), None, None).await;
+        assert_eq!(detection.content_type, "image/png");
+        let mut out = Vec::new();
+        let mut s = wrapped;
+        while let Some(item) = s.next().await {
+            out.extend_from_slice(&item.unwrap());
+        }
+        assert_eq!(out, input, "peeked bytes must be forwarded exactly once");
+    }
+
+    #[tokio::test]
+    async fn peek_wrap_with_single_large_chunk() {
+        let input = vec![b'a'; 20_000];
+        let chunks = vec![Ok(Bytes::from(input.clone()))];
+        let (detection, wrapped) = detect_and_wrap(stream::iter(chunks), None, None).await;
+        assert_eq!(detection.content_type, "text/plain; charset=utf-8");
+        let mut out = Vec::new();
+        let mut s = wrapped;
+        while let Some(item) = s.next().await {
+            out.extend_from_slice(&item.unwrap());
+        }
+        assert_eq!(out, input);
+    }
+}
