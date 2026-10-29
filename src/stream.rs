@@ -168,7 +168,7 @@ where
 
     let run_result: Result<(), StoreError> = async {
         while let Some(item) = stream.next().await {
-            let chunk = item.map_err(|e| e)?;
+            let chunk = item?;
             total += chunk.len() as u64;
             if total > max_bytes {
                 return Err(StoreError::TooLarge { limit: max_bytes });
@@ -372,6 +372,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_and_file_caps_at_the_single_streaming_call_site() {
+        // The same payload through the one call site that `store_stream`
+        // drives: the text cap rejects it, the file cap accepts it.
+        let total = 10 * 1024 * 1024 + 1;
+        let chunks = vec![vec![b'a'; total]];
+
+        let mut sink = FakeSink::default();
+        let result = run_streaming_upload(
+            chunk_stream(chunks.clone()),
+            &mut sink,
+            Some(total as u64),
+            10 * 1024 * 1024,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(StoreError::TooLarge { limit }) if limit == 10 * 1024 * 1024
+        ));
+        assert!(
+            sink.state.lock().unwrap().created.is_empty(),
+            "an early rejection must not start a multipart upload"
+        );
+
+        let mut sink = FakeSink::default();
+        let outcome = run_streaming_upload(
+            chunk_stream(chunks),
+            &mut sink,
+            Some(total as u64),
+            1024 * 1024 * 1024,
+        )
+        .await
+        .expect("the same payload must fit under the file cap");
+        assert_eq!(outcome.total_bytes, total as u64);
+    }
+
+    #[tokio::test]
     async fn known_small_length_uses_single_put() {
         let chunks = vec![b"hello ".to_vec(), b"world".to_vec()];
         let mut sink = FakeSink::default();
@@ -389,10 +425,11 @@ mod tests {
     #[tokio::test]
     async fn disconnect_aborts_and_returns_no_outcome() {
         // Stream yields two parts worth of data, then an error (disconnect).
-        let mut items: Vec<Result<Bytes, StoreError>> = Vec::new();
-        items.push(Ok(Bytes::from(vec![b'x'; STREAM_PART_BYTES])));
-        items.push(Ok(Bytes::from(vec![b'y'; STREAM_PART_BYTES])));
-        items.push(Err(StoreError::Io("client disconnected".into())));
+        let items: Vec<Result<Bytes, StoreError>> = vec![
+            Ok(Bytes::from(vec![b'x'; STREAM_PART_BYTES])),
+            Ok(Bytes::from(vec![b'y'; STREAM_PART_BYTES])),
+            Err(StoreError::Io("client disconnected".into())),
+        ];
         let mut sink = FakeSink::default();
         let result =
             run_streaming_upload(Box::pin(stream::iter(items)), &mut sink, None, u64::MAX).await;

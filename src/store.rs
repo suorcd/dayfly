@@ -523,10 +523,7 @@ impl Store {
             if let Some(t) = token {
                 req = req.continuation_token(t);
             }
-            let out = req
-                .send()
-                .await
-                .map_err(|e| map_sdk_error(e, id))?;
+            let out = req.send().await.map_err(|e| map_sdk_error(e, id))?;
             for obj in out.contents() {
                 if let Some(key) = obj.key() {
                     if key.ends_with(&suffix) || key == format!("pastes/{stripped}") {
@@ -821,6 +818,11 @@ impl Store {
     /// (via [`crate::content_type::detect_and_wrap`]), then drive the
     /// S3 sink. The peeked bytes are forwarded exactly once by the
     /// wrapper, so detection never loses or duplicates data.
+    ///
+    /// `max_bytes` is chosen by the caller before streaming: the text cap
+    /// for a text paste (no filename), or the file cap for a file upload.
+    /// A known `Content-Length` over that cap is rejected before detection
+    /// peeks, so an oversized body is not read at all.
     pub async fn store_stream<S>(
         &self,
         stream: S,
@@ -828,10 +830,16 @@ impl Store {
         content_type: Option<&str>,
         ttl_days: Option<u32>,
         known_length: Option<u64>,
+        max_bytes: u64,
     ) -> Result<StoredPaste, StoreError>
     where
         S: futures::Stream<Item = Result<Bytes, StoreError>> + Send + Unpin,
     {
+        if let Some(len) = known_length {
+            if len > max_bytes {
+                return Err(StoreError::TooLarge { limit: max_bytes });
+            }
+        }
         let ttl = ttl_days.unwrap_or(self.config.default_ttl_days);
         let created_at = Utc::now();
         let random_id = generate_random_id();
@@ -853,13 +861,9 @@ impl Store {
             content_type: ct.clone(),
             metadata: initial_meta,
         };
-        let outcome = crate::stream::run_streaming_upload(
-            wrapped,
-            &mut sink,
-            known_length,
-            self.config.max_file_bytes,
-        )
-        .await?;
+        let outcome =
+            crate::stream::run_streaming_upload(wrapped, &mut sink, known_length, max_bytes)
+                .await?;
         if outcome.used_multipart {
             // Attach the full metadata (sha256, real size) by copy-in-
             // place, best effort, exactly as in store_file_path.

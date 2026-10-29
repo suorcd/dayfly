@@ -34,6 +34,9 @@ pub struct AppState {
     pub store: Store,
 }
 
+// Axum handlers return `Response` directly; boxing it here would only add
+// indirection at every call site.
+#[allow(clippy::result_large_err)]
 fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
     let Some(token) = state.store.config.http_bearer_token.as_deref() else {
         return Ok(());
@@ -60,9 +63,9 @@ fn status_for(e: &StoreError) -> StatusCode {
         StoreError::NotFound(_) => StatusCode::NOT_FOUND,
         StoreError::Expired(_) => StatusCode::GONE,
         StoreError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
-        StoreError::InvalidId(_)
-        | StoreError::InvalidDate(_)
-        | StoreError::InvalidRange(_) => StatusCode::BAD_REQUEST,
+        StoreError::InvalidId(_) | StoreError::InvalidDate(_) | StoreError::InvalidRange(_) => {
+            StatusCode::BAD_REQUEST
+        }
         StoreError::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
         StoreError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         StoreError::S3(_) => StatusCode::BAD_GATEWAY,
@@ -193,6 +196,9 @@ async fn upload_dispatch(
         let ttl = parse_ttl(&headers, &query);
         let known_length = header_str(&headers, CONTENT_LENGTH.as_str())
             .and_then(|s| s.trim().parse::<u64>().ok());
+        // A filename means a file upload; no filename means a text paste,
+        // which must obey the smaller text cap rather than the file cap.
+        let max_bytes = state.store.config.max_bytes_for_upload(filename.as_deref());
         let body = req.into_body();
         let stream = body
             .into_data_stream()
@@ -212,6 +218,7 @@ async fn upload_dispatch(
                 explicit,
                 ttl,
                 known_length,
+                max_bytes,
             )
             .await
         {
@@ -243,6 +250,7 @@ async fn multipart_inner(
             if filename.is_none() {
                 filename = field.file_name().map(|s| s.to_string());
             }
+            let max_bytes = state.store.config.max_bytes_for_upload(filename.as_deref());
             let stream = futures::stream::unfold(field, |mut f| async move {
                 match f.chunk().await {
                     Ok(Some(chunk)) => Some((Ok(chunk), f)),
@@ -258,6 +266,7 @@ async fn multipart_inner(
                     field_content_type.as_deref(),
                     ttl,
                     None,
+                    max_bytes,
                 )
                 .await
             {
@@ -419,9 +428,7 @@ async fn download_inner(
             }
         },
     );
-    let body_stream = stream.map(|item| {
-        item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-    });
+    let body_stream = stream.map(|item| item.map_err(|e| std::io::Error::other(e.to_string())));
     let status = if range.is_some() {
         StatusCode::PARTIAL_CONTENT
     } else {
@@ -561,4 +568,75 @@ pub fn api_router() -> Router<AppState> {
         )
         .route("/v1/pastes/{date}/{random}/meta", get(meta_dated))
         .route("/v1/pastes/{random}/meta", get(meta_bare))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::task::Poll;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::config::Config;
+
+    fn test_config(max_text_bytes: u64, max_file_bytes: u64) -> Config {
+        Config {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key_id: "test-access-key".to_string(),
+            secret_access_key: "test-secret-key".to_string(),
+            max_text_bytes,
+            max_file_bytes,
+            default_ttl_days: 7,
+            http_bind: "127.0.0.1:0".to_string(),
+            http_bearer_token: None,
+        }
+    }
+
+    async fn test_state(max_text_bytes: u64, max_file_bytes: u64) -> AppState {
+        AppState {
+            store: Store::from_config(test_config(max_text_bytes, max_file_bytes))
+                .await
+                .expect("test S3 config must build without network access"),
+        }
+    }
+
+    /// A raw body with no filename is a text paste. Its declared length is
+    /// over the text cap, so the handler must return 413 before polling the
+    /// body. This is the HTTP-level counterpart of issue #2.
+    #[tokio::test]
+    async fn raw_text_upload_over_text_cap_is_rejected_before_body_read() {
+        let state = test_state(10 * 1024 * 1024, 1024 * 1024 * 1024).await;
+        let app = api_router().with_state(state);
+
+        let polled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&polled);
+        let body = Body::from_stream(futures::stream::poll_fn(move |_| {
+            flag.store(true, Ordering::SeqCst);
+            Poll::<Option<Result<Bytes, std::io::Error>>>::Ready(None)
+        }));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .header(CONTENT_LENGTH, (64u64 * 1024 * 1024).to_string())
+            .body(body)
+            .expect("request must build");
+
+        let resp = app.oneshot(req).await.expect("router call must complete");
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a no-filename upload over the text cap must be 413"
+        );
+        assert!(
+            !polled.load(Ordering::SeqCst),
+            "the body must not be read after an early cap rejection"
+        );
+    }
 }
