@@ -91,8 +91,8 @@ Operations, in both MCP tools and HTTP endpoints:
 
 | Operation | MCP tool | HTTP |
 | --- | --- | --- |
-| Store text | `store_text` | `POST /upload` or `POST /v1/pastes` (raw body) |
-| Store file (multipart for large files) | `store_file` (local path) | `POST /upload` (raw body or `-F file=@...`) |
+| Store text | `store_text` | `POST /upload` or `POST /v1/pastes` (raw body, no filename) |
+| Store file (multipart for large files) | `store_file` (local path) | `POST /upload` (raw body with `X-Filename`, or `-F file=@...`) |
 | Fetch text (offset/limit) | `fetch_text` | `GET /v1/pastes/<id>` (raw; use `Range` for slices) |
 | Fetch file (streaming, Range) | `fetch_file` (downloads to a local path) | `GET /v1/pastes/<id>` with `Range` → 206 |
 | Fetch metadata (HeadObject equivalent) | `fetch_metadata` | `GET /v1/pastes/<id>/meta`, or `HEAD /v1/pastes/<id>` |
@@ -135,7 +135,7 @@ placeholder values replaced by your own Garage values.
 | `S3_ACCESS_KEY_ID` | yes | — | Garage access key, held only by this binary |
 | `S3_SECRET_ACCESS_KEY` | yes | — | Garage secret key, held only by this binary |
 | `S3_REGION` | no | `us-east-1` | Signing placeholder for Garage; supply your own, do not rely on the default being "yours" |
-| `DAYFLY_MAX_TEXT_BYTES` | no | 10485760 (10 MiB) | Max text paste size for MCP `store_text` and the human text form. **Not enforced on `POST /upload`**, which only applies the file cap (see Known limitations) |
+| `DAYFLY_MAX_TEXT_BYTES` | no | 10485760 (10 MiB) | Max text paste size for MCP `store_text`, the human text form, and `POST /upload` without a filename; oversize → 413. A filename (including a multipart filename) uses `DAYFLY_MAX_FILE_BYTES` instead |
 | `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in whole days |
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
@@ -216,8 +216,16 @@ curl --data-binary @- -H 'Accept: application/json' \
 ### Streaming upload (curl piping, 0x0.st style)
 
 ```sh
-cat large-file.bin | curl --data-binary @- http://127.0.0.1:8080/upload
-URL=$(cat large-file.bin | curl --data-binary @- http://127.0.0.1:8080/upload)
+# Text paste: no filename, capped by DAYFLY_MAX_TEXT_BYTES.
+cat notes.txt | curl --data-binary @- http://127.0.0.1:8080/upload
+
+# File upload: a filename selects the DAYFLY_MAX_FILE_BYTES cap.
+cat large-file.bin | curl --data-binary @- \
+  -H 'X-Filename: large-file.bin' \
+  http://127.0.0.1:8080/upload
+URL=$(cat large-file.bin | curl --data-binary @- \
+  -H 'X-Filename: large-file.bin' \
+  http://127.0.0.1:8080/upload)
 
 # With a filename, TTL, and an explicit content type:
 cat report.csv | curl --data-binary @- \
@@ -229,11 +237,19 @@ cat report.csv | curl --data-binary @- \
 curl -F file=@photo.png -F ttl_days=30 http://127.0.0.1:8080/upload
 ```
 
-Both `Content-Length` and chunked transfer encoding (unknown length)
-are accepted. For S3: a single streaming PutObject is used when the
-length is known and at most one 5 MiB part; otherwise S3 multipart
-upload is used — parts are buffered to the 5 MiB minimum (except the
-last part) and uploaded as they arrive, `CompleteMultipartUpload` at
+A request with no filename is a text paste and is capped at
+`DAYFLY_MAX_TEXT_BYTES`; supply `X-Filename` (or a multipart filename)
+for larger files. The text/file split is a client-declared convention,
+not a property of the bytes: adding a filename opts into the file cap.
+The text cap is therefore a guardrail for text-paste traffic, not an
+authorization boundary or a hard bound on stored inline text. Enforcing
+it from the sniffed type would make an ASCII file upload with a
+filename subject to the text cap, which contradicts the file-upload
+contract above. Both `Content-Length` and chunked transfer encoding
+(unknown length) are accepted. For S3: a single streaming PutObject is
+used when the length is known and at most one 5 MiB part; otherwise S3
+multipart upload is used — parts are buffered to the 5 MiB minimum
+(except the last part) and uploaded as they arrive, `CompleteMultipartUpload` at
 EOF, `AbortMultipartUpload` on client disconnect or any error.
 **A URL is returned only on successful completion. On disconnect or
 any error, no URL is returned and any multipart upload is aborted.**
@@ -521,17 +537,6 @@ not by reading the code. They are recorded here so a reader does not
 have to discover them, and so the claims elsewhere in this file stay
 honest.
 
-- **Downloads can truncate without an error.** If a chunk fetch fails
-  mid-transfer the response still carries the original
-  `Content-Length` and a `200 OK`, while the body stops early. Deleting
-  an object mid-transfer reproduced it at 16,777,216 bytes delivered
-  against a declared 67,108,864.
-- **`DAYFLY_MAX_TEXT_BYTES` is not enforced on `POST /upload`.** Only
-  the file cap applies on that path, so a nominal text paste can be as
-  large as `DAYFLY_MAX_FILE_BYTES`.
-- **A wrong `S3_BUCKET` reads as data loss.** `NoSuchBucket` is mapped
-  to 404, so a missing bucket reports every paste as not found and
-  reports a failed upload as `paste not found`.
 - **A local-file upload over 8 MiB depends on a copy for metadata.**
   `store_file` creates the multipart upload with no metadata and adds
   it afterwards with a same-key `CopyObject` whose error is discarded.
@@ -542,9 +547,6 @@ honest.
   served inline.
 - **Office documents report as `application/zip`.** Sniffing outranks
   the filename extension and the signature is only the PK header.
-- **Downloads re-issue one `HeadObject` per 8 MiB chunk**, and a bare
-  random ID re-scans the bucket for each one. A 64 MiB download by
-  bare ID produced 8 `GET`s, 9 `HEAD`s and 9 prefix listings.
 - **The HTTP endpoint is internal-only in the weakest sense.** The
   bearer token comparison is not constant time, and the HTML form
   routes have no CSRF protection, so run this on a private network

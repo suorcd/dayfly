@@ -15,9 +15,9 @@ pub struct Config {
     pub access_key_id: String,
     pub secret_access_key: String,
     /// Maximum size, in bytes, for a text paste. Enforced by the MCP
-    /// `store_text` tool and by the human text form. NOT enforced on the
-    /// raw-body `POST /upload` path, which only applies `max_file_bytes`;
-    /// see README "Known limitations". Default: 10 MiB.
+    /// `store_text` tool, the human text form, and HTTP uploads with no
+    /// filename. A filename selects [`Self::max_file_bytes`] instead.
+    /// Default: 10 MiB.
     pub max_text_bytes: u64,
     /// Maximum size, in bytes, for a file paste. Default: 1 GiB.
     pub max_file_bytes: u64,
@@ -104,6 +104,21 @@ impl Config {
         })
     }
 
+    /// Cap for an HTTP upload, decided before the body is streamed.
+    ///
+    /// A filename (`X-Filename`, `?filename=`, or a multipart filename)
+    /// means a file upload and gets [`Self::max_file_bytes`]. No filename
+    /// means a text paste and gets [`Self::max_text_bytes`]. Content-Type
+    /// is deliberately not used here: detection needs bytes, and a file
+    /// named `report.txt` is still a file upload even though its bytes
+    /// look like text.
+    pub fn max_bytes_for_upload(&self, filename: Option<&str>) -> u64 {
+        match filename {
+            Some(name) if !name.trim().is_empty() => self.max_file_bytes,
+            _ => self.max_text_bytes,
+        }
+    }
+
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
@@ -127,6 +142,30 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_config(max_text_bytes: u64, max_file_bytes: u64) -> Config {
+        Config {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key_id: "test-access-key".to_string(),
+            secret_access_key: "test-secret-key".to_string(),
+            max_text_bytes,
+            max_file_bytes,
+            default_ttl_days: 7,
+            http_bind: "127.0.0.1:0".to_string(),
+            http_bearer_token: None,
+        }
+    }
+
+    #[test]
+    fn upload_cap_follows_filename_presence() {
+        let config = test_config(10, 1_000);
+        assert_eq!(config.max_bytes_for_upload(None), 10);
+        assert_eq!(config.max_bytes_for_upload(Some("")), 10);
+        assert_eq!(config.max_bytes_for_upload(Some("   ")), 10);
+        assert_eq!(config.max_bytes_for_upload(Some("report.txt")), 1_000);
+    }
 
     #[test]
     fn endpoint_must_be_http_url() {

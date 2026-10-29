@@ -144,6 +144,9 @@ fn ttl_options(selected: u32) -> String {
     out
 }
 
+// Axum handlers return `Response` directly; boxing it here would only add
+// indirection at every call site.
+#[allow(clippy::result_large_err)]
 fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
     let Some(token) = state.store.config.http_bearer_token.as_deref() else {
         return Ok(());
@@ -285,6 +288,7 @@ async fn upload_submit_handler(
         if name == "file" {
             let field_content_type = field.content_type().map(|s| s.to_string());
             let filename = field.file_name().map(|s| s.to_string());
+            let max_bytes = state.store.config.max_bytes_for_upload(filename.as_deref());
             let stream = futures::stream::unfold(field, |mut f| async move {
                 match f.chunk().await {
                     Ok(Some(chunk)) => Some((Ok(chunk), f)),
@@ -300,6 +304,7 @@ async fn upload_submit_handler(
                     field_content_type.as_deref(),
                     ttl,
                     None,
+                    max_bytes,
                 )
                 .await
             {
