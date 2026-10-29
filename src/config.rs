@@ -161,30 +161,74 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
 
-    fn lookup_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: HashMap<String, String> = pairs
-            .iter()
-            .map(|(name, value)| (name.to_string(), value.to_string()))
-            .collect();
+    fn lookup_from(pairs: &[(String, String)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs.iter().cloned().collect();
         move |name| map.get(name).cloned()
     }
 
-    fn base_env() -> Vec<(&'static str, &'static str)> {
-        vec![
+    fn base_env() -> Vec<(String, String)> {
+        [
             ("S3_ENDPOINT", "http://127.0.0.1:3900"),
             ("S3_BUCKET", "test-bucket"),
             ("S3_ACCESS_KEY_ID", "test-access-key"),
             ("S3_SECRET_ACCESS_KEY", "test-secret-key"),
         ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+    }
+
+    fn with_credential_file(
+        mut pairs: Vec<(String, String)>,
+        direct: &str,
+        file: &str,
+        path: &str,
+    ) -> Vec<(String, String)> {
+        pairs.retain(|(name, _)| name != direct);
+        pairs.push((file.to_string(), path.to_string()));
+        pairs
     }
 
     fn expect_error(result: Result<Config, ConfigError>) -> ConfigError {
         match result {
             Ok(_) => panic!("expected a configuration error"),
             Err(error) => error,
+        }
+    }
+
+    fn unique_temp_path() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "dayfly-config-test-{}-{count}.txt",
+            std::process::id()
+        ))
+    }
+
+    struct TempCredentialFile {
+        path: PathBuf,
+    }
+
+    impl TempCredentialFile {
+        fn new(contents: &str) -> Self {
+            let path = unique_temp_path();
+            std::fs::write(&path, contents).expect("write temp credential file");
+            Self { path }
+        }
+
+        fn path(&self) -> &str {
+            self.path.to_str().expect("temp path is UTF-8")
+        }
+    }
+
+    impl Drop for TempCredentialFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
         }
     }
 
@@ -215,7 +259,7 @@ mod tests {
     #[test]
     fn endpoint_must_be_http_url() {
         let mut pairs = base_env();
-        pairs[0].1 = "ftp://127.0.0.1:3900";
+        pairs[0].1 = "ftp://127.0.0.1:3900".to_string();
         let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
         assert!(matches!(error, ConfigError::BadEndpoint));
     }
@@ -225,5 +269,75 @@ mod tests {
         let config = Config::from_lookup(lookup_from(&base_env())).expect("direct config");
         assert_eq!(config.access_key_id, "test-access-key");
         assert_eq!(config.secret_access_key, "test-secret-key");
+    }
+
+    #[test]
+    fn credential_file_value_is_trimmed() {
+        let access = TempCredentialFile::new("file-access-key\n");
+        let secret = TempCredentialFile::new("file-secret-key\r\n");
+        let mut pairs = base_env();
+        pairs = with_credential_file(
+            pairs,
+            "S3_ACCESS_KEY_ID",
+            "S3_ACCESS_KEY_ID_FILE",
+            access.path(),
+        );
+        pairs = with_credential_file(
+            pairs,
+            "S3_SECRET_ACCESS_KEY",
+            "S3_SECRET_ACCESS_KEY_FILE",
+            secret.path(),
+        );
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("file config");
+        assert_eq!(config.access_key_id, "file-access-key");
+        assert_eq!(config.secret_access_key, "file-secret-key");
+    }
+
+    #[test]
+    fn empty_credential_file_is_rejected() {
+        let file = TempCredentialFile::new("\n");
+        let pairs = with_credential_file(
+            base_env(),
+            "S3_ACCESS_KEY_ID",
+            "S3_ACCESS_KEY_ID_FILE",
+            file.path(),
+        );
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        let message = error.to_string();
+        assert!(
+            message.contains("S3_ACCESS_KEY_ID_FILE"),
+            "message: {message}"
+        );
+        assert!(message.contains("empty"), "message: {message}");
+        assert!(message.contains(file.path()), "message: {message}");
+    }
+
+    #[test]
+    fn missing_credential_file_is_rejected() {
+        let path = unique_temp_path();
+        assert!(!path.exists());
+        let path = path.to_str().expect("temp path is UTF-8");
+        let pairs = with_credential_file(
+            base_env(),
+            "S3_SECRET_ACCESS_KEY",
+            "S3_SECRET_ACCESS_KEY_FILE",
+            path,
+        );
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        let message = error.to_string();
+        assert!(message.contains("cannot read"), "message: {message}");
+        assert!(message.contains(path), "message: {message}");
+    }
+
+    #[test]
+    fn direct_and_file_credentials_conflict() {
+        let file = TempCredentialFile::new("file-access-key\n");
+        let mut pairs = base_env();
+        pairs.push(("S3_ACCESS_KEY_ID_FILE".to_string(), file.path().to_string()));
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        let message = error.to_string();
+        assert!(message.contains("S3_ACCESS_KEY_ID"), "message: {message}");
+        assert!(message.contains("both"), "message: {message}");
+        assert!(!message.contains("test-access-key"), "message: {message}");
     }
 }
