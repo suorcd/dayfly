@@ -525,11 +525,18 @@ curl --data-binary @- http://127.0.0.1:8080/upload <<< 'hello'
 ## Lifecycle example
 
 `docs/lifecycle-example.json` is an **example only**. It is not
-applied automatically. Apply it manually to the test bucket, verify
-the behaviour above, and only then consider the production bucket.
-Deletion may run after the TTL day; objects are already unreadable
-via the API once `expires-at` passes, regardless of when the sweeper
-runs.
+applied automatically. Apply the file manually to a test bucket first.
+Garage lifecycle support is partial and version-dependent. Verify
+`Expiration` and `AbortIncompleteMultipartUpload` on the exact Garage
+build before production use.
+
+The rule expires objects after 90 days. 90 days is the longest TTL
+the human frontend offers, so the rule is a backstop only. Do not set
+the rule below the longest TTL you use. Otherwise, the sweeper can
+delete an object that the API still serves. Deletion is day-rounded
+and asynchronous, and it can run after the TTL day. Objects are
+already unreadable through the API when `expires-at` passes,
+regardless of when the sweeper runs.
 
 ## Known limitations (v1)
 
