@@ -76,6 +76,16 @@ where
     }
 }
 
+fn optional_string<F>(lookup: &F, name: &str, default: &str) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match lookup(name) {
+        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => default.to_string(),
+    }
+}
+
 fn optional_u64<F>(lookup: &F, name: &str, default: u64) -> Result<u64, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
@@ -241,13 +251,13 @@ impl Config {
             bucket,
             // Region is a signing placeholder for S3-compatible stores such
             // as Garage. It is not hardcoded: the operator supplies it.
-            region: lookup("S3_REGION").unwrap_or_else(|| "us-east-1".to_string()),
+            region: optional_string(&lookup, "S3_REGION", "us-east-1"),
             access_key_id: credential(&lookup, "S3_ACCESS_KEY_ID")?,
             secret_access_key: credential(&lookup, "S3_SECRET_ACCESS_KEY")?,
             max_text_bytes: optional_u64(&lookup, "DAYFLY_MAX_TEXT_BYTES", 10 * 1024 * 1024)?,
             max_file_bytes: optional_u64(&lookup, "DAYFLY_MAX_FILE_BYTES", 1024 * 1024 * 1024)?,
             default_ttl_days: optional_u32(&lookup, "DAYFLY_DEFAULT_TTL_DAYS", 7)?,
-            http_bind: lookup("DAYFLY_HTTP_BIND").unwrap_or_else(|| "127.0.0.1:8080".to_string()),
+            http_bind: optional_string(&lookup, "DAYFLY_HTTP_BIND", "127.0.0.1:8080"),
             http_bearer_token: bearer_token(lookup("DAYFLY_HTTP_BEARER_TOKEN"))?,
         })
     }
@@ -471,6 +481,29 @@ mod tests {
         pairs[0].1 = "ftp://127.0.0.1:3900".to_string();
         let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
         assert!(matches!(error, ConfigError::BadEndpoint));
+    }
+
+    #[test]
+    fn region_and_http_bind_values_are_trimmed() {
+        let mut pairs = base_env();
+        pairs.push(("S3_REGION".to_string(), " eu-west-1 ".to_string()));
+        pairs.push((
+            "DAYFLY_HTTP_BIND".to_string(),
+            " 127.0.0.1:9090 ".to_string(),
+        ));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("trimmed config");
+        assert_eq!(config.region, "eu-west-1");
+        assert_eq!(config.http_bind, "127.0.0.1:9090");
+    }
+
+    #[test]
+    fn whitespace_only_region_and_http_bind_use_defaults() {
+        let mut pairs = base_env();
+        pairs.push(("S3_REGION".to_string(), "   ".to_string()));
+        pairs.push(("DAYFLY_HTTP_BIND".to_string(), "\t".to_string()));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("default config");
+        assert_eq!(config.region, "us-east-1");
+        assert_eq!(config.http_bind, "127.0.0.1:8080");
     }
 
     #[test]
