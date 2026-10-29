@@ -459,6 +459,35 @@ cargo test
 cargo build --release
 ```
 
+`cargo test` runs the unit tests in the modules and the integration suite in
+`tests/`. The integration suite is hermetic. It starts an in-process fake S3
+service on an ephemeral localhost port, points a real `Store` at it with dummy
+credentials, and needs no network and no Garage.
+
+| File | Covers |
+| --- | --- |
+| `tests/common/mod.rs` | Stateful fake S3 service, request helpers, multipart bodies, temporary files |
+| `tests/store_s3.rs` | `store_text`, `store_file_path`, `store_stream`, multipart abort paths, caps, `head_metadata`, `fetch_text`, `fetch_range_by_key`, `download_file`, `delete`, `list_recent`, error mapping |
+| `tests/http_routes.rs` | Raw and multipart uploads, bearer auth, download, `HEAD`, `Range`, metadata, delete, list, failed uploads |
+| `tests/web_handlers.rs` | Index, text submit, upload submit, list, view, delete, auth, error pages |
+| `tests/mcp_stdio.rs` | The real binary over MCP stdio: all tools and their error paths |
+| `tests/config_env.rs` | `Config::from_env` defaults, overrides, and error text |
+| `tests/real_garage.rs` | Ignored tests for a disposable real Garage/S3 bucket |
+
+The unit tests in the modules are retained. They cover: key generation, ID
+validation (including traversal rejection), range parsing, offset/limit
+windows, UTF-8 prefix truncation, metadata/expiry round-trip, content-type
+detection (PNG, JPEG, GIF, WebP, PDF, ZIP, UTF-8 text, binary fallback, curl's
+`x-www-form-urlencoded` default ignored, explicit type overriding a generic
+one, sniffed-signature conflict, extension fallback), peeked-byte forwarding
+(neither lost nor duplicated), streaming part buffering, chunked and
+multi-part-sized uploads, disconnect/part-failure/oversize abort (no URL
+material), empty uploads, HTML escaping, human sizes, and days-remaining math.
+
+`.github/workflows/ci.yml` runs `cargo fmt --check`, clippy with warnings
+denied, `cargo test`, and `cargo build` on every push and pull request. A
+coverage job runs `cargo llvm-cov` on pushes to `main` and on manual dispatch.
+
 ### Nix build path (additional, not a replacement for Cargo)
 
 The project is also flake-based. The flake uses nixpkgs'
@@ -496,14 +525,13 @@ exits 0 with no errors; `nix build` exits 0 and creates a
 where `cargo --version`, `rustc --version`, and
 `rust-analyzer --version` all succeed.
 
-**Nix validation result:** `nix build` and the unit test suite were
-run on `x86_64-linux` against `nixos-unstable` and both pass, 36 of
-36 tests. On the stable `nixos-25.11` branch the build fails before
-compilation with a rustc-too-old error naming 23 AWS crates, which
-is why the flake tracks unstable. Before this was built on a machine
-with Nix, an earlier version of this note said the flake was
-unvalidated. That is no longer true and is corrected here rather
-than left standing.
+**Nix validation result:** `nix build` and the test suite were run on
+`x86_64-linux` against `nixos-unstable` and both pass. On the stable
+`nixos-25.11` branch the build fails before compilation with a
+rustc-too-old error naming 23 AWS crates, which is why the flake
+tracks unstable. Before this was built on a machine with Nix, an
+earlier version of this note said the flake was unvalidated. That is
+no longer true and is corrected here rather than left standing.
 
 Unit tests cover: key generation, ID validation (including
 traversal rejection), range parsing, offset/limit windows, UTF-8
@@ -517,26 +545,24 @@ disconnect/part-failure/oversize abort (no URL material), empty
 uploads, the write-route origin guard, HTML escaping, human sizes, and
 days-remaining math.
 
-### Against a local S3-compatible emulator or a separate test bucket
+### Optional tests against a real Garage or S3-compatible endpoint
 
-Garage is on the user's LAN and is out of reach from this VM, so no
-Garage testing was done here. To test where Garage (or an emulator)
-is reachable, use a **separate test bucket/prefix** first — do not
-point the binary at the production bucket until the checklist below
-passes:
+The default suite never contacts a network service. `tests/real_garage.rs`
+holds ignored tests for a real endpoint. Use a disposable test bucket. The
+tests create new random IDs and delete only the objects they create.
 
 ```sh
-export S3_ENDPOINT=https://garage.example.invalid:3900
-export S3_BUCKET=pastebin-test
-export S3_REGION=us-east-1
-export S3_ACCESS_KEY_ID=TEST-KEY
-export S3_SECRET_ACCESS_KEY=TEST-SECRET
-./target/release/dayfly serve &
-curl --data-binary @- http://127.0.0.1:8080/upload <<< 'hello'
-# then fetch, range-fetch, metadata, delete, and list with the returned URL
+export DAYFLY_TEST_S3_ENDPOINT=https://garage.example.invalid:3900
+export DAYFLY_TEST_S3_BUCKET=dayfly-test-disposable
+export DAYFLY_TEST_S3_REGION=us-east-1
+export DAYFLY_TEST_S3_ACCESS_KEY_ID=TEST-KEY
+export DAYFLY_TEST_S3_SECRET_ACCESS_KEY=TEST-SECRET
+cargo test --test real_garage -- --ignored --test-threads=1
 ```
 
-### Garage test checklist (run on a machine where Garage is reachable)
+`DAYFLY_TEST_S3_REGION` is optional and defaults to `us-east-1`.
+
+Use the same checklist for a real Garage instance:
 
 - [ ] Create a test bucket (or test prefix) separate from any
       production data.

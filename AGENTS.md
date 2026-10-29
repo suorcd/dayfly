@@ -69,7 +69,10 @@ cargo build --release
 - Run `cargo fmt` before handing code over; fix clippy warnings
   rather than leaving them, or say plainly why one is left.
 - Tests live in the modules they cover (`src/store.rs`,
-  `src/stream.rs`, `src/content_type.rs`, `src/web.rs`). Add a test
+  `src/stream.rs`, `src/content_type.rs`, `src/web.rs`) and in the
+  hermetic integration suite in `tests/`. The suite uses an in-process
+  fake S3 service. Do not make the default test run depend on Garage or
+  a network service. Add a test
   for any new detection, range, expiry, or streaming behaviour —
   especially: a failed upload must return no URL material, and peeked
   bytes must be forwarded exactly once.
