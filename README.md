@@ -556,8 +556,9 @@ honest.
 - **Office documents report as `application/zip`.** Sniffing outranks
   the filename extension and the signature is only the PK header.
 - **The HTTP endpoint is internal-only in the weakest sense.** The
-  bearer token comparison is not constant time, and the HTML form
-  routes have no CSRF protection, so run this on a private network
+  bearer token comparison is constant time for equal-length tokens.
+  A length difference still leaks through timing. The HTML form
+  routes have no CSRF protection. Run this on a private network
   rather than exposing it.
 
 ## Future work (not in v1)
