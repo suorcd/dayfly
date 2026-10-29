@@ -1,4 +1,5 @@
 use std::env;
+use std::io::Read;
 
 use thiserror::Error;
 
@@ -122,12 +123,18 @@ where
 }
 
 fn read_credential_file(file_variable: &str, path: &str) -> Result<String, ConfigError> {
-    let contents =
-        std::fs::read_to_string(path).map_err(|source| ConfigError::CredentialFileRead {
-            file_variable: file_variable.to_string(),
-            path: path.to_string(),
-            source,
-        })?;
+    let map_error = |source| ConfigError::CredentialFileRead {
+        file_variable: file_variable.to_string(),
+        path: path.to_string(),
+        source,
+    };
+    let mut file = std::fs::File::open(path).map_err(map_error)?;
+    let metadata = file.metadata().map_err(map_error)?;
+    if let Some(warning) = credential_file_warning(path, &metadata) {
+        tracing::warn!("{warning}");
+    }
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).map_err(map_error)?;
     let value = contents.trim();
     if value.is_empty() {
         return Err(ConfigError::EmptyCredentialFile {
@@ -159,6 +166,53 @@ fn bearer_token(value: Option<String>) -> Result<Option<String>, ConfigError> {
         ));
     }
     Ok(Some(value))
+}
+
+/// Build a warning for unsafe credential file metadata.
+///
+/// The warning names the path, the mode, and the owner IDs. It never
+/// contains the file contents. A group or world read bit is unsafe. A
+/// file owner other than the effective user is unsafe.
+#[cfg(unix)]
+fn credential_file_warning(path: &str, metadata: &std::fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    credential_file_warning_parts(path, metadata.mode(), metadata.uid(), effective_uid())
+}
+
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(unix)]
+fn credential_file_warning_parts(
+    path: &str,
+    mode: u32,
+    owner: u32,
+    effective_uid: u32,
+) -> Option<String> {
+    let mode = mode & 0o777;
+    let loose_mode = mode & 0o044 != 0;
+    let foreign_owner = owner != effective_uid;
+    match (loose_mode, foreign_owner) {
+        (false, false) => None,
+        (true, false) => Some(format!(
+            "credential file {path} has mode {mode:04o}. Group or world read access can expose the key. Set mode 0600."
+        )),
+        (false, true) => Some(format!(
+            "credential file {path} is owned by uid {owner}. The effective uid is {effective_uid}. Make the effective user the owner."
+        )),
+        (true, true) => Some(format!(
+            "credential file {path} has mode {mode:04o} and owner uid {owner}. The effective uid is {effective_uid}. Set mode 0600 and make the effective user the owner."
+        )),
+    }
+}
+
+#[cfg(not(unix))]
+fn credential_file_warning(_path: &str, _metadata: &std::fs::Metadata) -> Option<String> {
+    None
 }
 
 impl Config {
@@ -299,12 +353,92 @@ mod tests {
         fn path(&self) -> &str {
             self.path.to_str().expect("temp path is UTF-8")
         }
+
+        #[cfg(unix)]
+        fn set_mode(&self, mode: u32) {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(mode))
+                .expect("set temp credential file mode");
+        }
     }
 
     impl Drop for TempCredentialFile {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);
         }
+    }
+
+    #[cfg(unix)]
+    fn credential_metadata(file: &TempCredentialFile) -> std::fs::Metadata {
+        std::fs::metadata(file.path()).expect("read temp credential file metadata")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_file_with_mode_0600_produces_no_warning() {
+        let file = TempCredentialFile::new("private-secret\n");
+        file.set_mode(0o600);
+        assert_eq!(
+            credential_file_warning(file.path(), &credential_metadata(&file)),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_file_warning_for_world_readable_file() {
+        let file = TempCredentialFile::new("world-readable-secret\n");
+        file.set_mode(0o644);
+        let warning = credential_file_warning(file.path(), &credential_metadata(&file))
+            .expect("a warning for a world-readable credential file");
+        assert!(warning.contains(file.path()), "warning: {warning}");
+        assert!(warning.contains("0644"), "warning: {warning}");
+        assert!(
+            !warning.contains("world-readable-secret"),
+            "warning: {warning}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_file_warning_for_group_readable_file() {
+        let file = TempCredentialFile::new("group-readable-secret\n");
+        file.set_mode(0o640);
+        let warning = credential_file_warning(file.path(), &credential_metadata(&file))
+            .expect("a warning for a group-readable credential file");
+        assert!(warning.contains("0640"), "warning: {warning}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_file_warning_for_world_readable_bit() {
+        let file = TempCredentialFile::new("world-readable-secret\n");
+        file.set_mode(0o604);
+        let warning = credential_file_warning(file.path(), &credential_metadata(&file))
+            .expect("a warning for a world-readable credential file");
+        assert!(warning.contains("0604"), "warning: {warning}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_file_with_execute_bits_only_produces_no_warning() {
+        let file = TempCredentialFile::new("private-secret\n");
+        file.set_mode(0o700);
+        assert_eq!(
+            credential_file_warning(file.path(), &credential_metadata(&file)),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_file_owned_by_another_user_produces_a_warning() {
+        let warning = credential_file_warning_parts("/tmp/credential", 0o600, 1000, 1001)
+            .expect("a warning for a foreign owner");
+        assert!(warning.contains("/tmp/credential"), "warning: {warning}");
+        assert!(warning.contains("1000"), "warning: {warning}");
+        assert!(warning.contains("1001"), "warning: {warning}");
     }
 
     fn test_config(max_text_bytes: u64, max_file_bytes: u64) -> Config {
