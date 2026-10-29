@@ -14,6 +14,46 @@ specification is in `README.md`; do not re-litigate settled decisions
 there (Garage first, no database in v1, day-granular expiry, no
 presigned URLs, no `If-None-Match` reliance) without new user input.
 
+## Writing standard
+
+All new and changed prose must follow ASD-STE100 Simplified Technical
+English. The current issue is Issue 9, released 2025-01-15. The
+standard is at https://www.asd-ste100.org/.
+
+This standard covers this prose:
+
+- `AGENTS.md`, `README.md`, and `docs/`
+- commit messages and pull request descriptions
+- Rust doc comments (`///` and `//!`) and code comments
+- CLI help, error messages, and frontend copy
+
+This standard does not cover names in code:
+
+- identifiers, module paths, CLI flags, JSON keys, HTTP headers, and
+  MCP tool names
+- quoted third-party text, license text, and verbatim command output
+
+Rules (a subset of the 53 writing rules):
+
+- Write one instruction in one sentence. Use the active voice.
+- Use 20 words or fewer in a procedural sentence. Use 25 words or
+  fewer in a descriptive sentence.
+- Use 6 sentences or fewer in a paragraph.
+- Write the action as a verb. Write "delete the object", not "perform
+  the deletion".
+- Use one word for one thing. An S3 object is an "object" in all
+  files.
+- Do not use marketing adjectives, idioms, or phrasal verbs.
+- Do not use "simply", "just", or "obviously".
+- Use American English spelling.
+
+Do not change code names to obey these rules. Keep the prose term and
+the identifier equal in meaning, so the documents cannot drift from the
+API.
+
+Existing text does not obey these rules yet. Do not rewrite unrelated
+text in a change that has another purpose.
+
 ## Build and test (Cargo — the primary path)
 
 ```sh
