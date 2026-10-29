@@ -287,14 +287,15 @@ Error responses are machine-readable JSON, e.g.
 413 for oversize, 400 for invalid input, 404 for not found, 410 for
 expired, 416 for an unsatisfiable range, and 502 for S3 errors.
 
-Two status codes need reading carefully, because the current
+One status code needs reading carefully, because the current
 behaviour is narrower than the list above suggests. `DELETE` is
 idempotent, so deleting a full paste ID that does not exist returns
 204 rather than 404; a 404 comes back only when a bare random ID
-cannot be resolved against the bucket at all. And `NoSuchBucket` is
-mapped to 404, so a wrong `S3_BUCKET` name makes every paste look
-missing and even reports a failed upload as `paste not found`. Both
-are tracked under Known limitations.
+cannot be resolved against the bucket at all.
+
+A wrong `S3_BUCKET` name is not one of those cases. `NoSuchBucket`
+carries its own error and maps to 502, so a misconfigured bucket says
+so rather than reporting every paste as missing.
 
 ## Content-Type detection (streamed uploads)
 
