@@ -62,11 +62,11 @@ fn status_for(e: &StoreError) -> StatusCode {
         StoreError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
         StoreError::InvalidId(_)
         | StoreError::InvalidDate(_)
-        | StoreError::InvalidRange(_)
-        | StoreError::InvalidUtf8 => StatusCode::BAD_REQUEST,
+        | StoreError::InvalidRange(_) => StatusCode::BAD_REQUEST,
         StoreError::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
         StoreError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         StoreError::S3(_) => StatusCode::BAD_GATEWAY,
+        StoreError::BucketUnavailable(_) => StatusCode::BAD_GATEWAY,
     }
 }
 
@@ -392,26 +392,30 @@ async fn download_inner(
     // Stream back in 8 MiB range chunks: the server holds one chunk at
     // a time, never the whole object.
     let store = state.store.clone();
-    let key_id = id.to_string();
+    let object_key = meta.key.clone();
     let stream = futures::stream::unfold(
-        (start, end, store, key_id),
-        move |(cur, end, store, id)| async move {
+        (start, end, store, object_key),
+        move |(cur, end, store, key)| async move {
             if cur > end {
                 return None;
             }
             let chunk_end = (cur + MULTIPART_CHUNK_BYTES as u64 - 1).min(end);
-            match store.fetch_range(&id, Some((cur, chunk_end))).await {
-                Ok((bytes, _)) => {
+            match store.fetch_range_by_key(&key, Some((cur, chunk_end))).await {
+                Ok(bytes) => {
                     if bytes.is_empty() {
                         return None;
                     }
                     let next = chunk_end + 1;
                     Some((
                         Ok::<Bytes, StoreError>(Bytes::from(bytes)),
-                        (next, end, store, id),
+                        (next, end, store, key),
                     ))
                 }
-                Err(_) => None,
+                // Propagate instead of ending the body. Ending it here sent a
+                // `200 OK` with the full `Content-Length` already on the wire
+                // and only part of the object delivered, which reads to a
+                // client as a short but successful read.
+                Err(e) => Some((Err(e), (end.saturating_add(1), end, store, key))),
             }
         },
     );

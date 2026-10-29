@@ -58,6 +58,9 @@ impl PartBuffer {
         }
     }
 
+    /// Bytes currently held that have not yet formed a complete part.
+    /// Used by the unit tests to assert the buffering boundary.
+    #[cfg(test)]
     pub fn buffered_len(&self) -> usize {
         self.buf.len()
     }
@@ -92,6 +95,8 @@ pub struct UploadOutcome {
     pub total_bytes: u64,
     pub sha256: String,
     pub used_multipart: bool,
+    /// Read by the unit tests only; the binary reports total_bytes instead.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub parts_uploaded: usize,
 }
 
@@ -360,6 +365,7 @@ mod tests {
             .unwrap();
         assert!(outcome.used_multipart);
         assert_eq!(outcome.parts_uploaded, 2);
+        assert_eq!(outcome.total_bytes, total as u64);
         let state = sink.state.lock().unwrap();
         assert_eq!(state.parts[0].1.len(), STREAM_PART_BYTES);
         assert_eq!(state.parts[1].1.len(), 1);
