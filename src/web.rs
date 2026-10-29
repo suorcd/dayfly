@@ -537,17 +537,20 @@ async fn view_bare(
 /// UI routes, without state attached. `main` merges these with the
 /// API routes and attaches a single shared [`AppState`].
 pub fn ui_router() -> Router<AppState> {
+    // See http.rs: the store caps streams while it reads them. The 2 MiB
+    // axum default would reject real file uploads early. Keep the limit on
+    // the form routes, which buffer their bodies in memory.
+    let upload_routes = Router::new()
+        .route("/ui/upload", post(upload_submit_handler))
+        .layer(DefaultBodyLimit::disable());
     Router::new()
+        .merge(upload_routes)
         .route("/", get(index_handler))
         .route("/ui/text", post(text_submit_handler))
-        .route("/ui/upload", post(upload_submit_handler))
         .route("/ui/delete", post(delete_submit_handler))
         .route("/pastes", get(list_handler))
         .route("/view/{date}/{random}", get(view_dated))
         .route("/view/{random}", get(view_bare))
-        // See http.rs: the store caps streams while it reads them. The
-        // 2 MiB axum default would reject real file uploads early.
-        .layer(DefaultBodyLimit::disable())
 }
 
 #[cfg(test)]

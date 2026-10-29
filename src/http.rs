@@ -611,9 +611,16 @@ async fn delete_bare(
 /// API routes, without state attached. `main` merges these with the
 /// human UI routes and attaches a single shared [`AppState`].
 pub fn api_router() -> Router<AppState> {
-    Router::new()
+    // Uploads are streamed and capped by the store while they are read.
+    // The axum default limit (2 MiB) would reject real file uploads before
+    // the store can apply the file cap or abort a multipart upload cleanly.
+    // Keep the limit on the other routes, where bodies are buffered.
+    let upload_routes = Router::new()
         .route("/upload", post(upload_dispatch))
         .route("/v1/pastes", post(upload_dispatch).get(list_handler))
+        .layer(DefaultBodyLimit::disable());
+    Router::new()
+        .merge(upload_routes)
         .route(
             "/v1/pastes/{date}/{random}",
             get(download_dated)
@@ -628,11 +635,6 @@ pub fn api_router() -> Router<AppState> {
         )
         .route("/v1/pastes/{date}/{random}/meta", get(meta_dated))
         .route("/v1/pastes/{random}/meta", get(meta_bare))
-        // Uploads are streamed and capped by the store while they are read.
-        // The axum default limit (2 MiB) would reject real file uploads
-        // before the store can apply the file cap or abort a multipart
-        // upload cleanly.
-        .layer(DefaultBodyLimit::disable())
 }
 
 #[cfg(test)]
