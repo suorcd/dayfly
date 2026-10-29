@@ -614,6 +614,45 @@ async fn download_file_writes_whole_and_ranged_content() {
 }
 
 #[tokio::test]
+async fn download_file_streams_multiple_s3_chunks() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let body = common::pattern_bytes(MULTIPART_CHUNK_BYTES + 1024);
+    let source = common::write_temp_file("multi-chunk-source.bin", &body);
+    let stored = store
+        .store_file_path(&source, Some("multi-chunk.bin"), None, None)
+        .await
+        .expect("large file must store");
+
+    let whole_path = common::temp_path("multi-chunk-whole.bin");
+    let meta = store
+        .download_file(&stored.id, &whole_path, None)
+        .await
+        .expect("multi-chunk download must succeed");
+    assert_eq!(meta.size, body.len() as u64);
+    assert_eq!(
+        std::fs::read(&whole_path).expect("downloaded file must be readable"),
+        body
+    );
+
+    let start = MULTIPART_CHUNK_BYTES - 10;
+    let end = MULTIPART_CHUNK_BYTES + 10;
+    let range_path = common::temp_path("multi-chunk-range.bin");
+    store
+        .download_file(&stored.id, &range_path, Some((start as u64, end as u64)))
+        .await
+        .expect("range across a chunk boundary must succeed");
+    assert_eq!(
+        std::fs::read(&range_path).expect("ranged file must be readable"),
+        body[start..=end].to_vec()
+    );
+
+    let _ = std::fs::remove_file(source);
+    let _ = std::fs::remove_file(whole_path);
+    let _ = std::fs::remove_file(range_path);
+}
+
+#[tokio::test]
 async fn download_file_supports_empty_objects() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
