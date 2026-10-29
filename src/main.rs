@@ -7,8 +7,8 @@
 //!   human frontend (`/`, `/pastes`, `/view/<id>`).
 //!
 //! Logging goes to stderr only in both modes, so the MCP JSON-RPC
-//! stream on stdout is never corrupted. Credentials come from the
-//! environment only and are never logged.
+//! stream on stdout is never corrupted. Credentials come from
+//! environment variables or credential files and are never logged.
 
 mod config;
 mod content_type;

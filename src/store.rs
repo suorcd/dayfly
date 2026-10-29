@@ -472,9 +472,9 @@ impl crate::stream::UploadSink for AwsUploadSink {
 
 impl Store {
     pub async fn from_config(config: Config) -> Result<Self, StoreError> {
-        // Credentials come from the environment variables named in Config
-        // only. The AWS default chain is not used, so a stray AWS profile
-        // or instance role can never silently supply credentials.
+        // Credentials come from the environment or the credential files
+        // named in Config only. The AWS default chain is not used, so a
+        // stray AWS profile or instance role can never supply credentials.
         let credentials = Credentials::new(
             config.access_key_id.clone(),
             config.secret_access_key.clone(),

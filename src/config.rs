@@ -2,11 +2,13 @@ use std::env;
 
 use thiserror::Error;
 
-/// Configuration loaded from the environment only.
+/// Configuration loaded from the environment.
 ///
-/// No S3 credential is ever logged. [`Config`] deliberately has no `Debug`
-/// implementation that prints secret fields; callers that log configuration
-/// must use [`Config::safe_summary`].
+/// The S3 credentials come from a direct environment variable or from a
+/// file named by the `_FILE` alternative. No S3 credential is ever logged.
+/// [`Config`] deliberately has no `Debug` implementation that prints secret
+/// fields; callers that log configuration must use
+/// [`Config::safe_summary`].
 #[derive(Clone)]
 pub struct Config {
     pub endpoint: String,
@@ -47,6 +49,20 @@ pub enum ConfigError {
     EmptyBucket,
     #[error("S3_ENDPOINT must be an http:// or https:// URL")]
     BadEndpoint,
+    #[error("{variable} and {file_variable} are both set; set only one of them")]
+    ConflictingCredentialSources {
+        variable: String,
+        file_variable: String,
+    },
+    #[error("cannot read {file_variable} file {path}: {source}")]
+    CredentialFileRead {
+        file_variable: String,
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{file_variable} file {path} is empty")]
+    EmptyCredentialFile { file_variable: String, path: String },
 }
 
 fn required<F>(lookup: &F, name: &str) -> Result<String, ConfigError>
@@ -83,6 +99,45 @@ where
     }
 }
 
+/// Read an S3 credential from a direct variable or from a file.
+///
+/// A credential file read error names the variable and the path only. The
+/// error never contains the file contents.
+fn credential<F>(lookup: &F, name: &str) -> Result<String, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let file_variable = format!("{name}_FILE");
+    let direct = lookup(name).filter(|value| !value.trim().is_empty());
+    let file_path = lookup(&file_variable).filter(|value| !value.trim().is_empty());
+    match (direct, file_path) {
+        (Some(_), Some(_)) => Err(ConfigError::ConflictingCredentialSources {
+            variable: name.to_string(),
+            file_variable,
+        }),
+        (Some(value), None) => Ok(value.trim().to_string()),
+        (None, Some(path)) => read_credential_file(&file_variable, path.trim()),
+        (None, None) => Err(ConfigError::Missing(format!("{name} or {file_variable}"))),
+    }
+}
+
+fn read_credential_file(file_variable: &str, path: &str) -> Result<String, ConfigError> {
+    let contents =
+        std::fs::read_to_string(path).map_err(|source| ConfigError::CredentialFileRead {
+            file_variable: file_variable.to_string(),
+            path: path.to_string(),
+            source,
+        })?;
+    let value = contents.trim();
+    if value.is_empty() {
+        return Err(ConfigError::EmptyCredentialFile {
+            file_variable: file_variable.to_string(),
+            path: path.to_string(),
+        });
+    }
+    Ok(value.to_string())
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|name| env::var(name).ok())
@@ -110,8 +165,8 @@ impl Config {
             // Region is a signing placeholder for S3-compatible stores such
             // as Garage. It is not hardcoded: the operator supplies it.
             region: lookup("S3_REGION").unwrap_or_else(|| "us-east-1".to_string()),
-            access_key_id: required(&lookup, "S3_ACCESS_KEY_ID")?,
-            secret_access_key: required(&lookup, "S3_SECRET_ACCESS_KEY")?,
+            access_key_id: credential(&lookup, "S3_ACCESS_KEY_ID")?,
+            secret_access_key: credential(&lookup, "S3_SECRET_ACCESS_KEY")?,
             max_text_bytes: optional_u64(&lookup, "DAYFLY_MAX_TEXT_BYTES", 10 * 1024 * 1024)?,
             max_file_bytes: optional_u64(&lookup, "DAYFLY_MAX_FILE_BYTES", 1024 * 1024 * 1024)?,
             default_ttl_days: optional_u32(&lookup, "DAYFLY_DEFAULT_TTL_DAYS", 7)?,
