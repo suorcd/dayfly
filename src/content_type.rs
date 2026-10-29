@@ -14,12 +14,16 @@
 //!    recorded in metadata.
 //! 3. Filename extension via `mime_guess`, when no signature was found
 //!    (and the extension maps to something more specific than octet-stream).
-//! 4. Plain-text detection: valid UTF-8 with no NUL bytes.
+//! 4. Plain-text detection: valid UTF-8 with no NUL bytes in the whole
+//!    payload.
 //! 5. Fallback: `application/octet-stream`.
 //!
-//! Sniffing peeks at only the first chunk (up to 8 KiB, see
-//! [`detect_and_wrap`]) and forwards those same bytes into the upload
-//! stream. It never buffers a whole file to detect its type.
+//! Buffered uploads detect on the whole payload. Streaming uploads
+//! peek at the first chunk (up to 8 KiB, see [`detect_and_wrap`]) and
+//! forward those same bytes into the upload stream. A streamed sample
+//! that is truncated cannot prove that the whole body is text. Such a
+//! sample falls back to `application/octet-stream`, unless a known
+//! length shows that the whole body fits in the sample.
 
 use std::path::Path;
 use std::pin::Pin;
@@ -33,8 +37,8 @@ use crate::store::StoreError;
 
 /// How many bytes are peeked for sniffing. The peek buffer may hold one
 /// whole incoming chunk if that chunk is larger than this (chunk sizes
-/// from HTTP bodies are bounded), but detection only looks at the first
-/// [`PEEK_BYTES`] of it.
+/// from HTTP bodies are bounded), but a streamed upload sees no more
+/// than this sample before it starts the S3 upload.
 pub const PEEK_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,19 +126,33 @@ fn is_text(prefix: &[u8]) -> bool {
     !prefix.contains(&0) && std::str::from_utf8(prefix).is_ok()
 }
 
-/// Pure detection function: given an explicit type, a filename, and the
-/// first bytes of the payload, decide the final Content-Type.
+/// Pure detection function: given an explicit type, a filename, and a
+/// payload known in full, decide the final Content-Type.
 pub fn detect_content_type(
     explicit: Option<&str>,
     filename: Option<&str>,
-    prefix: &[u8],
+    payload: &[u8],
+) -> Detection {
+    detect_content_type_sample(explicit, filename, payload, true)
+}
+
+/// Pure detection function for a sample that may be truncated. When
+/// `sample_complete` is false, plain-text detection cannot prove that
+/// the whole body is valid UTF-8 with no NUL bytes, so the fallback
+/// wins. Sniffing, an explicit client type, and a filename extension
+/// still apply to a truncated sample.
+pub fn detect_content_type_sample(
+    explicit: Option<&str>,
+    filename: Option<&str>,
+    sample: &[u8],
+    sample_complete: bool,
 ) -> Detection {
     let explicit_norm = normalise_explicit(explicit);
     let explicit_specific = explicit_norm.clone().filter(|e| !is_generic_type(e));
-    let peek = &prefix[..prefix.len().min(PEEK_BYTES)];
 
-    // 2. Magic-byte sniffing. `infer` only returns specific signatures.
-    if let Some(kind) = infer::get(peek) {
+    // 2. Magic-byte sniffing. `infer` only returns specific signatures
+    // and only reads bytes near the start of the sample.
+    if let Some(kind) = infer::get(sample) {
         let mut sniffed = kind.mime_type().to_string();
         let mut source: &'static str = "sniffed";
         // The ZIP signature alone cannot name an Office, OpenDocument,
@@ -185,8 +203,8 @@ pub fn detect_content_type(
         };
     }
 
-    // 4. Plain text.
-    if is_text(peek) {
+    // 4. Plain text, but only when the sample is the whole body.
+    if sample_complete && is_text(sample) {
         return Detection {
             content_type: "text/plain; charset=utf-8".to_string(),
             source: "text",
@@ -269,12 +287,15 @@ where
 ///
 /// The peek accumulates chunks until it holds at least [`PEEK_BYTES`]
 /// bytes or the stream ends. If the very first chunk is larger than
-/// [`PEEK_BYTES`], the whole chunk is buffered and forwarded — detection
-/// still only looks at its first [`PEEK_BYTES`] bytes.
+/// [`PEEK_BYTES`], the whole chunk is buffered and forwarded, but
+/// detection sees no more than the first [`PEEK_BYTES`] bytes. A
+/// `known_length` at or below [`PEEK_BYTES`] proves that the sample is
+/// the whole body, so text detection can run on it.
 pub async fn detect_and_wrap<'a, S>(
     stream: S,
     explicit: Option<&str>,
     filename: Option<&str>,
+    known_length: Option<u64>,
 ) -> (
     Detection,
     Pin<Box<dyn Stream<Item = Result<Bytes, StoreError>> + Send + 'a>>,
@@ -318,7 +339,11 @@ where
             Box::pin(err_stream),
         );
     }
-    let detection = detect_content_type(explicit, filename, &buffer);
+    // The sample is complete when the stream ended below the cap, or
+    // when a known length shows that the whole body fits in the sample.
+    let sample_complete =
+        known_length.map_or(buffer.len() < PEEK_BYTES, |len| len <= PEEK_BYTES as u64);
+    let detection = detect_content_type_sample(explicit, filename, &buffer, sample_complete);
     let peek = if buffer.is_empty() {
         None
     } else {
@@ -486,6 +511,23 @@ mod tests {
     }
 
     #[test]
+    fn ascii_payload_with_nul_after_peek_is_not_text() {
+        let mut payload = vec![b'a'; PEEK_BYTES];
+        payload.push(0);
+        let d = detect_content_type(None, None, &payload);
+        assert_eq!(d.content_type, "application/octet-stream");
+        assert_eq!(d.source, "fallback");
+    }
+
+    #[test]
+    fn utf8_text_over_peek_is_text_when_payload_is_whole() {
+        let payload = vec![b'a'; PEEK_BYTES + 1];
+        let d = detect_content_type(None, None, &payload);
+        assert_eq!(d.content_type, "text/plain; charset=utf-8");
+        assert_eq!(d.source, "text");
+    }
+
+    #[test]
     fn arbitrary_binary_falls_back() {
         let d = detect_content_type(None, None, &[0x00, 0xff, 0x01, 0x02, 0xfe, 0x00]);
         assert_eq!(d.content_type, "application/octet-stream");
@@ -552,7 +594,7 @@ mod tests {
             Ok(Bytes::from(input[100..5000].to_vec())),
             Ok(Bytes::from(input[5000..].to_vec())),
         ];
-        let (detection, wrapped) = detect_and_wrap(stream::iter(chunks), None, None).await;
+        let (detection, wrapped) = detect_and_wrap(stream::iter(chunks), None, None, None).await;
         assert_eq!(detection.content_type, "image/png");
         let mut out = Vec::new();
         let mut s = wrapped;
@@ -563,11 +605,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peek_wrap_with_single_large_chunk() {
+    async fn truncated_streamed_text_falls_back_to_octet_stream() {
+        let input = vec![b'a'; PEEK_BYTES + 1];
+        let chunks = vec![Ok(Bytes::from(input))];
+        let (detection, _wrapped) = detect_and_wrap(stream::iter(chunks), None, None, None).await;
+        assert_eq!(detection.content_type, "application/octet-stream");
+        assert_eq!(detection.source, "fallback");
+    }
+
+    #[tokio::test]
+    async fn short_streamed_text_is_text() {
+        let chunks = vec![Ok(Bytes::from_static(b"hello, world\nsecond line\n"))];
+        let (detection, _wrapped) = detect_and_wrap(stream::iter(chunks), None, None, None).await;
+        assert_eq!(detection.content_type, "text/plain; charset=utf-8");
+        assert_eq!(detection.source, "text");
+    }
+
+    #[tokio::test]
+    async fn known_length_within_peek_allows_text() {
+        let input = vec![b'a'; PEEK_BYTES];
+        let chunks = vec![Ok(Bytes::from(input))];
+        let (detection, _wrapped) =
+            detect_and_wrap(stream::iter(chunks), None, None, Some(PEEK_BYTES as u64)).await;
+        assert_eq!(detection.content_type, "text/plain; charset=utf-8");
+        assert_eq!(detection.source, "text");
+    }
+
+    #[tokio::test]
+    async fn explicit_text_plain_wins_with_truncated_sample() {
+        let input = vec![b'a'; PEEK_BYTES + 1];
+        let chunks = vec![Ok(Bytes::from(input))];
+        let (detection, _wrapped) =
+            detect_and_wrap(stream::iter(chunks), Some("text/plain"), None, None).await;
+        assert_eq!(detection.content_type, "text/plain");
+        assert_eq!(detection.source, "client");
+    }
+
+    #[tokio::test]
+    async fn extension_wins_with_truncated_sample() {
+        let input = vec![b'a'; PEEK_BYTES + 1];
+        let chunks = vec![Ok(Bytes::from(input))];
+        let (detection, _wrapped) =
+            detect_and_wrap(stream::iter(chunks), None, Some("notes.csv"), None).await;
+        assert_eq!(detection.content_type, "text/csv");
+        assert_eq!(detection.source, "extension");
+    }
+
+    #[tokio::test]
+    async fn truncated_single_large_chunk_falls_back_and_forwards_bytes() {
         let input = vec![b'a'; 20_000];
         let chunks = vec![Ok(Bytes::from(input.clone()))];
-        let (detection, wrapped) = detect_and_wrap(stream::iter(chunks), None, None).await;
-        assert_eq!(detection.content_type, "text/plain; charset=utf-8");
+        let (detection, wrapped) = detect_and_wrap(stream::iter(chunks), None, None, None).await;
+        assert_eq!(detection.content_type, "application/octet-stream");
+        assert_eq!(detection.source, "fallback");
         let mut out = Vec::new();
         let mut s = wrapped;
         while let Some(item) = s.next().await {
