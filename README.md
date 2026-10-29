@@ -435,6 +435,20 @@ for this use was not established; on machines without those fonts
 the stack falls back to system monospace. No suorcd.us content is
 copied.
 
+### Write-route origin check
+
+The three browser write routes (`POST /ui/text`, `POST /ui/upload`,
+and `POST /ui/delete`) require an `Origin` header that matches the
+`Host` header. If `Origin` is absent, the server uses `Referer`.
+
+The server returns 403 when both headers are absent. It also returns
+403 when a value is `null` or malformed, or when the host or port does
+not match `Host`. A scripted client must send `Origin` or `Referer`.
+A reverse proxy must preserve the public `Host` header.
+
+`GET` routes and the `/v1` API routes do not use this check. API
+clients use the bearer token and JSON.
+
 ## Testing
 
 ```sh
@@ -499,7 +513,8 @@ type overriding a generic one, sniffed-signature conflict, extension
 fallback), peeked-byte forwarding (neither lost nor duplicated),
 streaming part buffering, chunked and multi-part-sized uploads,
 disconnect/part-failure/oversize abort (no URL material), empty
-uploads, HTML escaping, human sizes, and days-remaining math.
+uploads, the write-route origin guard, HTML escaping, human sizes, and
+days-remaining math.
 
 ### Against a local S3-compatible emulator or a separate test bucket
 
@@ -591,9 +606,9 @@ honest.
   only. Other zip-based formats keep the plain ZIP type.
 - **The HTTP endpoint is internal-only in the weakest sense.** The
   bearer token comparison is constant time for equal-length tokens.
-  A length difference still leaks through timing. The HTML form
-  routes have no CSRF protection. Run this on a private network
-  rather than exposing it.
+  A length difference still leaks through timing. The write-route origin
+  check trusts the `Host` header. Run this on a private network rather
+  than exposing it.
 
 ## Future work (not in v1)
 

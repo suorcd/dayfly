@@ -36,6 +36,8 @@
 use std::collections::HashMap;
 
 use axum::extract::{Multipart, Path, Query, State};
+use axum::http::header::{HOST, ORIGIN, REFERER};
+use axum::http::uri::{Authority, Uri};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -144,6 +146,62 @@ fn ttl_options(selected: u32) -> String {
     out
 }
 
+/// Return true when the request's `Origin`, or its fallback `Referer`,
+/// has the same authority as the `Host` header.
+///
+/// The three browser write routes use this check. Only absolute
+/// `http://` and `https://` values are accepted. The authority
+/// comparison ignores ASCII case, and a missing port uses the scheme's
+/// default port.
+fn same_origin_allowed(headers: &HeaderMap) -> bool {
+    let Some(host) = headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<Authority>().ok())
+    else {
+        return false;
+    };
+
+    let candidate = match headers.get(ORIGIN) {
+        Some(value) => match value.to_str() {
+            Ok(value) => value,
+            Err(_) => return false,
+        },
+        None => match headers.get(REFERER).and_then(|value| value.to_str().ok()) {
+            Some(value) => value,
+            None => return false,
+        },
+    };
+
+    let Ok(uri) = candidate.parse::<Uri>() else {
+        return false;
+    };
+    let Some(scheme) = uri.scheme_str() else {
+        return false;
+    };
+    let is_https = scheme.eq_ignore_ascii_case("https");
+    if !is_https && !scheme.eq_ignore_ascii_case("http") {
+        return false;
+    }
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    if authority.as_str().contains('@') {
+        return false;
+    }
+    let default_port = if is_https { 443 } else { 80 };
+    authority.host().eq_ignore_ascii_case(host.host())
+        && authority.port_u16().unwrap_or(default_port) == host.port_u16().unwrap_or(default_port)
+}
+
+fn forbidden_page() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Html("<p>Forbidden: the request origin does not match the Host header.</p>".to_string()),
+    )
+        .into_response()
+}
+
 async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(resp) = check_auth(&state, &headers) {
         return resp;
@@ -188,6 +246,9 @@ async fn text_submit_handler(
 ) -> Response {
     if let Err(resp) = check_auth(&state, &headers) {
         return resp;
+    }
+    if !same_origin_allowed(&headers) {
+        return forbidden_page();
     }
     let filename = form.filename.filter(|f| !f.trim().is_empty());
     match state
@@ -254,6 +315,9 @@ async fn upload_submit_handler(
 ) -> Response {
     if let Err(resp) = check_auth(&state, &headers) {
         return resp;
+    }
+    if !same_origin_allowed(&headers) {
+        return forbidden_page();
     }
     let mut ttl: Option<u32> = None;
     // Stream the file field inside the loop, not moved out of it: an
@@ -368,6 +432,9 @@ async fn delete_submit_handler(
     if let Err(resp) = check_auth(&state, &headers) {
         return resp;
     }
+    if !same_origin_allowed(&headers) {
+        return forbidden_page();
+    }
     match state.store.delete(&form.id).await {
         Ok(()) => Redirect::to("/pastes").into_response(),
         Err(e) => error_page(e),
@@ -463,6 +530,7 @@ pub fn ui_router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use axum::body::Body;
+    use axum::http::header::{CONTENT_TYPE, HOST, ORIGIN, REFERER};
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
@@ -567,5 +635,123 @@ mod tests {
         // Ceil of ~3 days; allow the exact string for 3 days.
         assert_eq!(days_remaining(Some(future)), "3 days");
         assert_eq!(days_remaining(None), "—");
+    }
+
+    fn same_origin(host: &str, origin: Option<&str>, referer: Option<&str>) -> bool {
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, host.parse().expect("host header"));
+        if let Some(origin) = origin {
+            headers.insert(ORIGIN, origin.parse().expect("origin header"));
+        }
+        if let Some(referer) = referer {
+            headers.insert(REFERER, referer.parse().expect("referer header"));
+        }
+        same_origin_allowed(&headers)
+    }
+
+    #[test]
+    fn same_origin_origin_is_allowed() {
+        assert!(same_origin(
+            "dayfly.example",
+            Some("https://dayfly.example"),
+            None
+        ));
+    }
+
+    #[test]
+    fn cross_site_origin_is_denied() {
+        assert!(!same_origin(
+            "dayfly.example",
+            Some("https://evil.example"),
+            None
+        ));
+    }
+
+    #[test]
+    fn same_origin_referer_with_path_is_allowed() {
+        assert!(same_origin(
+            "dayfly.example:8080",
+            None,
+            Some("http://dayfly.example:8080/pastes")
+        ));
+    }
+
+    #[test]
+    fn cross_site_referer_is_denied() {
+        assert!(!same_origin(
+            "dayfly.example",
+            None,
+            Some("https://evil.example/pastes")
+        ));
+    }
+
+    #[test]
+    fn missing_origin_and_referer_is_denied() {
+        assert!(!same_origin("dayfly.example", None, None));
+    }
+
+    #[test]
+    fn null_origin_is_denied() {
+        assert!(!same_origin("dayfly.example", Some("null"), None));
+    }
+
+    #[test]
+    fn malformed_origin_is_denied() {
+        assert!(!same_origin("dayfly.example", Some("https://"), None));
+        assert!(!same_origin("dayfly.example", Some("not a url"), None));
+    }
+
+    #[test]
+    fn malformed_origin_does_not_fall_back_to_referer() {
+        assert!(!same_origin(
+            "dayfly.example",
+            Some("null"),
+            Some("https://dayfly.example/pastes")
+        ));
+    }
+
+    #[test]
+    fn host_comparison_ignores_ascii_case() {
+        assert!(same_origin(
+            "DAYFLY.EXAMPLE",
+            Some("https://dayfly.EXAMPLE"),
+            None
+        ));
+    }
+
+    #[test]
+    fn default_port_matches_omitted_port() {
+        assert!(same_origin(
+            "dayfly.example",
+            Some("https://dayfly.example:443"),
+            None
+        ));
+    }
+
+    #[tokio::test]
+    async fn cross_site_delete_post_is_forbidden() {
+        let state = AppState {
+            store: Store::from_config(test_config())
+                .await
+                .expect("test S3 config must build without network access"),
+        };
+        let app = ui_router().with_state(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/ui/delete")
+            .header(HOST, "dayfly.example")
+            .header(ORIGIN, "https://evil.example")
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("id=2026-10-28/abc123"))
+            .expect("request must build");
+        let response = app
+            .oneshot(request)
+            .await
+            .expect("router call must complete");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a cross-site delete post must be rejected"
+        );
     }
 }
