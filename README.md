@@ -310,7 +310,11 @@ Detection precedence, in order:
    unspecified.
 2. **Magic-byte sniffing** of the first bytes (`infer` crate) for
    images (PNG, JPEG, GIF, WebP, …), PDF, ZIP, video/audio
-   containers, and other formats with signatures.
+   containers, and other formats with signatures. A ZIP signature
+   alone cannot name an Office, OpenDocument, or EPUB document. A
+   known zip-based extension (`.docx`, `.xlsx`, `.pptx`, `.odt`,
+   `.ods`, `.odp`, `.odg`, `.epub`, `.docm`, `.xlsm`, `.pptm`)
+   supplies the specific type.
 3. **Filename extension** (`mime_guess`), when an `X-Filename` /
    multipart filename is supplied.
 4. **Plain-text detection**: valid UTF-8 with no NUL bytes in the
@@ -553,8 +557,9 @@ honest.
 - **Text detection inspects the first 8 KiB only.** A file that is
   ASCII at the start and binary later is stored as `text/plain` and
   served inline.
-- **Office documents report as `application/zip`.** Sniffing outranks
-  the filename extension and the signature is only the PK header.
+- **Some zip-based documents still report as `application/zip`.** The
+  mapping covers the common Office, OpenDocument, and EPUB extensions
+  only. Other zip-based formats keep the plain ZIP type.
 - **The HTTP endpoint is internal-only in the weakest sense.** The
   bearer token comparison is not constant time, and the HTML form
   routes have no CSRF protection, so run this on a private network
