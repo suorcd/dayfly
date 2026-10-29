@@ -112,6 +112,68 @@ over crane / naersk, see `flake.nix` for the justification, and
 pins nixpkgs via the `nixos-unstable` input. After the first
 `nix flake update`, commit the generated `flake.lock`.
 
+## Red-green test protocol (required for every change)
+
+Every change must follow the red-green protocol, or state why a test
+is not applicable. Write the test before you change the code. Name the
+test for the behavior under test, not for the fix.
+
+Run the single test against the unmodified tree. Capture the failure.
+If the test passes, it does not reproduce the defect: the test is
+wrong, or the diagnosis is wrong. Correct the test or the diagnosis
+before you continue.
+
+The change has four evidence checkpoints:
+
+1. **Test**: the test name and the behavior that it asserts.
+2. **Red run**: the command and the tail of the failing output from the
+   unmodified tree.
+3. **Green run**: the same command and the tail of the passing output
+   after the change.
+4. **Full suite**: the command and the totals.
+
+The red run and the green run must use the same test invocation. Make
+the change between the two runs. A failure from one command and a pass
+from a different command are not evidence. The red run must fail for
+the reason that the test targets.
+
+Use these commands:
+
+- Single test: `nix develop -c cargo test <test_name>`
+- Full suite through the real build: `nix build -L`. The check phase
+  runs the test suite.
+- Flake level: `nix flake check`
+
+Post the command and the tail of its real output for each checkpoint
+in the pull request or issue comments. Do not paraphrase, summarize, or
+describe the output. A checkpoint without captured output has not
+happened.
+
+When a test is not applicable, state the reason in one line in the pull
+request or issue comments. Docs, prose, comments, version pins, and
+dependency bumps may have nothing to assert. Use this line for a
+documentation change:
+
+    No test: documentation only
+
+For another change, write `No test: <reason>`. Silence is not
+acceptable: a reviewer cannot tell "no test needed" from "no test
+written".
+
+When the change is not directly testable but its effect is observable,
+test the effect. Check a flake change by building it. Check a config
+change by running the binary with the value and reading the error.
+
+Test standards:
+
+- Assert on behavior, not on rendered strings. A test on an error
+  message can pass while the behavior is wrong.
+- Exercise the boundary that the change touches, not a helper next to
+  it.
+- Do not write a test that can only fail when the compiler breaks.
+- Prefer the smallest test that fails for the right reason over a broad
+  test that fails for any reason.
+
 ## Key constraints (do not break these silently)
 
 - **Local only until the user says otherwise.** Do not publish to
