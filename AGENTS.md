@@ -72,10 +72,10 @@ cargo build --release
   `src/stream.rs`, `src/content_type.rs`, `src/web.rs`) and in the
   hermetic integration suite in `tests/`. The suite uses an in-process
   fake S3 service. Do not make the default test run depend on Garage or
-  a network service. Add a test
-  for any new detection, range, expiry, or streaming behaviour —
-  especially: a failed upload must return no URL material, and peeked
-  bytes must be forwarded exactly once.
+  a network service.
+- Add a test for any new detection, range, expiry, or streaming
+  behaviour — especially: a failed upload must return no URL material,
+  and peeked bytes must be forwarded exactly once.
 - Never fake a build/test result. Report the real command output,
   including failures.
 
