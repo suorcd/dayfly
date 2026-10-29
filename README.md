@@ -66,9 +66,10 @@ by guessing:
 
 The bucket is **private, NOT open, NOT anonymous**. No public bucket
 policy and no anonymous access path are created or documented here.
-The binary alone holds the Garage access key and secret, from the
-environment only. Agents/clients never get S3 credentials and never
-talk to S3 directly; they only talk to the binary's MCP/HTTP interface.
+The binary alone holds the Garage access key and secret, from
+environment variables or credential files. Agents/clients never get S3
+credentials and never talk to S3 directly; they only talk to the
+binary's MCP/HTTP interface.
 
 Bucket privacy is **not** the same as securing the binary's own HTTP
 endpoint. The intended deployment is **private-network / localhost**.
@@ -132,8 +133,10 @@ placeholder values replaced by your own Garage values.
 | --- | --- | --- | --- |
 | `S3_ENDPOINT` | yes | — | Garage endpoint URL, `http://` or `https://` |
 | `S3_BUCKET` | yes | — | Bucket name (private) |
-| `S3_ACCESS_KEY_ID` | yes | — | Garage access key, held only by this binary |
-| `S3_SECRET_ACCESS_KEY` | yes | — | Garage secret key, held only by this binary |
+| `S3_ACCESS_KEY_ID` | one form | — | Garage access key, held only by this binary; set this variable or `S3_ACCESS_KEY_ID_FILE` |
+| `S3_ACCESS_KEY_ID_FILE` | one form | — | Path to a file that contains the Garage access key; set this variable or `S3_ACCESS_KEY_ID` |
+| `S3_SECRET_ACCESS_KEY` | one form | — | Garage secret key, held only by this binary; set this variable or `S3_SECRET_ACCESS_KEY_FILE` |
+| `S3_SECRET_ACCESS_KEY_FILE` | one form | — | Path to a file that contains the Garage secret key; set this variable or `S3_SECRET_ACCESS_KEY` |
 | `S3_REGION` | no | `us-east-1` | Signing placeholder for Garage; supply your own, do not rely on the default being "yours" |
 | `DAYFLY_MAX_TEXT_BYTES` | no | 10485760 (10 MiB) | Max text paste size for MCP `store_text`, the human text form, and `POST /upload` without a filename; oversize → 413. A filename (including a multipart filename) uses `DAYFLY_MAX_FILE_BYTES` instead |
 | `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error |
@@ -141,8 +144,15 @@ placeholder values replaced by your own Garage values.
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
 | `DAYFLY_HTTP_BEARER_TOKEN` | no | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model) |
 
+For each S3 credential, set the direct variable or its `_FILE`
+alternative, not both. If both are set, startup stops with a
+configuration error. The binary trims whitespace from file values and
+rejects an empty file.
+
 Credentials are never logged. `Config` has no `Debug` that prints
 secrets; startup logs only bucket, endpoint scheme, region, and limits.
+A credential file read error names the path only, not the file
+contents.
 
 ## Running the MCP server
 
@@ -157,7 +167,8 @@ cargo run
 
 Example MCP client config (placeholder binary path — replace with the
 real path on the machine where the binary is installed; no real paths
-to the user's machines are in this repo):
+to the user's machines are in this repo). The config contains paths
+only, not key material:
 
 ```json
 {
@@ -169,13 +180,29 @@ to the user's machines are in this repo):
         "S3_ENDPOINT": "https://garage.example.invalid:3900",
         "S3_BUCKET": "pastebin",
         "S3_REGION": "us-east-1",
-        "S3_ACCESS_KEY_ID": "YOUR-GARAGE-ACCESS-KEY",
-        "S3_SECRET_ACCESS_KEY": "YOUR-GARAGE-SECRET-KEY"
+        "S3_ACCESS_KEY_ID_FILE": "/home/you/.config/dayfly/access-key-id",
+        "S3_SECRET_ACCESS_KEY_FILE": "/home/you/.config/dayfly/secret-access-key"
       }
     }
   }
 }
 ```
+
+Create the files outside the repository. The directory must have mode
+`0700`, and each file must have mode `0600`. The account that runs
+`dayfly` must own the directory and the files. For example:
+
+```sh
+install -d -m 0700 ~/.config/dayfly
+umask 077
+$EDITOR ~/.config/dayfly/access-key-id
+$EDITOR ~/.config/dayfly/secret-access-key
+```
+
+The direct form is also valid: set `S3_ACCESS_KEY_ID` and
+`S3_SECRET_ACCESS_KEY` in the environment. Do not set a direct
+variable and its `_FILE` alternative together. A client config that
+every agent can read must not hold the key values.
 
 Logging goes to stderr only, never stdout, so the JSON-RPC stream is
 not corrupted.
