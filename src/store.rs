@@ -20,6 +20,7 @@ use std::time::{Duration, SystemTime};
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{Builder as S3ConfigBuilder, Region};
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client;
@@ -42,6 +43,8 @@ pub const LIST_SCAN_MAX_PAGES: usize = 10;
 pub enum StoreError {
     #[error("paste not found: {0}")]
     NotFound(String),
+    #[error("bucket unavailable or misconfigured: {0}")]
+    BucketUnavailable(String),
     #[error("paste expired: {0}")]
     Expired(String),
     #[error("payload too large: limit is {limit} bytes")]
@@ -54,8 +57,6 @@ pub enum StoreError {
     InvalidRange(String),
     #[error("range not satisfiable")]
     RangeNotSatisfiable,
-    #[error("invalid utf-8 in text paste")]
-    InvalidUtf8,
     #[error("io error: {0}")]
     Io(String),
     #[error("s3 error: {0}")]
@@ -68,27 +69,36 @@ impl From<std::io::Error> for StoreError {
     }
 }
 
-/// Best-effort mapping of an AWS SDK error to NotFound.
-/// The SDK error shape varies by operation/version, so this inspects the
-/// debug representation for the well-known not-found markers. It is
-/// documented as best-effort, not as an exact protocol guarantee.
-pub fn map_sdk_error(debug: &str, id: &str) -> StoreError {
-    if debug.contains("NoSuchKey")
-        || debug.contains("NoSuchBucket")
-        || debug.contains("NotFound")
-        || debug.contains("404")
-    {
-        StoreError::NotFound(id.to_string())
-    } else {
-        StoreError::S3(debug.to_string())
+/// Map an AWS SDK error to a [`StoreError`] using the typed error metadata
+/// rather than substring matching on the debug representation.
+///
+/// `NoSuchBucket` is deliberately kept distinct from `NoSuchKey`. A missing
+/// bucket is an operator misconfiguration, and folding it into `NotFound` made
+/// a wrong `S3_BUCKET` look like every paste had been deleted, while also
+/// reporting a failed upload as "paste not found".
+pub fn map_sdk_error<E, R>(err: SdkError<E, R>, id: &str) -> StoreError
+where
+    E: ProvideErrorMetadata + std::fmt::Debug,
+    R: std::fmt::Debug,
+{
+    if let SdkError::ServiceError(ctx) = &err {
+        match ctx.err().code() {
+            Some("NoSuchKey") | Some("NoSuchVersion") | Some("NotFound") => {
+                return StoreError::NotFound(id.to_string());
+            }
+            Some("NoSuchBucket") => {
+                return StoreError::BucketUnavailable(id.to_string());
+            }
+            _ => {}
+        }
     }
+    StoreError::S3(format!("{err:?}"))
 }
 
 #[derive(Debug, Clone)]
 pub struct StoredPaste {
     /// Full paste ID returned to clients: "<yyyy-mm-dd>/<random-id>".
     pub id: String,
-    pub random_id: String,
     pub key: String,
     pub size: u64,
     pub sha256: String,
@@ -379,7 +389,7 @@ impl crate::stream::UploadSink for AwsUploadSink {
             .set_metadata(Some(meta))
             .send()
             .await
-            .map_err(|e| map_sdk_error(&format!("{e:?}"), &self.key))?;
+            .map_err(|e| map_sdk_error(e, &self.key))?;
         Ok(())
     }
 
@@ -393,7 +403,7 @@ impl crate::stream::UploadSink for AwsUploadSink {
             .set_metadata(Some(self.metadata.clone()))
             .send()
             .await
-            .map_err(|e| map_sdk_error(&format!("{e:?}"), &self.key))?;
+            .map_err(|e| map_sdk_error(e, &self.key))?;
         let id = out.upload_id().unwrap_or("").to_string();
         if id.is_empty() {
             return Err(StoreError::S3(
@@ -419,7 +429,7 @@ impl crate::stream::UploadSink for AwsUploadSink {
             .body(ByteStream::from(bytes))
             .send()
             .await
-            .map_err(|e| map_sdk_error(&format!("{e:?}"), &self.key))?;
+            .map_err(|e| map_sdk_error(e, &self.key))?;
         Ok(out.e_tag().unwrap_or("").to_string())
     }
 
@@ -444,7 +454,7 @@ impl crate::stream::UploadSink for AwsUploadSink {
             .multipart_upload(completed)
             .send()
             .await
-            .map_err(|e| map_sdk_error(&format!("{e:?}"), &self.key))?;
+            .map_err(|e| map_sdk_error(e, &self.key))?;
         Ok(())
     }
 
@@ -516,7 +526,7 @@ impl Store {
             let out = req
                 .send()
                 .await
-                .map_err(|e| map_sdk_error(&format!("{e:?}"), id))?;
+                .map_err(|e| map_sdk_error(e, id))?;
             for obj in out.contents() {
                 if let Some(key) = obj.key() {
                     if key.ends_with(&suffix) || key == format!("pastes/{stripped}") {
@@ -576,10 +586,9 @@ impl Store {
             .set_metadata(Some(meta))
             .send()
             .await
-            .map_err(|e| map_sdk_error(&format!("{e:?}"), &key))?;
+            .map_err(|e| map_sdk_error(e, &key))?;
         Ok(StoredPaste {
             id: format!("{date}/{random_id}"),
-            random_id,
             key,
             size: text.len() as u64,
             sha256: sha,
@@ -656,10 +665,9 @@ impl Store {
                 .set_metadata(Some(meta))
                 .send()
                 .await
-                .map_err(|e| map_sdk_error(&format!("{e:?}"), &key))?;
+                .map_err(|e| map_sdk_error(e, &key))?;
             return Ok(StoredPaste {
                 id: format!("{date}/{random_id}"),
-                random_id,
                 key,
                 size,
                 sha256: sha,
@@ -681,7 +689,7 @@ impl Store {
             .content_type(ct.clone())
             .send()
             .await
-            .map_err(|e| map_sdk_error(&format!("{e:?}"), &key))?;
+            .map_err(|e| map_sdk_error(e, &key))?;
         let upload_id = create.upload_id().unwrap_or("").to_string();
         if upload_id.is_empty() {
             return Err(StoreError::S3(
@@ -717,7 +725,7 @@ impl Store {
                     .body(ByteStream::from(chunk))
                     .send()
                     .await
-                    .map_err(|e| map_sdk_error(&format!("{e:?}"), &key))?;
+                    .map_err(|e| map_sdk_error(e, &key))?;
                 parts.push(
                     CompletedPart::builder()
                         .part_number(part_number)
@@ -767,7 +775,7 @@ impl Store {
                 .upload_id(&upload_id)
                 .send()
                 .await;
-            return Err(map_sdk_error(&format!("{e:?}"), &key));
+            return Err(map_sdk_error(e, &key));
         }
         let sha = hex_encode(&hasher.finalize());
         // Metadata for a multipart object cannot be set at completion time
@@ -798,7 +806,6 @@ impl Store {
             .await;
         Ok(StoredPaste {
             id: format!("{date}/{random_id}"),
-            random_id,
             key,
             size,
             sha256: sha,
@@ -879,7 +886,6 @@ impl Store {
         }
         Ok(StoredPaste {
             id: format!("{date}/{random_id}"),
-            random_id,
             key,
             size: outcome.total_bytes,
             sha256: outcome.sha256,
@@ -900,7 +906,7 @@ impl Store {
             .key(&key)
             .send()
             .await
-            .map_err(|e| map_sdk_error(&format!("{e:?}"), id))?;
+            .map_err(|e| map_sdk_error(e, id))?;
         let meta = out.metadata().cloned().unwrap_or_default();
         let created_at = meta.get("created-at").and_then(|s| parse_rfc3339(s));
         let expires_at = meta.get("expires-at").and_then(|s| parse_rfc3339(s));
@@ -933,29 +939,30 @@ impl Store {
         Ok(())
     }
 
-    /// Fetch a byte range (inclusive) from an object, after expiry check.
-    pub async fn fetch_range(
+    /// Fetch a byte range from an already-resolved object key.
+    ///
+    /// Callers that already hold metadata should use this rather than resolving
+    /// the ID again, because resolution issues a `HeadObject` and, for a bare
+    /// ID, a bucket scan. Downloading in chunks through the ID-based path
+    /// re-ran that once per chunk, so a 64 MiB download cost nine prefix
+    /// listings and nine heads.
+    pub async fn fetch_range_by_key(
         &self,
-        id: &str,
+        key: &str,
         range: Option<(u64, u64)>,
-    ) -> Result<(Vec<u8>, PasteMetadata), StoreError> {
-        let meta = self.head_metadata(id).await?;
-        Self::check_not_expired(&meta)?;
-        let mut req = self.client.get_object().bucket(&self.bucket).key(&meta.key);
+    ) -> Result<Vec<u8>, StoreError> {
+        let mut req = self.client.get_object().bucket(&self.bucket).key(key);
         if let Some((start, end)) = range {
             req = req.range(format!("bytes={start}-{end}"));
         }
-        let out = req
-            .send()
-            .await
-            .map_err(|e| map_sdk_error(&format!("{e:?}"), id))?;
+        let out = req.send().await.map_err(|e| map_sdk_error(e, key))?;
         let bytes = out
             .body
             .collect()
             .await
             .map_err(|e| StoreError::S3(e.to_string()))?
             .to_vec();
-        Ok((bytes, meta))
+        Ok(bytes)
     }
 
     pub async fn fetch_text(
@@ -974,8 +981,8 @@ impl Store {
                 truncated: false,
             });
         };
-        let (bytes, _) = self
-            .fetch_range(id, Some((start, end_exclusive - 1)))
+        let bytes = self
+            .fetch_range_by_key(&meta.key, Some((start, end_exclusive - 1)))
             .await?;
         let text = valid_utf8_prefix(&bytes).to_string();
         let returned = text.len() as u64;
@@ -1014,7 +1021,9 @@ impl Store {
         let mut file = File::create(dest).await?;
         while start <= end {
             let chunk_end = (start + MULTIPART_CHUNK_BYTES as u64 - 1).min(end);
-            let (bytes, _) = self.fetch_range(id, Some((start, chunk_end))).await?;
+            let bytes = self
+                .fetch_range_by_key(&meta.key, Some((start, chunk_end)))
+                .await?;
             if bytes.is_empty() {
                 break;
             }
@@ -1033,7 +1042,7 @@ impl Store {
             .key(&key)
             .send()
             .await
-            .map_err(|e| map_sdk_error(&format!("{e:?}"), id))?;
+            .map_err(|e| map_sdk_error(e, id))?;
         Ok(())
     }
 
@@ -1071,7 +1080,7 @@ impl Store {
             .max_keys(limit)
             .send()
             .await
-            .map_err(|e| map_sdk_error(&format!("{e:?}"), &date_str))?;
+            .map_err(|e| map_sdk_error(e, &date_str))?;
         let mut summaries = Vec::new();
         for obj in out.contents() {
             let Some(key) = obj.key() else { continue };

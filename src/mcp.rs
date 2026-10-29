@@ -13,7 +13,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{tool, tool_handler, tool_router};
@@ -25,7 +24,6 @@ use crate::store::Store;
 #[derive(Clone)]
 pub struct Pastebin {
     store: Arc<Store>,
-    tool_router: ToolRouter<Self>,
 }
 
 fn result_json(value: serde_json::Value) -> Result<CallToolResult, rmcp::ErrorData> {
@@ -89,7 +87,6 @@ impl Pastebin {
     pub fn new(store: Store) -> Self {
         Self {
             store: Arc::new(store),
-            tool_router: Self::tool_router(),
         }
     }
 
