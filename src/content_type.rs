@@ -272,7 +272,7 @@ where
 /// [`PEEK_BYTES`], the whole chunk is buffered and forwarded — detection
 /// still only looks at its first [`PEEK_BYTES`] bytes.
 pub async fn detect_and_wrap<'a, S>(
-    mut stream: S,
+    stream: S,
     explicit: Option<&str>,
     filename: Option<&str>,
 ) -> (
@@ -282,6 +282,11 @@ pub async fn detect_and_wrap<'a, S>(
 where
     S: Stream<Item = Result<Bytes, StoreError>> + Send + Unpin + 'a,
 {
+    // Fuse the input once. A multipart field stream built with
+    // `stream::unfold` panics when it is polled after it returns `None`,
+    // and both detection and the upload driver may poll a short body to
+    // EOF before the upload path runs.
+    let mut stream = stream.fuse();
     let mut buffer: Vec<u8> = Vec::new();
     let mut first_error: Option<StoreError> = None;
     while buffer.len() < PEEK_BYTES {

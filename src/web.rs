@@ -35,7 +35,7 @@
 
 use std::collections::HashMap;
 
-use axum::extract::{Multipart, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::header::{HOST, ORIGIN, REFERER};
 use axum::http::uri::{Authority, Uri};
 use axum::http::{HeaderMap, StatusCode};
@@ -308,6 +308,21 @@ fn error_page(e: StoreError) -> Response {
         .into_response()
 }
 
+/// A malformed multipart body is a client error, not a missing field.
+fn bad_request_page(message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        page(
+            "Error",
+            &format!(
+                "<p>{}</p><p><a href=\"/\">Back</a></p>",
+                html_escape(message)
+            ),
+        ),
+    )
+        .into_response()
+}
+
 async fn upload_submit_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -323,7 +338,12 @@ async fn upload_submit_handler(
     // Stream the file field inside the loop, not moved out of it: an
     // axum Field borrows its Multipart, so holding it across a
     // next_field call does not compile (see http.rs for the same note).
-    while let Ok(Some(field)) = multipart.next_field().await {
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(e) => return bad_request_page(&format!("invalid multipart body: {e}")),
+        };
         let name = field.name().unwrap_or("").to_string();
         if name == "file" {
             let field_content_type = field.content_type().map(|s| s.to_string());
@@ -525,6 +545,9 @@ pub fn ui_router() -> Router<AppState> {
         .route("/pastes", get(list_handler))
         .route("/view/{date}/{random}", get(view_dated))
         .route("/view/{random}", get(view_bare))
+        // See http.rs: the store caps streams while it reads them. The
+        // 2 MiB axum default would reject real file uploads early.
+        .layer(DefaultBodyLimit::disable())
 }
 
 #[cfg(test)]
