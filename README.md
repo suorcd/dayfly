@@ -239,7 +239,13 @@ curl -F file=@photo.png -F ttl_days=30 http://127.0.0.1:8080/upload
 
 A request with no filename is a text paste and is capped at
 `DAYFLY_MAX_TEXT_BYTES`; supply `X-Filename` (or a multipart filename)
-for larger files. Both `Content-Length` and chunked transfer encoding
+for larger files. The text/file split is a client-declared convention,
+not a property of the bytes: adding a filename opts into the file cap.
+The text cap is therefore a guardrail for text-paste traffic, not an
+authorization boundary or a hard bound on stored inline text. Enforcing
+it from the sniffed type would make an ASCII file upload with a
+filename subject to the text cap, which contradicts the file-upload
+contract above. Both `Content-Length` and chunked transfer encoding
 (unknown length) are accepted. For S3: a single streaming PutObject is
 used when the length is known and at most one 5 MiB part; otherwise S3
 multipart upload is used — parts are buffered to the 5 MiB minimum
@@ -531,14 +537,6 @@ not by reading the code. They are recorded here so a reader does not
 have to discover them, and so the claims elsewhere in this file stay
 honest.
 
-- **Downloads can truncate without an error.** If a chunk fetch fails
-  mid-transfer the response still carries the original
-  `Content-Length` and a `200 OK`, while the body stops early. Deleting
-  an object mid-transfer reproduced it at 16,777,216 bytes delivered
-  against a declared 67,108,864.
-- **A wrong `S3_BUCKET` reads as data loss.** `NoSuchBucket` is mapped
-  to 404, so a missing bucket reports every paste as not found and
-  reports a failed upload as `paste not found`.
 - **A local-file upload over 8 MiB depends on a copy for metadata.**
   `store_file` creates the multipart upload with no metadata and adds
   it afterwards with a same-key `CopyObject` whose error is discarded.
@@ -549,9 +547,6 @@ honest.
   served inline.
 - **Office documents report as `application/zip`.** Sniffing outranks
   the filename extension and the signature is only the PK header.
-- **Downloads re-issue one `HeadObject` per 8 MiB chunk**, and a bare
-  random ID re-scans the bucket for each one. A 64 MiB download by
-  bare ID produced 8 `GET`s, 9 `HEAD`s and 9 prefix listings.
 - **The HTTP endpoint is internal-only in the weakest sense.** The
   bearer token comparison is not constant time, and the HTML form
   routes have no CSRF protection, so run this on a private network

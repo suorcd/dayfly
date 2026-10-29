@@ -78,6 +78,23 @@ fn error_response(e: StoreError) -> Response {
     (status, Json(serde_json::json!({"error": e.to_string()}))).into_response()
 }
 
+/// A 413 for a text paste points at the way out: a filename uses the file
+/// cap. Other errors, and file uploads, keep the generic message.
+fn upload_error_response(e: StoreError, text_paste: bool) -> Response {
+    match e {
+        StoreError::TooLarge { limit } if text_paste => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": format!(
+                    "payload too large: limit is {limit} bytes for a text paste; send X-Filename for larger files"
+                )
+            })),
+        )
+            .into_response(),
+        other => error_response(other),
+    }
+}
+
 #[derive(Serialize)]
 struct UploadEnvelope {
     id: String,
@@ -198,6 +215,9 @@ async fn upload_dispatch(
             .and_then(|s| s.trim().parse::<u64>().ok());
         // A filename means a file upload; no filename means a text paste,
         // which must obey the smaller text cap rather than the file cap.
+        let text_paste = filename
+            .as_deref()
+            .is_none_or(|name| name.trim().is_empty());
         let max_bytes = state.store.config.max_bytes_for_upload(filename.as_deref());
         let body = req.into_body();
         let stream = body
@@ -223,7 +243,7 @@ async fn upload_dispatch(
             .await
         {
             Ok(stored) => upload_response(&headers, &query, &stored),
-            Err(e) => error_response(e),
+            Err(e) => upload_error_response(e, text_paste),
         }
     }
 }
@@ -629,14 +649,48 @@ mod tests {
             .expect("request must build");
 
         let resp = app.oneshot(req).await.expect("router call must complete");
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1024)
+            .await
+            .expect("error body must be readable");
+        let body = String::from_utf8_lossy(&body);
         assert_eq!(
-            resp.status(),
+            status,
             StatusCode::PAYLOAD_TOO_LARGE,
             "a no-filename upload over the text cap must be 413"
         );
         assert!(
+            body.contains("send X-Filename"),
+            "the 413 should name the remedy, got: {body}"
+        );
+        assert!(
             !polled.load(Ordering::SeqCst),
             "the body must not be read after an early cap rejection"
+        );
+    }
+
+    /// The mirror image of the rejection test: a filename must select the
+    /// file cap. The request reaches the unreachable test S3 endpoint and
+    /// returns 502; if the cap selection regressed to the text cap it would
+    /// be rejected locally with 413 instead.
+    #[tokio::test]
+    async fn filename_selects_file_cap_at_the_http_boundary() {
+        let state = test_state(10 * 1024 * 1024, 1024 * 1024 * 1024).await;
+        let app = api_router().with_state(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .header(CONTENT_LENGTH, (64u64 * 1024 * 1024).to_string())
+            .header("x-filename", "large.bin")
+            .body(Body::empty())
+            .expect("request must build");
+
+        let resp = app.oneshot(req).await.expect("router call must complete");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "X-Filename must select the file cap and reach the S3 sink"
         );
     }
 }
