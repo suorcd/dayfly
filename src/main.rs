@@ -10,22 +10,17 @@
 //! stream on stdout is never corrupted. Credentials come from
 //! environment variables or credential files and are never logged.
 
-mod config;
-mod content_type;
-mod http;
-mod mcp;
-mod store;
-mod stream;
-mod web;
-
 use clap::{Parser, Subcommand};
 use rmcp::transport::stdio;
 use rmcp::ServiceExt;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::Config;
-use crate::http::AppState;
-use crate::store::Store;
+use dayfly::config::Config;
+use dayfly::http;
+use dayfly::http::AppState;
+use dayfly::mcp;
+use dayfly::store::Store;
+use dayfly::web;
 
 #[derive(Parser)]
 #[command(
