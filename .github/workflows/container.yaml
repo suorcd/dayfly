@@ -1,0 +1,110 @@
+name: container
+
+# Builds the OCI image from the flake, proves it runs, then publishes it to
+# ghcr.io. Pull requests build and smoke test only, so a branch cannot publish.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# Read the tree, write packages, nothing else. Publishing uses the
+# workflow-scoped GITHUB_TOKEN rather than a stored secret, so no PAT exists to
+# rotate.
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build the image
+        run: nix build .#container -L
+
+      - name: Load it
+        id: load
+        run: |
+          set -euo pipefail
+          # Read the reference out of the image's own manifest rather than
+          # hard-coding a name and tag here, so a version bump in the flake
+          # does not silently break this workflow.
+          image=$(tar -xzOf result manifest.json \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["RepoTags"][0])')
+          docker load < result
+          docker image inspect "$image" > /dev/null
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "loaded $image"
+
+      - name: Smoke test
+        env:
+          IMAGE: ${{ steps.load.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker run --rm "$IMAGE" --version
+
+          # It must serve, not merely start. S3 points at a closed port on
+          # purpose: the frontend needs no object store, so a 200 proves the
+          # binary, the bind address and the runtime user all work.
+          docker run -d --name dayfly -p 18080:8080 \
+            -e S3_ENDPOINT=http://127.0.0.1:1 \
+            -e S3_BUCKET=test \
+            -e S3_REGION=us-east-1 \
+            -e S3_ACCESS_KEY_ID=unused \
+            -e S3_SECRET_ACCESS_KEY=unused \
+            "$IMAGE"
+
+          code=000
+          for _ in $(seq 1 30); do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/ || true)
+            [ "$code" = "200" ] && break
+            sleep 1
+          done
+
+          echo "GET / -> $code"
+          echo "--- container log ---"
+          docker logs dayfly || true
+          docker rm -f dayfly || true
+          test "$code" = "200"
+
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Publish
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ steps.load.outputs.image }}
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/${{ github.repository }}"
+
+          tags=("sha-${GITHUB_SHA::7}")
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            tags+=("${GITHUB_REF_NAME}" "latest")
+          elif [ "${GITHUB_REF_NAME}" = "main" ]; then
+            tags+=("edge")
+          fi
+
+          for t in "${tags[@]}"; do
+            docker tag "$IMAGE" "$repo:$t"
+            docker push "$repo:$t"
+          done
+          echo "published ${tags[*]}"
