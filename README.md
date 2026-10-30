@@ -552,7 +552,8 @@ Detection precedence, in order:
    alone cannot name an Office, OpenDocument, or EPUB document. A
    known zip-based extension (`.docx`, `.xlsx`, `.pptx`, `.odt`,
    `.ods`, `.odp`, `.odg`, `.epub`, `.docm`, `.xlsm`, `.pptm`)
-   supplies the specific type.
+   supplies the specific type. The extension comes from the
+   client-supplied filename; the container contents are not inspected.
 3. **Filename extension** (`mime_guess`), when an `X-Filename` /
    multipart filename is supplied.
 4. **Plain-text detection**: valid UTF-8 with no NUL bytes in the
