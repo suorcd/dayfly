@@ -11,8 +11,16 @@
 //! The binary alone holds the Garage credentials (from environment
 //! variables or credential files); tools never return them and no
 //! presigned URL is ever issued.
+//!
+//! The two local-path tools are the exception to "a paste endpoint is
+//! not a shell". `store_file` reads a server path and `fetch_file`
+//! writes one, so a remote MCP client that could call them would hold
+//! the process's file access. The stdio transport keeps them, because
+//! the caller already runs on the host. The HTTP transport refuses them
+//! unless `DAYFLY_MCP_LOCAL_ROOT` names a directory, and then both tools
+//! are confined to that directory.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
@@ -23,9 +31,103 @@ use serde::Deserialize;
 
 use crate::store::{parse_list_window_request, ListWindowRequest, Store, StoreError, Ttl};
 
+/// How a transport may use server-local paths.
+#[derive(Clone, Debug)]
+enum LocalFiles {
+    /// Any path the process can reach. This is the stdio behavior when
+    /// no root is configured, because the caller already runs on the
+    /// host that spawned the binary.
+    Open,
+    /// Only paths inside this canonical directory.
+    Root(Arc<PathBuf>),
+    /// No local file access at all.
+    Deny,
+}
+
+impl LocalFiles {
+    /// Resolve the mode for one transport.
+    ///
+    /// A configured root applies to both transports. Without one, the
+    /// caller's `open_when_unset` decides: true for stdio, false for
+    /// HTTP, so an HTTP client never inherits the host's filesystem by
+    /// default.
+    fn resolve(store: &Store, open_when_unset: bool) -> Self {
+        match store.config.mcp_local_root.clone() {
+            Some(root) => LocalFiles::Root(Arc::new(root)),
+            None if open_when_unset => LocalFiles::Open,
+            None => LocalFiles::Deny,
+        }
+    }
+}
+
+/// Resolve a path that a tool will read.
+///
+/// A canonical root compares real paths, so a symlink that points away
+/// from the root is refused instead of followed.
+async fn local_read_path(local: &LocalFiles, requested: &str) -> Result<PathBuf, StoreError> {
+    match local {
+        LocalFiles::Open => Ok(PathBuf::from(requested)),
+        LocalFiles::Deny => Err(StoreError::LocalFilesDisabled),
+        LocalFiles::Root(root) => {
+            let resolved = tokio::fs::canonicalize(requested)
+                .await
+                .map_err(|e| StoreError::InvalidPath(format!("cannot resolve {requested}: {e}")))?;
+            if resolved.starts_with(root.as_path()) {
+                Ok(resolved)
+            } else {
+                Err(StoreError::PathOutsideRoot(requested.to_string()))
+            }
+        }
+    }
+}
+
+/// Resolve a path that a tool will write.
+///
+/// A destination that does not exist yet is resolved through its parent,
+/// because the file cannot be canonicalized before it exists. An
+/// existing destination is canonicalized, so a symlink that points
+/// outside the root is refused.
+async fn local_write_path(local: &LocalFiles, requested: &str) -> Result<PathBuf, StoreError> {
+    match local {
+        LocalFiles::Open => Ok(PathBuf::from(requested)),
+        LocalFiles::Deny => Err(StoreError::LocalFilesDisabled),
+        LocalFiles::Root(root) => {
+            let requested = PathBuf::from(requested);
+            let parent = requested
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let real_parent = tokio::fs::canonicalize(&parent).await.map_err(|e| {
+                StoreError::InvalidPath(format!("cannot resolve {}: {e}", parent.display()))
+            })?;
+            if !real_parent.starts_with(root.as_path()) {
+                return Err(StoreError::PathOutsideRoot(requested.display().to_string()));
+            }
+            // `file_name` is None for a path that ends in `..`, which is
+            // the one form that would escape the checked parent.
+            let Some(name) = requested.file_name() else {
+                return Err(StoreError::InvalidPath(requested.display().to_string()));
+            };
+            let candidate = real_parent.join(name);
+            if tokio::fs::symlink_metadata(&candidate).await.is_ok() {
+                let real = tokio::fs::canonicalize(&candidate).await.map_err(|e| {
+                    StoreError::InvalidPath(format!("cannot resolve {}: {e}", candidate.display()))
+                })?;
+                if !real.starts_with(root.as_path()) {
+                    return Err(StoreError::PathOutsideRoot(requested.display().to_string()));
+                }
+                return Ok(real);
+            }
+            Ok(candidate)
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Pastebin {
     store: Arc<Store>,
+    local: LocalFiles,
 }
 
 fn result_json(value: serde_json::Value) -> Result<CallToolResult, rmcp::ErrorData> {
@@ -48,7 +150,12 @@ fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> 
         | StoreError::RangeNotSatisfiable => Ok(CallToolResult::error(vec![ContentBlock::text(
             e.to_string(),
         )])),
-        StoreError::InvalidId(_) | StoreError::InvalidDate(_) | StoreError::InvalidRange(_) => {
+        StoreError::InvalidId(_)
+        | StoreError::InvalidDate(_)
+        | StoreError::InvalidRange(_)
+        | StoreError::InvalidPath(_)
+        | StoreError::PathOutsideRoot(_)
+        | StoreError::LocalFilesDisabled => {
             Err(rmcp::ErrorData::invalid_params(e.to_string(), None))
         }
         StoreError::Io(_)
@@ -174,9 +281,28 @@ fn list_request(params: &ListRecentParams) -> Result<ListWindowRequest, StoreErr
 
 #[tool_router]
 impl Pastebin {
-    pub fn new(store: Store) -> Self {
+    /// Build the handler for the stdio transport.
+    ///
+    /// Spawning the binary locally is the trust boundary, so the
+    /// local-path tools keep any readable path unless
+    /// `DAYFLY_MCP_LOCAL_ROOT` narrows them.
+    pub fn stdio(store: Store) -> Self {
+        let local = LocalFiles::resolve(&store, true);
         Self {
             store: Arc::new(store),
+            local,
+        }
+    }
+
+    /// Build the handler for the HTTP transport.
+    ///
+    /// The caller is remote, so the local-path tools are refused unless
+    /// `DAYFLY_MCP_LOCAL_ROOT` names a directory they may use.
+    pub fn http(store: Store) -> Self {
+        let local = LocalFiles::resolve(&store, false);
+        Self {
+            store: Arc::new(store),
+            local,
         }
     }
 
@@ -220,10 +346,14 @@ impl Pastebin {
         Parameters(params): Parameters<StoreFileParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let ttl = resolve_ttl(params.ttl.as_deref(), params.ttl_days)?;
+        let path = match local_read_path(&self.local, &params.path).await {
+            Ok(path) => path,
+            Err(e) => return store_error_result(e),
+        };
         let stored = try_store!(
             self.store
                 .store_file_path(
-                    PathBuf::from(&params.path).as_path(),
+                    path.as_path(),
                     params.filename.as_deref(),
                     params.content_type.as_deref(),
                     ttl,
@@ -304,13 +434,13 @@ impl Pastebin {
             (Some(s), None) => Some((s, u64::MAX)),
             _ => None,
         };
+        let dest = match local_write_path(&self.local, &params.dest_path).await {
+            Ok(dest) => dest,
+            Err(e) => return store_error_result(e),
+        };
         let meta = try_store!(
             self.store
-                .download_file(
-                    &params.id,
-                    PathBuf::from(&params.dest_path).as_path(),
-                    range,
-                )
+                .download_file(&params.id, dest.as_path(), range)
                 .await
         );
         result_json(serde_json::json!({
@@ -399,20 +529,43 @@ impl Pastebin {
     }
 }
 
+impl Pastebin {
+    /// The initialize instructions, including what the local-path tools
+    /// allow on this transport.
+    fn instructions(&self) -> String {
+        let mut text = String::from(
+            "Internal pastebin/file-share backed by a private Garage bucket. \
+             The binary is the sole S3 reader/writer; agents never get S3 \
+             credentials and no presigned URL is issued. The TTL accepts \
+             seconds or a duration such as 90m, 1h30m, or 2d. A bare \
+             integer is seconds; use 7d for seven days. Use ttl or \
+             ttl_days, not both. Expiry is enforced on read. A three-word \
+             alias is a second name for a paste; use the ID or the alias.",
+        );
+        match &self.local {
+            LocalFiles::Open => text.push_str(
+                " store_file reads and fetch_file writes any path this process can reach, \
+                 because this transport is local.",
+            ),
+            LocalFiles::Root(root) => text.push_str(&format!(
+                " store_file and fetch_file are limited to paths under {}.",
+                root.display()
+            )),
+            LocalFiles::Deny => text.push_str(
+                " store_file and fetch_file are not available on this transport. \
+                 Use store_text, fetch_text, and the HTTP upload route instead.",
+            ),
+        }
+        text
+    }
+}
+
 #[tool_handler]
 impl rmcp::handler::server::ServerHandler for Pastebin {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("dayfly", "0.1.0"))
-            .with_instructions(
-                "Internal pastebin/file-share backed by a private Garage bucket. \
-                 The binary is the sole S3 reader/writer; agents never get S3 \
-                 credentials and no presigned URL is issued. The TTL accepts \
-                 seconds or a duration such as 90m, 1h30m, or 2d. A bare \
-                 integer is seconds; use 7d for seven days. Use ttl or \
-                 ttl_days, not both. Expiry is enforced on read. A three-word \
-                 alias is a second name for a paste; use the ID or the alias.",
-            )
+            .with_instructions(self.instructions())
     }
 }
 
@@ -420,6 +573,99 @@ impl rmcp::handler::server::ServerHandler for Pastebin {
 mod tests {
     use super::*;
     use rmcp::model::ErrorCode;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dayfly-mcp-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test directory must be creatable");
+        dir
+    }
+
+    fn rooted(dir: &Path) -> LocalFiles {
+        LocalFiles::Root(Arc::new(
+            dir.canonicalize().expect("test root must canonicalize"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_read_under_the_root_is_allowed_and_an_escape_is_not() {
+        let root = test_dir("read");
+        let inside = root.join("note.txt");
+        std::fs::write(&inside, b"payload").expect("test file must be writable");
+        let outside =
+            std::env::temp_dir().join(format!("dayfly-mcp-{}-outside.txt", std::process::id()));
+        std::fs::write(&outside, b"secret").expect("test file must be writable");
+
+        let local = rooted(&root);
+        let ok = local_read_path(&local, inside.to_str().expect("UTF-8")).await;
+        assert!(ok.is_ok(), "a file under the root must resolve: {ok:?}");
+
+        // A symlink inside the root that points out of it is resolved and
+        // then refused, so the target is not read.
+        let link = root.join("escape.txt");
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink must be creatable");
+        match local_read_path(&local, link.to_str().expect("UTF-8")).await {
+            Err(StoreError::PathOutsideRoot(_)) => {}
+            other => panic!("a symlink out of the root must be refused, got {other:?}"),
+        }
+
+        // `..` out of the root, on a path that exists.
+        let traversal = root.join("..").join(outside.file_name().expect("name"));
+        match local_read_path(&local, traversal.to_str().expect("UTF-8")).await {
+            Err(StoreError::PathOutsideRoot(_)) => {}
+            other => panic!("a traversal out of the root must be refused, got {other:?}"),
+        }
+
+        match local_read_path(&local, outside.to_str().expect("UTF-8")).await {
+            Err(StoreError::PathOutsideRoot(_)) => {}
+            other => panic!("an absolute path outside the root must be refused, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_write_under_the_root_is_allowed_for_a_new_file() {
+        let root = test_dir("write");
+        let local = rooted(&root);
+        let dest = root.join("new.txt");
+        assert!(!dest.exists());
+        let resolved = local_write_path(&local, dest.to_str().expect("UTF-8"))
+            .await
+            .expect("a new file under the root must resolve");
+        assert_eq!(
+            resolved,
+            root.canonicalize().expect("root").join("new.txt"),
+            "the resolved destination keeps the requested file name"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_http_transport_denies_both_paths() {
+        for path in ["/etc/hostname", "relative.txt"] {
+            match local_read_path(&LocalFiles::Deny, path).await {
+                Err(StoreError::LocalFilesDisabled) => {}
+                other => panic!("a denied transport must refuse reads, got {other:?}"),
+            }
+            match local_write_path(&LocalFiles::Deny, path).await {
+                Err(StoreError::LocalFilesDisabled) => {}
+                other => panic!("a denied transport must refuse writes, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_open_transport_keeps_the_stdio_path_behavior() {
+        let path = std::env::temp_dir().join(format!("dayfly-mcp-{}-open.txt", std::process::id()));
+        std::fs::write(&path, b"x").expect("test file must be writable");
+        let resolved = local_read_path(&LocalFiles::Open, path.to_str().expect("UTF-8"))
+            .await
+            .expect("an open transport must resolve any path");
+        assert_eq!(resolved, path);
+        let _ = std::fs::remove_file(&path);
+    }
 
     fn assert_tool_error(e: StoreError) {
         let expected = e.to_string();

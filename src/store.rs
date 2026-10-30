@@ -71,6 +71,12 @@ pub enum StoreError {
     RangeNotSatisfiable,
     #[error("could not allocate a three-word alias after {attempts} attempts")]
     AliasUnavailable { attempts: usize },
+    #[error("local file access is disabled on this transport: set DAYFLY_MCP_LOCAL_ROOT on the server to allow a directory")]
+    LocalFilesDisabled,
+    #[error("path outside the allowed root: {0}")]
+    PathOutsideRoot(String),
+    #[error("invalid path: {0}")]
+    InvalidPath(String),
     #[error("io error: {0}")]
     Io(String),
     #[error("s3 error: {0}")]

@@ -1198,6 +1198,24 @@ fn initialized_body() -> Value {
     json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
 }
 
+fn store_file_body(id: u64, path: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {"name": "store_file", "arguments": {"path": path}}
+    })
+}
+
+fn fetch_file_body(id: u64, target: &str, dest_path: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {"name": "fetch_file", "arguments": {"id": target, "dest_path": dest_path}}
+    })
+}
+
 fn store_text_body(id: u64, text: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -1441,4 +1459,195 @@ async fn two_mcp_clients_store_text_through_one_shared_store() {
         paste_keys[0], paste_keys[1],
         "each paste must use a distinct key"
     );
+}
+
+// --- Issue #63: local-path tools on the HTTP transport ---
+
+/// Build a state whose MCP handler is configured with an allowed local root.
+async fn state_with_local_root(fake: &FakeS3, root: &std::path::Path) -> AppState {
+    let mut config = fake.config();
+    config.mcp_local_root = Some(
+        root.canonicalize()
+            .expect("the allowed root must exist before the store is built"),
+    );
+    AppState {
+        store: Store::from_config(config).await.expect("store builds"),
+    }
+}
+
+fn temp_dir(name: &str) -> std::path::PathBuf {
+    let dir = common::temp_path(name);
+    std::fs::create_dir_all(&dir).expect("temporary test directory must be creatable");
+    dir
+}
+
+fn rpc_error_code(payload: &Value) -> Option<i64> {
+    payload["error"]["code"].as_i64()
+}
+
+/// An HTTP MCP client must not be able to read a file the process can reach.
+#[tokio::test]
+async fn http_mcp_cannot_position_itself_to_read_a_local_file() {
+    let fake = FakeS3::start().await;
+    let app = app_router(AppState {
+        store: fake.store().await,
+    });
+    let session = initialize_mcp_session(&app).await;
+
+    let canary = b"dayfly-test-canary-credential-material";
+    let canary_path = common::write_temp_file("issue63-canary.txt", canary);
+    let paths = [
+        canary_path
+            .to_str()
+            .expect("path must be UTF-8")
+            .to_string(),
+        "/proc/self/environ".to_string(),
+    ];
+
+    for (index, path) in paths.iter().enumerate() {
+        let id = 20 + index as u64;
+        let (status, _, body) = mcp_post(&app, &store_file_body(id, path), Some(&session)).await;
+        assert_eq!(status, StatusCode::OK);
+        let payload = sse_json(&body);
+        assert_eq!(
+            rpc_error_code(&payload),
+            Some(-32602),
+            "the HTTP transport must refuse a local read of {path}, got: {payload}"
+        );
+        assert!(
+            payload["result"]["content"].is_null(),
+            "a refused read must return no tool result: {payload}"
+        );
+    }
+
+    assert!(
+        fake.puts()
+            .iter()
+            .all(|(_, body)| body.as_slice() != canary),
+        "the canary must never reach the bucket"
+    );
+    assert!(
+        fake.puts().is_empty(),
+        "a refused local read must issue no PutObject"
+    );
+}
+
+/// An HTTP MCP client must not be able to write a file the process can reach.
+#[tokio::test]
+async fn http_mcp_cannot_position_itself_to_write_a_local_file() {
+    let fake = FakeS3::start().await;
+    let app = app_router(AppState {
+        store: fake.store().await,
+    });
+    let session = initialize_mcp_session(&app).await;
+
+    let (status, _, body) = mcp_post(&app, &store_text_body(30, "payload"), Some(&session)).await;
+    assert_eq!(status, StatusCode::OK);
+    let id = stored_paste(&sse_json(&body))["id"]
+        .as_str()
+        .expect("stored paste must carry an id")
+        .to_string();
+
+    let dest = common::temp_path("issue63-dest.txt");
+    let _ = std::fs::remove_file(&dest);
+    let (status, _, body) = mcp_post(
+        &app,
+        &fetch_file_body(31, &id, dest.to_str().expect("path must be UTF-8")),
+        Some(&session),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let payload = sse_json(&body);
+    assert_eq!(
+        rpc_error_code(&payload),
+        Some(-32602),
+        "the HTTP transport must refuse a local write, got: {payload}"
+    );
+    assert!(
+        !dest.exists(),
+        "a refused local write must not create the destination"
+    );
+}
+
+/// With an allowed root configured, the same tools work inside it.
+#[tokio::test]
+async fn http_mcp_allows_a_local_file_under_the_configured_root() {
+    let fake = FakeS3::start().await;
+    let root = temp_dir("issue63-root");
+    let app = app_router(state_with_local_root(&fake, &root).await);
+    let session = initialize_mcp_session(&app).await;
+
+    let inside = root.join("note.txt");
+    std::fs::write(&inside, b"allowed payload").expect("test file must be writable");
+    let (status, _, body) = mcp_post(
+        &app,
+        &store_file_body(40, inside.to_str().expect("path must be UTF-8")),
+        Some(&session),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let payload = sse_json(&body);
+    assert_eq!(
+        payload["result"]["isError"], false,
+        "a file under the allowed root must be accepted, got: {payload}"
+    );
+    assert!(
+        fake.puts()
+            .iter()
+            .any(|(_, body)| body.as_slice() == b"allowed payload"),
+        "the allowed file must reach the bucket"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A path outside the allowed root is refused, including through a symlink.
+#[tokio::test]
+async fn http_mcp_rejects_a_local_path_outside_the_configured_root() {
+    let fake = FakeS3::start().await;
+    let root = temp_dir("issue63-root-escape");
+    let outside = common::write_temp_file("issue63-outside.txt", b"outside payload");
+    let app = app_router(state_with_local_root(&fake, &root).await);
+    let session = initialize_mcp_session(&app).await;
+
+    let link = root.join("escape.txt");
+    std::os::unix::fs::symlink(&outside, &link).expect("test symlink must be creatable");
+
+    // `..` out of the root, with a file that exists, so the check runs
+    // against a real path instead of a resolution failure.
+    let traversal = root
+        .join("..")
+        .join(outside.file_name().expect("temp file has a name"));
+    let candidates = [
+        outside.clone(),
+        link.clone(),
+        traversal,
+        std::path::PathBuf::from("/etc/hostname"),
+    ];
+
+    for (index, path) in candidates.iter().enumerate() {
+        let id = 50 + index as u64;
+        let (status, _, body) = mcp_post(
+            &app,
+            &store_file_body(id, path.to_str().expect("path must be UTF-8")),
+            Some(&session),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let payload = sse_json(&body);
+        assert_eq!(
+            rpc_error_code(&payload),
+            Some(-32602),
+            "a path outside the root must be refused ({}), got: {payload}",
+            path.display()
+        );
+    }
+
+    assert!(
+        fake.puts().is_empty(),
+        "no out-of-root file may reach the bucket"
+    );
+
+    let _ = std::fs::remove_file(&outside);
+    let _ = std::fs::remove_dir_all(&root);
 }

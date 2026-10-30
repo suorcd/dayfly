@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         None | Some(Command::Mcp) => {
-            let service = mcp::Pastebin::new(store).serve(stdio()).await?;
+            let service = mcp::Pastebin::stdio(store).serve(stdio()).await?;
             service.waiting().await?;
         }
         Some(Command::Serve { bind }) => {

@@ -1,5 +1,6 @@
 use std::env;
 use std::io::Read;
+use std::path::PathBuf;
 
 use thiserror::Error;
 
@@ -40,6 +41,17 @@ pub struct Config {
     /// The MCP stdio transport does not use this token: spawning the
     /// binary locally is the trust boundary there.
     pub http_bearer_token: Option<String>,
+    /// Optional directory that limits the MCP local-path tools.
+    ///
+    /// When set, `store_file` and `fetch_file` resolve their path and
+    /// reject anything outside this directory, including a symlink that
+    /// points away from it. The path is canonical at startup.
+    ///
+    /// When unset, the stdio transport allows any path the process can
+    /// reach, because spawning the binary locally is the trust boundary.
+    /// The HTTP transport has no such boundary, so it refuses both tools
+    /// until this is set.
+    pub mcp_local_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Error)]
@@ -179,6 +191,34 @@ fn bearer_token(value: Option<String>) -> Result<Option<String>, ConfigError> {
         ));
     }
     Ok(Some(value))
+}
+
+/// Parse the optional MCP local-file root.
+///
+/// The value must name an existing directory. The result is canonical,
+/// because the path check compares real paths after resolving symlinks.
+/// A relative value resolves against the working directory.
+fn local_root(value: Option<String>) -> Result<Option<PathBuf>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let resolved = std::fs::canonicalize(value).map_err(|e| {
+        ConfigError::Invalid(
+            "DAYFLY_MCP_LOCAL_ROOT".to_string(),
+            format!("expected an existing directory: {e}"),
+        )
+    })?;
+    if !resolved.is_dir() {
+        return Err(ConfigError::Invalid(
+            "DAYFLY_MCP_LOCAL_ROOT".to_string(),
+            "expected an existing directory".to_string(),
+        ));
+    }
+    Ok(Some(resolved))
 }
 
 /// Build a warning for unsafe credential file metadata.
@@ -333,6 +373,7 @@ impl Config {
             default_ttl_days,
             http_bind: optional_string(&lookup, "DAYFLY_HTTP_BIND", "127.0.0.1:8080"),
             http_bearer_token: bearer_token(lookup("DAYFLY_HTTP_BEARER_TOKEN"))?,
+            mcp_local_root: local_root(lookup("DAYFLY_MCP_LOCAL_ROOT"))?,
         })
     }
 
@@ -354,7 +395,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} default_ttl_days={}",
+            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} default_ttl_days={} mcp_local_root={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -364,7 +405,12 @@ impl Config {
             self.region,
             self.max_text_bytes,
             self.max_file_bytes,
-            self.default_ttl_days
+            self.default_ttl_days,
+            if self.mcp_local_root.is_some() {
+                "set"
+            } else {
+                "unset"
+            }
         )
         // Deliberately no bearer-token presence flag here either: even
         // "auth is on" is not logged, to keep the summary boring.
@@ -620,6 +666,7 @@ mod tests {
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
             http_bearer_token: None,
+            mcp_local_root: None,
         }
     }
 

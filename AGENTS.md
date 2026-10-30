@@ -200,6 +200,12 @@ Test standards:
 - **Garage first, expansion later.** Keep the code S3-shaped, but do
   not spend v1 effort on generic AWS/MinIO tuning or multi-backend
   abstraction.
+- **A paste endpoint is not a shell.** `store_file` reads a server
+  path and `fetch_file` writes one. The stdio transport may use any path
+  unless `DAYFLY_MCP_LOCAL_ROOT` narrows it to a directory. The HTTP
+  transport refuses both tools unless that variable names a directory,
+  and then both stay inside it. A new local-path tool must follow the
+  same rule.
 - **Logging to stderr only** in both modes, so MCP JSON-RPC on
   stdout is never corrupted. Never log credentials.
 - **No panics on bad input.** Validate IDs (reject traversal),

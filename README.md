@@ -103,6 +103,17 @@ binary locally is the trust boundary there. The MCP transport over
 HTTP at `/mcp` is part of HTTP mode and uses the same bearer token as
 the REST routes.
 
+The bearer token does not make the local-path tools safe. `store_file`
+reads a server path and `fetch_file` writes one, so a caller of either
+tool can reach what the dayfly process can reach. The stdio transport
+keeps both tools, because the caller already runs on the host that
+spawned the binary. The HTTP transport refuses both tools, and the
+client gets an invalid-parameter error. To allow them over HTTP, set
+`DAYFLY_MCP_LOCAL_ROOT` to one directory. Both tools then resolve the
+path and refuse anything outside that directory, including a symlink
+that points away from it. A paste endpoint must not also act as a
+shell.
+
 ## v1 scope
 
 Operations, in both MCP tools and HTTP endpoints:
@@ -117,6 +128,12 @@ Operations, in both MCP tools and HTTP endpoints:
 | Fetch metadata (HeadObject equivalent) | `fetch_metadata` | `GET /v1/pastes/<id-or-alias>/meta`, or `HEAD /v1/pastes/<id-or-alias>` |
 | Delete | `delete_paste` | `DELETE /v1/pastes/<id-or-alias>` |
 | List recent (date or inclusive date window) | `list_recent` | `GET /v1/pastes?date=YYYY-MM-DD&limit=N` or `GET /v1/pastes?start=YYYY-MM-DD&end=YYYY-MM-DD&limit=N` |
+
+The two file tools work with server-local paths, so the transport
+decides what they may touch. `store_file` and `fetch_file` are
+available on the stdio transport. The HTTP transport refuses both tools
+unless `DAYFLY_MCP_LOCAL_ROOT` names a directory, and then both tools
+stay inside that directory. The Access model section states the rule.
 
 IDs may be full (`2026-10-28/abc123…`) or bare random IDs. Bare IDs
 are resolved by scanning the `pastes/` prefix (up to 10 pages of
@@ -184,6 +201,7 @@ placeholder values replaced by your own Garage values.
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1. The name and meaning are unchanged |
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
 | `DAYFLY_HTTP_BEARER_TOKEN` | no | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model) |
+| `DAYFLY_MCP_LOCAL_ROOT` | no | (unset) | Directory for the MCP local-path tools. It must exist, or startup fails. When set, `store_file` and `fetch_file` refuse any path outside it, after resolving symlinks. When unset, the stdio transport accepts any readable path and the HTTP transport refuses both tools |
 
 For each S3 credential, set the direct variable or its `_FILE`
 alternative, not both. If both are set, startup stops with a
@@ -259,6 +277,10 @@ MCP tools: `store_text`, `store_file`, `append_text`, `fetch_text`,
 `fetch_file` (downloads to a local path and returns metadata — binary
 content is never sent over JSON-RPC), `fetch_metadata`, `delete_paste`,
 `list_recent`.
+
+`store_file` and `fetch_file` are subject to the transport rule in the
+Access model section: the HTTP transport refuses them until
+`DAYFLY_MCP_LOCAL_ROOT` sets a directory.
 
 ## Running HTTP mode
 
