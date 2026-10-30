@@ -249,7 +249,11 @@ async fn malformed_multipart_body_returns_400_without_url() {
     let request = common::request(
         "POST",
         "/ui/upload",
-        &[("content-type", "multipart/form-data".to_string())],
+        &[
+            ("host", "localhost".to_string()),
+            ("origin", "http://localhost".to_string()),
+            ("content-type", "multipart/form-data".to_string()),
+        ],
         Vec::new(),
     );
     let (status, _, body) = common::send(&app, request).await;
@@ -281,6 +285,8 @@ async fn malformed_multipart_body_returns_400_without_url() {
         "POST",
         "/ui/upload",
         &[
+            ("host", "localhost".to_string()),
+            ("origin", "http://localhost".to_string()),
             (
                 "content-type",
                 "multipart/form-data; boundary=xyz".to_string(),

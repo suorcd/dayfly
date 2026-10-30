@@ -7,11 +7,28 @@ use chrono::{Duration, Utc};
 use common::{FailOp, FakeS3};
 use dayfly::store::Store;
 
+const TEST_HOST: &str = "localhost";
+const TEST_ORIGIN: &str = "http://localhost";
+
 fn form_headers(body_len: usize) -> Vec<(&'static str, String)> {
     vec![
+        ("host", TEST_HOST.to_string()),
+        ("origin", TEST_ORIGIN.to_string()),
         (
             "content-type",
             "application/x-www-form-urlencoded".to_string(),
+        ),
+        ("content-length", body_len.to_string()),
+    ]
+}
+
+fn multipart_headers(boundary: &str, body_len: usize) -> Vec<(&'static str, String)> {
+    vec![
+        ("host", TEST_HOST.to_string()),
+        ("origin", TEST_ORIGIN.to_string()),
+        (
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
         ),
         ("content-length", body_len.to_string()),
     ]
@@ -118,13 +135,7 @@ async fn upload_submit_creates_a_paste_with_form_ttl() {
         b"file body",
         &[("ttl_days", "3")],
     );
-    let headers = vec![
-        (
-            "content-type",
-            format!("multipart/form-data; boundary={boundary}"),
-        ),
-        ("content-length", body.len().to_string()),
-    ];
+    let headers = multipart_headers(boundary, body.len());
 
     let request = common::request("POST", "/ui/upload", &headers, body);
     let (status, _, body) = common::send(&app, request).await;
@@ -152,26 +163,14 @@ async fn upload_submit_reports_missing_fields_and_caps() {
     let boundary = "web-boundary";
 
     let body = common::multipart_fields_only(boundary, &[("ttl_days", "1")]);
-    let headers = vec![
-        (
-            "content-type",
-            format!("multipart/form-data; boundary={boundary}"),
-        ),
-        ("content-length", body.len().to_string()),
-    ];
+    let headers = multipart_headers(boundary, body.len());
     let request = common::request("POST", "/ui/upload", &headers, body);
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(html_text(&body).contains("upload requires a"));
 
     let body = common::multipart_body(boundary, Some("big.bin"), None, b"123456", &[]);
-    let headers = vec![
-        (
-            "content-type",
-            format!("multipart/form-data; boundary={boundary}"),
-        ),
-        ("content-length", body.len().to_string()),
-    ];
+    let headers = multipart_headers(boundary, body.len());
     let request = common::request("POST", "/ui/upload", &headers, body);
     let (status, _, _) = common::send(&app, request).await;
     assert_eq!(
@@ -194,13 +193,7 @@ async fn upload_submit_accepts_bodies_above_the_axum_default_limit() {
         &content,
         &[],
     );
-    let headers = vec![
-        (
-            "content-type",
-            format!("multipart/form-data; boundary={boundary}"),
-        ),
-        ("content-length", body.len().to_string()),
-    ];
+    let headers = multipart_headers(boundary, body.len());
     let request = common::request("POST", "/ui/upload", &headers, body);
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(
@@ -422,6 +415,31 @@ async fn ui_auth_rejects_requests_without_the_bearer_token() {
     );
     let (status, _, _) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn cross_site_form_post_is_forbidden() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let form = b"text=blocked".to_vec();
+    let headers = vec![
+        ("host", TEST_HOST.to_string()),
+        ("origin", "http://evil.example".to_string()),
+        (
+            "content-type",
+            "application/x-www-form-urlencoded".to_string(),
+        ),
+        ("content-length", form.len().to_string()),
+    ];
+
+    let request = common::request("POST", "/ui/text", &headers, form);
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(html_text(&body).contains("does not match the Host header"));
+    assert!(
+        fake.keys().is_empty(),
+        "a cross-site post must write nothing"
+    );
 }
 
 #[tokio::test]
