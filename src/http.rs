@@ -1791,6 +1791,7 @@ mod tests {
         let expected = [
             "store_text",
             "store_file",
+            "append_text",
             "fetch_text",
             "fetch_file",
             "fetch_metadata",
@@ -2066,5 +2067,41 @@ mod tests {
         let resp = app.oneshot(req).await.expect("router call must complete");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert!(fake.puts().is_empty(), "a missing id must write nothing");
+    }
+
+    #[tokio::test]
+    async fn append_text_works_through_the_http_mcp_endpoint() {
+        let (state, _fake) = fake_state(1024).await;
+        let (addr, server) = start_mcp_server(state.clone()).await;
+        let client = mcp_http_client();
+        let (session, _) = initialize_session(&client, addr).await;
+
+        let store_body = store_text_body(10, "hello");
+        let response = mcp_request(&client, addr, "POST", &store_body, Some(&session)).await;
+        assert_eq!(response.status, StatusCode::OK);
+        let stored = stored_paste(&sse_json(&response));
+        let id = stored["id"].as_str().expect("id must be a string");
+
+        let append_body = json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {"name": "append_text", "arguments": {"id": id, "text": " world"}}
+        });
+        let response = mcp_request(&client, addr, "POST", &append_body, Some(&session)).await;
+        assert_eq!(response.status, StatusCode::OK);
+        let payload = sse_json(&response);
+        assert_eq!(payload["result"]["isError"], false);
+        let appended = stored_paste(&payload);
+        assert_eq!(appended["appended_bytes"], 6);
+        assert_eq!(appended["size"], 11);
+
+        let slice = state
+            .store
+            .fetch_text(id, 0, None)
+            .await
+            .expect("fetch must succeed");
+        assert_eq!(slice.text, "hello world");
+        server.abort();
     }
 }
