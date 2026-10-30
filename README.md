@@ -29,7 +29,7 @@ is needed. See "No database in v1" below.
   `pastes/<yyyy-mm-dd>/<random-id>`, where the random ID has at least
   128 bits of entropy (base62). A user-supplied filename is never put
   in the key. An append adds one segment object under
-  `pastes/<yyyy-mm-dd>/<random-id>/<sequence>`; see "Append and
+  `pastes/<yyyy-mm-dd>/<random-id>/<sequence>-<suffix>`; see "Append and
   segmented storage".
 - Filename, content-type, created date, and TTL are stored in object
   metadata. The S3 `Content-Length` gives the size. A `sha256` value is
@@ -325,7 +325,7 @@ printf 'another line\n' | curl --data-binary @- \
   -H 'Content-Type: text/plain' \
   http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123.../append
 # → {"id": "...", "url": "...", "appended_bytes": 13,
-#    "segment_key": "pastes/2026-10-28/AbC123.../00000000000000000000",
+#    "segment_key": "pastes/2026-10-28/AbC123.../00000000000000000000-Xk9mP2qR7sT4",
 #    "size": ..., "sha256": null, "expires_at": "..."}
 ```
 
@@ -480,17 +480,21 @@ S3 has no append primitive. dayfly stores each append as a new segment
 object and leaves the base object unchanged.
 
 - The base object stays at `pastes/<date>/<id>`. It is segment 0.
-- An append writes `pastes/<date>/<id>/<sequence>`. The sequence is a
-  20-digit zero-padded number. The first append has sequence 0. A
-  segment stays under the base date prefix, so the paste belongs to
-  its creation date, not to the append date.
+- An append writes `pastes/<date>/<id>/<sequence>-<suffix>`. The
+  sequence is a 20-digit zero-padded number. The suffix is 12 random
+  base62 characters. The first append has sequence 0. A segment stays
+  under the base date prefix, so the paste belongs to its creation
+  date, not to the append date.
 - An append lists the segment prefix and takes max + 1. It writes only
   the new bytes. The cost is the new bytes plus metadata calls that
   scale with the segment count, not with the total size. It does not
   copy or rewrite the base object.
+- Two appends can choose the same sequence. The random suffix keeps the
+  object names distinct, so both appends survive.
 - An ID has at most two components after `pastes/`. A segment key has
   a third component, so listing and bare-ID resolution skip it.
-- Reads join the base object and the segments in sequence order.
+- Reads join the base object and the segments in sequence order. Two
+  segments with the same sequence use suffix order.
 - A range read maps the global byte range to the base object and to
   the segments that hold it. It sends one range request for the
   overlap in each object. It does not read the whole paste for a small
@@ -508,13 +512,20 @@ object and leaves the base object unchanged.
 - `list_recent` reports the total size and does not show a segment as
   a paste.
 
+An earlier version wrote `pastes/<date>/<id>/<sequence>` with no
+suffix. No old segment data exists. This version does not read the
+unsuffixed name.
+
 Limits:
 
-- **Concurrent appends can race.** Two appends to the same ID can
-  choose the same sequence. The second write wins and the first append
-  is lost. The store does not use a conditional write, because Garage
-  accepts `If-None-Match` and ignores it. A delete that races an append
-  can leave an orphan segment; a later delete of the full ID removes it.
+- **Concurrent appends are lossless but unordered.** Two appends to the
+  same ID can choose the same sequence. Both writes survive, because
+  the segment names have random suffixes. A read returns both chunks.
+  The order of the chunks for one sequence follows the suffix, so the
+  order is arbitrary but deterministic. The store does not use a
+  conditional write, because Garage accepts `If-None-Match` and ignores
+  it. A delete that races an append can leave an orphan segment; a
+  later delete of the full ID removes it.
 - **A segment key is not a paste ID.** The API rejects an ID with three
   components after `pastes/`.
 - **An empty append is a no-op.** It writes no object and keeps the
@@ -755,10 +766,11 @@ streaming part buffering, chunked and multi-part-sized uploads,
 disconnect/part-failure/oversize abort (no URL material), empty
 uploads, the write-route origin guard, HTML escaping, human sizes,
 days-remaining math, MCP HTTP bearer auth, two independent concurrent
-MCP sessions, the unchanged stdio initialize path, segment key format
-and order, segment range mapping, total size, listing and bare-ID
-skipping of segment keys, delete of segments, append cost (only the
-new bytes), and append errors before a write. The store tests use a
+MCP sessions, the unchanged stdio initialize path, suffixed segment
+key format, suffix shape, segment order, segment range mapping, total
+size, listing and bare-ID skipping of segment keys, delete of segments,
+append cost (only the new bytes), same-sequence appends that both
+survive a read, and append errors before a write. The store tests use a
 small test-only fake S3 server for Put, Get (with Range), Head, List
 and Delete.
 
@@ -788,6 +800,8 @@ Use the same checklist for a real Garage instance:
       the base/segment boundary, confirm the total size and a null
       `sha256`, delete it, and confirm that the base and segments are
       gone.
+- [ ] Run two concurrent appends to one ID. Confirm that two segment
+      objects exist and that a read returns both chunks.
 - [ ] Verify path-style requests work (Garage uses path-style URLs,
       not virtual-hosted style; the binary sets
       `force_path_style = true`).
@@ -861,9 +875,10 @@ honest.
 - **An append removes the total-file `sha256`.** The stored hash covers
   the base object only, so `fetch_metadata` returns `sha256: null`
   after the first append. See "Append and segmented storage".
-- **Concurrent appends to one paste can overwrite each other.** Two
-  appends can choose the same sequence. See "Append and segmented
-  storage".
+- **Concurrent appends to one paste are lossless but unordered.** Two
+  appends can choose the same sequence. Both survive, because the
+  segment names have random suffixes. A read orders one sequence by
+  suffix. See "Append and segmented storage".
 - **The HTTP endpoint is internal-only in the weakest sense.** The
   bearer token comparison is constant time for equal-length tokens.
   A length difference still leaks through timing. The write-route origin
