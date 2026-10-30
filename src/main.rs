@@ -1,10 +1,11 @@
 //! dayfly: internal pastebin/file-share backed by a private
 //! Garage bucket, with no database in v1.
 //!
-//! Two transports share one S3 core:
+//! Two modes share one S3 core:
 //! * MCP server over stdio (default, no subcommand) — primary interface.
-//! * HTTP mode (`serve`) — plain-curl API plus a small server-rendered
-//!   human frontend (`/`, `/pastes`, `/view/<id>`).
+//! * HTTP mode (`serve`) — plain-curl API, a small server-rendered human
+//!   frontend (`/`, `/pastes`, `/view/<id>`), and the MCP server over
+//!   streamable HTTP at `/mcp`.
 //!
 //! Logging goes to stderr only in both modes, so the MCP JSON-RPC
 //! stream on stdout is never corrupted. Credentials come from
@@ -38,7 +39,7 @@ struct Cli {
 enum Command {
     /// Run the MCP server over stdio (also the default with no subcommand).
     Mcp,
-    /// Run HTTP mode: curl API plus the human frontend.
+    /// Run HTTP mode: curl API, the human frontend, and MCP at /mcp.
     Serve {
         /// Bind address, overriding DAYFLY_HTTP_BIND.
         #[arg(long)]
