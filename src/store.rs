@@ -40,6 +40,9 @@ use crate::content_type::{detect_content_type, detect_content_type_sample, Detec
 
 pub const MULTIPART_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 pub const LIST_SCAN_MAX_PAGES: usize = 10;
+/// Longest accepted listing window, in days. This cap bounds the number of
+/// date prefixes that one request can scan.
+pub const LIST_WINDOW_MAX_DAYS: usize = 366;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -249,6 +252,87 @@ impl Ttl {
             None
         }
     }
+}
+
+/// One validated listing request from HTTP, MCP, or the web frontend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListWindowRequest {
+    /// A single UTC date.
+    Date(String),
+    /// Inclusive start and end dates.
+    Range { start: String, end: String },
+    /// The default window: yesterday and today in UTC.
+    Default,
+}
+
+/// Parse a date, a range, or a default request into a
+/// [`ListWindowRequest`].
+///
+/// A date takes precedence over a range. A range must supply both dates and
+/// the start date must not be after the end date. A malformed or inverted
+/// range returns [`StoreError::InvalidDate`].
+pub fn parse_list_window_request(
+    date: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
+) -> Result<ListWindowRequest, StoreError> {
+    if let Some(date) = date {
+        parse_list_date(date)?;
+        return Ok(ListWindowRequest::Date(date.to_string()));
+    }
+    match (start, end) {
+        (None, None) => Ok(ListWindowRequest::Default),
+        (Some(start), Some(end)) => {
+            let start_date = parse_list_date(start)?;
+            let end_date = parse_list_date(end)?;
+            if start_date > end_date {
+                return Err(StoreError::InvalidDate(format!(
+                    "start {start} is after end {end}"
+                )));
+            }
+            Ok(ListWindowRequest::Range {
+                start: start.to_string(),
+                end: end.to_string(),
+            })
+        }
+        _ => Err(StoreError::InvalidDate(
+            "supply both start and end, or neither".to_string(),
+        )),
+    }
+}
+
+fn parse_list_date(value: &str) -> Result<NaiveDate, StoreError> {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map_err(|_| StoreError::InvalidDate(value.to_string()))
+}
+
+/// Resolve a request into an inclusive window. This function also applies
+/// [`LIST_WINDOW_MAX_DAYS`].
+fn resolve_list_window(
+    request: &ListWindowRequest,
+    now: DateTime<Utc>,
+) -> Result<(NaiveDate, NaiveDate), StoreError> {
+    let (start, end) = match request {
+        ListWindowRequest::Date(date) => {
+            let day = parse_list_date(date)?;
+            (day, day)
+        }
+        ListWindowRequest::Range { start, end } => (parse_list_date(start)?, parse_list_date(end)?),
+        ListWindowRequest::Default => default_list_window(now),
+    };
+    let days = (end - start).num_days() + 1;
+    if days > LIST_WINDOW_MAX_DAYS as i64 {
+        return Err(StoreError::InvalidDate(format!(
+            "window has {days} days; the limit is {LIST_WINDOW_MAX_DAYS}"
+        )));
+    }
+    Ok((start, end))
+}
+
+fn inclusive_dates(start: NaiveDate, end: NaiveDate) -> impl Iterator<Item = NaiveDate> {
+    std::iter::successors(Some(start), move |date| {
+        date.succ_opt().filter(|next| *next <= end)
+    })
 }
 
 /// Map an AWS SDK error to a [`StoreError`] using the typed error metadata
@@ -1280,69 +1364,125 @@ impl Store {
         Ok(())
     }
 
-    /// List recent pastes for one date prefix only, by scanning the
-    /// bucket directly: ListObjectsV2 (one page, up to 1,000 keys) for
-    /// the `pastes/<date>/` prefix, then HeadObject per key to recover
-    /// expiry/content-type/filename and to filter expired objects out.
+    /// List current pastes for an inclusive date window.
     ///
-    /// There is no database in v1 and no SQLite placeholder. This is
-    /// deliberately O(n) in the objects scanned (plus one Head per key):
-    /// it is fast for a small internal bucket and gets slower as the
+    /// No dates select the default window: yesterday and today in UTC. A
+    /// date for [`list_recent`](Self::list_recent) means one day.
+    /// [`parse_list_window_request`] documents the range rules.
+    ///
+    /// The scan starts at the newest date and moves to older dates. The
+    /// `limit` applies to the newest objects in the window, so an older
+    /// date can be omitted when the limit is reached. The returned
+    /// summaries are sorted by date ascending, then by key.
+    ///
+    /// The function scans the bucket directly: `ListObjectsV2` for each
+    /// `pastes/<date>/` prefix, then one `HeadObject` per key to recover
+    /// expiry/content-type/filename and to filter expired objects. Each
+    /// prefix follows continuation tokens for up to [`LIST_SCAN_MAX_PAGES`]
+    /// pages. A window can span at most [`LIST_WINDOW_MAX_DAYS`] dates. The
+    /// listing is O(n) in the objects scanned (plus one Head per
+    /// key): it is fast for a small internal bucket and gets slower as the
     /// bucket grows. That slowdown is exactly the trigger for adding a
     /// database later — it is documented in README, not hidden, and no
-    /// database schema is invented in v1. Results are in S3 key order,
-    /// not sorted by anything else, and this is not search.
+    /// database schema is invented in v1. This is not search.
+    pub async fn list_window(
+        &self,
+        start: Option<&str>,
+        end: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PasteSummary>, StoreError> {
+        let request = parse_list_window_request(None, start, end)?;
+        let (start_date, end_date) = resolve_list_window(&request, Utc::now())?;
+        let limit = limit.clamp(1, 1000);
+        let mut summaries = Vec::new();
+        let dates: Vec<NaiveDate> = inclusive_dates(start_date, end_date).collect();
+        for date in dates.into_iter().rev() {
+            if summaries.len() >= limit {
+                break;
+            }
+            let date_str = date.format("%Y-%m-%d").to_string();
+            let prefix = format!("pastes/{date_str}/");
+            let mut token: Option<String> = None;
+            for _ in 0..LIST_SCAN_MAX_PAGES {
+                let mut req = self
+                    .client
+                    .list_objects_v2()
+                    .bucket(&self.bucket)
+                    .prefix(&prefix)
+                    .max_keys(1000);
+                if let Some(t) = token.as_deref() {
+                    req = req.continuation_token(t);
+                }
+                let out = req.send().await.map_err(|e| map_sdk_error(e, &date_str))?;
+                for obj in out.contents() {
+                    if summaries.len() >= limit {
+                        break;
+                    }
+                    let Some(key) = obj.key() else { continue };
+                    let id = key.strip_prefix("pastes/").unwrap_or(key).to_string();
+                    // HeadObject per key: ListObjectsV2 returns no user
+                    // metadata. A head failure (e.g. deleted between list
+                    // and head) drops the entry instead of failing the
+                    // whole listing.
+                    let Some(meta) = self.head_metadata(&id).await.ok() else {
+                        continue;
+                    };
+                    if meta.expired {
+                        continue;
+                    }
+                    summaries.push(PasteSummary {
+                        id,
+                        key: key.to_string(),
+                        size: u64::try_from(obj.size().unwrap_or(0)).unwrap_or(0),
+                        last_modified: obj
+                            .last_modified()
+                            .and_then(|dt| DateTime::from_timestamp(dt.secs(), dt.subsec_nanos())),
+                        expires_at: meta.expires_at,
+                        created_at: meta.created_at,
+                        content_type: Some(meta.content_type),
+                        filename: meta.filename,
+                    });
+                }
+                let truncated = out.is_truncated().unwrap_or(false);
+                token = match (truncated, out.next_continuation_token()) {
+                    (true, Some(t)) => Some(t.to_string()),
+                    _ => None,
+                };
+                if token.is_none() || summaries.len() >= limit {
+                    break;
+                }
+            }
+        }
+        summaries.sort_by(|a, b| {
+            let a_date = a.id.split_once('/').map(|(date, _)| date).unwrap_or("");
+            let b_date = b.id.split_once('/').map(|(date, _)| date).unwrap_or("");
+            a_date.cmp(b_date).then_with(|| a.key.cmp(&b.key))
+        });
+        Ok(summaries)
+    }
+
+    /// Compatibility wrapper. A date means one day. No date delegates to the
+    /// default window of [`list_window`](Self::list_window).
     pub async fn list_recent(
         &self,
         date: Option<&str>,
         limit: usize,
     ) -> Result<Vec<PasteSummary>, StoreError> {
-        let date_str = match date {
-            Some(d) => {
-                NaiveDate::parse_from_str(d, "%Y-%m-%d")
-                    .map_err(|_| StoreError::InvalidDate(d.to_string()))?;
-                d.to_string()
-            }
-            None => Utc::now().format("%Y-%m-%d").to_string(),
-        };
-        let limit = limit.clamp(1, 1000) as i32;
-        let out = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(format!("pastes/{date_str}/"))
-            .max_keys(limit)
-            .send()
-            .await
-            .map_err(|e| map_sdk_error(e, &date_str))?;
-        let mut summaries = Vec::new();
-        for obj in out.contents() {
-            let Some(key) = obj.key() else { continue };
-            let id = key.strip_prefix("pastes/").unwrap_or(key).to_string();
-            // HeadObject per key: ListObjectsV2 returns no user metadata.
-            // A head failure (e.g. deleted between list and head) drops
-            // the entry instead of failing the whole listing.
-            let Some(meta) = self.head_metadata(&id).await.ok() else {
-                continue;
-            };
-            if meta.expired {
-                continue;
-            }
-            summaries.push(PasteSummary {
-                id,
-                key: key.to_string(),
-                size: u64::try_from(obj.size().unwrap_or(0)).unwrap_or(0),
-                last_modified: obj
-                    .last_modified()
-                    .and_then(|dt| DateTime::from_timestamp(dt.secs(), dt.subsec_nanos())),
-                expires_at: meta.expires_at,
-                created_at: meta.created_at,
-                content_type: Some(meta.content_type),
-                filename: meta.filename,
-            });
+        match date {
+            Some(date) => self.list_window(Some(date), Some(date), limit).await,
+            None => self.list_window(None, None, limit).await,
         }
-        Ok(summaries)
     }
+}
+
+/// Default listing window: yesterday and today in UTC.
+///
+/// The key layout uses UTC dates. At 20:00 Pacific the UTC clock is already
+/// on the next day, so the pastes written during that Pacific evening use
+/// two UTC date prefixes. Yesterday and today cover the full Pacific day.
+fn default_list_window(now: DateTime<Utc>) -> (NaiveDate, NaiveDate) {
+    let today = now.date_naive();
+    (today - chrono::Duration::days(1), today)
 }
 
 /// Parse a `DateTime` from an S3 `LastModified` smithy date without
@@ -1381,6 +1521,73 @@ mod tests {
         assert!(validate_id("2026-10-28/abcXYZ0123").is_ok());
         assert!(validate_id("abcXYZ0123").is_ok());
         assert!(validate_id("bad id!").is_err());
+    }
+
+    #[test]
+    fn default_list_window_covers_the_pacific_evening() {
+        // At 20:00 Pacific on 2026-10-28 the UTC clock is already
+        // 2026-10-29T03:00Z. The default window must cover both UTC dates,
+        // because the Pacific day spans the UTC midnight boundary.
+        let now = Utc.with_ymd_and_hms(2026, 10, 29, 3, 0, 0).unwrap();
+        let (start, end) = default_list_window(now);
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 10, 28).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 10, 29).unwrap());
+    }
+
+    #[test]
+    fn list_recent_date_stays_one_day() {
+        let request = parse_list_window_request(Some("2026-10-28"), None, None).unwrap();
+        assert_eq!(request, ListWindowRequest::Date("2026-10-28".to_string()));
+        let (start, end) = resolve_list_window(&request, Utc::now()).unwrap();
+        let days: Vec<_> = inclusive_dates(start, end).collect();
+        assert_eq!(days, vec![NaiveDate::from_ymd_opt(2026, 10, 28).unwrap()]);
+    }
+
+    #[test]
+    fn inclusive_range_spans_two_dates_in_order() {
+        let request =
+            parse_list_window_request(None, Some("2026-10-28"), Some("2026-10-29")).unwrap();
+        let (start, end) = resolve_list_window(&request, Utc::now()).unwrap();
+        let days: Vec<_> = inclusive_dates(start, end)
+            .map(|date| date.format("%Y-%m-%d").to_string())
+            .collect();
+        assert_eq!(days, vec!["2026-10-28", "2026-10-29"]);
+    }
+
+    #[test]
+    fn inverted_range_is_rejected() {
+        let err =
+            parse_list_window_request(None, Some("2026-10-29"), Some("2026-10-28")).unwrap_err();
+        assert!(matches!(err, StoreError::InvalidDate(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn malformed_date_is_rejected() {
+        let err =
+            parse_list_window_request(None, Some("2026-13-01"), Some("2026-12-01")).unwrap_err();
+        assert!(matches!(err, StoreError::InvalidDate(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn overlong_range_is_rejected() {
+        let request =
+            parse_list_window_request(None, Some("2025-01-01"), Some("2026-10-29")).unwrap();
+        assert!(matches!(
+            resolve_list_window(&request, Utc::now()),
+            Err(StoreError::InvalidDate(_))
+        ));
+    }
+
+    #[test]
+    fn one_sided_range_is_rejected() {
+        assert!(matches!(
+            parse_list_window_request(None, Some("2026-10-28"), None),
+            Err(StoreError::InvalidDate(_))
+        ));
+        assert!(matches!(
+            parse_list_window_request(None, None, Some("2026-10-28")),
+            Err(StoreError::InvalidDate(_))
+        ));
     }
 
     #[test]

@@ -877,6 +877,155 @@ async fn list_recent_filters_expired_objects_and_applies_the_limit() {
 }
 
 #[tokio::test]
+async fn list_window_default_limit_keeps_the_newest_day() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let now = Utc::now();
+    let today = now.format("%Y-%m-%d").to_string();
+    let yesterday = (now - Duration::days(1)).format("%Y-%m-%d").to_string();
+    let valid = future_metadata(5);
+    for key in ["aaa", "bbb"] {
+        fake.seed(
+            &format!("pastes/{yesterday}/{key}"),
+            b"abcde",
+            "text/plain",
+            &common::metadata_refs(&valid),
+        );
+        fake.seed(
+            &format!("pastes/{today}/{key}"),
+            b"abcde",
+            "text/plain",
+            &common::metadata_refs(&valid),
+        );
+    }
+
+    let items = store
+        .list_recent(None, 2)
+        .await
+        .expect("listing must succeed");
+    let ids: Vec<&str> = items.iter().map(|item| item.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![format!("{today}/aaa"), format!("{today}/bbb"),],
+        "the limit must keep the newest day, not the oldest"
+    );
+}
+
+#[tokio::test]
+async fn list_window_range_returns_both_days_in_ascending_order() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let now = Utc::now();
+    let today = now.format("%Y-%m-%d").to_string();
+    let yesterday = (now - Duration::days(1)).format("%Y-%m-%d").to_string();
+    let valid = future_metadata(5);
+    for key in ["aaa", "bbb"] {
+        fake.seed(
+            &format!("pastes/{yesterday}/{key}"),
+            b"abcde",
+            "text/plain",
+            &common::metadata_refs(&valid),
+        );
+        fake.seed(
+            &format!("pastes/{today}/{key}"),
+            b"abcde",
+            "text/plain",
+            &common::metadata_refs(&valid),
+        );
+    }
+
+    let items = store
+        .list_window(Some(&yesterday), Some(&today), 10)
+        .await
+        .expect("listing must succeed");
+    let ids: Vec<String> = items.iter().map(|item| item.id.clone()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            format!("{yesterday}/aaa"),
+            format!("{yesterday}/bbb"),
+            format!("{today}/aaa"),
+            format!("{today}/bbb"),
+        ],
+        "a full range must return both days in ascending date order"
+    );
+}
+
+#[tokio::test]
+async fn list_window_range_limit_omits_older_days() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let now = Utc::now();
+    let today = now.format("%Y-%m-%d").to_string();
+    let yesterday = (now - Duration::days(1)).format("%Y-%m-%d").to_string();
+    let valid = future_metadata(5);
+    for key in ["aaa", "bbb"] {
+        fake.seed(
+            &format!("pastes/{yesterday}/{key}"),
+            b"abcde",
+            "text/plain",
+            &common::metadata_refs(&valid),
+        );
+        fake.seed(
+            &format!("pastes/{today}/{key}"),
+            b"abcde",
+            "text/plain",
+            &common::metadata_refs(&valid),
+        );
+    }
+
+    let items = store
+        .list_window(Some(&yesterday), Some(&today), 2)
+        .await
+        .expect("listing must succeed");
+    let ids: Vec<&str> = items.iter().map(|item| item.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![format!("{today}/aaa"), format!("{today}/bbb")],
+        "the limit must omit older dates before newer objects"
+    );
+}
+
+#[tokio::test]
+async fn list_window_follows_continuation_tokens() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let expired = expired_metadata(5);
+    let valid = future_metadata(5);
+    for n in 0..1000 {
+        fake.seed(
+            &format!("pastes/{today}/expired-{n:04}"),
+            b"abcde",
+            "text/plain",
+            &common::metadata_refs(&expired),
+        );
+    }
+    fake.seed(
+        &format!("pastes/{today}/zzz-live"),
+        b"abcde",
+        "text/plain",
+        &common::metadata_refs(&valid),
+    );
+
+    let items = store
+        .list_recent(Some(&today), 1000)
+        .await
+        .expect("listing must succeed");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, format!("{today}/zzz-live"));
+    let list_calls = fake
+        .requests()
+        .into_iter()
+        .filter(|request| request.query.contains("list-type=2"))
+        .count();
+    assert!(
+        list_calls >= 2,
+        "the continuation token must fetch a second page, saw {list_calls} list calls"
+    );
+}
+
+#[tokio::test]
 async fn list_recent_rejects_an_invalid_date() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;

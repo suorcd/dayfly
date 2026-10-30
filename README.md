@@ -11,9 +11,9 @@ one S3 core:
   `/view/<id>`).
 
 There is **no database in v1, and no SQLite placeholder**. Listing and
-info come from scanning the bucket directly: ListObjectsV2 (paginated,
-1,000 keys per page) for a date prefix, plus HeadObject per key where
-metadata is needed. See "No database in v1" below.
+info come from scanning the bucket directly. Listing uses ListObjectsV2
+for each UTC date in the window, then HeadObject per key where metadata
+is needed. See "No database in v1" below.
 
 > **Copyright holder is still open.** The LICENSE file says
 > `Copyright (c) 2026 suorcd` and `Cargo.toml` points at
@@ -105,7 +105,7 @@ Operations, in both MCP tools and HTTP endpoints:
 | Fetch file (streaming, Range) | `fetch_file` (downloads to a local path) | `GET /v1/pastes/<id>` with `Range` → 206 |
 | Fetch metadata (HeadObject equivalent) | `fetch_metadata` | `GET /v1/pastes/<id>/meta`, or `HEAD /v1/pastes/<id>` |
 | Delete | `delete_paste` | `DELETE /v1/pastes/<id>` |
-| List recent (date prefix only) | `list_recent` | `GET /v1/pastes?date=YYYY-MM-DD&limit=N` |
+| List recent (date or inclusive date window) | `list_recent` | `GET /v1/pastes?date=YYYY-MM-DD&limit=N` or `GET /v1/pastes?start=YYYY-MM-DD&end=YYYY-MM-DD&limit=N` |
 
 IDs may be full (`2026-10-28/abc123…`) or bare random IDs. Bare IDs
 are resolved by scanning the `pastes/` prefix (up to 10 pages of
@@ -113,7 +113,7 @@ are resolved by scanning the `pastes/` prefix (up to 10 pages of
 
 ### Explicitly OUT of v1
 
-Listing/search/sorting beyond a date prefix, view counters,
+Listing/search/sorting beyond a date window, view counters,
 burn-after-read, per-paste permissions/ownership, audit history, and
 deduplication. These are the future SQLite triggers: they are the
 reasons a database would be added later. No database schema is
@@ -127,8 +127,22 @@ ListObjectsV2 does not return, and to filter expired objects out).
 For a small internal bucket that is fine. As the bucket grows,
 listing gets slower — that slowdown, not a guessed threshold, is
 exactly the trigger for adding a database later. The date prefix
-(`pastes/<yyyy-mm-dd>/`) is the optimisation available in v1: recent
-listings scan one day, not the whole bucket.
+(`pastes/<yyyy-mm-dd>/`) is the optimization available in v1: a
+listing scans the requested dates, not the whole bucket. Each date
+prefix follows continuation tokens for up to 10 pages of 1,000 keys.
+A window can span at most 366 days.
+
+The listing window is inclusive. With no dates, it covers yesterday
+and today in UTC. At 20:00 Pacific the UTC clock is already on the
+next day, so the pastes from that Pacific evening are under two UTC
+date prefixes. The default window includes both, so the evening
+listing does not go empty.
+
+The scan starts at the newest date and moves to older dates. The
+`limit` applies to the newest objects in the window. An older date can
+be omitted when the limit is reached. Results are sorted by date, then
+by key. The response has no truncation field in v1; use a narrower date
+range to see older objects.
 
 ## Configuration
 
@@ -356,9 +370,20 @@ curl -I http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123...
 # Delete (204 on success, and also 204 when the object does not exist):
 curl -X DELETE http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123...
 
-# List recent (date prefix only, expired filtered out):
+# List recent (expired filtered out). No dates means yesterday and today UTC:
+curl 'http://127.0.0.1:8080/v1/pastes?limit=100'
+
+# List one UTC date:
 curl 'http://127.0.0.1:8080/v1/pastes?date=2026-10-28&limit=100'
+
+# List an inclusive range across a date boundary:
+curl 'http://127.0.0.1:8080/v1/pastes?start=2026-10-28&end=2026-10-29&limit=100'
 ```
+
+`date` takes precedence over `start` and `end`. Supply both `start` and
+`end` for a range; a one-sided range returns 400. Results are in date
+order, then in S3 key order within each date. The limit applies to the
+newest objects, so an older date can be omitted.
 
 Error responses are machine-readable JSON, e.g.
 `{"error": "payload too large: limit is 1073741824 bytes"}` with HTTP
@@ -587,7 +612,7 @@ where `cargo --version`, `rustc --version`, and
 `rust-analyzer --version` all succeed.
 
 **Nix validation result:** `nix build` and the test suite were run on
-`x86_64-linux` against `nixos-unstable`: 179 passed and 2 ignored. On the stable
+`x86_64-linux` against `nixos-unstable`: 245 passed and 2 ignored. On the stable
 `nixos-25.11` branch the build fails before compilation with a
 rustc-too-old error naming 23 AWS crates, which is why the flake
 tracks unstable. Before this was built on a machine with Nix, an

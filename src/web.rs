@@ -46,7 +46,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::http::{check_auth, AppState};
-use crate::store::{StoreError, Ttl};
+use crate::store::{parse_list_window_request, ListWindowRequest, StoreError, Ttl};
 
 /// Adapted base look from suorcd.us/style.css, palette cyberpunkNeon
 /// (background #091833, text #e3e8fc, accent #ea00d9, code background
@@ -401,13 +401,27 @@ async fn list_handler(
     if let Err(resp) = check_auth(&state, &headers) {
         return resp;
     }
-    let date = query
-        .get("date")
-        .cloned()
-        .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
-    // list_recent already filters expired objects (HeadObject per key),
+    let date = query.get("date").cloned().unwrap_or_default();
+    let start = query.get("start").cloned().unwrap_or_default();
+    let end = query.get("end").cloned().unwrap_or_default();
+    let request = match parse_list_window_request(
+        query.get("date").map(String::as_str),
+        query.get("start").map(String::as_str),
+        query.get("end").map(String::as_str),
+    ) {
+        Ok(request) => request,
+        Err(e) => return error_page(e),
+    };
+    // list_window already filters expired objects (HeadObject per key),
     // so this page is consistent with the API's read-time expiry check.
-    let items = match state.store.list_recent(Some(&date), 1000).await {
+    let items = match &request {
+        ListWindowRequest::Date(date) => state.store.list_recent(Some(date), 1000).await,
+        ListWindowRequest::Range { start, end } => {
+            state.store.list_window(Some(start), Some(end), 1000).await
+        }
+        ListWindowRequest::Default => state.store.list_window(None, None, 1000).await,
+    };
+    let items = match items {
         Ok(items) => items,
         Err(e) => return error_page(e),
     };
@@ -428,16 +442,19 @@ async fn list_handler(
     }
     if rows.is_empty() {
         rows.push_str(
-            "<tr><td colspan=\"8\" class=\"muted\">No current pastes for this date.</td></tr>\n",
+            "<tr><td colspan=\"8\" class=\"muted\">No current pastes in this window.</td></tr>\n",
         );
     }
     page(
         "Current pastes",
         &format!(
-            r#"<form method="get" action="/pastes"><p><label>Date <input type="date" name="date" value="{}"></label> <button type="submit">Show</button></p></form>
-<p class="muted">Built from a direct bucket scan (ListObjectsV2 for this date prefix, plus HeadObject per paste). No database. Listing is O(n) in objects scanned and gets slower as the bucket grows — that slowdown is the trigger for adding a database later.</p>
+            r#"<form method="get" action="/pastes"><p><label>Date <input type="date" name="date" value="{}"></label> <button type="submit">Show date</button></p></form>
+<form method="get" action="/pastes"><p><label>Start <input type="date" name="start" value="{}"></label> <label>End <input type="date" name="end" value="{}"></label> <button type="submit">Show range</button></p></form>
+<p class="muted">Dates are UTC. With no dates, the page shows yesterday and today in UTC, so a Pacific evening is included. Built from a direct bucket scan (ListObjectsV2 for each date prefix, plus HeadObject per paste). No database. Listing is O(n) in objects scanned and gets slower as the bucket grows — that slowdown is the trigger for adding a database later.</p>
 <table><thead><tr><th>Link / ID</th><th>Filename</th><th>Content-Type</th><th>Size</th><th>Created</th><th>Expires</th><th>Remaining</th><th></th></tr></thead><tbody>{}</tbody></table>"#,
             html_escape(&date),
+            html_escape(&start),
+            html_escape(&end),
             rows,
         ),
     )
