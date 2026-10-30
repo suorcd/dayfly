@@ -510,6 +510,78 @@ fn list_recent_filters_expired_objects_through_mcp() {
 }
 
 #[test]
+fn fetch_file_rejects_malformed_ranges_before_writing() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let mut client = McpClient::spawn(&fake, &[]);
+    let stored = client
+        .call_tool("store_text", json!({"text": "abcdefghij"}))
+        .expect("text must store");
+    let id = stored["id"]
+        .as_str()
+        .expect("id must be a string")
+        .to_string();
+
+    let dest = common::temp_path("mcp-bad-range.bin");
+    std::fs::write(&dest, b"keep me").expect("destination sentinel must be writable");
+
+    // An end without a start is a malformed request, not "whole paste".
+    let error = client
+        .call_tool(
+            "fetch_file",
+            json!({
+                "id": id,
+                "dest_path": dest.to_str().unwrap(),
+                "range_end": 4
+            }),
+        )
+        .expect_err("range_end without range_start must be rejected");
+    assert_json_rpc_error(error, -32602, "range");
+    assert_eq!(
+        std::fs::read(&dest).expect("destination must still exist"),
+        b"keep me",
+        "a rejected range must not touch the destination"
+    );
+
+    // A reversed range must not truncate the destination or report success.
+    let error = client
+        .call_tool(
+            "fetch_file",
+            json!({
+                "id": id,
+                "dest_path": dest.to_str().unwrap(),
+                "range_start": 5,
+                "range_end": 2
+            }),
+        )
+        .expect_err("a reversed range must be rejected");
+    assert_json_rpc_error(error, -32602, "range");
+    assert_eq!(
+        std::fs::read(&dest).expect("destination must still exist"),
+        b"keep me",
+        "a rejected range must not truncate the destination"
+    );
+
+    // A start-only range still downloads to the end.
+    client
+        .call_tool(
+            "fetch_file",
+            json!({
+                "id": id,
+                "dest_path": dest.to_str().unwrap(),
+                "range_start": 2
+            }),
+        )
+        .expect("a start-only range must succeed");
+    assert_eq!(
+        std::fs::read(&dest).expect("destination must exist"),
+        b"cdefghij"
+    );
+
+    let _ = std::fs::remove_file(dest);
+}
+
+#[test]
 fn fetch_file_missing_object_returns_an_error_without_writing() {
     let runtime = runtime();
     let fake = runtime.block_on(FakeS3::start());

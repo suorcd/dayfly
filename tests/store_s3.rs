@@ -1156,6 +1156,34 @@ async fn download_file_writes_whole_and_ranged_content() {
 }
 
 #[tokio::test]
+async fn download_file_rejects_a_reversed_range_without_touching_the_destination() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"abcdefghij", None, None, None)
+        .await
+        .expect("text must store");
+    let dest = common::temp_path("reversed-range.bin");
+    std::fs::write(&dest, b"keep me").expect("destination sentinel must be writable");
+
+    let error = store
+        .download_file(&stored.id, &dest, Some((5, 2)))
+        .await
+        .expect_err("a reversed range must be rejected");
+    assert!(
+        matches!(error, StoreError::InvalidRange(_)),
+        "a reversed range must be an invalid range, got {error:?}"
+    );
+    assert_eq!(
+        std::fs::read(&dest).expect("destination must still exist"),
+        b"keep me",
+        "a rejected range must not truncate the destination"
+    );
+
+    let _ = std::fs::remove_file(dest);
+}
+
+#[tokio::test]
 async fn download_file_streams_multiple_s3_chunks() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
