@@ -1,14 +1,15 @@
 # dayfly
 
 Internal pastebin / file-share for LLM agents (and one human), backed by
-a private Garage bucket. One small Rust binary, two transports sharing
-one S3 core:
+a private Garage bucket. One small Rust binary, two modes sharing one
+S3 core:
 
 - **MCP server over stdio** (default, no subcommand) — the primary
   interface for agents.
 - **HTTP mode** (`serve`) — a plain-curl API in the style of 0x0.st,
-  plus a small server-rendered human frontend (`/`, `/pastes`,
-  `/view/<id>`).
+  a small server-rendered human frontend (`/`, `/pastes`,
+  `/view/<id>`), and the same MCP server over streamable HTTP at
+  `/mcp`.
 
 There is **no database in v1, and no SQLite placeholder**. Listing and
 info come from scanning the bucket directly. Listing uses ListObjectsV2
@@ -82,16 +83,19 @@ endpoint. The intended deployment is **private-network / localhost**.
 As a simple, optional extra for the binary's own endpoint (not a
 replacement for the S3 credentials), set
 `DAYFLY_HTTP_BEARER_TOKEN`: HTTP mode then requires
-`Authorization: Bearer <token>` on every route, including the human
-pages. The token must not contain ASCII whitespace; startup fails if
-it does. Note the limitation this creates: a plain browser form cannot
-send an `Authorization` header, so for browser use of the frontend,
-run on a private network / localhost without the token set, and use
-the token for API clients. Do not put the token in a URL query
+`Authorization: Bearer <token>` on every HTTP route, including `/mcp`
+and the human pages. The token must not contain ASCII whitespace;
+startup fails if it does. Note the limitation this creates: a plain
+browser form cannot send an `Authorization` header, so for browser use
+of the frontend, run on a private network / localhost without the token
+set, and use the token for API clients. Do not put the token in a URL
+query
 parameter — it would leak into logs and browser history.
 
 The MCP stdio transport does not use the bearer token: spawning the
-binary locally is the trust boundary there.
+binary locally is the trust boundary there. The MCP transport over
+HTTP at `/mcp` is part of HTTP mode and uses the same bearer token as
+the REST routes.
 
 ## v1 scope
 
@@ -176,6 +180,9 @@ A credential file read error names the path only, not the file
 contents. The permission warnings never include the file contents.
 
 ## Running the MCP server
+
+stdio is the default transport. For the HTTP transport, see
+[MCP over HTTP](#mcp-over-http).
 
 ```sh
 # from the project directory, with env set (see .env.example)
@@ -399,6 +406,49 @@ cannot be resolved against the bucket at all.
 A wrong `S3_BUCKET` name is not one of those cases. `NoSuchBucket`
 carries its own error and maps to 502, so a misconfigured bucket says
 so rather than reporting every paste as missing.
+
+## MCP over HTTP
+
+`serve` exposes the MCP server over streamable HTTP at `/mcp`. The
+endpoint is on by default; no flag is needed. It shares the one
+`Store` and the one configuration path with the REST routes. A second
+store does not exist.
+
+stdio remains the default. The `mcp` subcommand and the start with no
+subcommand keep the stdio transport. Run `serve` when several agents
+must share one process and one binary.
+
+The endpoint uses the same auth rule as the REST routes:
+
+- When `DAYFLY_HTTP_BEARER_TOKEN` is set, every request needs
+  `Authorization: Bearer <token>`. A missing or wrong token gets HTTP
+  401 and `{"error":"unauthorized"}`.
+- When the token is unset, the endpoint stays open. In that case,
+  serve it on a private network or localhost only.
+
+Each `initialize` request creates an in-memory MCP session. The
+process accepts several sessions at the same time. Sessions do not
+survive a restart; the client then initializes again.
+
+Minimal client configuration. Field names depend on the client; this
+example uses the common `mcpServers` shape:
+
+```json
+{
+  "mcpServers": {
+    "dayfly": {
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:8080/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR-BEARER-TOKEN"
+      }
+    }
+  }
+}
+```
+
+Remove the `headers` block when the token is unset. Start the server
+with `dayfly serve` before the client connects.
 
 ## Content-Type detection
 
@@ -629,8 +679,9 @@ type overriding a generic one, sniffed-signature conflict, extension
 fallback), peeked-byte forwarding (neither lost nor duplicated),
 streaming part buffering, chunked and multi-part-sized uploads,
 disconnect/part-failure/oversize abort (no URL material), empty
-uploads, the write-route origin guard, HTML escaping, human sizes, and
-days-remaining math.
+uploads, the write-route origin guard, HTML escaping, human sizes,
+days-remaining math, MCP HTTP bearer auth, two independent concurrent
+MCP sessions, and the unchanged stdio initialize path.
 
 ### Optional tests against a real Garage or S3-compatible endpoint
 
@@ -730,6 +781,15 @@ honest.
   A length difference still leaks through timing. The write-route origin
   check trusts the `Host` header. Run this on a private network rather
   than exposing it.
+
+The MCP transport over HTTP adds these limitations:
+
+- **MCP sessions are held in memory.** A restart ends every session.
+  The client must initialize again. The process accepts several
+  sessions at the same time.
+- **The MCP endpoint accepts any `Host` header.** This matches the
+  REST routes, and a LAN name must work in a private-network
+  deployment. Use the bearer token or a private network as the guard.
 
 ## Future work (not in v1)
 

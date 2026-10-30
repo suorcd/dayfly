@@ -1,8 +1,9 @@
 //! HTTP mode (axum) for plain-curl agents.
 //!
-//! The binary is the sole S3 reader/writer. Agents talk only to this
-//! HTTP interface (or to MCP over stdio); they never get Garage
-//! credentials and no presigned URL is ever issued.
+//! This module serves the REST routes and mounts the streamable HTTP MCP
+//! endpoint at `/mcp`. The binary is the sole S3 reader/writer. Agents talk
+//! only to this HTTP interface (or to MCP over stdio); they never get
+//! Garage credentials and no presigned URL is ever issued.
 //!
 //! Deployment note (see README): the intended deployment is
 //! private-network / localhost. When `DAYFLY_HTTP_BEARER_TOKEN` is
@@ -12,6 +13,7 @@
 //! for securing this endpoint.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State};
@@ -19,11 +21,14 @@ use axum::http::header::{
     ACCEPT, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, HOST, RANGE,
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use futures::StreamExt;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
@@ -699,7 +704,53 @@ async fn delete_bare(
     }
 }
 
-/// API routes, without state attached. `main` merges these with the
+/// Compose the complete HTTP app from one [`AppState`].
+///
+/// The API routes, the human UI routes, and the MCP transport share the
+/// same store and configuration. Do not build a second store here.
+pub fn app_router(state: AppState) -> Router {
+    api_router()
+        .merge(mcp_router(state.clone()))
+        .merge(crate::web::ui_router())
+        .with_state(state)
+}
+
+/// Require the REST bearer token on the MCP endpoint.
+///
+/// The check is [`check_auth`], so `/mcp` and the REST routes agree on the
+/// token, the scheme, and the 401 JSON error.
+async fn require_bearer(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    match check_auth(&state, request.headers()) {
+        Ok(()) => next.run(request).await,
+        Err(response) => response,
+    }
+}
+
+/// Streamable HTTP MCP endpoint at `/mcp`.
+///
+/// The service factory clones the one [`Store`] in `state`, so every MCP
+/// session reads and writes the same bucket as the REST routes. Each
+/// `initialize` request creates an in-memory session with
+/// [`LocalSessionManager`]. A restart ends the sessions, and a client then
+/// initializes again.
+///
+/// rmcp rejects a request whose `Host` is not loopback by default. The REST
+/// routes accept any `Host`, and a private-network deployment can use a LAN
+/// name, so the endpoint disables that list. The bearer token and the
+/// private network guard the endpoint, as they guard the REST routes.
+pub fn mcp_router(state: AppState) -> Router<AppState> {
+    let store = state.store.clone();
+    let service = StreamableHttpService::new(
+        move || Ok(crate::mcp::Pastebin::new(store.clone())),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default().disable_allowed_hosts(),
+    );
+    Router::new()
+        .nest_service("/mcp", service)
+        .layer(middleware::from_fn_with_state(state, require_bearer))
+}
+
+/// API routes, without state attached. [`app_router`] merges these with the
 /// human UI routes and attaches a single shared [`AppState`].
 pub fn api_router() -> Router<AppState> {
     // Uploads are streamed and capped by the store while they are read.
@@ -730,18 +781,32 @@ pub fn api_router() -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::task::Poll;
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use http_body_util::{BodyExt, Full};
+    use hyper_util::client::legacy::connect::HttpConnector;
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+    use serde_json::{json, Value};
     use tower::ServiceExt;
 
     use super::*;
     use crate::config::Config;
 
     type CapturedMetadata = Arc<std::sync::Mutex<Option<HashMap<String, String>>>>;
+
+    type McpClient = Client<HttpConnector, Full<Bytes>>;
+
+    struct McpResponse {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Bytes,
+    }
 
     fn test_config(max_text_bytes: u64, max_file_bytes: u64) -> Config {
         Config {
@@ -1387,5 +1452,420 @@ mod tests {
         assert!(TtlSelection::default().set("ttl", "0").is_err());
         assert!(TtlSelection::default().set("ttl_days", "soon").is_err());
         assert!(TtlSelection::default().set("ttl_days", "0").is_err());
+    }
+
+    // --- Streamable HTTP MCP endpoint -------------------------------------
+
+    const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
+
+    fn initialize_body() -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "dayfly-test", "version": "0.1.0"}
+            }
+        })
+    }
+
+    fn tools_list_body() -> Value {
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+    }
+
+    fn initialized_body() -> Value {
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    }
+
+    fn mcp_initialize_request(auth: Option<HeaderValue>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(HOST, "localhost")
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "application/json, text/event-stream");
+        if let Some(value) = auth {
+            builder = builder.header(AUTHORIZATION, value);
+        }
+        builder
+            .body(Body::from(
+                serde_json::to_vec(&initialize_body()).expect("initialize body must serialize"),
+            ))
+            .expect("request must build")
+    }
+
+    async fn mcp_oneshot(
+        state: AppState,
+        auth: Option<HeaderValue>,
+    ) -> (StatusCode, HeaderMap, Bytes) {
+        let app = app_router(state);
+        let resp = app
+            .oneshot(mcp_initialize_request(auth))
+            .await
+            .expect("router call must complete");
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("response body must be readable");
+        (status, headers, body)
+    }
+
+    /// The MCP endpoint must reject a request with no credential when the
+    /// token is set. The 401 body is the same JSON error as the REST routes.
+    #[tokio::test]
+    async fn mcp_endpoint_rejects_missing_bearer_token() {
+        let state = test_state_with_token(TEST_TOKEN).await;
+        let (status, _, body) = mcp_oneshot(state, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            r#"{"error":"unauthorized"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_endpoint_rejects_wrong_bearer_token() {
+        let state = test_state_with_token(TEST_TOKEN).await;
+        let auth = HeaderValue::from_static("Bearer wrong-horse-battery-staple");
+        let (status, _, body) = mcp_oneshot(state, Some(auth)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            r#"{"error":"unauthorized"}"#
+        );
+    }
+
+    /// The right credential must pass auth and reach the MCP handler, which
+    /// answers the initialize request and creates a session.
+    #[tokio::test]
+    async fn mcp_endpoint_accepts_correct_bearer_token() {
+        let state = test_state_with_token(TEST_TOKEN).await;
+        let auth = HeaderValue::from_str(&format!("Bearer {TEST_TOKEN}"))
+            .expect("header value must build");
+        let (status, headers, body) = mcp_oneshot(state, Some(auth)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the correct token must pass auth, got: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            headers.contains_key("mcp-session-id"),
+            "initialize must create a session"
+        );
+    }
+
+    /// An unset token keeps the MCP endpoint open, as it does for REST.
+    #[tokio::test]
+    async fn mcp_endpoint_is_open_without_configured_token() {
+        let state = test_state(10 * 1024 * 1024, 1024 * 1024 * 1024).await;
+        let (status, headers, body) = mcp_oneshot(state, None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an unset token must leave the endpoint open, got: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(headers.contains_key("mcp-session-id"));
+    }
+
+    /// A client that speaks HTTP to a real listener. A new instance is a new
+    /// connection pool, so a test can use two independent clients.
+    fn mcp_http_client() -> McpClient {
+        Client::builder(TokioExecutor::new()).build_http()
+    }
+
+    async fn start_mcp_server(state: AppState) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener must bind");
+        let addr = listener.local_addr().expect("bound address must exist");
+        let app = app_router(state);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test HTTP server must run");
+        });
+        (addr, handle)
+    }
+
+    async fn mcp_request(
+        client: &McpClient,
+        addr: SocketAddr,
+        method: &str,
+        body: &Value,
+        session_id: Option<&str>,
+    ) -> McpResponse {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(format!("http://{addr}/mcp"))
+            .header(HOST, addr.to_string())
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "application/json, text/event-stream")
+            .header("mcp-protocol-version", MCP_PROTOCOL_VERSION);
+        if let Some(session_id) = session_id {
+            builder = builder.header("mcp-session-id", session_id);
+        }
+        let request = builder
+            .body(Full::new(Bytes::from(body.to_string())))
+            .expect("request must build");
+        let response = client
+            .request(request)
+            .await
+            .expect("HTTP request must complete");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body must be readable")
+            .to_bytes();
+        McpResponse {
+            status,
+            headers,
+            body,
+        }
+    }
+
+    /// Return the first non-empty JSON-RPC payload from an SSE response.
+    fn sse_json(response: &McpResponse) -> Value {
+        let text = String::from_utf8_lossy(&response.body);
+        let data = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .find(|data| !data.is_empty())
+            .unwrap_or_else(|| {
+                panic!(
+                    "response must carry an SSE JSON-RPC payload, status {} body: {text}",
+                    response.status
+                )
+            });
+        serde_json::from_str(data).expect("SSE payload must be JSON")
+    }
+
+    async fn initialize_session(client: &McpClient, addr: SocketAddr) -> (String, Value) {
+        let response = mcp_request(client, addr, "POST", &initialize_body(), None).await;
+        let payload = sse_json(&response);
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "initialize must succeed, payload: {payload}"
+        );
+        let session_id = response
+            .headers
+            .get("mcp-session-id")
+            .expect("initialize response must carry a session id")
+            .to_str()
+            .expect("session id must be ASCII")
+            .to_string();
+        assert_eq!(payload["result"]["serverInfo"]["name"], "dayfly");
+        let initialized =
+            mcp_request(client, addr, "POST", &initialized_body(), Some(&session_id)).await;
+        assert_eq!(
+            initialized.status,
+            StatusCode::ACCEPTED,
+            "the initialized notification must be accepted"
+        );
+        (session_id, payload)
+    }
+
+    async fn list_tools(client: &McpClient, addr: SocketAddr, session_id: &str) -> McpResponse {
+        mcp_request(client, addr, "POST", &tools_list_body(), Some(session_id)).await
+    }
+
+    fn tool_names(payload: &Value) -> Vec<String> {
+        payload["result"]["tools"]
+            .as_array()
+            .expect("tools/list result must carry a tools array")
+            .iter()
+            .map(|tool| {
+                tool["name"]
+                    .as_str()
+                    .expect("tool must carry a name")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Two independent HTTP clients must get two independent MCP sessions on
+    /// one server and one store. Closing one session must not close the other.
+    #[tokio::test]
+    async fn two_http_clients_get_independent_mcp_sessions() {
+        let state = test_state(10 * 1024 * 1024, 1024 * 1024 * 1024).await;
+        let (addr, server) = start_mcp_server(state).await;
+        let client_a = mcp_http_client();
+        let client_b = mcp_http_client();
+
+        let (session_a, _) = initialize_session(&client_a, addr).await;
+        let (session_b, _) = initialize_session(&client_b, addr).await;
+        assert_ne!(
+            session_a, session_b,
+            "each initialize must create a distinct session"
+        );
+
+        let (tools_a, tools_b) = tokio::join!(
+            list_tools(&client_a, addr, &session_a),
+            list_tools(&client_b, addr, &session_b)
+        );
+        assert_eq!(tools_a.status, StatusCode::OK);
+        assert_eq!(tools_b.status, StatusCode::OK);
+        let expected = [
+            "store_text",
+            "store_file",
+            "fetch_text",
+            "fetch_file",
+            "fetch_metadata",
+            "delete_paste",
+            "list_recent",
+        ];
+        for response in [&tools_a, &tools_b] {
+            let names = tool_names(&sse_json(response));
+            for name in expected {
+                assert!(
+                    names.iter().any(|candidate| candidate == name),
+                    "tools/list must expose {name}, got: {names:?}"
+                );
+            }
+        }
+
+        let closed = mcp_request(&client_a, addr, "DELETE", &json!({}), Some(&session_a)).await;
+        assert_eq!(closed.status, StatusCode::ACCEPTED);
+        let (gone, alive) = tokio::join!(
+            list_tools(&client_a, addr, &session_a),
+            list_tools(&client_b, addr, &session_b)
+        );
+        assert_eq!(
+            gone.status,
+            StatusCode::NOT_FOUND,
+            "the closed session must be gone"
+        );
+        assert_eq!(
+            alive.status,
+            StatusCode::OK,
+            "closing one session must not close the other"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_mcp_initializations_create_independent_sessions() {
+        let state = test_state(10 * 1024 * 1024, 1024 * 1024 * 1024).await;
+        let (addr, server) = start_mcp_server(state).await;
+        let client_a = mcp_http_client();
+        let client_b = mcp_http_client();
+
+        let (client_a, client_b) = tokio::join!(
+            initialize_session(&client_a, addr),
+            initialize_session(&client_b, addr)
+        );
+        assert_ne!(
+            client_a.0, client_b.0,
+            "concurrent initializations must not share a session"
+        );
+        server.abort();
+    }
+
+    /// A minimal PutObject sink. `store_text` sends one PutObject, so a
+    /// 200 with an ETag is enough to complete the call.
+    async fn mock_s3_put(
+        State(keys): State<Arc<Mutex<Vec<String>>>>,
+        request: Request<Body>,
+    ) -> Response {
+        if request.method() != axum::http::Method::PUT {
+            return (StatusCode::NOT_IMPLEMENTED, "only PUT is mocked").into_response();
+        }
+        let path = request.uri().path().trim_start_matches('/');
+        let (_, key) = path.split_once('/').unwrap_or(("", path));
+        keys.lock()
+            .expect("mock S3 lock must not be poisoned")
+            .push(key.to_string());
+        (
+            StatusCode::OK,
+            [(axum::http::header::ETAG, "\"mock-etag\"")],
+        )
+            .into_response()
+    }
+
+    async fn start_mock_s3() -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().fallback(mock_s3_put).with_state(keys.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock S3 listener must bind");
+        let addr = listener.local_addr().expect("bound address must exist");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock S3 server must run");
+        });
+        (format!("http://{addr}"), keys, handle)
+    }
+
+    async fn test_state_at_endpoint(endpoint: &str) -> AppState {
+        let mut config = test_config(10 * 1024 * 1024, 1024 * 1024 * 1024);
+        config.endpoint = endpoint.to_string();
+        AppState {
+            store: Store::from_config(config)
+                .await
+                .expect("test S3 config must build without network access"),
+        }
+    }
+
+    fn store_text_body(id: u64, text: &str) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": "store_text", "arguments": {"text": text}}
+        })
+    }
+
+    fn stored_paste(payload: &Value) -> Value {
+        let text = payload["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("store_text must return JSON text, got: {payload}"));
+        serde_json::from_str(text).expect("store_text result must be JSON")
+    }
+
+    /// Two clients must store text through one HTTP MCP endpoint and one
+    /// shared store. The mock S3 records two distinct object keys.
+    #[tokio::test]
+    async fn two_mcp_clients_store_text_through_one_shared_store() {
+        let (endpoint, keys, mock_s3) = start_mock_s3().await;
+        let state = test_state_at_endpoint(&endpoint).await;
+        let (addr, server) = start_mcp_server(state).await;
+        let client_a = mcp_http_client();
+        let client_b = mcp_http_client();
+        let (session_a, _) = initialize_session(&client_a, addr).await;
+        let (session_b, _) = initialize_session(&client_b, addr).await;
+
+        let body_a = store_text_body(10, "paste from client a");
+        let body_b = store_text_body(11, "paste from client b");
+        let (response_a, response_b) = tokio::join!(
+            mcp_request(&client_a, addr, "POST", &body_a, Some(&session_a)),
+            mcp_request(&client_b, addr, "POST", &body_b, Some(&session_b))
+        );
+        assert_eq!(response_a.status, StatusCode::OK);
+        assert_eq!(response_b.status, StatusCode::OK);
+        let payload_a = sse_json(&response_a);
+        let payload_b = sse_json(&response_b);
+        assert_eq!(payload_a["result"]["isError"], false);
+        assert_eq!(payload_b["result"]["isError"], false);
+        let paste_a = stored_paste(&payload_a);
+        let paste_b = stored_paste(&payload_b);
+        assert_ne!(
+            paste_a["id"], paste_b["id"],
+            "each store_text call must create a new paste"
+        );
+
+        let keys = keys.lock().expect("mock S3 lock must not be poisoned");
+        assert_eq!(keys.len(), 2, "one PutObject per store_text call");
+        assert_ne!(keys[0], keys[1], "each paste must use a distinct key");
+        server.abort();
+        mock_s3.abort();
     }
 }

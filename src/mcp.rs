@@ -1,14 +1,16 @@
-//! MCP server over stdio (the primary interface).
+//! MCP server handler, shared by the stdio and streamable HTTP transports.
 //!
 //! All logging goes to stderr, never stdout, so the JSON-RPC stream on
 //! stdout is not corrupted. Tool results are JSON strings; binary
 //! content is never sent over JSON-RPC — `fetch_file` downloads to a
 //! local path and returns its metadata instead.
 //!
-//! Access model: the MCP process is spawned locally by the agent host,
-//! so spawning is the trust boundary here. The binary alone holds the
-//! Garage credentials (from environment variables or credential files);
-//! tools never return them and no presigned URL is ever issued.
+//! Access model: the stdio transport is spawned locally by the agent
+//! host, so spawning is the trust boundary there. The HTTP transport is
+//! part of HTTP mode and uses that mode's bearer token when it is set.
+//! The binary alone holds the Garage credentials (from environment
+//! variables or credential files); tools never return them and no
+//! presigned URL is ever issued.
 
 use std::path::PathBuf;
 use std::sync::Arc;
