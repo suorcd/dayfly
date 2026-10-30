@@ -13,6 +13,14 @@ use chrono::Utc;
 use common::FakeS3;
 use serde_json::{json, Value};
 
+#[derive(Debug)]
+enum ToolCallError {
+    /// A JSON-RPC protocol error, with its JSON-RPC code.
+    JsonRpc { code: i64, message: String },
+    /// A tool result with `isError: true`. The request itself succeeded.
+    Tool { message: String },
+}
+
 struct McpClient {
     child: Child,
     stdin: ChildStdin,
@@ -102,26 +110,51 @@ impl McpClient {
         }
     }
 
-    fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value, String> {
+    fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value, ToolCallError> {
         let response = self.request("tools/call", json!({"name": name, "arguments": arguments}));
         if let Some(error) = response.get("error") {
+            let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
             let message = error
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown MCP error")
                 .to_string();
-            return Err(message);
+            return Err(ToolCallError::JsonRpc { code, message });
         }
         let result = &response["result"];
-        assert_ne!(
-            result.get("isError").and_then(Value::as_bool),
-            Some(true),
-            "unexpected tool error result: {result}"
-        );
+        if result.get("isError").and_then(Value::as_bool) == Some(true) {
+            let message = result["content"][0]["text"]
+                .as_str()
+                .unwrap_or("unknown tool error")
+                .to_string();
+            return Err(ToolCallError::Tool { message });
+        }
         let text = result["content"][0]["text"]
             .as_str()
             .unwrap_or_else(|| panic!("tool result must contain text: {result}"));
         Ok(serde_json::from_str(text).expect("tool result text must be JSON"))
+    }
+}
+
+fn assert_tool_error(error: ToolCallError, expected: &str) {
+    match error {
+        ToolCallError::Tool { message } => {
+            assert!(message.contains(expected), "got: {message}");
+        }
+        other => panic!("expected a tool error result, got {other:?}"),
+    }
+}
+
+fn assert_json_rpc_error(error: ToolCallError, code: i64, expected: &str) {
+    match error {
+        ToolCallError::JsonRpc {
+            code: actual,
+            message,
+        } => {
+            assert_eq!(actual, code, "message: {message}");
+            assert!(message.contains(expected), "got: {message}");
+        }
+        other => panic!("expected JSON-RPC error {code}, got {other:?}"),
     }
 }
 
@@ -215,7 +248,7 @@ fn store_text_fetch_metadata_list_and_delete_round_trip() {
     let error = client
         .call_tool("fetch_metadata", json!({"id": id}))
         .expect_err("a deleted paste must not be found");
-    assert!(error.contains("paste not found"), "got: {error}");
+    assert_tool_error(error, "paste not found");
 }
 
 #[test]
@@ -290,7 +323,7 @@ fn text_cap_and_file_cap_are_enforced_through_mcp() {
     let error = client
         .call_tool("store_text", json!({"text": "123456"}))
         .expect_err("six text bytes must exceed a five-byte cap");
-    assert!(error.contains("payload too large"), "got: {error}");
+    assert_tool_error(error, "payload too large");
     assert!(fake.keys().is_empty());
 
     let error = client
@@ -299,7 +332,7 @@ fn text_cap_and_file_cap_are_enforced_through_mcp() {
             json!({"path": source_path.to_str().unwrap(), "filename": "over.bin"}),
         )
         .expect_err("six file bytes must exceed a five-byte cap");
-    assert!(error.contains("payload too large"), "got: {error}");
+    assert_tool_error(error, "payload too large");
     assert!(fake.keys().is_empty());
     let _ = std::fs::remove_file(source_path);
 }
@@ -313,27 +346,27 @@ fn errors_are_reported_for_missing_and_invalid_inputs() {
     let error = client
         .call_tool("fetch_text", json!({"id": "2026-10-28/missing"}))
         .expect_err("a missing paste must be an error");
-    assert!(error.contains("paste not found"), "got: {error}");
+    assert_tool_error(error, "paste not found");
 
     let error = client
         .call_tool("fetch_metadata", json!({"id": "../etc/passwd"}))
         .expect_err("a traversal id must be rejected");
-    assert!(error.contains("invalid id"), "got: {error}");
+    assert_json_rpc_error(error, -32602, "invalid id");
 
     let error = client
         .call_tool("store_file", json!({"path": "/no/such/dayfly/file"}))
         .expect_err("a missing local file must be an error");
-    assert!(error.contains("io error"), "got: {error}");
+    assert_json_rpc_error(error, -32603, "io error");
 
     let error = client
         .call_tool("list_recent", json!({"date": "not-a-date"}))
         .expect_err("an invalid date must be an error");
-    assert!(error.contains("invalid date"), "got: {error}");
+    assert_json_rpc_error(error, -32602, "invalid date");
 
     let error = client
         .call_tool("delete_paste", json!({"id": ".."}))
         .expect_err("a traversal id must be rejected on delete");
-    assert!(error.contains("invalid id"), "got: {error}");
+    assert_json_rpc_error(error, -32602, "invalid id");
 }
 
 #[test]
@@ -391,7 +424,7 @@ fn fetch_file_missing_object_returns_an_error_without_writing() {
             }),
         )
         .expect_err("a missing object must be an error");
-    assert!(error.contains("paste not found"), "got: {error}");
+    assert_tool_error(error, "paste not found");
     assert!(
         !dest_path.exists(),
         "a failed fetch must not create the destination file"
