@@ -76,6 +76,7 @@ pub struct FakeState {
     pub fail_ops: Vec<FailOp>,
     pub fail_part_number: Option<i32>,
     pub fail_head_keys: Vec<String>,
+    pub fail_put_prefixes: Vec<String>,
     pub missing_bucket: bool,
 }
 
@@ -252,6 +253,15 @@ impl FakeS3 {
             .expect("fake state lock")
             .fail_head_keys
             .push(key.to_string());
+    }
+
+    /// Make every PutObject whose key starts with `prefix` fail.
+    pub fn fail_put_prefix(&self, prefix: &str) {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .fail_put_prefixes
+            .push(prefix.to_string());
     }
 
     pub fn drop_upload(&self, upload_id: &str) {
@@ -461,13 +471,6 @@ fn put_object(
     body: Bytes,
 ) -> Response {
     let mut state = state.lock().expect("fake state lock");
-    if state.fail_ops.contains(&FailOp::PutObject) {
-        return s3_error(
-            StatusCode::FORBIDDEN,
-            "AccessDenied",
-            "injected PutObject failure",
-        );
-    }
     let Some(key) = key else {
         return s3_error(
             StatusCode::BAD_REQUEST,
@@ -475,6 +478,18 @@ fn put_object(
             "missing object key",
         );
     };
+    if state.fail_ops.contains(&FailOp::PutObject)
+        || state
+            .fail_put_prefixes
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+    {
+        return s3_error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "injected PutObject failure",
+        );
+    }
     let object = S3Object {
         body: body.to_vec(),
         content_type: content_type_from_headers(headers),
