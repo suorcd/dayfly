@@ -533,17 +533,18 @@ async fn download_inner(
         return (status, resp_headers, Body::empty()).into_response();
     }
     // Stream back in 8 MiB range chunks: the server holds one chunk at
-    // a time, never the whole object.
+    // a time, never the whole paste. The plan is built once, so each
+    // chunk maps to the base object or to the segment that holds it.
     let store = state.store.clone();
-    let object_key = meta.key.clone();
+    let plan = meta.plan();
     let stream = futures::stream::unfold(
-        (start, end, store, object_key),
-        move |(cur, end, store, key)| async move {
+        (start, end, store, plan),
+        move |(cur, end, store, plan)| async move {
             if cur > end {
                 return None;
             }
             let chunk_end = (cur + MULTIPART_CHUNK_BYTES as u64 - 1).min(end);
-            match store.fetch_range_by_key(&key, Some((cur, chunk_end))).await {
+            match store.fetch_range_with_plan(&plan, cur, chunk_end).await {
                 Ok(bytes) => {
                     if bytes.is_empty() {
                         return None;
@@ -551,14 +552,14 @@ async fn download_inner(
                     let next = chunk_end + 1;
                     Some((
                         Ok::<Bytes, StoreError>(Bytes::from(bytes)),
-                        (next, end, store, key),
+                        (next, end, store, plan),
                     ))
                 }
                 // Propagate instead of ending the body. Ending it here sent a
                 // `200 OK` with the full `Content-Length` already on the wire
                 // and only part of the object delivered, which reads to a
                 // client as a short but successful read.
-                Err(e) => Some((Err(e), (end.saturating_add(1), end, store, key))),
+                Err(e) => Some((Err(e), (end.saturating_add(1), end, store, plan))),
             }
         },
     );
@@ -750,6 +751,65 @@ pub fn mcp_router(state: AppState) -> Router<AppState> {
         .layer(middleware::from_fn_with_state(state, require_bearer))
 }
 
+
+async fn append_inner(state: &AppState, headers: &HeaderMap, id: &str, req: Request) -> Response {
+    if let Err(resp) = check_auth(state, headers) {
+        return resp;
+    }
+    let limit = state.store.config.max_text_bytes;
+    if let Some(len) =
+        header_str(headers, CONTENT_LENGTH.as_str()).and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        if len > limit {
+            return error_response(StoreError::TooLarge { limit });
+        }
+    }
+    let mut stream = req.into_body().into_data_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => return error_response(StoreError::Io(e.to_string())),
+        };
+        if u64::try_from(bytes.len().saturating_add(chunk.len())).unwrap_or(u64::MAX) > limit {
+            return error_response(StoreError::TooLarge { limit });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    match state.store.append_text(id, &bytes).await {
+        Ok(appended) => Json(serde_json::json!({
+            "id": appended.meta.id,
+            "url": paste_url(headers, &appended.meta.id),
+            "appended_bytes": appended.appended_bytes,
+            "segment_key": appended.segment_key,
+            "size": appended.meta.size,
+            "sha256": appended.meta.sha256,
+            "expires_at": appended.meta.expires_at.map(|d| d.to_rfc3339()),
+        }))
+        .into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn append_dated(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((date, random)): Path<(String, String)>,
+    req: Request,
+) -> Response {
+    append_inner(&state, &headers, &format!("{date}/{random}"), req).await
+}
+
+async fn append_bare(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(random): Path<String>,
+    req: Request,
+) -> Response {
+    append_inner(&state, &headers, &random, req).await
+}
+
+
 /// API routes, without state attached. [`app_router`] merges these with the
 /// human UI routes and attaches a single shared [`AppState`].
 pub fn api_router() -> Router<AppState> {
@@ -777,6 +837,8 @@ pub fn api_router() -> Router<AppState> {
         )
         .route("/v1/pastes/{date}/{random}/meta", get(meta_dated))
         .route("/v1/pastes/{random}/meta", get(meta_bare))
+        .route("/v1/pastes/{date}/{random}/append", post(append_dated))
+        .route("/v1/pastes/{random}/append", post(append_bare))
 }
 
 #[cfg(test)]
@@ -797,6 +859,7 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
+    use crate::test_s3;
 
     type CapturedMetadata = Arc<std::sync::Mutex<Option<HashMap<String, String>>>>;
 
@@ -808,9 +871,9 @@ mod tests {
         body: Bytes,
     }
 
-    fn test_config(max_text_bytes: u64, max_file_bytes: u64) -> Config {
+    fn test_config_at(endpoint: &str, max_text_bytes: u64, max_file_bytes: u64) -> Config {
         Config {
-            endpoint: "http://127.0.0.1:1".to_string(),
+            endpoint: endpoint.to_string(),
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
             access_key_id: "test-access-key".to_string(),
@@ -821,6 +884,10 @@ mod tests {
             http_bind: "127.0.0.1:0".to_string(),
             http_bearer_token: None,
         }
+    }
+
+    fn test_config(max_text_bytes: u64, max_file_bytes: u64) -> Config {
+        test_config_at("http://127.0.0.1:1", max_text_bytes, max_file_bytes)
     }
 
     async fn test_state(max_text_bytes: u64, max_file_bytes: u64) -> AppState {
@@ -1006,6 +1073,16 @@ mod tests {
             status_for_auth_request(state, None).await,
             StatusCode::BAD_GATEWAY
         );
+    }
+
+    async fn fake_state(max_text_bytes: u64) -> (AppState, test_s3::FakeS3) {
+        let (fake, endpoint) = test_s3::spawn().await;
+        let state = AppState {
+            store: Store::from_config(test_config_at(&endpoint, max_text_bytes, 1024 * 1024))
+                .await
+                .expect("test S3 config must build without network access"),
+        };
+        (state, fake)
     }
 
     /// A raw body with no filename is a text paste. Its declared length is
