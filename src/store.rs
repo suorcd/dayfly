@@ -26,6 +26,7 @@ use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client;
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDate, Utc};
+use futures::StreamExt;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use rand::Rng;
 use sha2::{Digest, Sha256};
@@ -34,7 +35,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::Config;
-use crate::content_type::{detect_content_type, Detection};
+use crate::content_type::{detect_content_type, detect_content_type_sample, Detection};
 
 pub const MULTIPART_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 pub const LIST_SCAN_MAX_PAGES: usize = 10;
@@ -298,12 +299,30 @@ fn decode_filename(encoded: &str) -> String {
         .unwrap_or_else(|_| encoded.to_string())
 }
 
-/// Detection for in-memory / local-file uploads, where the first bytes
-/// are available before the S3 call. Streaming HTTP uploads use
+/// Detection for buffered uploads, where the whole payload is available
+/// before the S3 call. Streaming HTTP uploads use
 /// [`crate::content_type::detect_and_wrap`] instead, which peeks at the
 /// live stream; both paths go through the same precedence rules.
-fn detection_for(filename: Option<&str>, supplied: Option<&str>, prefix: &[u8]) -> Detection {
-    detect_content_type(supplied, filename, prefix)
+fn detection_for(filename: Option<&str>, supplied: Option<&str>, payload: &[u8]) -> Detection {
+    detect_content_type(supplied, filename, payload)
+}
+
+/// Collect a stream into memory and stop with `TooLarge` as soon as the
+/// body exceeds `max_bytes`. A read error returns before any S3 call.
+async fn collect_stream_body<S>(mut stream: S, max_bytes: u64) -> Result<Vec<u8>, StoreError>
+where
+    S: futures::Stream<Item = Result<Bytes, StoreError>> + Unpin,
+{
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let new_len = body.len() as u64 + chunk.len() as u64;
+        if new_len > max_bytes {
+            return Err(StoreError::TooLarge { limit: max_bytes });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -583,12 +602,9 @@ impl Store {
         let sha = sha256_hex(text);
         // Text with no filename and no explicit type is still detected
         // (it will come out as text/plain), so the stored type is never
-        // a blind guess.
-        let detection = detection_for(
-            filename,
-            content_type,
-            &text[..text.len().min(crate::content_type::PEEK_BYTES)],
-        );
+        // a blind guess. The whole payload is checked, so a NUL byte
+        // after the first 8 KiB still makes the payload binary.
+        let detection = detection_for(filename, content_type, text);
         let ct = detection.content_type.clone();
         let (meta, expires_at) = metadata_for(
             filename,
@@ -654,20 +670,12 @@ impl Store {
                 .and_then(|n| n.to_str())
                 .map(|s| s.to_string())
         });
-        // Sniff the first bytes for detection, then re-read the file
-        // from the start for the actual upload, so no bytes are lost.
-        let prefix: Vec<u8> = {
-            let mut f = File::open(path).await?;
-            let mut buf = vec![0u8; crate::content_type::PEEK_BYTES];
-            let n = f.read(&mut buf).await?;
-            buf.truncate(n);
-            buf
-        };
-        let detection = detection_for(display_name.as_deref(), content_type, &prefix);
-        let ct = detection.content_type.clone();
-
         if size as usize <= MULTIPART_CHUNK_BYTES {
+            // One read gives the whole payload for both detection and
+            // upload, so text detection sees every byte.
             let bytes = tokio::fs::read(path).await?;
+            let detection = detection_for(display_name.as_deref(), content_type, &bytes);
+            let ct = detection.content_type.clone();
             let sha = sha256_hex(&bytes);
             let (meta, expires_at) = metadata_for(
                 display_name.as_deref(),
@@ -704,6 +712,23 @@ impl Store {
         // CreateMultipartUpload. Hash the file first, because the hash is
         // part of that metadata, then upload the parts. A later CopyObject
         // would cost a second put and could fail after the object exists.
+        // The prefetch is only a sample, so plain-text detection cannot
+        // prove that the whole file is text. A specific explicit type
+        // or a specific filename extension still wins.
+        let prefix: Vec<u8> = {
+            let mut f = File::open(path).await?;
+            let mut buf = vec![0u8; crate::content_type::PEEK_BYTES];
+            let n = f.read(&mut buf).await?;
+            buf.truncate(n);
+            buf
+        };
+        let detection = detect_content_type_sample(
+            content_type,
+            display_name.as_deref(),
+            &prefix,
+            size <= crate::content_type::PEEK_BYTES as u64,
+        );
+        let ct = detection.content_type.clone();
         let sha = sha256_file(path).await?;
         let (meta, expires_at) = metadata_for(
             display_name.as_deref(),
@@ -822,10 +847,22 @@ impl Store {
         })
     }
 
-    /// Streaming upload: detect Content-Type from the first peeked chunk
-    /// (via [`crate::content_type::detect_and_wrap`]), then drive the
-    /// S3 sink. The peeked bytes are forwarded exactly once by the
-    /// wrapper, so detection never loses or duplicates data.
+    /// Store a streamed upload.
+    ///
+    /// A text paste (no filename) is buffered up to `max_bytes`. The
+    /// text cap bounds that buffer, so detection sees the whole body and
+    /// an oversize body is rejected before any S3 write. The buffered
+    /// body goes through [`Store::store_text`], which keeps the text
+    /// cap, TTL, metadata, and detection rules.
+    ///
+    /// A file upload streams. Detection peeks at the first chunk (via
+    /// [`crate::content_type::detect_and_wrap`]), then drives the S3
+    /// sink. The peeked bytes are forwarded exactly once by the
+    /// wrapper, so detection never loses or duplicates data. A plain
+    /// text candidate needs the whole body. When the peek is a
+    /// truncated sample, the candidate falls back to
+    /// `application/octet-stream` unless `known_length` shows that the
+    /// whole body fits in the sample.
     ///
     /// `max_bytes` is chosen by the caller before streaming: the text cap
     /// for a text paste (no filename), or the file cap for a file upload.
@@ -848,6 +885,14 @@ impl Store {
                 return Err(StoreError::TooLarge { limit: max_bytes });
             }
         }
+        // A text paste has no filename. Buffer the whole body, bounded
+        // by the text cap, so detection sees every byte and text is
+        // served inline. A file upload keeps the streaming path, because
+        // its cap can be much larger.
+        if filename.is_none_or(|name| name.trim().is_empty()) {
+            let body = collect_stream_body(stream, max_bytes).await?;
+            return self.store_text(&body, None, content_type, ttl_days).await;
+        }
         let ttl = ttl_days.unwrap_or(self.config.default_ttl_days);
         let created_at = Utc::now();
         let random_id = generate_random_id();
@@ -855,7 +900,8 @@ impl Store {
         let key = key_for(&date, &random_id);
         let display_name = filename.map(|s| s.to_string());
         let (detection, wrapped) =
-            crate::content_type::detect_and_wrap(stream, content_type, filename).await;
+            crate::content_type::detect_and_wrap(stream, content_type, filename, known_length)
+                .await;
         let ct = detection.content_type.clone();
         // Metadata for the initial upload: filename, TTL, expiry, final
         // type and detection record. The hash and the final size are not
