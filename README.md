@@ -331,7 +331,7 @@ A wrong `S3_BUCKET` name is not one of those cases. `NoSuchBucket`
 carries its own error and maps to 502, so a misconfigured bucket says
 so rather than reporting every paste as missing.
 
-## Content-Type detection (streamed uploads)
+## Content-Type detection
 
 The server sets the S3 object's Content-Type from detection and
 serves that same type back on download, so a web frontend can render
@@ -352,10 +352,11 @@ Detection precedence, in order:
 3. **Filename extension** (`mime_guess`), when an `X-Filename` /
    multipart filename is supplied.
 4. **Plain-text detection**: valid UTF-8 with no NUL bytes in the
-   whole payload → `text/plain; charset=utf-8`. A buffered upload
-   checks every byte. A streamed upload checks only the 8 KiB sample,
-   so a truncated sample cannot prove that the whole body is text;
-   see the streaming constraint below.
+   whole payload → `text/plain; charset=utf-8`. A text paste with no
+   filename is buffered up to the text cap, so it checks every byte.
+   A file upload streams and checks only the 8 KiB sample, so a
+   truncated sample cannot prove that the whole body is text; see the
+   streaming constraint below.
 5. **Fallback**: `application/octet-stream`.
 
 If sniffing and an explicit type disagree on a well-known signature
@@ -363,15 +364,19 @@ If sniffing and an explicit type disagree on a well-known signature
 sniffed type wins and the conflict is recorded in object metadata as
 `detection-conflict` (e.g. `text/plain -> image/png`).
 
-**Streaming constraint:** sniffing peeks at only the first chunk (up
-to 8 KiB) and then forwards those same bytes into the S3 upload
-stream. It does not buffer the whole file to detect its type, and the
-peeked bytes are neither lost nor duplicated. If the peek is a
-truncated sample, a plain-text candidate becomes
-`application/octet-stream`, because the sample cannot prove that the
-rest of the body is text. A specific client type or filename
-extension still wins. If a known length is at or below 8 KiB, the
-whole body was seen, so text detection still applies.
+**Buffering and streaming:** a text paste with no filename is
+buffered up to `DAYFLY_MAX_TEXT_BYTES` before detection and upload.
+The text cap bounds this buffer, so text detection is exact and an
+oversize body is rejected before any S3 write. A file upload streams.
+Sniffing peeks at only the first chunk (up to 8 KiB) and then
+forwards those same bytes into the S3 upload stream. It does not
+buffer the whole file to detect its type, and the peeked bytes are
+neither lost nor duplicated. If the peek is a truncated sample, a
+plain-text candidate becomes `application/octet-stream`, because the
+sample cannot prove that the rest of the body is text. A specific
+client type or filename extension still wins. If a known length is at
+or below 8 KiB, the whole body was seen, so text detection still
+applies.
 
 Stored in S3 object metadata: the final `content-type`, the
 detection source (`client` | `sniffed` | `extension` | `text` |
@@ -538,7 +543,7 @@ where `cargo --version`, `rustc --version`, and
 `rust-analyzer --version` all succeed.
 
 **Nix validation result:** `nix build` and the test suite were run on
-`x86_64-linux` against `nixos-unstable`: 169 passed and 2 ignored. On the stable
+`x86_64-linux` against `nixos-unstable`: 179 passed and 2 ignored. On the stable
 `nixos-25.11` branch the build fails before compilation with a
 rustc-too-old error naming 23 AWS crates, which is why the flake
 tracks unstable. Before this was built on a machine with Nix, an
@@ -549,8 +554,8 @@ Unit tests cover: key generation, ID validation (including
 traversal rejection), range parsing, offset/limit windows, UTF-8
 prefix truncation, metadata/expiry round-trip, content-type
 detection (PNG, JPEG, GIF, WebP, PDF, ZIP, whole-payload UTF-8
-text, truncated-sample fallback, binary fallback, curl's
-`x-www-form-urlencoded` default ignored, explicit
+text for buffered pastes, truncated-sample fallback, binary
+fallback, curl's `x-www-form-urlencoded` default ignored, explicit
 type overriding a generic one, sniffed-signature conflict, extension
 fallback), peeked-byte forwarding (neither lost nor duplicated),
 streaming part buffering, chunked and multi-part-sized uploads,
@@ -590,12 +595,16 @@ Use the same checklist for a real Garage instance:
 - [ ] Verify day TTL: store with `ttl_days=1`, confirm the paste is
       readable before expiry and returns 410 / expired after the
       stored `expires-at` passes.
-- [ ] Verify streaming upload: pipe a file larger than 5 MiB with
-      `cat file | curl --data-binary @- <base>/upload`, confirm the
-      returned URL streams back (Range download), and confirm that
-      killing the client mid-upload yields no URL and leaves no
-      completed object (an aborted multipart upload may leave an
-      incomplete upload for the lifecycle sweeper — see below).
+- [ ] Verify a buffered text paste: pipe 20 KiB of text with
+      `cat text | curl --data-binary @- <base>/upload`, confirm
+      `text/plain; charset=utf-8` and an inline download.
+- [ ] Verify streaming file upload: pipe a file larger than 5 MiB with
+      `cat file | curl -H 'X-Filename: large.bin' --data-binary @- <base>/upload`,
+      confirm the returned URL streams back (Range download), and
+      confirm that killing the client mid-upload yields no URL and
+      leaves no completed object (an aborted multipart upload may
+      leave an incomplete upload for the lifecycle sweeper — see
+      below).
 - [ ] Verify content-type tagging: upload a PNG without an explicit
       Content-Type (curl's default), confirm metadata shows
       `image/png` with source `sniffed`; upload text with

@@ -18,12 +18,13 @@
 //!    payload.
 //! 5. Fallback: `application/octet-stream`.
 //!
-//! Buffered uploads detect on the whole payload. Streaming uploads
-//! peek at the first chunk (up to 8 KiB, see [`detect_and_wrap`]) and
-//! forward those same bytes into the upload stream. A streamed sample
-//! that is truncated cannot prove that the whole body is text. Such a
-//! sample falls back to `application/octet-stream`, unless a known
-//! length shows that the whole body fits in the sample.
+//! A text paste with no filename is buffered up to the text cap, so
+//! detection sees the whole body. A file upload streams: it peeks at
+//! the first chunk (up to 8 KiB, see [`detect_and_wrap`]) and forwards
+//! those same bytes into the upload stream. A streamed sample that is
+//! truncated cannot prove that the whole body is text. Such a sample
+//! falls back to `application/octet-stream`, unless a known length
+//! shows that the whole body fits in the sample.
 
 use std::path::Path;
 use std::pin::Pin;
