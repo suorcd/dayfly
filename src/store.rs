@@ -2,17 +2,21 @@
 //!
 //! Design rules enforced here, not just documented:
 //!
-//! * One S3 object per paste/file. No metadata sidecar, no database in v1.
+//! * One base S3 object per paste/file, plus one segment object per
+//!   append. No metadata sidecar, no database in v1.
 //! * The binary is the only S3 credential holder. Agents never get S3
 //!   credentials and no presigned URL is ever issued in v1.
-//! * A store always creates a *new* random ID. Nothing in v1 overwrites an
-//!   existing ID, and conditional writes (`If-None-Match`) are deliberately
-//!   NOT relied on: some S3-compatible stores, including Garage, accept
-//!   that header but ignore it and overwrite. See README.
+//! * A store creates a *new* random ID. An append adds a segment under the
+//!   existing ID and never rewrites the base object. Conditional writes
+//!   (`If-None-Match`) are deliberately NOT relied on: some S3-compatible
+//!   stores, including Garage, accept that header but ignore it and
+//!   overwrite. Two concurrent appends can therefore choose the same
+//!   sequence. See the README for that limit.
 //! * Expiry is enforced on read by comparing stored `expires-at` metadata
-//!   with now. A TTL can be shorter than one day. S3 lifecycle deletion,
-//!   if configured, is only a day-rounded storage sweeper and may run
-//!   after expiry.
+//!   with now. A TTL can be shorter than one day. An append inherits the
+//!   base expiry and does not extend it. S3 lifecycle deletion, if
+//!   configured, is only a day-rounded storage sweeper and may run after
+//!   expiry.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -385,11 +389,26 @@ pub struct PasteMetadata {
     pub content_type: String,
     pub detection_source: Option<String>,
     pub detection_conflict: Option<String>,
+    /// Total size: the base object plus every appended segment.
     pub size: u64,
+    /// Size of the base object alone. The first segment starts at this
+    /// offset in the paste.
+    pub base_size: u64,
+    /// Appended segments in sequence order.
+    pub segments: Vec<Segment>,
+    /// SHA-256 of the base object. None when segments exist, because no
+    /// stored value describes the concatenated paste.
     pub sha256: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
     pub expired: bool,
+}
+
+impl PasteMetadata {
+    /// Build the range plan for this paste without another S3 call.
+    pub fn plan(&self) -> SegmentPlan {
+        SegmentPlan::new(self.key.clone(), self.base_size, self.segments.clone())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -398,6 +417,16 @@ pub struct TextSlice {
     pub total_bytes: u64,
     pub returned_bytes: u64,
     pub truncated: bool,
+}
+
+/// Result of one append. `meta` describes the whole paste after the
+/// append, including the new total size.
+#[derive(Debug, Clone)]
+pub struct AppendResult {
+    pub appended_bytes: u64,
+    /// None when the appended text was empty and no object was written.
+    pub segment_key: Option<String>,
+    pub meta: PasteMetadata,
 }
 
 #[derive(Debug, Clone)]
@@ -440,10 +469,11 @@ pub fn generate_random_id() -> String {
 /// Validate a client-supplied paste ID.
 ///
 /// Accepts either a bare random ID (`abc123…`) or a full ID
-/// (`2026-10-28/abc123…`). Segments must be non-empty, must not be `.` or
-/// `..`, and may only contain ASCII alphanumerics, `-`, `_` and `.`.
-/// The key itself is never taken from user input verbatim: it is always
-/// rebuilt as `pastes/<validated-id>`.
+/// (`2026-10-28/abc123…`). An ID has at most two components after
+/// `pastes/`, so a segment key is not a valid paste ID. Components must
+/// be non-empty, must not be `.` or `..`, and may only contain ASCII
+/// alphanumerics, `-`, `_` and `.`. The key itself is never taken from
+/// user input verbatim: it is always rebuilt as `pastes/<validated-id>`.
 pub fn validate_id(id: &str) -> Result<(), StoreError> {
     if id.is_empty() || id.len() > 128 {
         return Err(StoreError::InvalidId(
@@ -453,6 +483,12 @@ pub fn validate_id(id: &str) -> Result<(), StoreError> {
     let stripped = id.strip_prefix("pastes/").unwrap_or(id);
     if stripped.is_empty() {
         return Err(StoreError::InvalidId("empty id".into()));
+    }
+    let parts: Vec<&str> = stripped.split('/').collect();
+    if parts.len() > 2 {
+        return Err(StoreError::InvalidId(format!(
+            "id must be <random> or <date>/<random>: {id:?}"
+        )));
     }
     for segment in stripped.split('/') {
         if segment.is_empty() || segment == "." || segment == ".." {
@@ -472,6 +508,138 @@ pub fn validate_id(id: &str) -> Result<(), StoreError> {
 
 pub fn key_for(date: &str, random_id: &str) -> String {
     format!("pastes/{date}/{random_id}")
+}
+
+/// Number of decimal digits in a segment sequence number.
+///
+/// The width is the number of digits in `u64::MAX`, so numeric order and
+/// lexicographic key order are the same for every possible sequence.
+pub const SEGMENT_SEQUENCE_DIGITS: usize = 20;
+
+/// Key for one appended segment. The base object is segment 0, so the
+/// first appended segment has sequence 0.
+pub fn segment_key(base_key: &str, sequence: u64) -> String {
+    format!(
+        "{base_key}/{sequence:0width$}",
+        width = SEGMENT_SEQUENCE_DIGITS
+    )
+}
+
+/// Prefix that holds every appended segment for a base key.
+pub fn segment_prefix(base_key: &str) -> String {
+    format!("{base_key}/")
+}
+
+/// Parse a segment key that belongs directly to `base_key`.
+///
+/// Returns `None` for a nested key, a short name, or a non-digit name.
+/// Such keys are not part of the paste and must not change its size.
+pub fn parse_segment_key(base_key: &str, key: &str) -> Option<u64> {
+    let name = key.strip_prefix(&segment_prefix(base_key))?;
+    if name.len() != SEGMENT_SEQUENCE_DIGITS || !name.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    name.parse::<u64>().ok()
+}
+
+/// True when the key has the paste shape `pastes/<date>/<id>`.
+///
+/// A segment key adds a third component after `pastes/`, so it is not a
+/// paste. Listing and bare-id resolution use this predicate to skip it.
+pub fn is_paste_key(key: &str) -> bool {
+    let Some(rest) = key.strip_prefix("pastes/") else {
+        return false;
+    };
+    let mut parts = rest.split('/');
+    let date = parts.next().unwrap_or("");
+    let id = parts.next().unwrap_or("");
+    !date.is_empty() && !id.is_empty() && parts.next().is_none()
+}
+
+/// One appended segment of a paste.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Segment {
+    pub sequence: u64,
+    pub key: String,
+    pub size: u64,
+}
+
+/// Base object plus appended segments, in sequence order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentPlan {
+    pub base_key: String,
+    pub base_size: u64,
+    pub segments: Vec<Segment>,
+}
+
+impl SegmentPlan {
+    pub fn new(base_key: impl Into<String>, base_size: u64, mut segments: Vec<Segment>) -> Self {
+        segments.sort_by_key(|s| s.sequence);
+        Self {
+            base_key: base_key.into(),
+            base_size,
+            segments,
+        }
+    }
+
+    /// Sum of the base object and every segment.
+    pub fn total_size(&self) -> u64 {
+        self.base_size
+            + self
+                .segments
+                .iter()
+                .fold(0u64, |sum, s| sum.saturating_add(s.size))
+    }
+
+    /// Map an inclusive global byte range to object-local inclusive
+    /// ranges. Each tuple is `(key, local_start, local_end)`.
+    ///
+    /// Empty objects are skipped. A range that starts past the end
+    /// returns an empty list, so the caller issues no read.
+    pub fn object_ranges(&self, start: u64, end: u64) -> Vec<(String, u64, u64)> {
+        if start > end {
+            return Vec::new();
+        }
+        let end_exclusive = end.saturating_add(1);
+        let mut out = Vec::new();
+        let mut offset = 0u64;
+        let objects = std::iter::once((self.base_key.clone(), self.base_size))
+            .chain(self.segments.iter().map(|s| (s.key.clone(), s.size)));
+        for (key, size) in objects {
+            let object_start = offset;
+            let object_end = offset.saturating_add(size);
+            offset = object_end;
+            if size == 0 {
+                continue;
+            }
+            let overlap_start = start.max(object_start);
+            let overlap_end = end_exclusive.min(object_end);
+            if overlap_start < overlap_end {
+                out.push((
+                    key,
+                    overlap_start - object_start,
+                    overlap_end - object_start - 1,
+                ));
+            }
+        }
+        out
+    }
+}
+
+/// Keep only well-formed segment keys for `base_key`, in sequence order.
+pub fn segments_from_listing(base_key: &str, entries: &[(String, u64)]) -> Vec<Segment> {
+    let mut segments: Vec<Segment> = entries
+        .iter()
+        .filter_map(|(key, size)| {
+            parse_segment_key(base_key, key).map(|sequence| Segment {
+                sequence,
+                key: key.clone(),
+                size: *size,
+            })
+        })
+        .collect();
+    segments.sort_by_key(|s| s.sequence);
+    segments
 }
 
 /// Parse an HTTP `Range` header value into an inclusive (start, end) pair
@@ -845,6 +1013,9 @@ impl Store {
             let out = req.send().await.map_err(|e| map_sdk_error(e, id))?;
             for obj in out.contents() {
                 if let Some(key) = obj.key() {
+                    if !is_paste_key(key) {
+                        continue;
+                    }
                     if key.ends_with(&suffix) || key == format!("pastes/{stripped}") {
                         return Ok(key.to_string());
                     }
@@ -1215,6 +1386,117 @@ impl Store {
         })
     }
 
+    /// List every object under the segment prefix of `base_key`.
+    ///
+    /// The list is paginated. Keys that do not have the exact
+    /// 20-digit segment shape stay in the result: `delete` removes them
+    /// too, so a stray key cannot keep storage forever. The read path
+    /// uses [`segments_from_listing`], which ignores them.
+    async fn list_segment_entries(&self, base_key: &str) -> Result<Vec<(String, u64)>, StoreError> {
+        let prefix = segment_prefix(base_key);
+        let mut entries = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&prefix)
+                .max_keys(1000);
+            if let Some(t) = token {
+                req = req.continuation_token(t);
+            }
+            let out = req.send().await.map_err(|e| map_sdk_error(e, base_key))?;
+            for obj in out.contents() {
+                if let Some(key) = obj.key() {
+                    entries.push((
+                        key.to_string(),
+                        u64::try_from(obj.size().unwrap_or(0)).unwrap_or(0),
+                    ));
+                }
+            }
+            match out.next_continuation_token() {
+                Some(t) if out.is_truncated().unwrap_or(false) => token = Some(t.to_string()),
+                _ => break,
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Build the base-plus-segments plan for a known base key and size.
+    async fn load_plan(&self, base_key: &str, base_size: u64) -> Result<SegmentPlan, StoreError> {
+        let entries = self.list_segment_entries(base_key).await?;
+        let segments = segments_from_listing(base_key, &entries);
+        Ok(SegmentPlan::new(base_key.to_string(), base_size, segments))
+    }
+
+    /// Append text to an existing paste as one new segment object.
+    ///
+    /// The base object is never rewritten or copied. The text cap applies
+    /// to this append only, not to the total size. The expiry check
+    /// happens before the write, so an expired or missing id creates no
+    /// object.
+    ///
+    /// Sequence assignment lists the segment prefix and uses max + 1.
+    /// Two concurrent appends to the same id can choose the same
+    /// sequence, and the second write wins. This is documented in the
+    /// README; the store does not rely on a conditional write, because
+    /// Garage ignores `If-None-Match`.
+    pub async fn append_text(&self, id: &str, text: &[u8]) -> Result<AppendResult, StoreError> {
+        if u64::try_from(text.len()).unwrap_or(u64::MAX) > self.config.max_text_bytes {
+            return Err(StoreError::TooLarge {
+                limit: self.config.max_text_bytes,
+            });
+        }
+        let mut meta = self.head_metadata(id).await?;
+        Self::check_not_expired(&meta)?;
+        if text.is_empty() {
+            return Ok(AppendResult {
+                appended_bytes: 0,
+                segment_key: None,
+                meta,
+            });
+        }
+        let sequence = match meta.segments.iter().map(|s| s.sequence).max() {
+            Some(max) => max
+                .checked_add(1)
+                .ok_or_else(|| StoreError::S3("segment sequence exhausted".into()))?,
+            None => 0,
+        };
+        let key = segment_key(&meta.key, sequence);
+        let mut object_meta = HashMap::new();
+        object_meta.insert("sequence".to_string(), sequence.to_string());
+        object_meta.insert("size".to_string(), text.len().to_string());
+        object_meta.insert("created-at".to_string(), Utc::now().to_rfc3339());
+        if let Some(expires_at) = meta.expires_at {
+            // The append inherits the base expiry. It does not extend it.
+            object_meta.insert("expires-at".to_string(), expires_at.to_rfc3339());
+        }
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .body(ByteStream::from(text.to_vec()))
+            .content_type(meta.content_type.clone())
+            .set_metadata(Some(object_meta))
+            .send()
+            .await
+            .map_err(|e| map_sdk_error(e, &key))?;
+        let appended_bytes = text.len() as u64;
+        meta.segments.push(Segment {
+            sequence,
+            key: key.clone(),
+            size: appended_bytes,
+        });
+        meta.size = meta.size.saturating_add(appended_bytes);
+        meta.sha256 = None;
+        Ok(AppendResult {
+            appended_bytes,
+            segment_key: Some(key),
+            meta,
+        })
+    }
+
     pub async fn head_metadata(&self, id: &str) -> Result<PasteMetadata, StoreError> {
         let key = self.resolve_key(id).await?;
         let out = self
@@ -1235,6 +1517,9 @@ impl Store {
             .map(|s| s.to_string())
             .or_else(|| meta.get("content-type").cloned())
             .unwrap_or_else(|| "application/octet-stream".to_string());
+        let base_size = u64::try_from(out.content_length().unwrap_or(0)).unwrap_or(0);
+        let plan = self.load_plan(&key, base_size).await?;
+        let has_segments = !plan.segments.is_empty();
         Ok(PasteMetadata {
             id: key.strip_prefix("pastes/").unwrap_or(&key).to_string(),
             key,
@@ -1242,8 +1527,16 @@ impl Store {
             content_type,
             detection_source: meta.get("detection-source").cloned(),
             detection_conflict: meta.get("detection-conflict").cloned(),
-            size: u64::try_from(out.content_length().unwrap_or(0)).unwrap_or(0),
-            sha256: meta.get("sha256").cloned(),
+            size: plan.total_size(),
+            base_size,
+            segments: plan.segments,
+            // A stored hash covers the base object only. Do not report it
+            // as if it covered the concatenated paste.
+            sha256: if has_segments {
+                None
+            } else {
+                meta.get("sha256").cloned()
+            },
             created_at,
             expires_at,
             expired,
@@ -1257,14 +1550,9 @@ impl Store {
         Ok(())
     }
 
-    /// Fetch a byte range from an already-resolved object key.
-    ///
-    /// Callers that already hold metadata should use this rather than resolving
-    /// the ID again, because resolution issues a `HeadObject` and, for a bare
-    /// ID, a bucket scan. Downloading in chunks through the ID-based path
-    /// re-ran that once per chunk, so a 64 MiB download cost nine prefix
-    /// listings and nine heads.
-    pub async fn fetch_range_by_key(
+    /// Fetch one object's byte range. This is the only method that issues
+    /// a GET against a single key.
+    async fn fetch_object_range(
         &self,
         key: &str,
         range: Option<(u64, u64)>,
@@ -1281,6 +1569,66 @@ impl Store {
             .map_err(|e| StoreError::S3(e.to_string()))?
             .to_vec();
         Ok(bytes)
+    }
+
+    /// Fetch an inclusive global byte range from a paste.
+    ///
+    /// The plan maps the range to the base object and to the segments
+    /// that hold it. A segment that the range does not touch is not
+    /// read, and a touched object gets one range request for the overlap
+    /// only.
+    pub async fn fetch_range_with_plan(
+        &self,
+        plan: &SegmentPlan,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u8>, StoreError> {
+        let mut bytes = Vec::new();
+        for (key, local_start, local_end) in plan.object_ranges(start, end) {
+            let part = self
+                .fetch_object_range(&key, Some((local_start, local_end)))
+                .await?;
+            bytes.extend_from_slice(&part);
+        }
+        Ok(bytes)
+    }
+
+    /// Fetch a byte range from an already-resolved base key.
+    ///
+    /// Callers that already hold metadata should use
+    /// [`Self::fetch_range_with_plan`] rather than resolving the key
+    /// again, because this method issues a `HeadObject` and a segment
+    /// listing before the read. Downloading in chunks through the ID-based
+    /// path re-ran that once per chunk, so a 64 MiB download cost nine
+    /// prefix listings and nine heads.
+    ///
+    /// The binary keeps this method for callers that hold a key but not
+    /// metadata. The HTTP path uses the plan form to avoid the extra
+    /// calls. The store tests use this method to check that a range is
+    /// concatenated across the base object and its segments.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn fetch_range_by_key(
+        &self,
+        key: &str,
+        range: Option<(u64, u64)>,
+    ) -> Result<Vec<u8>, StoreError> {
+        let out = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| map_sdk_error(e, key))?;
+        let base_size = u64::try_from(out.content_length().unwrap_or(0)).unwrap_or(0);
+        let plan = self.load_plan(key, base_size).await?;
+        match range {
+            Some((start, end)) => self.fetch_range_with_plan(&plan, start, end).await,
+            None => {
+                self.fetch_range_with_plan(&plan, 0, plan.total_size().saturating_sub(1))
+                    .await
+            }
+        }
     }
 
     pub async fn fetch_text(
@@ -1300,7 +1648,7 @@ impl Store {
             });
         };
         let bytes = self
-            .fetch_range_by_key(&meta.key, Some((start, end_exclusive - 1)))
+            .fetch_range_with_plan(&meta.plan(), start, end_exclusive - 1)
             .await?;
         let text = valid_utf8_prefix(&bytes).to_string();
         let returned = text.len() as u64;
@@ -1312,9 +1660,12 @@ impl Store {
         })
     }
 
-    /// Download an object to a local file in 8 MiB range chunks, so the
-    /// whole object is never held in memory. `range` is an inclusive
-    /// (start, end) pair; None means the whole object.
+    /// Download a paste to a local file in 8 MiB range chunks, so the
+    /// whole paste is never held in memory. `range` is an inclusive
+    /// (start, end) pair; None means the whole paste.
+    ///
+    /// The plan keeps each read inside one object, so a segment is never
+    /// fetched as part of the base object.
     pub async fn download_file(
         &self,
         id: &str,
@@ -1323,7 +1674,7 @@ impl Store {
     ) -> Result<PasteMetadata, StoreError> {
         let meta = self.head_metadata(id).await?;
         Self::check_not_expired(&meta)?;
-        let (mut start, end) = match range {
+        let (start, end) = match range {
             Some((s, e)) => {
                 if s >= meta.size {
                     return Err(StoreError::RangeNotSatisfiable);
@@ -1336,24 +1687,33 @@ impl Store {
             tokio::fs::write(dest, b"").await?;
             return Ok(meta);
         }
+        let plan = meta.plan();
         let mut file = File::create(dest).await?;
-        while start <= end {
-            let chunk_end = (start + MULTIPART_CHUNK_BYTES as u64 - 1).min(end);
-            let bytes = self
-                .fetch_range_by_key(&meta.key, Some((start, chunk_end)))
-                .await?;
-            if bytes.is_empty() {
-                break;
+        for (key, local_start, local_end) in plan.object_ranges(start, end) {
+            let mut cur = local_start;
+            while cur <= local_end {
+                let chunk_end = (cur + MULTIPART_CHUNK_BYTES as u64 - 1).min(local_end);
+                let bytes = self
+                    .fetch_object_range(&key, Some((cur, chunk_end)))
+                    .await?;
+                if bytes.is_empty() {
+                    break;
+                }
+                file.write_all(&bytes).await?;
+                cur = chunk_end + 1;
             }
-            file.write_all(&bytes).await?;
-            start = chunk_end + 1;
         }
         file.flush().await?;
         Ok(meta)
     }
 
+    /// Delete the base object and every object under its segment prefix.
+    ///
+    /// The prefix listing runs first, so a listing failure leaves the
+    /// paste intact rather than deleting only the base object.
     pub async fn delete(&self, id: &str) -> Result<(), StoreError> {
         let key = self.resolve_key(id).await?;
+        let segments = self.list_segment_entries(&key).await?;
         self.client
             .delete_object()
             .bucket(&self.bucket)
@@ -1361,6 +1721,15 @@ impl Store {
             .send()
             .await
             .map_err(|e| map_sdk_error(e, id))?;
+        for (segment_key, _) in segments {
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&segment_key)
+                .send()
+                .await
+                .map_err(|e| map_sdk_error(e, &segment_key))?;
+        }
         Ok(())
     }
 
@@ -1376,15 +1745,17 @@ impl Store {
     /// summaries are sorted by date ascending, then by key.
     ///
     /// The function scans the bucket directly: `ListObjectsV2` for each
-    /// `pastes/<date>/` prefix, then one `HeadObject` per key to recover
-    /// expiry/content-type/filename and to filter expired objects. Each
-    /// prefix follows continuation tokens for up to [`LIST_SCAN_MAX_PAGES`]
-    /// pages. A window can span at most [`LIST_WINDOW_MAX_DAYS`] dates. The
-    /// listing is O(n) in the objects scanned (plus one Head per
-    /// key): it is fast for a small internal bucket and gets slower as the
-    /// bucket grows. That slowdown is exactly the trigger for adding a
-    /// database later — it is documented in README, not hidden, and no
-    /// database schema is invented in v1. This is not search.
+    /// `pastes/<date>/` prefix, then one `HeadObject` and a segment-prefix
+    /// listing per paste to recover expiry, content-type, filename, and
+    /// total size, and to filter expired objects. Segment keys are skipped,
+    /// so a segment never appears as a paste. Each prefix follows
+    /// continuation tokens for up to [`LIST_SCAN_MAX_PAGES`] pages. A
+    /// window can span at most [`LIST_WINDOW_MAX_DAYS`] dates. The listing
+    /// is O(n) in the objects scanned (plus a head and a list per paste):
+    /// it is fast for a small internal bucket and gets slower as the bucket
+    /// grows. That slowdown is exactly the trigger for adding a database
+    /// later — it is documented in README, not hidden, and no database
+    /// schema is invented in v1. This is not search.
     pub async fn list_window(
         &self,
         start: Option<&str>,
@@ -1419,6 +1790,11 @@ impl Store {
                         break;
                     }
                     let Some(key) = obj.key() else { continue };
+                    // A segment key has a third component after `pastes/`.
+                    // It is part of a paste, not a paste.
+                    if !is_paste_key(key) {
+                        continue;
+                    }
                     let id = key.strip_prefix("pastes/").unwrap_or(key).to_string();
                     // HeadObject per key: ListObjectsV2 returns no user
                     // metadata. A head failure (e.g. deleted between list
@@ -1433,7 +1809,7 @@ impl Store {
                     summaries.push(PasteSummary {
                         id,
                         key: key.to_string(),
-                        size: u64::try_from(obj.size().unwrap_or(0)).unwrap_or(0),
+                        size: meta.size,
                         last_modified: obj
                             .last_modified()
                             .and_then(|dt| DateTime::from_timestamp(dt.secs(), dt.subsec_nanos())),
@@ -1521,6 +1897,10 @@ mod tests {
         assert!(validate_id("2026-10-28/abcXYZ0123").is_ok());
         assert!(validate_id("abcXYZ0123").is_ok());
         assert!(validate_id("bad id!").is_err());
+        assert!(
+            validate_id("2026-10-28/abcXYZ0123/00000000000000000000").is_err(),
+            "a segment key must not be a paste id"
+        );
     }
 
     #[test]
@@ -1593,6 +1973,401 @@ mod tests {
     #[test]
     fn key_layout() {
         assert_eq!(key_for("2026-10-28", "abc"), "pastes/2026-10-28/abc");
+    }
+
+    async fn fake_store(max_text_bytes: u64) -> (Store, crate::test_s3::FakeS3) {
+        let (fake, endpoint) = crate::test_s3::spawn().await;
+        let config = Config {
+            endpoint,
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key_id: "test-access-key".to_string(),
+            secret_access_key: "test-secret-key".to_string(),
+            max_text_bytes,
+            max_file_bytes: 1024 * 1024,
+            default_ttl_days: 7,
+            http_bind: "127.0.0.1:0".to_string(),
+            http_bearer_token: None,
+        };
+        let store = Store::from_config(config)
+            .await
+            .expect("test S3 config must build without network access");
+        (store, fake)
+    }
+
+    #[tokio::test]
+    async fn store_and_fetch_roundtrip_against_fake_s3() {
+        let (store, fake) = fake_store(1024).await;
+        let stored = store
+            .store_text(b"hello", None, Some("text/plain"), Some(7))
+            .await
+            .expect("store must succeed against the fake");
+        let slice = store
+            .fetch_text(&stored.id, 0, None)
+            .await
+            .expect("fetch must succeed against the fake");
+        assert_eq!(slice.text, "hello");
+        assert!(fake.object(&stored.key).is_some());
+    }
+
+    #[tokio::test]
+    async fn append_writes_only_new_bytes_and_fetch_concatenates() {
+        let (store, fake) = fake_store(1024).await;
+        let stored = store
+            .store_text(b"hello", None, Some("text/plain"), Some(7))
+            .await
+            .expect("store must succeed against the fake");
+        let expires_before = store
+            .head_metadata(&stored.id)
+            .await
+            .expect("head must succeed")
+            .expires_at;
+        let puts_before = fake.puts().len();
+
+        let appended = store
+            .append_text(&stored.id, b" world")
+            .await
+            .expect("append must succeed");
+
+        assert_eq!(appended.appended_bytes, 6);
+        assert!(appended.segment_key.is_some());
+        assert_eq!(appended.meta.size, 11);
+        assert_eq!(appended.meta.expires_at, expires_before);
+        let puts = fake.puts();
+        assert_eq!(puts.len(), puts_before + 1, "append must write one object");
+        assert_eq!(
+            puts.last().expect("append must record a put").1,
+            b" world".to_vec(),
+            "append must write only the new bytes"
+        );
+
+        let slice = store
+            .fetch_text(&stored.id, 0, None)
+            .await
+            .expect("fetch must succeed");
+        assert_eq!(slice.text, "hello world");
+        assert_eq!(slice.total_bytes, 11);
+
+        let middle = store
+            .fetch_text(&stored.id, 3, Some(5))
+            .await
+            .expect("range fetch must succeed");
+        assert_eq!(middle.text, "lo wo");
+
+        let by_key = store
+            .fetch_range_by_key(&stored.key, Some((3, 7)))
+            .await
+            .expect("range fetch by key must succeed");
+        assert_eq!(by_key, b"lo wo".to_vec());
+    }
+
+    #[tokio::test]
+    async fn head_metadata_reports_total_size_and_omits_the_base_hash() {
+        let (store, _fake) = fake_store(1024).await;
+        let stored = store
+            .store_text(b"hello", None, Some("text/plain"), Some(7))
+            .await
+            .expect("store must succeed against the fake");
+        let before = store
+            .head_metadata(&stored.id)
+            .await
+            .expect("head must succeed");
+        assert_eq!(before.size, 5);
+        assert!(before.sha256.is_some());
+        assert!(before.segments.is_empty());
+
+        store
+            .append_text(&stored.id, b" world")
+            .await
+            .expect("append must succeed");
+        let after = store
+            .head_metadata(&stored.id)
+            .await
+            .expect("head must succeed");
+        assert_eq!(after.base_size, 5);
+        assert_eq!(after.size, 11);
+        assert_eq!(after.segments.len(), 1);
+        assert_eq!(
+            after.sha256, None,
+            "a base-only hash must not describe the concatenated paste"
+        );
+    }
+
+    #[tokio::test]
+    async fn range_fetch_reads_only_the_objects_it_touches() {
+        let (store, fake) = fake_store(1024).await;
+        let stored = store
+            .store_text(b"hello", None, Some("text/plain"), Some(7))
+            .await
+            .expect("store must succeed against the fake");
+        let appended = store
+            .append_text(&stored.id, b" world")
+            .await
+            .expect("append must succeed");
+        let segment = appended.segment_key.expect("append must name a segment");
+
+        let before = fake.gets().len();
+        let inside = store
+            .fetch_text(&stored.id, 6, Some(3))
+            .await
+            .expect("segment range must succeed");
+        assert_eq!(inside.text, "wor");
+        assert_eq!(
+            fake.gets()[before..].to_vec(),
+            vec![(segment.clone(), Some("bytes=1-3".to_string()))],
+            "a range inside a segment must not read the base object"
+        );
+
+        let before = fake.gets().len();
+        let spanned = store
+            .fetch_text(&stored.id, 3, Some(5))
+            .await
+            .expect("spanning range must succeed");
+        assert_eq!(spanned.text, "lo wo");
+        assert_eq!(
+            fake.gets()[before..].to_vec(),
+            vec![
+                (stored.key.clone(), Some("bytes=3-4".to_string())),
+                (segment, Some("bytes=0-2".to_string())),
+            ],
+            "each object must get a local range request"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_file_concatenates_base_and_segments() {
+        let (store, _fake) = fake_store(1024).await;
+        let stored = store
+            .store_text(b"hello", None, Some("text/plain"), Some(7))
+            .await
+            .expect("store must succeed against the fake");
+        store
+            .append_text(&stored.id, b" world")
+            .await
+            .expect("append must succeed");
+        let path = std::env::temp_dir().join(format!(
+            "dayfly-append-test-{}-{}",
+            std::process::id(),
+            rand::rng().random::<u64>()
+        ));
+        store
+            .download_file(&stored.id, &path, None)
+            .await
+            .expect("full download must succeed");
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("download must exist"),
+            b"hello world".to_vec()
+        );
+        store
+            .download_file(&stored.id, &path, Some((3, 7)))
+            .await
+            .expect("range download must succeed");
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("download must exist"),
+            b"lo wo".to_vec()
+        );
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn list_recent_skips_segment_keys() {
+        let (store, _fake) = fake_store(1024).await;
+        let stored = store
+            .store_text(b"base", None, Some("text/plain"), Some(7))
+            .await
+            .expect("store must succeed against the fake");
+        store
+            .append_text(&stored.id, b"+more")
+            .await
+            .expect("append must succeed");
+        let date = stored
+            .id
+            .split_once('/')
+            .expect("full id must contain a date")
+            .0;
+        let items = store
+            .list_recent(Some(date), 100)
+            .await
+            .expect("list must succeed");
+        assert_eq!(items.len(), 1, "a segment must not appear as a paste");
+        assert_eq!(items[0].id, stored.id);
+        assert_eq!(items[0].size, 9, "the listing must report the total size");
+    }
+
+    #[tokio::test]
+    async fn bare_id_resolution_skips_segment_keys() {
+        let (store, _fake) = fake_store(1024).await;
+        let stored = store
+            .store_text(b"base", None, Some("text/plain"), Some(7))
+            .await
+            .expect("store must succeed against the fake");
+        store
+            .append_text(&stored.id, b"more")
+            .await
+            .expect("append must succeed");
+        let sequence = format!("{:020}", 0);
+        let result = store.resolve_key(&sequence).await;
+        assert!(
+            matches!(result, Err(StoreError::NotFound(_))),
+            "a segment key must not resolve as a bare paste id: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_base_object_and_every_segment() {
+        let (store, fake) = fake_store(1024).await;
+        let stored = store
+            .store_text(b"base", None, Some("text/plain"), Some(7))
+            .await
+            .expect("store must succeed against the fake");
+        let first = store
+            .append_text(&stored.id, b"one")
+            .await
+            .expect("first append must succeed");
+        let second = store
+            .append_text(&stored.id, b"two")
+            .await
+            .expect("second append must succeed");
+        store.delete(&stored.id).await.expect("delete must succeed");
+        assert!(fake.object(&stored.key).is_none());
+        assert!(fake
+            .object(first.segment_key.as_ref().expect("first segment"))
+            .is_none());
+        assert!(fake
+            .object(second.segment_key.as_ref().expect("second segment"))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn append_errors_before_write_for_missing_expired_or_oversize() {
+        let (store, fake) = fake_store(10).await;
+        let missing = store.append_text("2026-10-28/missing", b"x").await;
+        assert!(missing.is_err(), "a missing id must be an error");
+        assert!(fake.puts().is_empty(), "a missing id must write nothing");
+
+        let stored = store
+            .store_text(b"base", None, None, Some(7))
+            .await
+            .expect("store must succeed against the fake");
+        let past = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        fake.set_metadata(&stored.key, "expires-at", &past);
+        let expired = store.append_text(&stored.id, b"x").await;
+        assert!(
+            matches!(expired, Err(StoreError::Expired(_))),
+            "an expired id must be an error: {expired:?}"
+        );
+        assert_eq!(fake.puts().len(), 1, "the expired append must not write");
+
+        let oversize = store.append_text(&stored.id, b"01234567890").await;
+        assert!(
+            matches!(oversize, Err(StoreError::TooLarge { limit: 10 })),
+            "the append cap must apply to the appended bytes: {oversize:?}"
+        );
+        assert_eq!(fake.puts().len(), 1, "the oversize append must not write");
+    }
+
+    #[tokio::test]
+    async fn empty_append_writes_nothing_and_keeps_the_base_hash() {
+        let (store, fake) = fake_store(1024).await;
+        let stored = store
+            .store_text(b"base", None, Some("text/plain"), Some(7))
+            .await
+            .expect("store must succeed against the fake");
+        let puts_before = fake.puts().len();
+        let result = store
+            .append_text(&stored.id, b"")
+            .await
+            .expect("an empty append is a no-op");
+        assert_eq!(result.appended_bytes, 0);
+        assert!(result.segment_key.is_none());
+        assert_eq!(fake.puts().len(), puts_before);
+        assert!(
+            result.meta.sha256.is_some(),
+            "a no-op must not drop the base hash"
+        );
+    }
+
+    #[test]
+    fn segment_key_format_and_order() {
+        let base = "pastes/2026-10-28/abcXYZ";
+        assert_eq!(
+            segment_key(base, 0),
+            "pastes/2026-10-28/abcXYZ/00000000000000000000"
+        );
+        assert_eq!(
+            segment_key(base, 7),
+            "pastes/2026-10-28/abcXYZ/00000000000000000007"
+        );
+        assert_eq!(parse_segment_key(base, &segment_key(base, 7)), Some(7));
+        assert!(segment_key(base, 2) < segment_key(base, 10));
+        assert_eq!(parse_segment_key(base, &format!("{base}/short")), None);
+        assert_eq!(
+            parse_segment_key(base, &format!("{base}/0000000000000000000x")),
+            None
+        );
+        assert_eq!(
+            parse_segment_key(base, &format!("{base}/00000000000000000000/extra")),
+            None
+        );
+        assert!(is_paste_key(base));
+        assert!(!is_paste_key(&segment_key(base, 0)));
+        assert!(!is_paste_key("pastes/2026-10-28"));
+        assert!(!is_paste_key("other/2026-10-28/abc"));
+    }
+
+    #[test]
+    fn segment_plan_totals_and_maps_ranges_across_base_and_segments() {
+        let base = "pastes/2026-10-28/abc";
+        let plan = SegmentPlan::new(
+            base,
+            10,
+            vec![
+                Segment {
+                    sequence: 1,
+                    key: segment_key(base, 1),
+                    size: 7,
+                },
+                Segment {
+                    sequence: 0,
+                    key: segment_key(base, 0),
+                    size: 5,
+                },
+            ],
+        );
+        assert_eq!(plan.total_size(), 22);
+        assert_eq!(plan.object_ranges(0, 9), vec![(base.to_string(), 0, 9)]);
+        assert_eq!(
+            plan.object_ranges(10, 14),
+            vec![(segment_key(base, 0), 0, 4)]
+        );
+        assert_eq!(
+            plan.object_ranges(8, 12),
+            vec![(base.to_string(), 8, 9), (segment_key(base, 0), 0, 2),]
+        );
+        assert_eq!(
+            plan.object_ranges(16, 21),
+            vec![(segment_key(base, 1), 1, 6)]
+        );
+        assert!(plan.object_ranges(22, 30).is_empty());
+    }
+
+    #[test]
+    fn segment_listing_keeps_only_direct_well_formed_keys_in_order() {
+        let base = "pastes/2026-10-28/abc";
+        let entries = vec![
+            (segment_key(base, 2), 3),
+            (format!("{base}/not-a-sequence"), 9),
+            (segment_key(base, 0), 4),
+            (format!("{base}/00000000000000000000/nested"), 8),
+        ];
+        let segments = segments_from_listing(base, &entries);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|s| (s.sequence, s.size))
+                .collect::<Vec<_>>(),
+            vec![(0, 4), (2, 3)]
+        );
     }
 
     #[test]
