@@ -2,11 +2,13 @@ use std::env;
 
 use thiserror::Error;
 
-/// Configuration loaded from the environment only.
+/// Configuration loaded from the environment.
 ///
-/// No S3 credential is ever logged. [`Config`] deliberately has no `Debug`
-/// implementation that prints secret fields; callers that log configuration
-/// must use [`Config::safe_summary`].
+/// The S3 credentials come from a direct environment variable or from a
+/// file named by the `_FILE` alternative. No S3 credential is ever logged.
+/// [`Config`] deliberately has no `Debug` implementation that prints secret
+/// fields; callers that log configuration must use
+/// [`Config::safe_summary`].
 #[derive(Clone)]
 pub struct Config {
     pub endpoint: String,
@@ -47,40 +49,113 @@ pub enum ConfigError {
     EmptyBucket,
     #[error("S3_ENDPOINT must be an http:// or https:// URL")]
     BadEndpoint,
+    #[error("{variable} and {file_variable} are both set; set only one of them")]
+    ConflictingCredentialSources {
+        variable: String,
+        file_variable: String,
+    },
+    #[error("cannot read {file_variable} file {path}: {source}")]
+    CredentialFileRead {
+        file_variable: String,
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{file_variable} file {path} is empty")]
+    EmptyCredentialFile { file_variable: String, path: String },
 }
 
-fn required(name: &str) -> Result<String, ConfigError> {
-    match env::var(name) {
-        Ok(v) if !v.trim().is_empty() => Ok(v.trim().to_string()),
+fn required<F>(lookup: &F, name: &str) -> Result<String, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match lookup(name) {
+        Some(v) if !v.trim().is_empty() => Ok(v.trim().to_string()),
         _ => Err(ConfigError::Missing(name.to_string())),
     }
 }
 
-fn optional_u64(name: &str, default: u64) -> Result<u64, ConfigError> {
-    match env::var(name) {
-        Ok(v) if !v.trim().is_empty() => v.trim().parse::<u64>().map_err(|_| {
+fn optional_u64<F>(lookup: &F, name: &str, default: u64) -> Result<u64, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match lookup(name) {
+        Some(v) if !v.trim().is_empty() => v.trim().parse::<u64>().map_err(|_| {
             ConfigError::Invalid(name.to_string(), "expected a non-negative integer".into())
         }),
         _ => Ok(default),
     }
 }
 
-fn optional_u32(name: &str, default: u32) -> Result<u32, ConfigError> {
-    match env::var(name) {
-        Ok(v) if !v.trim().is_empty() => v.trim().parse::<u32>().map_err(|_| {
+fn optional_u32<F>(lookup: &F, name: &str, default: u32) -> Result<u32, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match lookup(name) {
+        Some(v) if !v.trim().is_empty() => v.trim().parse::<u32>().map_err(|_| {
             ConfigError::Invalid(name.to_string(), "expected a non-negative integer".into())
         }),
         _ => Ok(default),
     }
+}
+
+/// Read an S3 credential from a direct variable or from a file.
+///
+/// A credential file read error names the variable and the path only. The
+/// error never contains the file contents.
+fn credential<F>(lookup: &F, name: &str) -> Result<String, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let file_variable = format!("{name}_FILE");
+    let direct = lookup(name).filter(|value| !value.trim().is_empty());
+    let file_path = lookup(&file_variable).filter(|value| !value.trim().is_empty());
+    match (direct, file_path) {
+        (Some(_), Some(_)) => Err(ConfigError::ConflictingCredentialSources {
+            variable: name.to_string(),
+            file_variable,
+        }),
+        (Some(value), None) => Ok(value.trim().to_string()),
+        (None, Some(path)) => read_credential_file(&file_variable, path.trim()),
+        (None, None) => Err(ConfigError::Missing(format!("{name} or {file_variable}"))),
+    }
+}
+
+fn read_credential_file(file_variable: &str, path: &str) -> Result<String, ConfigError> {
+    let contents =
+        std::fs::read_to_string(path).map_err(|source| ConfigError::CredentialFileRead {
+            file_variable: file_variable.to_string(),
+            path: path.to_string(),
+            source,
+        })?;
+    let value = contents.trim();
+    if value.is_empty() {
+        return Err(ConfigError::EmptyCredentialFile {
+            file_variable: file_variable.to_string(),
+            path: path.to_string(),
+        });
+    }
+    Ok(value.to_string())
 }
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let endpoint = required("S3_ENDPOINT")?;
+        Self::from_lookup(|name| env::var(name).ok())
+    }
+
+    /// Build a configuration from a name-to-value lookup.
+    ///
+    /// `from_env` passes the process environment. Unit tests pass a plain
+    /// map, so they do not change global process state.
+    fn from_lookup<F>(lookup: F) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let endpoint = required(&lookup, "S3_ENDPOINT")?;
         if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
             return Err(ConfigError::BadEndpoint);
         }
-        let bucket = required("S3_BUCKET")?;
+        let bucket = required(&lookup, "S3_BUCKET")?;
         if bucket.is_empty() {
             return Err(ConfigError::EmptyBucket);
         }
@@ -89,16 +164,15 @@ impl Config {
             bucket,
             // Region is a signing placeholder for S3-compatible stores such
             // as Garage. It is not hardcoded: the operator supplies it.
-            region: env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
-            access_key_id: required("S3_ACCESS_KEY_ID")?,
-            secret_access_key: required("S3_SECRET_ACCESS_KEY")?,
-            max_text_bytes: optional_u64("DAYFLY_MAX_TEXT_BYTES", 10 * 1024 * 1024)?,
-            max_file_bytes: optional_u64("DAYFLY_MAX_FILE_BYTES", 1024 * 1024 * 1024)?,
-            default_ttl_days: optional_u32("DAYFLY_DEFAULT_TTL_DAYS", 7)?,
-            http_bind: env::var("DAYFLY_HTTP_BIND")
-                .unwrap_or_else(|_| "127.0.0.1:8080".to_string()),
-            http_bearer_token: match env::var("DAYFLY_HTTP_BEARER_TOKEN") {
-                Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+            region: lookup("S3_REGION").unwrap_or_else(|| "us-east-1".to_string()),
+            access_key_id: credential(&lookup, "S3_ACCESS_KEY_ID")?,
+            secret_access_key: credential(&lookup, "S3_SECRET_ACCESS_KEY")?,
+            max_text_bytes: optional_u64(&lookup, "DAYFLY_MAX_TEXT_BYTES", 10 * 1024 * 1024)?,
+            max_file_bytes: optional_u64(&lookup, "DAYFLY_MAX_FILE_BYTES", 1024 * 1024 * 1024)?,
+            default_ttl_days: optional_u32(&lookup, "DAYFLY_DEFAULT_TTL_DAYS", 7)?,
+            http_bind: lookup("DAYFLY_HTTP_BIND").unwrap_or_else(|| "127.0.0.1:8080".to_string()),
+            http_bearer_token: match lookup("DAYFLY_HTTP_BEARER_TOKEN") {
+                Some(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
                 _ => None,
             },
         })
@@ -141,7 +215,77 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    fn lookup_from(pairs: &[(String, String)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs.iter().cloned().collect();
+        move |name| map.get(name).cloned()
+    }
+
+    fn base_env() -> Vec<(String, String)> {
+        [
+            ("S3_ENDPOINT", "http://127.0.0.1:3900"),
+            ("S3_BUCKET", "test-bucket"),
+            ("S3_ACCESS_KEY_ID", "test-access-key"),
+            ("S3_SECRET_ACCESS_KEY", "test-secret-key"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+    }
+
+    fn with_credential_file(
+        mut pairs: Vec<(String, String)>,
+        direct: &str,
+        file: &str,
+        path: &str,
+    ) -> Vec<(String, String)> {
+        pairs.retain(|(name, _)| name != direct);
+        pairs.push((file.to_string(), path.to_string()));
+        pairs
+    }
+
+    fn expect_error(result: Result<Config, ConfigError>) -> ConfigError {
+        match result {
+            Ok(_) => panic!("expected a configuration error"),
+            Err(error) => error,
+        }
+    }
+
+    fn unique_temp_path() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "dayfly-config-test-{}-{count}.txt",
+            std::process::id()
+        ))
+    }
+
+    struct TempCredentialFile {
+        path: PathBuf,
+    }
+
+    impl TempCredentialFile {
+        fn new(contents: &str) -> Self {
+            let path = unique_temp_path();
+            std::fs::write(&path, contents).expect("write temp credential file");
+            Self { path }
+        }
+
+        fn path(&self) -> &str {
+            self.path.to_str().expect("temp path is UTF-8")
+        }
+    }
+
+    impl Drop for TempCredentialFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 
     fn test_config(max_text_bytes: u64, max_file_bytes: u64) -> Config {
         Config {
@@ -169,10 +313,108 @@ mod tests {
 
     #[test]
     fn endpoint_must_be_http_url() {
-        // from_env reads the real process environment, so only test the
-        // validation rule indirectly via a helper-free check: a non-URL
-        // endpoint is rejected by construction in from_env, and this test
-        // documents that contract. See README for the env contract.
-        assert!(ConfigError::BadEndpoint.to_string().contains("http"));
+        let mut pairs = base_env();
+        pairs[0].1 = "ftp://127.0.0.1:3900".to_string();
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        assert!(matches!(error, ConfigError::BadEndpoint));
+    }
+
+    #[test]
+    fn direct_credentials_still_work() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("direct config");
+        assert_eq!(config.access_key_id, "test-access-key");
+        assert_eq!(config.secret_access_key, "test-secret-key");
+    }
+
+    #[test]
+    fn credential_file_value_is_trimmed() {
+        let access = TempCredentialFile::new("file-access-key\n");
+        let secret = TempCredentialFile::new("file-secret-key\r\n");
+        let mut pairs = base_env();
+        pairs = with_credential_file(
+            pairs,
+            "S3_ACCESS_KEY_ID",
+            "S3_ACCESS_KEY_ID_FILE",
+            access.path(),
+        );
+        pairs = with_credential_file(
+            pairs,
+            "S3_SECRET_ACCESS_KEY",
+            "S3_SECRET_ACCESS_KEY_FILE",
+            secret.path(),
+        );
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("file config");
+        assert_eq!(config.access_key_id, "file-access-key");
+        assert_eq!(config.secret_access_key, "file-secret-key");
+    }
+
+    #[test]
+    fn empty_credential_file_is_rejected() {
+        let file = TempCredentialFile::new("\n");
+        let pairs = with_credential_file(
+            base_env(),
+            "S3_ACCESS_KEY_ID",
+            "S3_ACCESS_KEY_ID_FILE",
+            file.path(),
+        );
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        match &error {
+            ConfigError::EmptyCredentialFile {
+                file_variable,
+                path,
+            } => {
+                assert_eq!(file_variable, "S3_ACCESS_KEY_ID_FILE");
+                assert_eq!(path, file.path());
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn missing_credential_file_is_rejected() {
+        let path = unique_temp_path();
+        assert!(!path.exists());
+        let path = path.to_str().expect("temp path is UTF-8");
+        let pairs = with_credential_file(
+            base_env(),
+            "S3_SECRET_ACCESS_KEY",
+            "S3_SECRET_ACCESS_KEY_FILE",
+            path,
+        );
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        match &error {
+            ConfigError::CredentialFileRead {
+                file_variable,
+                path: error_path,
+                source,
+            } => {
+                assert_eq!(file_variable, "S3_SECRET_ACCESS_KEY_FILE");
+                assert_eq!(error_path, path);
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn direct_and_file_credentials_conflict() {
+        let file = TempCredentialFile::new("file-access-key\n");
+        let mut pairs = base_env();
+        pairs.push(("S3_ACCESS_KEY_ID_FILE".to_string(), file.path().to_string()));
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        match &error {
+            ConfigError::ConflictingCredentialSources {
+                variable,
+                file_variable,
+            } => {
+                assert_eq!(variable, "S3_ACCESS_KEY_ID");
+                assert_eq!(file_variable, "S3_ACCESS_KEY_ID_FILE");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert!(
+            !error.to_string().contains("test-access-key"),
+            "message: {error}"
+        );
     }
 }

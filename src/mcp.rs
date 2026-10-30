@@ -7,8 +7,8 @@
 //!
 //! Access model: the MCP process is spawned locally by the agent host,
 //! so spawning is the trust boundary here. The binary alone holds the
-//! Garage credentials (from the environment); tools never return them
-//! and no presigned URL is ever issued.
+//! Garage credentials (from environment variables or credential files);
+//! tools never return them and no presigned URL is ever issued.
 
 use std::path::PathBuf;
 use std::sync::Arc;
