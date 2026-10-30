@@ -1419,11 +1419,11 @@ impl Store {
                     // metadata. A head failure (e.g. deleted between list
                     // and head) drops the entry instead of failing the
                     // whole listing.
-                    let meta = self.head_metadata(&id).await.ok();
-                    if let Some(m) = &meta {
-                        if m.expired {
-                            continue;
-                        }
+                    let Some(meta) = self.head_metadata(&id).await.ok() else {
+                        continue;
+                    };
+                    if meta.expired {
+                        continue;
                     }
                     summaries.push(PasteSummary {
                         id,
@@ -1432,10 +1432,10 @@ impl Store {
                         last_modified: obj
                             .last_modified()
                             .and_then(|dt| DateTime::from_timestamp(dt.secs(), dt.subsec_nanos())),
-                        expires_at: meta.as_ref().and_then(|m| m.expires_at),
-                        created_at: meta.as_ref().and_then(|m| m.created_at),
-                        content_type: meta.as_ref().map(|m| m.content_type.clone()),
-                        filename: meta.as_ref().and_then(|m| m.filename.clone()),
+                        expires_at: meta.expires_at,
+                        created_at: meta.created_at,
+                        content_type: Some(meta.content_type),
+                        filename: meta.filename,
                     });
                 }
                 let truncated = out.is_truncated().unwrap_or(false);
