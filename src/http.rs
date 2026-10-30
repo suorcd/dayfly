@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use axum::body::Body;
-use axum::extract::{FromRequest, Multipart, Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State};
 use axum::http::header::{
     ACCEPT, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, HOST, RANGE,
 };
@@ -102,6 +102,15 @@ fn status_for(e: &StoreError) -> StatusCode {
 fn error_response(e: StoreError) -> Response {
     let status = status_for(&e);
     (status, Json(serde_json::json!({"error": e.to_string()}))).into_response()
+}
+
+/// A malformed multipart body is a client error, not an S3 or I/O failure.
+fn bad_request(message: String) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": message})),
+    )
+        .into_response()
 }
 
 /// A 413 for a text paste points at the way out: a filename uses the file
@@ -231,7 +240,7 @@ async fn upload_dispatch(
     if content_type.starts_with("multipart/form-data") {
         match Multipart::from_request(req, &()).await {
             Ok(multipart) => multipart_inner(state, headers, query, multipart).await,
-            Err(e) => error_response(StoreError::Io(e.to_string())),
+            Err(e) => bad_request(format!("invalid multipart body: {e}")),
         }
     } else {
         let filename =
@@ -289,7 +298,12 @@ async fn multipart_inner(
     // keeps the field alive only while it is being read. Text fields
     // after the file field are not read (see README); use
     // headers/query for filename/TTL instead.
-    while let Ok(Some(field)) = multipart.next_field().await {
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(e) => return bad_request(format!("invalid multipart body: {e}")),
+        };
         let name = field.name().unwrap_or("").to_string();
         if name == "file" {
             let field_content_type = field.content_type().map(|s| s.to_string());
@@ -597,9 +611,16 @@ async fn delete_bare(
 /// API routes, without state attached. `main` merges these with the
 /// human UI routes and attaches a single shared [`AppState`].
 pub fn api_router() -> Router<AppState> {
-    Router::new()
+    // Uploads are streamed and capped by the store while they are read.
+    // The axum default limit (2 MiB) would reject real file uploads before
+    // the store can apply the file cap or abort a multipart upload cleanly.
+    // Keep the limit on the other routes, where bodies are buffered.
+    let upload_routes = Router::new()
         .route("/upload", post(upload_dispatch))
         .route("/v1/pastes", post(upload_dispatch).get(list_handler))
+        .layer(DefaultBodyLimit::disable());
+    Router::new()
+        .merge(upload_routes)
         .route(
             "/v1/pastes/{date}/{random}",
             get(download_dated)

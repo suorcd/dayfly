@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Format, lint, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache Cargo build output
+        uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run clippy with warnings denied
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Run the test suite
+        run: cargo test
+      - name: Build the binary
+        run: cargo build
+
+  flake:
+    name: Nix flake check and build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Run nix flake check
+        run: nix flake check
+      - name: Run nix build
+        run: nix build -L
+
+  coverage:
+    name: Coverage summary
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+      - name: Install the Rust toolchain with LLVM tools
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Cache Cargo build output
+        uses: Swatinem/rust-cache@v2
+      - name: Collect coverage
+        run: cargo llvm-cov --workspace --all-targets --summary-only | tee coverage.txt
+      - name: Publish the coverage summary
+        run: cat coverage.txt >> "$GITHUB_STEP_SUMMARY"

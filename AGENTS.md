@@ -69,10 +69,13 @@ cargo build --release
 - Run `cargo fmt` before handing code over; fix clippy warnings
   rather than leaving them, or say plainly why one is left.
 - Tests live in the modules they cover (`src/store.rs`,
-  `src/stream.rs`, `src/content_type.rs`, `src/web.rs`). Add a test
-  for any new detection, range, expiry, or streaming behaviour —
-  especially: a failed upload must return no URL material, and peeked
-  bytes must be forwarded exactly once.
+  `src/stream.rs`, `src/content_type.rs`, `src/web.rs`) and in the
+  hermetic integration suite in `tests/`. The suite uses an in-process
+  fake S3 service. Do not make the default test run depend on Garage or
+  a network service.
+- Add a test for any new detection, range, expiry, or streaming
+  behaviour — especially: a failed upload must return no URL material,
+  and peeked bytes must be forwarded exactly once.
 - Never fake a build/test result. Report the real command output,
   including failures.
 
@@ -95,9 +98,9 @@ What a pass looks like, on a machine with Nix:
 
 ## Nix build status (read this before claiming anything)
 
-The flake builds and its unit tests pass on `x86_64-linux` against
-`nixos-unstable`, 36 of 36. That is a real result from a real run,
-not an assumption.
+The flake builds and its test suite passes on `x86_64-linux` against
+`nixos-unstable`: 169 passed and 2 ignored. That is a real result from
+a real run, not an assumption.
 
 It does **not** build on the `nixos-25.11` stable branch. The AWS SDK
 crates pinned in `Cargo.lock` require rustc 1.94.1 and 25.11 ships
