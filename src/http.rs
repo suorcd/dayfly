@@ -167,93 +167,61 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TtlSource {
-    /// `X-TTL`, `ttl`, or a `ttl` form field. Prefer this form.
-    Duration,
-    /// `X-TTL-Days`, `ttl_days`, or a `ttl_days` form field.
-    Days,
+/// The two TTL forms that a request can supply.
+///
+/// A request must use one form only. Repeated values of the same form keep
+/// the last value that appears before the file field.
+#[derive(Debug, Default)]
+struct TtlSelection {
+    duration: Option<Ttl>,
+    days: Option<Ttl>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TtlInput {
-    ttl: Ttl,
-    source: TtlSource,
-}
-
-impl TtlInput {
-    fn duration(ttl: Ttl) -> Self {
-        Self {
-            ttl,
-            source: TtlSource::Duration,
+impl TtlSelection {
+    fn set(&mut self, name: &str, value: &str) -> Result<(), TtlParseError> {
+        match name {
+            "ttl" => self.duration = Some(Ttl::parse(value)?),
+            "ttl_days" => self.days = Some(Ttl::parse_days(value)?),
+            _ => {}
         }
+        Ok(())
     }
 
-    fn days(ttl: Ttl) -> Self {
-        Self {
-            ttl,
-            source: TtlSource::Days,
+    fn is_mixed(&self) -> bool {
+        self.duration.is_some() && self.days.is_some()
+    }
+
+    fn resolve(self) -> Result<Option<Ttl>, TtlParseError> {
+        match (self.duration, self.days) {
+            (Some(_), Some(_)) => Err(TtlParseError::mixed_forms()),
+            (Some(ttl), None) | (None, Some(ttl)) => Ok(Some(ttl)),
+            (None, None) => Ok(None),
         }
     }
 }
 
 fn ttl_error_response(e: TtlParseError) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({"error": e.to_string()})),
-    )
-        .into_response()
-}
-
-fn parse_days(value: &str) -> Result<Ttl, TtlParseError> {
-    value
-        .trim()
-        .parse::<u32>()
-        .map(Ttl::days)
-        .map_err(|_| TtlParseError::invalid_days(value))
-}
-
-/// Apply a multipart `ttl` or `ttl_days` field.
-///
-/// A duration always wins over a day count, regardless of field order.
-/// A later `ttl_days` field cannot replace a duration that is already set.
-fn apply_ttl_field(
-    current: Option<TtlInput>,
-    name: &str,
-    value: &str,
-) -> Result<Option<TtlInput>, TtlParseError> {
-    match name {
-        "ttl" => Ttl::parse(value).map(|ttl| Some(TtlInput::duration(ttl))),
-        "ttl_days" => {
-            let parsed = parse_days(value)?;
-            if current.is_some_and(|input| input.source == TtlSource::Duration) {
-                Ok(current)
-            } else {
-                Ok(Some(TtlInput::days(parsed)))
-            }
-        }
-        _ => Ok(current),
-    }
+    bad_request(e.to_string())
 }
 
 /// Read a TTL from headers and query parameters.
 ///
-/// A duration from `X-TTL` or `ttl` wins over a day count from
-/// `X-TTL-Days` or `ttl_days`. A header wins over the query parameter of
-/// the same form. An invalid value is an error, not a fallback.
+/// A header wins over the query parameter of the same form. A request
+/// must use one form only: a duration form plus a day form is an error.
 fn parse_ttl(
     headers: &HeaderMap,
     query: &HashMap<String, String>,
-) -> Result<Option<TtlInput>, TtlParseError> {
+) -> Result<TtlSelection, TtlParseError> {
+    let mut selection = TtlSelection::default();
     if let Some(value) = header_str(headers, "x-ttl").or_else(|| query.get("ttl").cloned()) {
-        return Ttl::parse(&value).map(|ttl| Some(TtlInput::duration(ttl)));
+        selection.set("ttl", &value)?;
     }
     if let Some(value) =
         header_str(headers, "x-ttl-days").or_else(|| query.get("ttl_days").cloned())
     {
-        return parse_days(&value).map(|ttl| Some(TtlInput::days(ttl)));
+        selection.set("ttl_days", &value)?;
     }
-    Ok(None)
+    Ok(selection)
 }
 
 fn wants_json(headers: &HeaderMap, query: &HashMap<String, String>) -> bool {
@@ -330,8 +298,8 @@ async fn upload_dispatch(
     } else {
         let filename =
             header_str(&headers, "x-filename").or_else(|| query.get("filename").cloned());
-        let ttl = match parse_ttl(&headers, &query) {
-            Ok(ttl) => ttl.map(|input| input.ttl),
+        let ttl = match parse_ttl(&headers, &query).and_then(TtlSelection::resolve) {
+            Ok(ttl) => ttl,
             Err(e) => return ttl_error_response(e),
         };
         let known_length = header_str(&headers, CONTENT_LENGTH.as_str())
@@ -379,10 +347,13 @@ async fn multipart_inner(
 ) -> Response {
     let mut filename: Option<String> =
         header_str(&headers, "x-filename").or_else(|| query.get("filename").cloned());
-    let mut ttl = match parse_ttl(&headers, &query) {
-        Ok(ttl) => ttl,
+    let mut ttl_selection = match parse_ttl(&headers, &query) {
+        Ok(selection) => selection,
         Err(e) => return ttl_error_response(e),
     };
+    if ttl_selection.is_mixed() {
+        return ttl_error_response(TtlParseError::mixed_forms());
+    }
     // The file field is streamed inside the loop, not moved out of it:
     // an axum Field borrows its Multipart, so holding it across a
     // next_field call does not compile. Streaming inside the iteration
@@ -397,6 +368,10 @@ async fn multipart_inner(
         };
         let name = field.name().unwrap_or("").to_string();
         if name == "file" {
+            let ttl = match ttl_selection.resolve() {
+                Ok(ttl) => ttl,
+                Err(e) => return ttl_error_response(e),
+            };
             let field_content_type = field.content_type().map(|s| s.to_string());
             if filename.is_none() {
                 filename = field.file_name().map(|s| s.to_string());
@@ -415,7 +390,7 @@ async fn multipart_inner(
                     Box::pin(stream),
                     filename.as_deref(),
                     field_content_type.as_deref(),
-                    ttl.map(|input| input.ttl),
+                    ttl,
                     None,
                     max_bytes,
                 )
@@ -433,9 +408,8 @@ async fn multipart_inner(
             }
         } else if name == "ttl" || name == "ttl_days" {
             if let Ok(text) = field.text().await {
-                match apply_ttl_field(ttl, &name, &text) {
-                    Ok(next) => ttl = next,
-                    Err(e) => return ttl_error_response(e),
+                if let Err(e) = ttl_selection.set(&name, &text) {
+                    return ttl_error_response(e);
                 }
             }
         }
@@ -1108,15 +1082,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn x_ttl_takes_precedence_over_x_ttl_days_at_the_http_boundary() {
-        let (endpoint, captured) = mock_s3().await;
-        let mut config = test_config(10 * 1024 * 1024, 1024 * 1024 * 1024);
-        config.endpoint = endpoint;
-        let state = AppState {
-            store: Store::from_config(config)
-                .await
-                .expect("test S3 config must build without network access"),
-        };
+    async fn mixed_x_ttl_and_x_ttl_days_are_rejected_at_the_http_boundary() {
+        let state = test_state(10 * 1024 * 1024, 1024 * 1024 * 1024).await;
         let app = api_router().with_state(state);
 
         let req = Request::builder()
@@ -1129,21 +1096,10 @@ mod tests {
             .body(Body::from("hello"))
             .expect("request must build");
         let resp = app.oneshot(req).await.expect("router call must complete");
-        assert_eq!(resp.status(), StatusCode::CREATED);
-
-        let meta = captured
-            .lock()
-            .expect("metadata lock must not be poisoned")
-            .take()
-            .expect("the upload must reach S3");
         assert_eq!(
-            meta.get("ttl-seconds").map(String::as_str),
-            Some("5400"),
-            "X-TTL must win when both TTL forms are present"
-        );
-        assert!(
-            !meta.contains_key("ttl-days"),
-            "a compound TTL must not store a rounded ttl-days value"
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "both TTL forms must be rejected, not silently resolved"
         );
     }
 
@@ -1236,65 +1192,93 @@ mod tests {
     }
 
     #[test]
-    fn ttl_query_duration_wins_over_day_header() {
+    fn mixed_duration_query_and_day_header_is_rejected() {
         let mut headers = HeaderMap::new();
         headers.insert("x-ttl-days", HeaderValue::from_static("7"));
         let query = HashMap::from([("ttl".to_string(), "90m".to_string())]);
-        let input = parse_ttl(&headers, &query)
-            .expect("a valid query TTL must parse")
-            .expect("the query TTL must be present");
-        assert_eq!(input.ttl.num_seconds(), 5_400);
-        assert_eq!(input.source, TtlSource::Duration);
+        let error = parse_ttl(&headers, &query)
+            .and_then(TtlSelection::resolve)
+            .expect_err("a duration query plus a day header must fail");
+        assert!(error.to_string().contains("one TTL form"), "got: {error}");
     }
 
     #[test]
     fn ttl_query_days_still_selects_whole_days() {
         let query = HashMap::from([("ttl_days".to_string(), "3".to_string())]);
-        let input = parse_ttl(&HeaderMap::new(), &query)
+        let ttl = parse_ttl(&HeaderMap::new(), &query)
             .expect("a valid day TTL must parse")
+            .resolve()
+            .expect("the day TTL must be valid")
             .expect("the day TTL must be present");
-        assert_eq!(input.ttl.num_seconds(), 3 * 86_400);
-        assert_eq!(input.source, TtlSource::Days);
+        assert_eq!(ttl.num_seconds(), 3 * 86_400);
     }
 
     #[test]
     fn multipart_ttl_field_sets_subday_duration() {
-        let input = apply_ttl_field(None, "ttl", "1h30m")
-            .expect("a valid ttl field must parse")
+        let mut selection = TtlSelection::default();
+        selection
+            .set("ttl", "1h30m")
+            .expect("a valid ttl field must parse");
+        let ttl = selection
+            .resolve()
+            .expect("one TTL form must resolve")
             .expect("a ttl must be present");
-        assert_eq!(input.ttl.num_seconds(), 5_400);
-        assert_eq!(input.source, TtlSource::Duration);
+        assert_eq!(ttl.num_seconds(), 5_400);
     }
 
     #[test]
     fn multipart_ttl_days_field_still_sets_whole_days() {
-        let input = apply_ttl_field(None, "ttl_days", "3")
-            .expect("a valid ttl_days field must parse")
+        let mut selection = TtlSelection::default();
+        selection
+            .set("ttl_days", "3")
+            .expect("a valid ttl_days field must parse");
+        let ttl = selection
+            .resolve()
+            .expect("one TTL form must resolve")
             .expect("a ttl must be present");
-        assert_eq!(input.ttl.num_seconds(), 3 * 86_400);
-        assert_eq!(input.source, TtlSource::Days);
+        assert_eq!(ttl.num_seconds(), 3 * 86_400);
     }
 
     #[test]
-    fn multipart_duration_field_wins_over_day_field_in_either_order() {
-        let days_first =
-            apply_ttl_field(None, "ttl_days", "7").expect("a valid ttl_days field must parse");
-        let duration_wins = apply_ttl_field(days_first, "ttl", "1h")
-            .expect("a valid ttl field must parse")
-            .expect("a ttl must be present");
-        assert_eq!(duration_wins.ttl.num_seconds(), 3_600);
-        assert_eq!(duration_wins.source, TtlSource::Duration);
-
-        let days_cannot_replace = apply_ttl_field(Some(duration_wins), "ttl_days", "7")
-            .expect("a valid ttl_days field must parse")
-            .expect("a ttl must be present");
-        assert_eq!(days_cannot_replace.ttl.num_seconds(), 3_600);
-        assert_eq!(days_cannot_replace.source, TtlSource::Duration);
+    fn multipart_duration_and_day_fields_are_rejected_in_either_order() {
+        for fields in [
+            [("ttl", "1h"), ("ttl_days", "7")],
+            [("ttl_days", "7"), ("ttl", "1h")],
+        ] {
+            let mut selection = TtlSelection::default();
+            for (name, value) in fields {
+                selection
+                    .set(name, value)
+                    .expect("each field value must parse");
+            }
+            assert!(
+                selection.resolve().is_err(),
+                "both TTL forms must be rejected"
+            );
+        }
     }
 
     #[test]
-    fn multipart_malformed_ttl_field_is_an_error() {
-        assert!(apply_ttl_field(None, "ttl", "1x").is_err());
-        assert!(apply_ttl_field(None, "ttl_days", "soon").is_err());
+    fn repeated_ttl_field_keeps_the_last_value() {
+        let mut selection = TtlSelection::default();
+        selection
+            .set("ttl", "1h")
+            .expect("the first value must parse");
+        selection
+            .set("ttl", "90m")
+            .expect("the second value must parse");
+        let ttl = selection
+            .resolve()
+            .expect("one TTL form must resolve")
+            .expect("a ttl must be present");
+        assert_eq!(ttl.num_seconds(), 5_400);
+    }
+
+    #[test]
+    fn multipart_malformed_or_zero_ttl_field_is_an_error() {
+        assert!(TtlSelection::default().set("ttl", "1x").is_err());
+        assert!(TtlSelection::default().set("ttl", "0").is_err());
+        assert!(TtlSelection::default().set("ttl_days", "soon").is_err());
+        assert!(TtlSelection::default().set("ttl_days", "0").is_err());
     }
 }

@@ -72,7 +72,23 @@ async fn index_page_renders_both_forms_and_the_default_ttl() {
     assert!(page.contains("action=\"/ui/upload\""));
     assert!(page.contains("enctype=\"multipart/form-data\""));
     assert!(page.contains("<option value=\"7\" selected>7 days</option>"));
-    assert!(page.contains("Day granularity only"));
+    assert!(page.contains("The selector uses whole days"));
+}
+
+#[tokio::test]
+async fn text_submit_rejects_zero_ttl_days() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let form = b"text=hello&ttl_days=0".to_vec();
+
+    let request = common::request("POST", "/ui/text", &form_headers(form.len()), form);
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a zero TTL must not create an expired paste, got: {}",
+        String::from_utf8_lossy(&body)
+    );
 }
 
 #[tokio::test]

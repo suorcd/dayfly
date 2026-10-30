@@ -24,7 +24,9 @@ pub struct Config {
     pub max_text_bytes: u64,
     /// Maximum size, in bytes, for a file paste. Default: 1 GiB.
     pub max_file_bytes: u64,
-    /// Default TTL in whole days when a store call does not specify one.
+    /// Default TTL in positive whole days when a store call does not
+    /// specify one. Zero is invalid because it would create a paste that
+    /// is already expired.
     pub default_ttl_days: u32,
     /// Default bind address for HTTP mode.
     pub http_bind: String,
@@ -311,6 +313,13 @@ impl Config {
         if bucket.is_empty() {
             return Err(ConfigError::EmptyBucket);
         }
+        let default_ttl_days = optional_u32(&lookup, "DAYFLY_DEFAULT_TTL_DAYS", 7)?;
+        if default_ttl_days == 0 {
+            return Err(ConfigError::Invalid(
+                "DAYFLY_DEFAULT_TTL_DAYS".to_string(),
+                "expected a positive integer".to_string(),
+            ));
+        }
         Ok(Self {
             endpoint,
             bucket,
@@ -321,7 +330,7 @@ impl Config {
             secret_access_key: credential(&lookup, "S3_SECRET_ACCESS_KEY")?,
             max_text_bytes: optional_u64(&lookup, "DAYFLY_MAX_TEXT_BYTES", 10 * 1024 * 1024)?,
             max_file_bytes: optional_u64(&lookup, "DAYFLY_MAX_FILE_BYTES", 1024 * 1024 * 1024)?,
-            default_ttl_days: optional_u32(&lookup, "DAYFLY_DEFAULT_TTL_DAYS", 7)?,
+            default_ttl_days,
             http_bind: optional_string(&lookup, "DAYFLY_HTTP_BIND", "127.0.0.1:8080"),
             http_bearer_token: bearer_token(lookup("DAYFLY_HTTP_BEARER_TOKEN"))?,
         })

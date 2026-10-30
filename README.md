@@ -35,13 +35,14 @@ metadata is needed. See "No database in v1" below.
   value. The TTL is stored as exact seconds and as whole days when the
   duration has no smaller part. No separate metadata sidecar in v1.
 - Expiry uses a read-time TTL. The TTL accepts seconds or a duration
-  such as `90m` or `1h30m`. `ttl_days` remains as a day-based form. The
-  default is 7 days, configurable via `DAYFLY_DEFAULT_TTL_DAYS`. The
-  API and MCP layer compare stored `expires-at` metadata with now and
-  enforce expiry on read. S3 lifecycle deletion is a separate,
-  asynchronous sweeper (see `docs/lifecycle-example.json`): it is
-  day-rounded and may run after the TTL. **Exact-time deletion from the
-  bucket is not promised.**
+  such as `90m` or `1h30m`. A bare integer is always seconds: `7` is
+  seven seconds, and `7d` is seven days. `ttl_days` remains as a
+  positive whole-day form. The default is 7 days, configurable via
+  `DAYFLY_DEFAULT_TTL_DAYS`. The API and MCP layer compare stored
+  `expires-at` metadata with now and enforce expiry on read. S3
+  lifecycle deletion is a separate, asynchronous sweeper (see
+  `docs/lifecycle-example.json`): it is day-rounded and may run after
+  the TTL. **Exact-time deletion from the bucket is not promised.**
 - Streaming upload and download. A returned URL can itself be streamed
   back without downloading the whole object first.
 
@@ -146,7 +147,7 @@ placeholder values replaced by your own Garage values.
 | `S3_REGION` | no | `us-east-1` | Signing placeholder for Garage; supply your own, do not rely on the default being "yours" |
 | `DAYFLY_MAX_TEXT_BYTES` | no | 10485760 (10 MiB) | Max text paste size for MCP `store_text`, the human text form, and `POST /upload` without a filename; oversize → 413. A filename (including a multipart filename) uses `DAYFLY_MAX_FILE_BYTES` instead |
 | `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error |
-| `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in whole days when a request does not set a TTL. The name and meaning are unchanged |
+| `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1. The name and meaning are unchanged |
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
 | `DAYFLY_HTTP_BEARER_TOKEN` | no | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model) |
 
@@ -252,21 +253,35 @@ curl --data-binary @- -H 'Accept: application/json' \
 
 ### TTL forms
 
-Send `X-TTL` (or `?ttl=`) with seconds or a duration. The accepted
-forms are a bare integer as seconds (`3600`) and number and unit pairs
-with `s`, `m`, `h`, and `d` (`90m`, `1h30m`, `2d`, `1d12h`).
-`X-TTL-Days` and `ttl_days` still accept a whole number of days. When
-both forms are present, `X-TTL` or `ttl` wins. A header wins over the
-query parameter of the same form.
+Send `X-TTL` (or `?ttl=`) with seconds or a duration. A bare integer
+is seconds: `3600` is one hour, and `7` is seven seconds. Use `7d` for
+seven days. The duration forms are number and unit pairs with `s`,
+`m`, `h`, and `d` (`90m`, `1h30m`, `2d`, `1d12h`).
 
-A malformed TTL returns 400 with a JSON error. It does not fall back
-to the default. `DAYFLY_DEFAULT_TTL_DAYS` sets the default in whole
-days when no TTL is given; its name and meaning are unchanged.
+`X-TTL-Days` and `ttl_days` accept a positive whole number of days.
+Zero is rejected. Do not send both forms: a duration form plus a day
+form returns 400. Repeated values of one form keep the last value. For
+one form, a header wins over the query parameter.
+
+A malformed or zero TTL returns 400 with a JSON error. It does not
+fall back to the default. `DAYFLY_DEFAULT_TTL_DAYS` sets the default
+in positive whole days when no TTL is given; its name and meaning are
+unchanged.
 
 ```sh
 # Sub-day TTL: one hour and thirty minutes.
 cat scratch.txt | curl --data-binary @- \
   -H 'X-TTL: 1h30m' \
+  http://127.0.0.1:8080/upload
+
+# The same TTL as a number of seconds.
+cat scratch.txt | curl --data-binary @- \
+  -H 'X-TTL: 5400' \
+  http://127.0.0.1:8080/upload
+
+# Seven days. A bare 7 would mean seven seconds.
+cat notes.txt | curl --data-binary @- \
+  -H 'X-TTL: 7d' \
   http://127.0.0.1:8080/upload
 
 # The legacy day form still works.

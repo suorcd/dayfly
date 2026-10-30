@@ -212,17 +212,30 @@ fn invalid_numeric_values_name_the_variable() {
 }
 
 #[test]
+fn default_ttl_days_zero_is_rejected() {
+    let _guard = lock_env();
+    clear_env();
+    set_required();
+    env::set_var("DAYFLY_DEFAULT_TTL_DAYS", "0");
+    let error = Config::from_env()
+        .err()
+        .expect("a zero default TTL must fail config load");
+    assert!(
+        matches!(error, ConfigError::Invalid(ref field, _) if field == "DAYFLY_DEFAULT_TTL_DAYS"),
+        "the error must name DAYFLY_DEFAULT_TTL_DAYS, got {error}"
+    );
+}
+
+#[test]
 fn optional_numeric_values_accept_zero() {
     let _guard = lock_env();
     clear_env();
     set_required();
     env::set_var("DAYFLY_MAX_TEXT_BYTES", "0");
     env::set_var("DAYFLY_MAX_FILE_BYTES", "0");
-    env::set_var("DAYFLY_DEFAULT_TTL_DAYS", "0");
     let config = Config::from_env().expect("zero is a non-negative integer");
     assert_eq!(config.max_text_bytes, 0);
     assert_eq!(config.max_file_bytes, 0);
-    assert_eq!(config.default_ttl_days, 0);
 }
 
 #[test]

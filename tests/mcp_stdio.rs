@@ -370,6 +370,52 @@ fn errors_are_reported_for_missing_and_invalid_inputs() {
 }
 
 #[test]
+fn ttl_days_zero_is_rejected() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let mut client = McpClient::spawn(&fake, &[]);
+
+    let error = client
+        .call_tool(
+            "store_text",
+            json!({"text": "expired at creation", "ttl_days": 0}),
+        )
+        .expect_err("ttl_days=0 must be rejected");
+    assert_json_rpc_error(error, -32602, "ttl_days");
+
+    let error = client
+        .call_tool(
+            "store_file",
+            json!({"path": "/no/such/file", "ttl_days": 0}),
+        )
+        .expect_err("ttl_days=0 must be rejected before the file is read");
+    assert_json_rpc_error(error, -32602, "ttl_days");
+}
+
+#[test]
+fn mixed_ttl_forms_are_rejected() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let mut client = McpClient::spawn(&fake, &[]);
+
+    let error = client
+        .call_tool(
+            "store_text",
+            json!({"text": "mixed", "ttl": "1h", "ttl_days": 7}),
+        )
+        .expect_err("ttl plus ttl_days must be rejected");
+    assert_json_rpc_error(error, -32602, "ttl");
+
+    let error = client
+        .call_tool(
+            "store_file",
+            json!({"path": "/no/such/file", "ttl": "1h", "ttl_days": 7}),
+        )
+        .expect_err("ttl plus ttl_days must be rejected before the file is read");
+    assert_json_rpc_error(error, -32602, "ttl");
+}
+
+#[test]
 fn list_recent_filters_expired_objects_through_mcp() {
     let runtime = runtime();
     let fake = runtime.block_on(FakeS3::start());

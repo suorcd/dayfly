@@ -251,14 +251,16 @@ async fn text_submit_handler(
         return forbidden_page();
     }
     let filename = form.filename.filter(|f| !f.trim().is_empty());
+    let ttl = match form.ttl_days {
+        Some(days) => match Ttl::checked_days(days) {
+            Ok(ttl) => Some(ttl),
+            Err(e) => return bad_request_page(&e.to_string()),
+        },
+        None => None,
+    };
     match state
         .store
-        .store_text(
-            form.text.as_bytes(),
-            filename.as_deref(),
-            None,
-            form.ttl_days.map(Ttl::days),
-        )
+        .store_text(form.text.as_bytes(), filename.as_deref(), None, ttl)
         .await
     {
         Ok(stored) => success_page(
@@ -379,8 +381,9 @@ async fn upload_submit_handler(
         }
         if name == "ttl_days" {
             if let Ok(text) = field.text().await {
-                if let Ok(days) = text.trim().parse::<u32>() {
-                    ttl = Some(Ttl::days(days));
+                match Ttl::parse_days(&text) {
+                    Ok(parsed) => ttl = Some(parsed),
+                    Err(e) => return bad_request_page(&e.to_string()),
                 }
             }
         }

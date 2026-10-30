@@ -81,23 +81,31 @@ pub struct Ttl {
 }
 
 /// An invalid TTL value from a header, query parameter, form field, or
-/// MCP parameter.
+/// MCP parameter. It also reports a request that supplies both TTL forms.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("invalid TTL {value:?}: {reason}. {hint}")]
 pub struct TtlParseError {
-    value: String,
+    value: Option<String>,
     reason: String,
     hint: &'static str,
 }
 
+impl std::fmt::Display for TtlParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.value {
+            Some(value) => write!(f, "invalid TTL {value:?}: {}. {}", self.reason, self.hint),
+            None => write!(f, "invalid TTL: {}. {}", self.reason, self.hint),
+        }
+    }
+}
+
 const TTL_FORMS_HINT: &str =
     "Use seconds (\"3600\") or number and unit pairs (\"90m\", \"1h30m\", \"2d\", \"1d12h\").";
-const TTL_DAYS_HINT: &str = "Use a non-negative integer number of whole days.";
+const TTL_DAYS_HINT: &str = "Use a positive integer number of whole days.";
 
 impl TtlParseError {
     fn new(value: &str, reason: impl Into<String>) -> Self {
         Self {
-            value: value.to_string(),
+            value: Some(value.to_string()),
             reason: reason.into(),
             hint: TTL_FORMS_HINT,
         }
@@ -106,9 +114,18 @@ impl TtlParseError {
     /// An invalid value for the legacy `ttl_days` form.
     pub fn invalid_days(value: &str) -> Self {
         Self {
-            value: value.to_string(),
-            reason: "the value must be a non-negative integer".to_string(),
+            value: Some(value.to_string()),
+            reason: "the value must be a positive integer".to_string(),
             hint: TTL_DAYS_HINT,
+        }
+    }
+
+    /// A request supplied both a duration form and a day form.
+    pub fn mixed_forms() -> Self {
+        Self {
+            value: None,
+            reason: "use one TTL form, not both".to_string(),
+            hint: "Remove either the duration form or the day form.",
         }
     }
 }
@@ -122,6 +139,27 @@ impl Ttl {
             // fallback so an invalid value can never panic.
             duration: chrono::Duration::try_days(i64::from(days)).unwrap_or(chrono::Duration::MAX),
         }
+    }
+
+    /// A positive whole-day TTL. Zero is rejected because a paste with a
+    /// zero TTL is expired at creation.
+    pub fn checked_days(days: u32) -> Result<Self, TtlParseError> {
+        if days == 0 {
+            return Err(TtlParseError::invalid_days("0"));
+        }
+        Ok(Self::days(days))
+    }
+
+    /// Parse a positive whole-day count for the legacy `ttl_days` forms.
+    pub fn parse_days(value: &str) -> Result<Self, TtlParseError> {
+        let days: u32 = value
+            .trim()
+            .parse()
+            .map_err(|_| TtlParseError::invalid_days(value))?;
+        if days == 0 {
+            return Err(TtlParseError::invalid_days(value));
+        }
+        Ok(Self::days(days))
     }
 
     /// Parse seconds or a compound duration.
@@ -1429,6 +1467,7 @@ mod tests {
             "   ",
             "0",
             "0s",
+            "0d",
             "0h30m",
             "-1",
             "-1h",
@@ -1443,6 +1482,14 @@ mod tests {
         ] {
             assert!(Ttl::parse(value).is_err(), "value {value:?} must fail");
         }
+    }
+
+    #[test]
+    fn ttl_days_zero_is_rejected() {
+        assert!(Ttl::parse_days("0").is_err());
+        assert!(Ttl::parse_days("0 ").is_err());
+        assert!(Ttl::checked_days(0).is_err());
+        assert_eq!(Ttl::parse_days("7").unwrap().num_seconds(), 7 * 86_400);
     }
 
     #[test]
@@ -1564,14 +1611,7 @@ mod tests {
         // The streaming multipart path builds this map before the hash
         // and the final size are known. An empty string or a zero must
         // not appear, because HeadObject would report them as real.
-        let (meta, _) = metadata_for(
-            Some("a.bin"),
-            None,
-            None,
-            Ttl::days(7),
-            created,
-            &detection,
-        );
+        let (meta, _) = metadata_for(Some("a.bin"), None, None, Ttl::days(7), created, &detection);
         assert!(
             !meta.contains_key("sha256"),
             "unknown sha256 must be absent, not empty"
