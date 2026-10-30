@@ -118,6 +118,14 @@ pub struct StoreFileParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct AppendTextParams {
+    /// Full or bare paste ID.
+    pub id: String,
+    /// Text to append. The text cap applies to this append only.
+    pub text: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct FetchTextParams {
     pub id: String,
     pub offset: Option<u64>,
@@ -225,6 +233,33 @@ impl Pastebin {
             "detection_source": stored.detection_source,
             "detection_conflict": stored.detection_conflict,
             "expires_at": stored.expires_at.to_rfc3339(),
+        }))
+    }
+
+    #[tool(
+        description = "Append text to an existing paste without resending its current contents. Writes one new segment object; reads concatenate the base object and segments. An expired or missing id returns an error and writes nothing. An empty append writes nothing. sha256 is null when segments exist."
+    )]
+    async fn append_text(
+        &self,
+        Parameters(params): Parameters<AppendTextParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let appended = try_store!(
+            self.store
+                .append_text(&params.id, params.text.as_bytes())
+                .await
+        );
+        result_json(serde_json::json!({
+            "id": appended.meta.id,
+            "key": appended.meta.key,
+            "appended_bytes": appended.appended_bytes,
+            "segment_key": appended.segment_key,
+            "size": appended.meta.size,
+            "sha256": appended.meta.sha256,
+            "content_type": appended.meta.content_type,
+            "filename": appended.meta.filename,
+            "created_at": appended.meta.created_at.map(|d| d.to_rfc3339()),
+            "expires_at": appended.meta.expires_at.map(|d| d.to_rfc3339()),
+            "segments": appended.meta.segments.len(),
         }))
     }
 
