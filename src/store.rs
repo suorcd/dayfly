@@ -312,6 +312,23 @@ fn sha256_hex(data: &[u8]) -> String {
     hex_encode(&hasher.finalize())
 }
 
+/// Hash a file in fixed-size reads, so a large file is never held whole
+/// in memory. S3 takes object metadata only at CreateMultipartUpload, so
+/// the hash must exist before that call.
+async fn sha256_file(path: &Path) -> Result<String, StoreError> {
+    let mut file = File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; MULTIPART_CHUNK_BYTES];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex_encode(&hasher.finalize()))
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -322,8 +339,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn metadata_for(
     filename: Option<&str>,
-    sha256: &str,
-    size: u64,
+    sha256: Option<&str>,
+    size: Option<u64>,
     ttl_days: u32,
     created_at: DateTime<Utc>,
     detection: &Detection,
@@ -335,8 +352,15 @@ fn metadata_for(
             meta.insert("filename".to_string(), encode_filename(f));
         }
     }
-    meta.insert("sha256".to_string(), sha256.to_string());
-    meta.insert("size".to_string(), size.to_string());
+    // sha256 and size are unknown until the upload completes. Omit both
+    // keys then, so HeadObject does not report an empty hash or a zero
+    // size as a real value.
+    if let Some(hash) = sha256 {
+        meta.insert("sha256".to_string(), hash.to_string());
+    }
+    if let Some(bytes) = size {
+        meta.insert("size".to_string(), bytes.to_string());
+    }
     meta.insert("ttl-days".to_string(), ttl_days.to_string());
     meta.insert("created-at".to_string(), created_at.to_rfc3339());
     meta.insert("expires-at".to_string(), expires_at.to_rfc3339());
@@ -568,8 +592,8 @@ impl Store {
         let ct = detection.content_type.clone();
         let (meta, expires_at) = metadata_for(
             filename,
-            &sha,
-            text.len() as u64,
+            Some(&sha),
+            Some(text.len() as u64),
             ttl,
             created_at,
             &detection,
@@ -647,8 +671,8 @@ impl Store {
             let sha = sha256_hex(&bytes);
             let (meta, expires_at) = metadata_for(
                 display_name.as_deref(),
-                &sha,
-                size,
+                Some(&sha),
+                Some(size),
                 ttl,
                 created_at,
                 &detection,
@@ -676,14 +700,26 @@ impl Store {
             });
         }
 
-        // Multipart path: single pass over the file, hashing as we go.
-        let mut hasher = Sha256::new();
+        // Multipart path: S3 takes the object metadata on
+        // CreateMultipartUpload. Hash the file first, because the hash is
+        // part of that metadata, then upload the parts. A later CopyObject
+        // would cost a second put and could fail after the object exists.
+        let sha = sha256_file(path).await?;
+        let (meta, expires_at) = metadata_for(
+            display_name.as_deref(),
+            Some(&sha),
+            Some(size),
+            ttl,
+            created_at,
+            &detection,
+        );
         let create = self
             .client
             .create_multipart_upload()
             .bucket(&self.bucket)
             .key(&key)
             .content_type(ct.clone())
+            .set_metadata(Some(meta))
             .send()
             .await
             .map_err(|e| map_sdk_error(e, &key))?;
@@ -710,7 +746,6 @@ impl Store {
                 if filled == 0 {
                     break;
                 }
-                hasher.update(&buf[..filled]);
                 let chunk = buf[..filled].to_vec();
                 let part = self
                     .client
@@ -774,33 +809,6 @@ impl Store {
                 .await;
             return Err(map_sdk_error(e, &key));
         }
-        let sha = hex_encode(&hasher.finalize());
-        // Metadata for a multipart object cannot be set at completion time
-        // through the same call, so it is attached with a copy-in-place:
-        // a CopyObject onto the same key with metadata replacement. If
-        // the store does not support that, the object is still stored and
-        // fetchable; expiry is then only visible via the returned record
-        // and the lifecycle sweeper, not via HeadObject metadata.
-        let (meta, expires_at) = metadata_for(
-            display_name.as_deref(),
-            &sha,
-            size,
-            ttl,
-            created_at,
-            &detection,
-        );
-        let copy_source = format!("{}/{}", self.bucket, key);
-        let _ = self
-            .client
-            .copy_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .copy_source(copy_source)
-            .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
-            .content_type(ct.clone())
-            .set_metadata(Some(meta))
-            .send()
-            .await;
         Ok(StoredPaste {
             id: format!("{date}/{random_id}"),
             key,
@@ -850,10 +858,18 @@ impl Store {
             crate::content_type::detect_and_wrap(stream, content_type, filename).await;
         let ct = detection.content_type.clone();
         // Metadata for the initial upload: filename, TTL, expiry, final
-        // type and detection record. sha256/size are added by put_small
-        // or by the post-multipart copy-in-place (see below).
-        let (initial_meta, expires_at) =
-            metadata_for(display_name.as_deref(), "", 0, ttl, created_at, &detection);
+        // type and detection record. The hash and the final size are not
+        // known yet. put_small adds both; for multipart, S3 stores the
+        // size in ContentLength. S3 takes metadata only at
+        // CreateMultipartUpload, so no later copy updates it.
+        let (initial_meta, expires_at) = metadata_for(
+            display_name.as_deref(),
+            None,
+            None,
+            ttl,
+            created_at,
+            &detection,
+        );
         let mut sink = AwsUploadSink {
             client: self.client.clone(),
             bucket: self.bucket.clone(),
@@ -864,30 +880,6 @@ impl Store {
         let outcome =
             crate::stream::run_streaming_upload(wrapped, &mut sink, known_length, max_bytes)
                 .await?;
-        if outcome.used_multipart {
-            // Attach the full metadata (sha256, real size) by copy-in-
-            // place, best effort, exactly as in store_file_path.
-            let (meta, _) = metadata_for(
-                display_name.as_deref(),
-                &outcome.sha256,
-                outcome.total_bytes,
-                ttl,
-                created_at,
-                &detection,
-            );
-            let copy_source = format!("{}/{}", self.bucket, key);
-            let _ = self
-                .client
-                .copy_object()
-                .bucket(&self.bucket)
-                .key(&key)
-                .copy_source(copy_source)
-                .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
-                .content_type(ct.clone())
-                .set_metadata(Some(meta))
-                .send()
-                .await;
-        }
         Ok(StoredPaste {
             id: format!("{date}/{random_id}"),
             key,
@@ -1194,7 +1186,14 @@ mod tests {
             source: "text",
             conflict: None,
         };
-        let (meta, expires) = metadata_for(Some("a b.txt"), "deadbeef", 3, 7, created, &detection);
+        let (meta, expires) = metadata_for(
+            Some("a b.txt"),
+            Some("deadbeef"),
+            Some(3),
+            7,
+            created,
+            &detection,
+        );
         assert_eq!(meta.get("detection-source").unwrap(), "text");
         assert_eq!(
             meta.get("content-type").unwrap(),
@@ -1205,5 +1204,65 @@ mod tests {
         assert_eq!(meta.get("filename").unwrap(), "a%20b%2Etxt");
         assert_eq!(decode_filename(meta.get("filename").unwrap()), "a b.txt");
         assert!(expires > created);
+    }
+
+    #[tokio::test]
+    async fn sha256_file_hashes_the_whole_file() {
+        let dir = std::env::temp_dir().join(format!("dayfly-sha256-{}", generate_random_id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("blob.bin");
+        // More than one read, so the loop boundary is exercised.
+        let data = vec![0x5au8; MULTIPART_CHUNK_BYTES + 17];
+        tokio::fs::write(&path, &data).await.unwrap();
+        assert_eq!(sha256_file(&path).await.unwrap(), sha256_hex(&data));
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[test]
+    fn metadata_map_for_known_hash_is_complete() {
+        let created = Utc.with_ymd_and_hms(2026, 10, 28, 0, 0, 0).unwrap();
+        let detection = Detection {
+            content_type: "text/plain; charset=utf-8".to_string(),
+            source: "text",
+            conflict: None,
+        };
+        let (meta, expires) = metadata_for(
+            Some("note.txt"),
+            Some("abc123"),
+            Some(42),
+            3,
+            created,
+            &detection,
+        );
+        assert_eq!(meta.get("expires-at").unwrap(), "2026-10-31T00:00:00+00:00");
+        assert_eq!(meta.get("created-at").unwrap(), "2026-10-28T00:00:00+00:00");
+        assert_eq!(meta.get("ttl-days").unwrap(), "3");
+        assert_eq!(
+            meta.get("content-type").unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(meta.get("sha256").unwrap(), "abc123");
+        assert_eq!(meta.get("size").unwrap(), "42");
+        assert_eq!(expires, created + chrono::Duration::days(3));
+    }
+
+    #[test]
+    fn metadata_map_for_unknown_hash_omits_hash_and_size() {
+        let created = Utc.with_ymd_and_hms(2026, 10, 28, 0, 0, 0).unwrap();
+        let detection = Detection {
+            content_type: "application/octet-stream".to_string(),
+            source: "fallback",
+            conflict: None,
+        };
+        // The streaming multipart path builds this map before the hash
+        // and the final size are known. An empty string or a zero must
+        // not appear, because HeadObject would report them as real.
+        let (meta, _) = metadata_for(Some("a.bin"), None, None, 7, created, &detection);
+        assert!(
+            !meta.contains_key("sha256"),
+            "unknown sha256 must be absent, not empty"
+        );
+        assert!(!meta.contains_key("size"), "unknown size must be absent");
+        assert_eq!(meta.get("expires-at").unwrap(), "2026-11-04T00:00:00+00:00");
     }
 }

@@ -28,9 +28,11 @@ metadata is needed. See "No database in v1" below.
   `pastes/<yyyy-mm-dd>/<random-id>`, where the random ID has at least
   128 bits of entropy (base62). A user-supplied filename is never put
   in the key.
-- Filename, content-type, size, sha256, created date, and TTL in days
-  are stored in object metadata/headers. No separate metadata sidecar
-  in v1.
+- Filename, content-type, created date, and TTL in days are stored in
+  object metadata. The S3 `Content-Length` gives the size. A `sha256`
+  value is stored when the hash is known before the object is created.
+  A multipart stream cannot know the hash in advance, so it omits the
+  value. No separate metadata sidecar in v1.
 - Expiry is **day-granular only**. `ttl_days` on store (default 7,
   configurable via `DAYFLY_DEFAULT_TTL_DAYS`). Expiry is enforced on
   read in the API/MCP layer by comparing stored `expires-at` metadata
@@ -549,11 +551,11 @@ not by reading the code. They are recorded here so a reader does not
 have to discover them, and so the claims elsewhere in this file stay
 honest.
 
-- **A local-file upload over 8 MiB depends on a copy for metadata.**
-  `store_file` creates the multipart upload with no metadata and adds
-  it afterwards with a same-key `CopyObject` whose error is discarded.
-  If that copy fails, the object has no `expires-at` and never expires
-  on read.
+- **A streaming multipart upload has no stored `sha256`.** S3 takes
+  object metadata only at `CreateMultipartUpload`, before the hash is
+  known. `HeadObject` and the `fetch_metadata` MCP tool report no hash
+  for these objects. The store response still includes it, and the
+  size still comes from `Content-Length`.
 - **Text detection inspects the first 8 KiB only.** A file that is
   ASCII at the start and binary later is stored as `text/plain` and
   served inline.
