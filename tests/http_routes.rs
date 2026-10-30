@@ -356,13 +356,13 @@ async fn bearer_auth_is_required_and_accepted_on_api_and_ui() {
     assert_eq!(status, StatusCode::CREATED);
 
     let request = common::request("GET", "/", &[], Vec::new());
-    let (status, headers, _) = common::send(&app, request).await;
+    let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert!(headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .starts_with("text/html"));
+    assert_eq!(
+        common::json_body(&body)["error"],
+        "unauthorized",
+        "the UI must use the shared JSON auth error"
+    );
 
     let request = common::request(
         "GET",

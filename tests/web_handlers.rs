@@ -398,13 +398,13 @@ async fn ui_auth_rejects_requests_without_the_bearer_token() {
 
     for uri in ["/", "/pastes", "/view/2026-10-28/missing"] {
         let request = common::request("GET", uri, &[], Vec::new());
-        let (status, headers, body) = common::send(&app, request).await;
+        let (status, _, body) = common::send(&app, request).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
-        assert!(html_text(&body).contains("requires an Authorization header"));
-        assert!(headers[header::CONTENT_TYPE]
-            .to_str()
-            .unwrap()
-            .starts_with("text/html"));
+        assert_eq!(
+            common::json_body(&body)["error"],
+            "unauthorized",
+            "{uri} must use the shared JSON auth error"
+        );
     }
 
     let form = b"text=blocked".to_vec();
