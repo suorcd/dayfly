@@ -2,8 +2,12 @@ name: container
 
 # Actions are pinned to commit SHAs. To update one, resolve the tag with
 # `git ls-remote --tags <repo> <tag>` and replace the SHA and version comment.
+# For an annotated tag, pin the peeled `^{}` commit SHA.
 # Builds the OCI image from the flake, proves it runs, then publishes it to
 # ghcr.io. Pull requests build and smoke test only, so a branch cannot publish.
+# Publication is x86_64-linux only: GitHub runners build that platform, and a
+# multi-platform image needs an emulated or native aarch64-linux builder, which
+# this pass does not add.
 on:
   push:
     branches: [main]
@@ -11,29 +15,32 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Read the tree, write packages, nothing else. Publishing uses the
-# workflow-scoped GITHUB_TOKEN rather than a stored secret, so no PAT exists to
-# rotate.
-permissions:
-  contents: read
-  packages: write
-
 concurrency:
   group: container-${{ github.ref }}
-  cancel-in-progress: true
+  # A tag run publishes several tags from one image. Cancelling it midway
+  # leaves a partial tag set, so tag runs are never cancelled.
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
   image:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install Nix
         uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+
+      - name: Restore and save the Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', '**/*.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
 
       - name: Build the image
         run: nix build .#container -L
@@ -57,7 +64,12 @@ jobs:
           IMAGE: ${{ steps.load.outputs.image }}
         run: |
           set -euo pipefail
-          docker run --rm "$IMAGE" --version
+          # The tag comes from the loaded image, so the check fails if the
+          # binary version and the image tag drift apart.
+          tag="${IMAGE##*:}"
+          version=$(docker run --rm "$IMAGE" --version)
+          echo "--version -> $version"
+          test "$version" = "dayfly $tag"
 
           # It must serve, not merely start. S3 points at a closed port on
           # purpose: the frontend needs no object store, so a 200 proves the
@@ -83,25 +95,68 @@ jobs:
           docker rm -f dayfly || true
           test "$code" = "200"
 
+      - name: Stage the image tar
+        run: cp --dereference result dayfly-image.tar
+
+      - name: Upload the image tar
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: dayfly-image
+          path: dayfly-image.tar
+          if-no-files-found: error
+
+  publish:
+    needs: image
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download the image tar
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: dayfly-image
+          path: image
+
+      - name: Load it
+        id: load
+        run: |
+          set -euo pipefail
+          tar_file=image/dayfly-image.tar
+          image=$(tar -xzOf "$tar_file" manifest.json \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["RepoTags"][0])')
+          docker load < "$tar_file"
+          docker image inspect "$image" > /dev/null
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "loaded $image"
+
       - name: Log in to ghcr.io
-        if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
           echo "${{ secrets.GITHUB_TOKEN }}" \
             | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Publish
-        if: github.event_name != 'pull_request'
         env:
           IMAGE: ${{ steps.load.outputs.image }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           repo="ghcr.io/${{ github.repository }}"
 
           tags=("sha-${GITHUB_SHA::7}")
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            tags+=("${GITHUB_REF_NAME}" "latest")
-          elif [ "${GITHUB_REF_NAME}" = "main" ]; then
+          if [ "$REF_TYPE" = "tag" ]; then
+            tags+=("$REF_NAME")
+            # Publish `latest` only for a stable release. A tag with a hyphen
+            # is a pre-release such as v1.2.3-rc.1, so it must not move
+            # `latest`.
+            case "$REF_NAME" in
+              *-*) ;;
+              *) tags+=("latest") ;;
+            esac
+          elif [ "$REF_NAME" = "main" ]; then
             tags+=("edge")
           fi
 

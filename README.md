@@ -740,6 +740,17 @@ S3_ENDPOINT=... S3_BUCKET=... S3_ACCESS_KEY_ID=... S3_SECRET_ACCESS_KEY=... \
 nix flake check
 ```
 
+The flake also builds the OCI image:
+
+```sh
+nix build .#container   # OCI image tar in ./result
+```
+
+The image runs `dayfly serve` on port 8080 as uid 65534. The container
+workflow publishes only `x86_64-linux` images. GitHub runners build that
+platform, and this pass does not add an emulated or native `aarch64-linux`
+builder. The flake still lists `aarch64-linux` for local builds.
+
 What a pass looks like, on a machine with Nix: `nix flake check`
 exits 0 with no errors; `nix build` exits 0 and creates a
 `./result` symlink pointing into the Nix store, and

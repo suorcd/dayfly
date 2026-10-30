@@ -25,6 +25,10 @@
   outputs =
     { self, nixpkgs }:
     let
+      # One version source: Cargo.toml. The package version and the container
+      # tag both read it, so a release bump changes only that file.
+      cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+      version = cargoToml.package.version;
       systems = [
         "x86_64-linux"
         "aarch64-linux"
@@ -38,7 +42,7 @@
         let
           dayfly = pkgs.rustPlatform.buildRustPackage {
             pname = "dayfly";
-            version = "0.1.0";
+            inherit version;
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
             # No system libraries are needed: TLS goes through Rust crates
@@ -51,7 +55,7 @@
           # does not hard-code a registry.
           container = pkgs.dockerTools.buildLayeredImage {
             name = "dayfly";
-            tag = "0.1.0";
+            tag = version;
             contents = [
               pkgs.dockerTools.binSh
               pkgs.dockerTools.fakeNss
