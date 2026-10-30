@@ -8,12 +8,14 @@ use std::sync::{Mutex, MutexGuard};
 
 use dayfly::config::{Config, ConfigError};
 
-const VARS: [&str; 9] = [
+const VARS: [&str; 11] = [
     "S3_ENDPOINT",
     "S3_BUCKET",
     "S3_REGION",
     "S3_ACCESS_KEY_ID",
     "S3_SECRET_ACCESS_KEY",
+    "S3_ACCESS_KEY_ID_FILE",
+    "S3_SECRET_ACCESS_KEY_FILE",
     "DAYFLY_MAX_TEXT_BYTES",
     "DAYFLY_MAX_FILE_BYTES",
     "DAYFLY_DEFAULT_TTL_DAYS",
@@ -74,7 +76,7 @@ fn optional_values_override_the_defaults() {
     env::set_var("DAYFLY_MAX_FILE_BYTES", "5678");
     env::set_var("DAYFLY_DEFAULT_TTL_DAYS", "30");
     env::set_var("DAYFLY_HTTP_BIND", "0.0.0.0:9999");
-    env::set_var("DAYFLY_HTTP_BEARER_TOKEN", " token-value ");
+    env::set_var("DAYFLY_HTTP_BEARER_TOKEN", "token-value");
 
     let config = Config::from_env().expect("overrides must parse");
     assert_eq!(config.region, "garage-test");
@@ -124,7 +126,11 @@ fn each_missing_required_value_names_the_variable() {
     let error = Config::from_env()
         .err()
         .expect("a missing access key must fail");
-    assert!(matches!(error, ConfigError::Missing(ref name) if name == "S3_ACCESS_KEY_ID"));
+    assert!(matches!(
+        error,
+        ConfigError::Missing(ref name)
+            if name == "S3_ACCESS_KEY_ID or S3_ACCESS_KEY_ID_FILE"
+    ));
 
     clear_env();
     env::set_var("S3_ENDPOINT", "https://s3.example.invalid");
@@ -133,7 +139,11 @@ fn each_missing_required_value_names_the_variable() {
     let error = Config::from_env()
         .err()
         .expect("a missing secret must fail");
-    assert!(matches!(error, ConfigError::Missing(ref name) if name == "S3_SECRET_ACCESS_KEY"));
+    assert!(matches!(
+        error,
+        ConfigError::Missing(ref name)
+            if name == "S3_SECRET_ACCESS_KEY or S3_SECRET_ACCESS_KEY_FILE"
+    ));
 }
 
 #[test]
@@ -150,7 +160,11 @@ fn blank_required_values_are_reported_as_missing() {
     let error = Config::from_env()
         .err()
         .expect("a blank access key must fail");
-    assert!(matches!(error, ConfigError::Missing(ref name) if name == "S3_ACCESS_KEY_ID"));
+    assert!(matches!(
+        error,
+        ConfigError::Missing(ref name)
+            if name == "S3_ACCESS_KEY_ID or S3_ACCESS_KEY_ID_FILE"
+    ));
 }
 
 #[test]
@@ -221,6 +235,21 @@ fn blank_bearer_token_means_no_auth() {
         let config = Config::from_env().expect("a blank token must parse");
         assert_eq!(config.http_bearer_token, None, "value {value:?}");
     }
+}
+
+#[test]
+fn bearer_token_with_whitespace_is_rejected() {
+    let _guard = lock_env();
+    clear_env();
+    set_required();
+    env::set_var("DAYFLY_HTTP_BEARER_TOKEN", "two words");
+    let error = Config::from_env()
+        .err()
+        .expect("a token with whitespace must fail");
+    assert!(matches!(
+        error,
+        ConfigError::Invalid(ref name, _) if name == "DAYFLY_HTTP_BEARER_TOKEN"
+    ));
 }
 
 #[test]
