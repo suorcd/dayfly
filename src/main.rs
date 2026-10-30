@@ -13,6 +13,7 @@
 use clap::{Parser, Subcommand};
 use rmcp::transport::stdio;
 use rmcp::ServiceExt;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
 use dayfly::config::Config;
@@ -48,9 +49,14 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Stderr only: stdout belongs to MCP JSON-RPC in MCP mode.
+    // The default level is WARN, so an unsafe credential file permission
+    // warning is visible without RUST_LOG. RUST_LOG still sets the filter.
+    let filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::WARN.into())
+        .from_env_lossy();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(filter)
         .init();
 
     let cli = Cli::parse();
