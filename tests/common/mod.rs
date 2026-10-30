@@ -89,11 +89,66 @@ impl FakeState {
     }
 }
 
+/// An operation that the fake service can hold open.
+///
+/// A held operation blocks the client inside that request, which is the
+/// only way to change a file at a known point in a store call. Without
+/// it, the size and hash races are untestable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gate {
+    /// Every HeadObject, including the alias probe.
+    HeadObject,
+    /// CreateMultipartUpload.
+    CreateMultipartUpload,
+}
+
+#[derive(Default)]
+struct GateState {
+    held: Vec<Gate>,
+    blocked: Vec<Gate>,
+}
+
+/// The hold-and-release control for [`Gate`].
+#[derive(Default)]
+struct GateControl {
+    state: Mutex<GateState>,
+}
+
+impl GateControl {
+    /// Wait here while `gate` is held. Called from the fake service.
+    async fn pass(&self, gate: Gate) {
+        if !self.state.lock().expect("gate lock").held.contains(&gate) {
+            return;
+        }
+        {
+            let mut state = self.state.lock().expect("gate lock");
+            if !state.blocked.contains(&gate) {
+                state.blocked.push(gate);
+            }
+        }
+        for _ in 0..4_000 {
+            if !self.state.lock().expect("gate lock").held.contains(&gate) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("the gate for {gate:?} was never released");
+    }
+}
+
+/// The service state: the fake bucket plus the gate control.
+#[derive(Clone)]
+struct FakeApp {
+    state: Arc<Mutex<FakeState>>,
+    gate: Arc<GateControl>,
+}
+
 /// Handle to a running fake S3 service.
 pub struct FakeS3 {
     pub endpoint: String,
     pub bucket: String,
     state: Arc<Mutex<FakeState>>,
+    gate: Arc<GateControl>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -110,9 +165,11 @@ impl FakeS3 {
 
     pub async fn start_with_bucket(bucket: &str) -> Self {
         let state = Arc::new(Mutex::new(FakeState::new(bucket)));
-        let app = Router::new()
-            .fallback(handle_request)
-            .with_state(Arc::clone(&state));
+        let gate = Arc::new(GateControl::default());
+        let app = Router::new().fallback(handle_request).with_state(FakeApp {
+            state: Arc::clone(&state),
+            gate: Arc::clone(&gate),
+        });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("fake S3 listener must bind");
@@ -126,6 +183,7 @@ impl FakeS3 {
             endpoint: format!("http://{addr}"),
             bucket: bucket.to_string(),
             state,
+            gate,
             handle,
         }
     }
@@ -233,6 +291,36 @@ impl FakeS3 {
 
     pub fn set_missing_bucket(&self, missing: bool) {
         self.state.lock().expect("fake state lock").missing_bucket = missing;
+    }
+
+    /// Hold every matching operation until [`Self::release`] runs.
+    pub fn hold(&self, gate: Gate) {
+        self.gate.state.lock().expect("gate lock").held.push(gate);
+    }
+
+    /// Wait until a held operation is blocked inside the fake service.
+    pub async fn wait_until_blocked(&self, gate: Gate) {
+        for _ in 0..4_000 {
+            if self
+                .gate
+                .state
+                .lock()
+                .expect("gate lock")
+                .blocked
+                .contains(&gate)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("the fake service never blocked on {gate:?}");
+    }
+
+    /// Release every held operation.
+    pub fn release(&self) {
+        let mut state = self.gate.state.lock().expect("gate lock");
+        state.held.clear();
+        state.blocked.clear();
     }
 
     pub fn fail(&self, op: FailOp) {
@@ -389,7 +477,9 @@ fn object_headers(object: &S3Object) -> HeaderMap {
     headers
 }
 
-async fn handle_request(State(state): State<Arc<Mutex<FakeState>>>, req: Request) -> Response {
+async fn handle_request(State(app): State<FakeApp>, req: Request) -> Response {
+    let state = Arc::clone(&app.state);
+    let gate_control = Arc::clone(&app.gate);
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
@@ -427,6 +517,16 @@ async fn handle_request(State(state): State<Arc<Mutex<FakeState>>>, req: Request
                 query: uri.query().unwrap_or("").to_string(),
                 headers,
             });
+    }
+    // A held operation parks the client here, so a test can change a
+    // file at a known point in the store call.
+    let gate = match method.as_str() {
+        "HEAD" => Some(Gate::HeadObject),
+        "POST" if has_query_param(&uri, "uploads") => Some(Gate::CreateMultipartUpload),
+        _ => None,
+    };
+    if let Some(gate) = gate {
+        gate_control.pass(gate).await;
     }
     if missing_bucket || bucket != configured_bucket {
         if method == Method::HEAD {

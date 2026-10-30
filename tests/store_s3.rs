@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::{Duration, Utc};
-use common::{FailOp, FakeS3};
+use common::{FailOp, FakeS3, Gate};
 use dayfly::store::{
     normalize_words, parse_segment_key, StoreError, Ttl, MULTIPART_CHUNK_BYTES, SEGMENT_SUFFIX_LEN,
 };
@@ -2006,4 +2006,126 @@ async fn concurrent_appends_write_distinct_segments_and_both_read_back() {
         .expect("fetch must succeed");
     assert_eq!(slice.text, expected);
     assert_eq!(slice.total_bytes, 17);
+}
+
+// --- Issue #58: one stable snapshot for size, hash, and bytes ---
+
+/// Append to a file while a store call is parked inside a request.
+fn append_to_file(path: &std::path::Path, bytes: &[u8]) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("the test file must reopen for append");
+    file.write_all(bytes).expect("the append must succeed");
+    file.sync_all().expect("the append must reach the file");
+}
+
+/// A file that grows past the cap after the size check must be rejected.
+///
+/// The alias probe is a HeadObject that happens before the read, so holding
+/// it puts the growth between the metadata call and the read.
+#[tokio::test]
+async fn store_file_path_rejects_a_file_that_grows_past_the_cap() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_caps(1024, 64).await;
+    let path = common::write_temp_file("grow-past-cap.bin", &common::pattern_bytes(32));
+
+    fake.hold(Gate::HeadObject);
+    let task = tokio::spawn({
+        let store = store.clone();
+        let path = path.clone();
+        async move {
+            store
+                .store_file_path(&path, Some("grow.bin"), None, None)
+                .await
+        }
+    });
+
+    fake.wait_until_blocked(Gate::HeadObject).await;
+    // 32 bytes at the size check, 96 bytes at the read, cap is 64.
+    append_to_file(&path, &common::pattern_bytes(64));
+    fake.release();
+
+    let result = task.await.expect("the store task must not panic");
+    assert!(
+        matches!(result, Err(StoreError::TooLarge { limit: 64 })),
+        "a file that grew past the cap must be rejected, got {result:?}"
+    );
+    assert!(
+        fake.keys().is_empty(),
+        "a rejected file must store nothing: {:?}",
+        fake.keys()
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+/// A file that changes during a multipart upload must leave no paste.
+///
+/// Metadata for a multipart object is fixed at CreateMultipartUpload, so a
+/// change between the hash pass and the upload pass stores a hash that
+/// describes bytes nobody uploaded. Holding CreateMultipartUpload makes that
+/// window deterministic.
+#[tokio::test]
+async fn store_file_path_rejects_a_file_that_changes_during_a_multipart_upload() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let len = MULTIPART_CHUNK_BYTES + 4096;
+    let path = common::write_temp_file("changes-mid-upload.bin", &common::pattern_bytes(len));
+
+    fake.hold(Gate::CreateMultipartUpload);
+    let task = tokio::spawn({
+        let store = store.clone();
+        let path = path.clone();
+        async move {
+            store
+                .store_file_path(&path, Some("changing.bin"), None, None)
+                .await
+        }
+    });
+
+    fake.wait_until_blocked(Gate::CreateMultipartUpload).await;
+    append_to_file(&path, &common::pattern_bytes(4096));
+    fake.release();
+
+    let result = task.await.expect("the store task must not panic");
+    assert!(
+        result.is_err(),
+        "a file that changed mid-upload must fail, got {result:?}"
+    );
+    assert!(
+        fake.keys().is_empty(),
+        "a changed file must leave no object and no alias: {:?}",
+        fake.keys()
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+/// The stored size and hash must describe the bytes in the object.
+#[tokio::test]
+async fn store_file_path_metadata_describes_the_stored_bytes() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let body = common::pattern_bytes(4096);
+    let path = common::write_temp_file("describes-bytes.bin", &body);
+
+    let stored = store
+        .store_file_path(&path, Some("bytes.bin"), None, None)
+        .await
+        .expect("the store must succeed");
+
+    let object = fake.object(&stored.key).expect("the object must exist");
+    assert_eq!(stored.size, object.body.len() as u64, "size must match");
+    assert_eq!(stored.sha256, sha256_hex(&object.body), "hash must match");
+    assert_eq!(
+        object.metadata.get("sha256").map(String::as_str),
+        Some(stored.sha256.as_str()),
+        "stored metadata must carry the same hash"
+    );
+    assert_eq!(
+        object.metadata.get("size").map(String::as_str),
+        Some(stored.size.to_string().as_str()),
+        "stored metadata must carry the same size"
+    );
+    let _ = std::fs::remove_file(path);
 }
