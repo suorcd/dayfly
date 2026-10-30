@@ -1999,7 +1999,7 @@ mod tests {
     async fn store_and_fetch_roundtrip_against_fake_s3() {
         let (store, fake) = fake_store(1024).await;
         let stored = store
-            .store_text(b"hello", None, Some("text/plain"), Some(7))
+            .store_text(b"hello", None, Some("text/plain"), Some(Ttl::days(7)))
             .await
             .expect("store must succeed against the fake");
         let slice = store
@@ -2014,7 +2014,7 @@ mod tests {
     async fn append_writes_only_new_bytes_and_fetch_concatenates() {
         let (store, fake) = fake_store(1024).await;
         let stored = store
-            .store_text(b"hello", None, Some("text/plain"), Some(7))
+            .store_text(b"hello", None, Some("text/plain"), Some(Ttl::days(7)))
             .await
             .expect("store must succeed against the fake");
         let expires_before = store
@@ -2092,7 +2092,7 @@ mod tests {
     async fn head_metadata_reports_total_size_and_omits_the_base_hash() {
         let (store, _fake) = fake_store(1024).await;
         let stored = store
-            .store_text(b"hello", None, Some("text/plain"), Some(7))
+            .store_text(b"hello", None, Some("text/plain"), Some(Ttl::days(7)))
             .await
             .expect("store must succeed against the fake");
         let before = store
@@ -2124,7 +2124,7 @@ mod tests {
     async fn range_fetch_reads_only_the_objects_it_touches() {
         let (store, fake) = fake_store(1024).await;
         let stored = store
-            .store_text(b"hello", None, Some("text/plain"), Some(7))
+            .store_text(b"hello", None, Some("text/plain"), Some(Ttl::days(7)))
             .await
             .expect("store must succeed against the fake");
         let appended = store
@@ -2165,7 +2165,7 @@ mod tests {
     async fn download_file_concatenates_base_and_segments() {
         let (store, _fake) = fake_store(1024).await;
         let stored = store
-            .store_text(b"hello", None, Some("text/plain"), Some(7))
+            .store_text(b"hello", None, Some("text/plain"), Some(Ttl::days(7)))
             .await
             .expect("store must succeed against the fake");
         store
@@ -2200,7 +2200,7 @@ mod tests {
     async fn list_recent_skips_segment_keys() {
         let (store, _fake) = fake_store(1024).await;
         let stored = store
-            .store_text(b"base", None, Some("text/plain"), Some(7))
+            .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(7)))
             .await
             .expect("store must succeed against the fake");
         store
@@ -2225,7 +2225,7 @@ mod tests {
     async fn bare_id_resolution_skips_segment_keys() {
         let (store, _fake) = fake_store(1024).await;
         let stored = store
-            .store_text(b"base", None, Some("text/plain"), Some(7))
+            .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(7)))
             .await
             .expect("store must succeed against the fake");
         store
@@ -2244,7 +2244,7 @@ mod tests {
     async fn delete_removes_the_base_object_and_every_segment() {
         let (store, fake) = fake_store(1024).await;
         let stored = store
-            .store_text(b"base", None, Some("text/plain"), Some(7))
+            .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(7)))
             .await
             .expect("store must succeed against the fake");
         let first = store
@@ -2273,7 +2273,7 @@ mod tests {
         assert!(fake.puts().is_empty(), "a missing id must write nothing");
 
         let stored = store
-            .store_text(b"base", None, None, Some(7))
+            .store_text(b"base", None, None, Some(Ttl::days(7)))
             .await
             .expect("store must succeed against the fake");
         let past = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
@@ -2297,7 +2297,7 @@ mod tests {
     async fn empty_append_writes_nothing_and_keeps_the_base_hash() {
         let (store, fake) = fake_store(1024).await;
         let stored = store
-            .store_text(b"base", None, Some("text/plain"), Some(7))
+            .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(7)))
             .await
             .expect("store must succeed against the fake");
         let puts_before = fake.puts().len();
@@ -2551,6 +2551,8 @@ mod tests {
             detection_source: Some("text".to_string()),
             detection_conflict: None,
             size: 3,
+            base_size: 3,
+            segments: Vec::new(),
             sha256: Some("deadbeef".to_string()),
             created_at: Some(created),
             expires_at: Some(expires),

@@ -751,7 +751,6 @@ pub fn mcp_router(state: AppState) -> Router<AppState> {
         .layer(middleware::from_fn_with_state(state, require_bearer))
 }
 
-
 async fn append_inner(state: &AppState, headers: &HeaderMap, id: &str, req: Request) -> Response {
     if let Err(resp) = check_auth(state, headers) {
         return resp;
@@ -808,7 +807,6 @@ async fn append_bare(
 ) -> Response {
     append_inner(&state, &headers, &random, req).await
 }
-
 
 /// API routes, without state attached. [`app_router`] merges these with the
 /// human UI routes and attaches a single shared [`AppState`].
@@ -1982,7 +1980,7 @@ mod tests {
         let (state, _fake) = fake_state(1024).await;
         let stored = state
             .store
-            .store_text(b"hello", None, Some("text/plain"), Some(7))
+            .store_text(b"hello", None, Some("text/plain"), Some(Ttl::days(7)))
             .await
             .expect("store must succeed against the fake");
         let app = api_router().with_state(state);
