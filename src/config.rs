@@ -143,6 +143,7 @@ fn read_credential_file(file_variable: &str, path: &str) -> Result<String, Confi
     if let Some(warning) = credential_file_warning(path, &metadata) {
         tracing::warn!("{warning}");
     }
+    warn_on_loose_credential_directory(path);
     let mut contents = String::new();
     file.read_to_string(&mut contents).map_err(map_error)?;
     let value = contents.trim();
@@ -181,8 +182,8 @@ fn bearer_token(value: Option<String>) -> Result<Option<String>, ConfigError> {
 /// Build a warning for unsafe credential file metadata.
 ///
 /// The warning names the path, the mode, and the owner IDs. It never
-/// contains the file contents. A group or world read bit is unsafe. A
-/// file owner other than the effective user is unsafe.
+/// contains the file contents. A group or world read or write bit is
+/// unsafe. A file owner other than the effective user is unsafe.
 #[cfg(unix)]
 fn credential_file_warning(path: &str, metadata: &std::fs::Metadata) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
@@ -204,18 +205,18 @@ fn credential_file_warning_parts(
     effective_uid: u32,
 ) -> Option<String> {
     let mode = mode & 0o777;
-    let loose_mode = mode & 0o044 != 0;
+    let loose_mode = mode & 0o066 != 0;
     let foreign_owner = owner != effective_uid;
     match (loose_mode, foreign_owner) {
         (false, false) => None,
         (true, false) => Some(format!(
-            "credential file {path} has mode {mode:04o}. Group or world read access can expose the key. Set mode 0600."
+            "credential file {path} has mode {mode:04o}. Group or world read or write access can expose or replace the key. Set mode 0600."
         )),
         (false, true) => Some(format!(
-            "credential file {path} is owned by uid {owner}. The effective uid is {effective_uid}. Make the effective user the owner."
+            "credential file {path} has mode {mode:04o} and is owned by uid {owner}. The effective uid is {effective_uid}. Make the effective user the owner."
         )),
         (true, true) => Some(format!(
-            "credential file {path} has mode {mode:04o} and owner uid {owner}. The effective uid is {effective_uid}. Set mode 0600 and make the effective user the owner."
+            "credential file {path} has mode {mode:04o} and owner uid {owner}. The effective uid is {effective_uid}. Group or world read or write access can expose or replace the key. Set mode 0600 and make the effective user the owner."
         )),
     }
 }
@@ -223,6 +224,70 @@ fn credential_file_warning_parts(
 #[cfg(not(unix))]
 fn credential_file_warning(_path: &str, _metadata: &std::fs::Metadata) -> Option<String> {
     None
+}
+
+/// Warn on an unsafe parent directory of a credential file.
+///
+/// A group or other user with access to the directory can replace the
+/// credential file. A parent directory that cannot be read is skipped.
+#[cfg(unix)]
+fn warn_on_loose_credential_directory(path: &str) {
+    let Some(parent) = std::path::Path::new(path).parent() else {
+        return;
+    };
+    // A bare relative path has an empty parent. Check the current directory.
+    let parent = if parent.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        parent
+    };
+    if let Some(warning) = credential_directory_warning(parent) {
+        tracing::warn!("{warning}");
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_on_loose_credential_directory(_path: &str) {}
+
+/// Build a warning for unsafe credential directory metadata.
+///
+/// The warning names the path, the mode, and the owner IDs. A group or
+/// world permission can let another user replace the credential file.
+#[cfg(unix)]
+fn credential_directory_warning(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path).ok()?;
+    credential_directory_warning_parts(
+        &path.display().to_string(),
+        metadata.mode(),
+        metadata.uid(),
+        effective_uid(),
+    )
+}
+
+#[cfg(unix)]
+fn credential_directory_warning_parts(
+    path: &str,
+    mode: u32,
+    owner: u32,
+    effective_uid: u32,
+) -> Option<String> {
+    let mode = mode & 0o777;
+    let loose_mode = mode & 0o077 != 0;
+    let foreign_owner = owner != effective_uid;
+    match (loose_mode, foreign_owner) {
+        (false, false) => None,
+        (true, false) => Some(format!(
+            "credential directory {path} has mode {mode:04o}. Group or world access to the directory can expose or replace the credential file. Set mode 0700."
+        )),
+        (false, true) => Some(format!(
+            "credential directory {path} has mode {mode:04o} and is owned by uid {owner}. The effective uid is {effective_uid}. Make the effective user the owner."
+        )),
+        (true, true) => Some(format!(
+            "credential directory {path} has mode {mode:04o} and owner uid {owner}. The effective uid is {effective_uid}. Group or world access to the directory can expose or replace the credential file. Set mode 0700 and make the effective user the owner."
+        )),
+    }
 }
 
 impl Config {
@@ -432,6 +497,41 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn credential_file_warning_for_world_writable_file() {
+        let file = TempCredentialFile::new("world-writable-secret\n");
+        file.set_mode(0o622);
+        let warning = credential_file_warning(file.path(), &credential_metadata(&file))
+            .expect("a warning for a world-writable credential file");
+        assert!(warning.contains(file.path()), "warning: {warning}");
+        assert!(warning.contains("0622"), "warning: {warning}");
+        assert!(
+            !warning.contains("world-writable-secret"),
+            "warning: {warning}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_file_warning_for_group_writable_file() {
+        let file = TempCredentialFile::new("group-writable-secret\n");
+        file.set_mode(0o660);
+        let warning = credential_file_warning(file.path(), &credential_metadata(&file))
+            .expect("a warning for a group-writable credential file");
+        assert!(warning.contains("0660"), "warning: {warning}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_file_warning_for_world_writable_bit() {
+        let file = TempCredentialFile::new("world-writable-secret\n");
+        file.set_mode(0o602);
+        let warning = credential_file_warning(file.path(), &credential_metadata(&file))
+            .expect("a warning for a world-writable credential file");
+        assert!(warning.contains("0602"), "warning: {warning}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn credential_file_with_execute_bits_only_produces_no_warning() {
         let file = TempCredentialFile::new("private-secret\n");
         file.set_mode(0o700);
@@ -447,8 +547,56 @@ mod tests {
         let warning = credential_file_warning_parts("/tmp/credential", 0o600, 1000, 1001)
             .expect("a warning for a foreign owner");
         assert!(warning.contains("/tmp/credential"), "warning: {warning}");
+        assert!(warning.contains("0600"), "warning: {warning}");
         assert!(warning.contains("1000"), "warning: {warning}");
         assert!(warning.contains("1001"), "warning: {warning}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_directory_with_mode_0700_produces_no_warning() {
+        assert_eq!(
+            credential_directory_warning_parts("/home/you/.config/dayfly", 0o700, 1000, 1000),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_directory_warning_for_group_or_world_accessible_directory() {
+        for mode in [0o755, 0o770, 0o777] {
+            let warning =
+                credential_directory_warning_parts("/home/you/.config/dayfly", mode, 1000, 1000)
+                    .unwrap_or_else(|| panic!("a warning for mode {mode:04o}"));
+            assert!(
+                warning.contains("/home/you/.config/dayfly"),
+                "warning: {warning}"
+            );
+            assert!(
+                warning.contains(&format!("{mode:04o}")),
+                "warning: {warning}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_directory_owned_by_another_user_produces_a_warning() {
+        let warning =
+            credential_directory_warning_parts("/home/you/.config/dayfly", 0o700, 1000, 1001)
+                .expect("a warning for a foreign directory owner");
+        assert!(warning.contains("0700"), "warning: {warning}");
+        assert!(warning.contains("1000"), "warning: {warning}");
+        assert!(warning.contains("1001"), "warning: {warning}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_directory_warning_skips_a_missing_parent() {
+        let missing_parent = unique_temp_path();
+        assert!(!missing_parent.exists());
+        let file = missing_parent.join("access-key-id");
+        assert_eq!(credential_directory_warning(&file), None);
     }
 
     fn test_config(max_text_bytes: u64, max_file_bytes: u64) -> Config {
