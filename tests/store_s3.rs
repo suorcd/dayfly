@@ -8,7 +8,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use chrono::{Duration, Utc};
 use common::{FailOp, FakeS3};
-use dayfly::store::{StoreError, MULTIPART_CHUNK_BYTES};
+use dayfly::store::{StoreError, Ttl, MULTIPART_CHUNK_BYTES};
 use futures::stream;
 use sha2::{Digest, Sha256};
 
@@ -47,7 +47,12 @@ async fn store_text_round_trip_through_the_s3_sdk() {
     let store = fake.store().await;
 
     let stored = store
-        .store_text(b"hello, integration", Some("note.txt"), None, Some(1))
+        .store_text(
+            b"hello, integration",
+            Some("note.txt"),
+            None,
+            Some(Ttl::days(1)),
+        )
         .await
         .expect("store_text must succeed against the fake");
 
@@ -101,7 +106,7 @@ async fn store_text_records_ttl_and_detection() {
             b"\x89PNG\r\n\x1a\nfake-body",
             None,
             Some("text/plain"),
-            Some(3),
+            Some(Ttl::days(3)),
         )
         .await
         .expect("store_text must store a sniffed image");
@@ -190,7 +195,7 @@ async fn store_file_path_large_file_uses_multipart_and_records_metadata() {
     let path = common::write_temp_file("large.bin", &body);
 
     let stored = store
-        .store_file_path(&path, Some("large data.bin"), None, Some(1))
+        .store_file_path(&path, Some("large data.bin"), None, Some(Ttl::days(1)))
         .await
         .expect("large file upload must succeed");
     assert_eq!(stored.size, body.len() as u64);
@@ -382,7 +387,7 @@ async fn store_stream_chunked_upload_uses_multipart_without_a_copy() {
             stream::iter(chunks),
             Some("chunked.bin"),
             None,
-            Some(1),
+            Some(Ttl::days(1)),
             None,
             u64::MAX,
         )

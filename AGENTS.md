@@ -11,7 +11,7 @@ by a **private Garage bucket**. One small Rust binary, two transports
 sharing one S3 core: MCP server over stdio (default) and HTTP mode
 (`serve`, curl API plus a server-rendered human frontend). Full
 specification is in `README.md`; do not re-litigate settled decisions
-there (Garage first, no database in v1, day-granular expiry, no
+there (Garage first, no database in v1, read-time expiry, no
 presigned URLs, no `If-None-Match` reliance) without new user input.
 
 ## Writing standard

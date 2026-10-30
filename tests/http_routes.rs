@@ -5,7 +5,7 @@ mod common;
 use axum::http::{header, StatusCode};
 use chrono::{DateTime, Duration, Utc};
 use common::{FailOp, FakeS3};
-use dayfly::store::Store;
+use dayfly::store::{Store, Ttl};
 use serde_json::Value;
 
 fn id_from_plain_url(body: &[u8]) -> String {
@@ -101,6 +101,133 @@ async fn raw_text_upload_returns_plain_url_or_json() {
             json["id"].as_str().unwrap()
         )
     );
+}
+
+#[tokio::test]
+async fn ttl_days_zero_is_rejected() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let app = common::app(store);
+
+    let body = b"header zero".to_vec();
+    let request = common::request(
+        "POST",
+        "/upload?format=json",
+        &[("x-ttl-days", "0".to_string()), content_length(body.len())],
+        body,
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "X-TTL-Days: 0 must be rejected, got body: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let body = b"query zero".to_vec();
+    let request = common::request(
+        "POST",
+        "/upload?ttl_days=0&format=json",
+        &[content_length(body.len())],
+        body,
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "ttl_days=0 must be rejected, got body: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let boundary = "dayfly-boundary";
+    let body = common::multipart_body(
+        boundary,
+        None,
+        Some("text/plain"),
+        b"form zero",
+        &[("ttl_days", "0")],
+    );
+    let mut headers = multipart_headers(boundary);
+    headers.push(content_length(body.len()));
+    headers.push(("host", "dayfly.test".to_string()));
+    let request = common::request("POST", "/upload?format=json", &headers, body);
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a multipart ttl_days=0 must be rejected, got body: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn mixed_ttl_forms_are_rejected() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let app = common::app(store);
+
+    let mixed_headers = [("x-ttl", "1h".to_string()), ("x-ttl-days", "7".to_string())];
+    let body = b"both headers".to_vec();
+    let mut headers = vec![content_length(body.len())];
+    headers.extend(mixed_headers.iter().cloned());
+    let request = common::request("POST", "/upload?format=json", &headers, body);
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "X-TTL plus X-TTL-Days must be rejected, got body: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let body = b"both query fields".to_vec();
+    let request = common::request(
+        "POST",
+        "/upload?ttl=1h&ttl_days=7&format=json",
+        &[content_length(body.len())],
+        body,
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "ttl plus ttl_days must be rejected, got body: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let body = b"mixed header and query".to_vec();
+    let request = common::request(
+        "POST",
+        "/upload?ttl_days=7&format=json",
+        &[("x-ttl", "1h".to_string()), content_length(body.len())],
+        body,
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a duration header plus a day query must be rejected, got body: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let boundary = "dayfly-boundary";
+    for fields in [
+        [("ttl", "1h"), ("ttl_days", "7")],
+        [("ttl_days", "7"), ("ttl", "1h")],
+    ] {
+        let body =
+            common::multipart_body(boundary, None, Some("text/plain"), b"mixed form", &fields);
+        let mut headers = multipart_headers(boundary);
+        headers.push(content_length(body.len()));
+        headers.push(("host", "dayfly.test".to_string()));
+        let request = common::request("POST", "/upload?format=json", &headers, body);
+        let (status, _, body) = common::send(&app, request).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "multipart ttl plus ttl_days must be rejected in either order, got body: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
 }
 
 #[tokio::test]
@@ -505,7 +632,7 @@ async fn metadata_and_delete_routes_work_for_dated_and_bare_ids() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
     let stored = store
-        .store_text(b"meta body", Some("meta.txt"), None, Some(4))
+        .store_text(b"meta body", Some("meta.txt"), None, Some(Ttl::days(4)))
         .await
         .expect("text must store");
     let other = store

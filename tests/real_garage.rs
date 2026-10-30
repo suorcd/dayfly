@@ -17,7 +17,7 @@ use std::path::Path;
 
 use chrono::Utc;
 use dayfly::config::Config;
-use dayfly::store::{Store, StoreError};
+use dayfly::store::{Store, StoreError, Ttl};
 
 fn test_config() -> Config {
     let endpoint = std::env::var("DAYFLY_TEST_S3_ENDPOINT")
@@ -58,7 +58,12 @@ async fn real_store_fetch_list_and_delete_text() {
         .expect("real S3 configuration must build");
     let marker = format!("dayfly real test {}", Utc::now().to_rfc3339());
     let stored = store
-        .store_text(marker.as_bytes(), Some("real-test.txt"), None, Some(1))
+        .store_text(
+            marker.as_bytes(),
+            Some("real-test.txt"),
+            None,
+            Some(Ttl::days(1)),
+        )
         .await
         .expect("real store_text must succeed");
     assert_eq!(stored.size, marker.len() as u64);
@@ -129,7 +134,7 @@ async fn real_multipart_file_round_trip() {
             Path::new(&source),
             Some("real-multipart.bin"),
             None,
-            Some(1),
+            Some(Ttl::days(1)),
         )
         .await
         .expect("real multipart store_file_path must succeed");

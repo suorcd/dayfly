@@ -46,7 +46,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::http::{check_auth, AppState};
-use crate::store::StoreError;
+use crate::store::{StoreError, Ttl};
 
 /// Adapted base look from suorcd.us/style.css, palette cyberpunkNeon
 /// (background #091833, text #e3e8fc, accent #ea00d9, code background
@@ -224,7 +224,7 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
 <p><label>Keep for <select name="ttl_days">{}</select></label></p>
 <p><button type="submit">Upload file</button></p>
 </form>
-<p class="muted">Day granularity only: a paste expires at the end of its TTL day count, checked on read. The bucket itself is private; only this binary talks to Garage.</p>"#,
+<p class="muted">The selector uses whole days. API clients can send a sub-day TTL with X-TTL. Expiry is checked on read; the bucket sweeper is day-rounded. The bucket itself is private; only this binary talks to Garage.</p>"#,
             ttl_options(default_ttl),
             ttl_options(default_ttl),
         ),
@@ -251,14 +251,16 @@ async fn text_submit_handler(
         return forbidden_page();
     }
     let filename = form.filename.filter(|f| !f.trim().is_empty());
+    let ttl = match form.ttl_days {
+        Some(days) => match Ttl::checked_days(days) {
+            Ok(ttl) => Some(ttl),
+            Err(e) => return bad_request_page(&e.to_string()),
+        },
+        None => None,
+    };
     match state
         .store
-        .store_text(
-            form.text.as_bytes(),
-            filename.as_deref(),
-            None,
-            form.ttl_days,
-        )
+        .store_text(form.text.as_bytes(), filename.as_deref(), None, ttl)
         .await
     {
         Ok(stored) => success_page(
@@ -334,7 +336,7 @@ async fn upload_submit_handler(
     if !same_origin_allowed(&headers) {
         return forbidden_page();
     }
-    let mut ttl: Option<u32> = None;
+    let mut ttl: Option<Ttl> = None;
     // Stream the file field inside the loop, not moved out of it: an
     // axum Field borrows its Multipart, so holding it across a
     // next_field call does not compile (see http.rs for the same note).
@@ -379,7 +381,10 @@ async fn upload_submit_handler(
         }
         if name == "ttl_days" {
             if let Ok(text) = field.text().await {
-                ttl = text.trim().parse::<u32>().ok().or(ttl);
+                match Ttl::parse_days(&text) {
+                    Ok(parsed) => ttl = Some(parsed),
+                    Err(e) => return bad_request_page(&e.to_string()),
+                }
             }
         }
     }

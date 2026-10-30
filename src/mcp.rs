@@ -19,7 +19,7 @@ use rmcp::{tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::store::{Store, StoreError};
+use crate::store::{Store, StoreError, Ttl};
 
 #[derive(Clone)]
 pub struct Pastebin {
@@ -66,12 +66,38 @@ macro_rules! try_store {
     };
 }
 
+fn invalid_ttl(message: impl Into<String>) -> rmcp::ErrorData {
+    rmcp::ErrorData::invalid_params(message.into(), None)
+}
+
+fn resolve_ttl(ttl: Option<&str>, ttl_days: Option<u32>) -> Result<Option<Ttl>, rmcp::ErrorData> {
+    if ttl.is_some() && ttl_days.is_some() {
+        return Err(invalid_ttl("use ttl or ttl_days, not both"));
+    }
+    if let Some(value) = ttl {
+        return Ttl::parse(value)
+            .map(Some)
+            .map_err(|e| invalid_ttl(format!("ttl: {e}")));
+    }
+    match ttl_days {
+        Some(days) => Ttl::checked_days(days)
+            .map(Some)
+            .map_err(|e| invalid_ttl(format!("ttl_days: {e}"))),
+        None => Ok(None),
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct StoreTextParams {
     /// The text to store.
     pub text: String,
     pub filename: Option<String>,
     pub content_type: Option<String>,
+    /// TTL as seconds or a duration such as "1h", "1h30m", or "2d".
+    /// Do not set both `ttl` and `ttl_days`.
+    pub ttl: Option<String>,
+    /// TTL in whole days, for example 7. Do not set both `ttl` and
+    /// `ttl_days`.
     pub ttl_days: Option<u32>,
 }
 
@@ -81,6 +107,11 @@ pub struct StoreFileParams {
     pub path: String,
     pub filename: Option<String>,
     pub content_type: Option<String>,
+    /// TTL as seconds or a duration such as "1h", "1h30m", or "2d".
+    /// Do not set both `ttl` and `ttl_days`.
+    pub ttl: Option<String>,
+    /// TTL in whole days, for example 7. Do not set both `ttl` and
+    /// `ttl_days`.
     pub ttl_days: Option<u32>,
 }
 
@@ -121,19 +152,20 @@ impl Pastebin {
     }
 
     #[tool(
-        description = "Store a text paste in Garage (S3). Returns id, url path, size, sha256, content_type, detection_source, detection_conflict, and expiry."
+        description = "Store a text paste in Garage (S3). Returns id, url path, size, sha256, content_type, detection_source, detection_conflict, and expiry. Set ttl to seconds or a duration such as 1h or 1h30m. A bare integer is seconds; use 7d for seven days. Do not set ttl and ttl_days together."
     )]
     async fn store_text(
         &self,
         Parameters(params): Parameters<StoreTextParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let ttl = resolve_ttl(params.ttl.as_deref(), params.ttl_days)?;
         let stored = try_store!(
             self.store
                 .store_text(
                     params.text.as_bytes(),
                     params.filename.as_deref(),
                     params.content_type.as_deref(),
-                    params.ttl_days,
+                    ttl,
                 )
                 .await
         );
@@ -151,19 +183,20 @@ impl Pastebin {
     }
 
     #[tool(
-        description = "Store a local file in Garage (S3), using multipart upload for large files. Returns id, size, sha256, content_type, detection_source, and expiry."
+        description = "Store a local file in Garage (S3), using multipart upload for large files. Returns id, size, sha256, content_type, detection_source, and expiry. Set ttl to seconds or a duration such as 1h or 1h30m. A bare integer is seconds; use 7d for seven days. Do not set ttl and ttl_days together."
     )]
     async fn store_file(
         &self,
         Parameters(params): Parameters<StoreFileParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let ttl = resolve_ttl(params.ttl.as_deref(), params.ttl_days)?;
         let stored = try_store!(
             self.store
                 .store_file_path(
                     PathBuf::from(&params.path).as_path(),
                     params.filename.as_deref(),
                     params.content_type.as_deref(),
-                    params.ttl_days,
+                    ttl,
                 )
                 .await
         );
@@ -302,8 +335,10 @@ impl rmcp::handler::server::ServerHandler for Pastebin {
             .with_instructions(
                 "Internal pastebin/file-share backed by a private Garage bucket. \
                  The binary is the sole S3 reader/writer; agents never get S3 \
-                 credentials and no presigned URL is issued. Expiry is \
-                 day-granular and enforced on read.",
+                 credentials and no presigned URL is issued. The TTL accepts \
+                 seconds or a duration such as 90m, 1h30m, or 2d. A bare \
+                 integer is seconds; use 7d for seven days. Use ttl or \
+                 ttl_days, not both. Expiry is enforced on read.",
             )
     }
 }
@@ -363,5 +398,41 @@ mod tests {
                 store_error_result(e).expect_err("an internal fault must be a protocol error");
             assert_eq!(err.code, ErrorCode::INTERNAL_ERROR);
         }
+    }
+
+    #[test]
+    fn ttl_parameter_accepts_subday_duration() {
+        let ttl = resolve_ttl(Some("1h30m"), None)
+            .expect("a valid ttl must parse")
+            .expect("a ttl must be present");
+        assert_eq!(ttl.num_seconds(), 5_400);
+    }
+
+    #[test]
+    fn ttl_days_still_selects_whole_days() {
+        let ttl = resolve_ttl(None, Some(3))
+            .expect("ttl_days must be valid")
+            .expect("a ttl must be present");
+        assert_eq!(ttl.num_seconds(), 3 * 86_400);
+    }
+
+    #[test]
+    fn ttl_days_zero_is_invalid_params() {
+        let err = resolve_ttl(None, Some(0)).expect_err("zero days must fail");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("ttl_days"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn mixed_ttl_parameters_are_invalid_params() {
+        let err = resolve_ttl(Some("1h"), Some(7)).expect_err("both TTL forms must fail");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("ttl_days"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn malformed_ttl_parameter_is_invalid_params() {
+        let err = resolve_ttl(Some("1x"), None).expect_err("a bad ttl must fail");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
     }
 }

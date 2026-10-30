@@ -9,9 +9,10 @@
 //!   existing ID, and conditional writes (`If-None-Match`) are deliberately
 //!   NOT relied on: some S3-compatible stores, including Garage, accept
 //!   that header but ignore it and overwrite. See README.
-//! * Expiry is day-granular and enforced on read by comparing stored
-//!   `expires-at` metadata with now. S3 lifecycle deletion, if configured,
-//!   is only a storage sweeper and may run after the TTL day.
+//! * Expiry is enforced on read by comparing stored `expires-at` metadata
+//!   with now. A TTL can be shorter than one day. S3 lifecycle deletion,
+//!   if configured, is only a day-rounded storage sweeper and may run
+//!   after expiry.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -67,6 +68,186 @@ pub enum StoreError {
 impl From<std::io::Error> for StoreError {
     fn from(e: std::io::Error) -> Self {
         StoreError::Io(e.to_string())
+    }
+}
+
+/// A time-to-live duration for a stored object.
+///
+/// A TTL can be shorter than one day. The stored `expires-at` metadata
+/// uses the exact duration, not a rounded day count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ttl {
+    duration: chrono::Duration,
+}
+
+/// An invalid TTL value from a header, query parameter, form field, or
+/// MCP parameter. It also reports a request that supplies both TTL forms.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub struct TtlParseError {
+    value: Option<String>,
+    reason: String,
+    hint: &'static str,
+}
+
+impl std::fmt::Display for TtlParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.value {
+            Some(value) => write!(f, "invalid TTL {value:?}: {}. {}", self.reason, self.hint),
+            None => write!(f, "invalid TTL: {}. {}", self.reason, self.hint),
+        }
+    }
+}
+
+const TTL_FORMS_HINT: &str =
+    "Use seconds (\"3600\") or number and unit pairs (\"90m\", \"1h30m\", \"2d\", \"1d12h\").";
+const TTL_DAYS_HINT: &str = "Use a positive integer number of whole days.";
+
+impl TtlParseError {
+    fn new(value: &str, reason: impl Into<String>) -> Self {
+        Self {
+            value: Some(value.to_string()),
+            reason: reason.into(),
+            hint: TTL_FORMS_HINT,
+        }
+    }
+
+    /// An invalid value for the legacy `ttl_days` form.
+    pub fn invalid_days(value: &str) -> Self {
+        Self {
+            value: Some(value.to_string()),
+            reason: "the value must be a positive integer".to_string(),
+            hint: TTL_DAYS_HINT,
+        }
+    }
+
+    /// A request supplied both a duration form and a day form.
+    pub fn mixed_forms() -> Self {
+        Self {
+            value: None,
+            reason: "use one TTL form, not both".to_string(),
+            hint: "Remove either the duration form or the day form.",
+        }
+    }
+}
+
+impl Ttl {
+    /// A TTL in whole days. This constructor serves the legacy
+    /// `ttl_days` inputs and `DAYFLY_DEFAULT_TTL_DAYS`.
+    pub fn days(days: u32) -> Self {
+        Self {
+            // A u32 day count always fits a chrono Duration. Keep the
+            // fallback so an invalid value can never panic.
+            duration: chrono::Duration::try_days(i64::from(days)).unwrap_or(chrono::Duration::MAX),
+        }
+    }
+
+    /// A positive whole-day TTL. Zero is rejected because a paste with a
+    /// zero TTL is expired at creation.
+    pub fn checked_days(days: u32) -> Result<Self, TtlParseError> {
+        if days == 0 {
+            return Err(TtlParseError::invalid_days("0"));
+        }
+        Ok(Self::days(days))
+    }
+
+    /// Parse a positive whole-day count for the legacy `ttl_days` forms.
+    pub fn parse_days(value: &str) -> Result<Self, TtlParseError> {
+        let days: u32 = value
+            .trim()
+            .parse()
+            .map_err(|_| TtlParseError::invalid_days(value))?;
+        if days == 0 {
+            return Err(TtlParseError::invalid_days(value));
+        }
+        Ok(Self::days(days))
+    }
+
+    /// Parse seconds or a compound duration.
+    ///
+    /// Accepted forms are a bare integer as seconds (`3600`) and a
+    /// sequence of number and unit pairs with `s`, `m`, `h`, and `d`
+    /// (`90m`, `1h30m`, `2d`, `1d12h`). Empty, zero, negative, unknown
+    /// unit, and overflow values are rejected.
+    pub fn parse(value: &str) -> Result<Self, TtlParseError> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(TtlParseError::new(value, "the value is empty"));
+        }
+        if value.starts_with('-') {
+            return Err(TtlParseError::new(value, "a negative value is not allowed"));
+        }
+        if value.bytes().all(|b| b.is_ascii_digit()) {
+            let seconds: i64 = value
+                .parse()
+                .map_err(|_| TtlParseError::new(value, "the number is too large"))?;
+            if seconds == 0 {
+                return Err(TtlParseError::new(value, "zero is not allowed"));
+            }
+            let duration = chrono::Duration::try_seconds(seconds)
+                .ok_or_else(|| TtlParseError::new(value, "the duration is too large"))?;
+            return Ok(Self { duration });
+        }
+        let mut total_seconds: i64 = 0;
+        let mut rest = value;
+        while !rest.is_empty() {
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            if digits == 0 {
+                return Err(TtlParseError::new(
+                    value,
+                    "a number must come before each unit",
+                ));
+            }
+            let (number_str, after_number) = rest.split_at(digits);
+            let number: i64 = number_str
+                .parse()
+                .map_err(|_| TtlParseError::new(value, "a number is too large"))?;
+            if number == 0 {
+                return Err(TtlParseError::new(value, "a number is zero"));
+            }
+            let unit = after_number
+                .chars()
+                .next()
+                .ok_or_else(|| TtlParseError::new(value, "a unit is missing after a number"))?;
+            let multiplier = match unit {
+                's' => 1,
+                'm' => 60,
+                'h' => 3_600,
+                'd' => 86_400,
+                other => return Err(TtlParseError::new(value, format!("unknown unit {other:?}"))),
+            };
+            let part = number
+                .checked_mul(multiplier)
+                .ok_or_else(|| TtlParseError::new(value, "the duration is too large"))?;
+            total_seconds = total_seconds
+                .checked_add(part)
+                .ok_or_else(|| TtlParseError::new(value, "the duration is too large"))?;
+            rest = &after_number[unit.len_utf8()..];
+        }
+        if total_seconds == 0 {
+            return Err(TtlParseError::new(value, "zero is not allowed"));
+        }
+        let duration = chrono::Duration::try_seconds(total_seconds)
+            .ok_or_else(|| TtlParseError::new(value, "the duration is too large"))?;
+        Ok(Self { duration })
+    }
+
+    /// The exact TTL in seconds.
+    pub fn num_seconds(&self) -> i64 {
+        self.duration.num_seconds()
+    }
+
+    fn duration(&self) -> chrono::Duration {
+        self.duration
+    }
+
+    /// Whole days, when the duration has no smaller part. This decides
+    /// whether the legacy `ttl-days` metadata is still accurate.
+    fn whole_days(&self) -> Option<u32> {
+        if self.duration.num_seconds() % 86_400 == 0 {
+            u32::try_from(self.duration.num_days()).ok()
+        } else {
+            None
+        }
     }
 }
 
@@ -360,11 +541,13 @@ fn metadata_for(
     filename: Option<&str>,
     sha256: Option<&str>,
     size: Option<u64>,
-    ttl_days: u32,
+    ttl: Ttl,
     created_at: DateTime<Utc>,
     detection: &Detection,
 ) -> (HashMap<String, String>, DateTime<Utc>) {
-    let expires_at = created_at + chrono::Duration::days(i64::from(ttl_days));
+    let expires_at = created_at
+        .checked_add_signed(ttl.duration())
+        .unwrap_or(DateTime::<Utc>::MAX_UTC);
     let mut meta = HashMap::new();
     if let Some(f) = filename {
         if !f.is_empty() {
@@ -380,7 +563,10 @@ fn metadata_for(
     if let Some(bytes) = size {
         meta.insert("size".to_string(), bytes.to_string());
     }
-    meta.insert("ttl-days".to_string(), ttl_days.to_string());
+    meta.insert("ttl-seconds".to_string(), ttl.num_seconds().to_string());
+    if let Some(days) = ttl.whole_days() {
+        meta.insert("ttl-days".to_string(), days.to_string());
+    }
     meta.insert("created-at".to_string(), created_at.to_rfc3339());
     meta.insert("expires-at".to_string(), expires_at.to_rfc3339());
     // Final Content-Type is also stored in metadata (not just the S3
@@ -397,6 +583,12 @@ fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// Read-time expiry rule. An object with no `expires-at` metadata never
+/// expires on read; the lifecycle sweeper is a separate backstop.
+fn is_expired_at(expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    expires_at.map(|expires| now > expires).unwrap_or(false)
 }
 
 #[derive(Clone)]
@@ -587,14 +779,14 @@ impl Store {
         text: &[u8],
         filename: Option<&str>,
         content_type: Option<&str>,
-        ttl_days: Option<u32>,
+        ttl: Option<Ttl>,
     ) -> Result<StoredPaste, StoreError> {
         if u64::try_from(text.len()).unwrap_or(u64::MAX) > self.config.max_text_bytes {
             return Err(StoreError::TooLarge {
                 limit: self.config.max_text_bytes,
             });
         }
-        let ttl = ttl_days.unwrap_or(self.config.default_ttl_days);
+        let ttl = ttl.unwrap_or_else(|| Ttl::days(self.config.default_ttl_days));
         let created_at = Utc::now();
         let random_id = generate_random_id();
         let date = created_at.format("%Y-%m-%d").to_string();
@@ -645,7 +837,7 @@ impl Store {
         path: &Path,
         filename: Option<&str>,
         content_type: Option<&str>,
-        ttl_days: Option<u32>,
+        ttl: Option<Ttl>,
     ) -> Result<StoredPaste, StoreError> {
         let file_meta = tokio::fs::metadata(path).await?;
         if !file_meta.is_file() {
@@ -660,7 +852,7 @@ impl Store {
                 limit: self.config.max_file_bytes,
             });
         }
-        let ttl = ttl_days.unwrap_or(self.config.default_ttl_days);
+        let ttl = ttl.unwrap_or_else(|| Ttl::days(self.config.default_ttl_days));
         let created_at = Utc::now();
         let random_id = generate_random_id();
         let date = created_at.format("%Y-%m-%d").to_string();
@@ -873,7 +1065,7 @@ impl Store {
         stream: S,
         filename: Option<&str>,
         content_type: Option<&str>,
-        ttl_days: Option<u32>,
+        ttl: Option<Ttl>,
         known_length: Option<u64>,
         max_bytes: u64,
     ) -> Result<StoredPaste, StoreError>
@@ -885,15 +1077,15 @@ impl Store {
                 return Err(StoreError::TooLarge { limit: max_bytes });
             }
         }
+        let ttl = ttl.unwrap_or_else(|| Ttl::days(self.config.default_ttl_days));
         // A text paste has no filename. Buffer the whole body, bounded
         // by the text cap, so detection sees every byte and text is
         // served inline. A file upload keeps the streaming path, because
         // its cap can be much larger.
         if filename.is_none_or(|name| name.trim().is_empty()) {
             let body = collect_stream_body(stream, max_bytes).await?;
-            return self.store_text(&body, None, content_type, ttl_days).await;
+            return self.store_text(&body, None, content_type, Some(ttl)).await;
         }
-        let ttl = ttl_days.unwrap_or(self.config.default_ttl_days);
         let created_at = Utc::now();
         let random_id = generate_random_id();
         let date = created_at.format("%Y-%m-%d").to_string();
@@ -952,7 +1144,7 @@ impl Store {
         let meta = out.metadata().cloned().unwrap_or_default();
         let created_at = meta.get("created-at").and_then(|s| parse_rfc3339(s));
         let expires_at = meta.get("expires-at").and_then(|s| parse_rfc3339(s));
-        let expired = expires_at.map(|e| Utc::now() > e).unwrap_or(false);
+        let expired = is_expired_at(expires_at, Utc::now());
         // Prefer the S3 Content-Type header; fall back to stored metadata.
         let content_type = out
             .content_type()
@@ -1236,7 +1428,7 @@ mod tests {
             Some("a b.txt"),
             Some("deadbeef"),
             Some(3),
-            7,
+            Ttl::days(7),
             created,
             &detection,
         );
@@ -1246,10 +1438,126 @@ mod tests {
             "text/plain; charset=utf-8"
         );
         assert_eq!(meta.get("ttl-days").unwrap(), "7");
+        assert_eq!(meta.get("ttl-seconds").unwrap(), "604800");
         // NON_ALPHANUMERIC encodes '.' too; decode still round-trips.
         assert_eq!(meta.get("filename").unwrap(), "a%20b%2Etxt");
         assert_eq!(decode_filename(meta.get("filename").unwrap()), "a b.txt");
-        assert!(expires > created);
+        assert_eq!(expires, created + chrono::Duration::days(7));
+    }
+
+    #[test]
+    fn ttl_parser_accepts_seconds_and_compound_forms() {
+        for (value, seconds) in [
+            ("3600", 3_600),
+            ("90m", 5_400),
+            ("1h30m", 5_400),
+            ("2d", 172_800),
+            ("1d12h", 129_600),
+            ("1h30m10s", 5_410),
+        ] {
+            let ttl = Ttl::parse(value).unwrap_or_else(|e| panic!("{value:?}: {e}"));
+            assert_eq!(ttl.num_seconds(), seconds, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn ttl_parser_rejects_empty_zero_negative_unknown_and_overflow() {
+        for value in [
+            "",
+            "   ",
+            "0",
+            "0s",
+            "0d",
+            "0h30m",
+            "-1",
+            "-1h",
+            "1x",
+            "1h30",
+            "h",
+            "1.5h",
+            "1 h",
+            "1H",
+            "999999999999999999999999999999",
+            "99999999999999d",
+        ] {
+            assert!(Ttl::parse(value).is_err(), "value {value:?} must fail");
+        }
+    }
+
+    #[test]
+    fn ttl_days_zero_is_rejected() {
+        assert!(Ttl::parse_days("0").is_err());
+        assert!(Ttl::parse_days("0 ").is_err());
+        assert!(Ttl::checked_days(0).is_err());
+        assert_eq!(Ttl::parse_days("7").unwrap().num_seconds(), 7 * 86_400);
+    }
+
+    #[test]
+    fn metadata_uses_exact_subday_expiry() {
+        let created = Utc.with_ymd_and_hms(2026, 10, 28, 0, 0, 0).unwrap();
+        let detection = Detection {
+            content_type: "text/plain; charset=utf-8".to_string(),
+            source: "text",
+            conflict: None,
+        };
+        let (meta, expires) = metadata_for(
+            None,
+            Some("deadbeef"),
+            Some(3),
+            Ttl::parse("1h").unwrap(),
+            created,
+            &detection,
+        );
+        assert_eq!(expires, created + chrono::Duration::hours(1));
+        assert_eq!(meta.get("ttl-seconds").unwrap(), "3600");
+        assert!(
+            !meta.contains_key("ttl-days"),
+            "a sub-day TTL must not store a rounded ttl-days value"
+        );
+    }
+
+    /// The read path marks a one-hour paste readable before expiry and
+    /// expired after it, without sleeping. `created_at` is in the past.
+    #[test]
+    fn one_hour_ttl_is_readable_before_expiry_and_expired_after() {
+        let created = Utc.with_ymd_and_hms(2026, 10, 28, 0, 0, 0).unwrap();
+        let detection = Detection {
+            content_type: "text/plain; charset=utf-8".to_string(),
+            source: "text",
+            conflict: None,
+        };
+        let (_, expires) = metadata_for(
+            None,
+            Some("deadbeef"),
+            Some(3),
+            Ttl::parse("1h").unwrap(),
+            created,
+            &detection,
+        );
+        let paste = |now: DateTime<Utc>| PasteMetadata {
+            id: "2026-10-28/abc".to_string(),
+            key: "pastes/2026-10-28/abc".to_string(),
+            filename: None,
+            content_type: "text/plain".to_string(),
+            detection_source: Some("text".to_string()),
+            detection_conflict: None,
+            size: 3,
+            sha256: Some("deadbeef".to_string()),
+            created_at: Some(created),
+            expires_at: Some(expires),
+            expired: is_expired_at(Some(expires), now),
+        };
+        assert!(
+            Store::check_not_expired(&paste(created + chrono::Duration::minutes(59))).is_ok(),
+            "the paste must be readable before the one-hour expiry"
+        );
+        assert!(
+            matches!(
+                Store::check_not_expired(&paste(created + chrono::Duration::minutes(61))),
+                Err(StoreError::Expired(_))
+            ),
+            "the paste must be expired after the one-hour expiry"
+        );
     }
 
     #[tokio::test]
@@ -1276,7 +1584,7 @@ mod tests {
             Some("note.txt"),
             Some("abc123"),
             Some(42),
-            3,
+            Ttl::days(3),
             created,
             &detection,
         );
@@ -1303,7 +1611,7 @@ mod tests {
         // The streaming multipart path builds this map before the hash
         // and the final size are known. An empty string or a zero must
         // not appear, because HeadObject would report them as real.
-        let (meta, _) = metadata_for(Some("a.bin"), None, None, 7, created, &detection);
+        let (meta, _) = metadata_for(Some("a.bin"), None, None, Ttl::days(7), created, &detection);
         assert!(
             !meta.contains_key("sha256"),
             "unknown sha256 must be absent, not empty"
