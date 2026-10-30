@@ -1368,8 +1368,12 @@ impl Store {
     ///
     /// No dates select the default window: yesterday and today in UTC. A
     /// date for [`list_recent`](Self::list_recent) means one day.
-    /// [`parse_list_window_request`] documents the range rules. Results are
-    /// in date order, then in S3 key order within each date.
+    /// [`parse_list_window_request`] documents the range rules.
+    ///
+    /// The scan starts at the newest date and moves to older dates. The
+    /// `limit` applies to the newest objects in the window, so an older
+    /// date can be omitted when the limit is reached. The returned
+    /// summaries are sorted by date ascending, then by key.
     ///
     /// The function scans the bucket directly: `ListObjectsV2` for each
     /// `pastes/<date>/` prefix, then one `HeadObject` per key to recover
@@ -1391,7 +1395,8 @@ impl Store {
         let (start_date, end_date) = resolve_list_window(&request, Utc::now())?;
         let limit = limit.clamp(1, 1000);
         let mut summaries = Vec::new();
-        for date in inclusive_dates(start_date, end_date) {
+        let dates: Vec<NaiveDate> = inclusive_dates(start_date, end_date).collect();
+        for date in dates.into_iter().rev() {
             if summaries.len() >= limit {
                 break;
             }
@@ -1448,6 +1453,11 @@ impl Store {
                 }
             }
         }
+        summaries.sort_by(|a, b| {
+            let a_date = a.id.split_once('/').map(|(date, _)| date).unwrap_or("");
+            let b_date = b.id.split_once('/').map(|(date, _)| date).unwrap_or("");
+            a_date.cmp(b_date).then_with(|| a.key.cmp(&b.key))
+        });
         Ok(summaries)
     }
 
