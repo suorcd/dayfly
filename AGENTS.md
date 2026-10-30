@@ -194,6 +194,9 @@ Test standards:
   prefix + HeadObject per key) and filter expired objects. Document
   the O(n) tradeoff honestly; its slowdown is the trigger for a
   database later.
+- **A three-word alias is a second name, not a second object.** The
+  canonical ID and the alias resolve to the same key. A change to one
+  form must work for the other.
 - **Garage first, expansion later.** Keep the code S3-shaped, but do
   not spend v1 effort on generic AWS/MinIO tuning or multi-backend
   abstraction.

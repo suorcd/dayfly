@@ -30,7 +30,11 @@ is needed. See "No database in v1" below.
   128 bits of entropy (base62). A user-supplied filename is never put
   in the key. An append adds one segment object under
   `pastes/<yyyy-mm-dd>/<random-id>/<sequence>-<suffix>`; see "Append and
-  segmented storage".
+  segmented storage". An alias adds one small object at
+  `words/<phrase>`; see "Three-word alias".
+- Each new paste also gets a three-word alias, for example
+  `abacus-abdomen-zoology`. The alias is a second name for the same
+  paste, not a second paste.
 - Filename, content-type, created date, and TTL are stored in object
   metadata. The S3 `Content-Length` gives the size. A `sha256` value is
   stored when the hash is known before the object is created. A
@@ -107,11 +111,11 @@ Operations, in both MCP tools and HTTP endpoints:
 | --- | --- | --- |
 | Store text | `store_text` | `POST /upload` or `POST /v1/pastes` (raw body, no filename) |
 | Store file (multipart for large files) | `store_file` (local path) | `POST /upload` (raw body with `X-Filename`, or `-F file=@...`) |
-| Append text | `append_text` | `POST /v1/pastes/<id>/append` (plain text body) |
-| Fetch text (offset/limit) | `fetch_text` | `GET /v1/pastes/<id>` (raw; use `Range` for slices) |
-| Fetch file (streaming, Range) | `fetch_file` (downloads to a local path) | `GET /v1/pastes/<id>` with `Range` → 206 |
-| Fetch metadata (HeadObject equivalent) | `fetch_metadata` | `GET /v1/pastes/<id>/meta`, or `HEAD /v1/pastes/<id>` |
-| Delete | `delete_paste` | `DELETE /v1/pastes/<id>` |
+| Append text | `append_text` | `POST /v1/pastes/<id-or-alias>/append` (plain text body) |
+| Fetch text (offset/limit) | `fetch_text` | `GET /v1/pastes/<id-or-alias>` (raw; use `Range` for slices) |
+| Fetch file (streaming, Range) | `fetch_file` (downloads to a local path) | `GET /v1/pastes/<id-or-alias>` with `Range` → 206 |
+| Fetch metadata (HeadObject equivalent) | `fetch_metadata` | `GET /v1/pastes/<id-or-alias>/meta`, or `HEAD /v1/pastes/<id-or-alias>` |
+| Delete | `delete_paste` | `DELETE /v1/pastes/<id-or-alias>` |
 | List recent (date or inclusive date window) | `list_recent` | `GET /v1/pastes?date=YYYY-MM-DD&limit=N` or `GET /v1/pastes?start=YYYY-MM-DD&end=YYYY-MM-DD&limit=N` |
 
 IDs may be full (`2026-10-28/abc123…`) or bare random IDs. Bare IDs
@@ -120,6 +124,11 @@ are resolved by scanning the `pastes/` prefix (up to 10 pages of
 An ID has one or two components after `pastes/`. A segment key has a
 third component and is never a paste ID. Listing and bare-ID
 resolution skip segment keys.
+
+Every operation that takes an ID also accepts a three-word alias, such
+as `abacus-abdomen-zoology`. The JSON and MCP store responses include
+both forms; the plain-text HTTP response returns only the URL. See
+"Three-word alias".
 
 ### Explicitly OUT of v1
 
@@ -273,6 +282,7 @@ printf 'hello, world\n' | curl --data-binary @- \
 curl --data-binary @- -H 'Accept: application/json' \
   http://127.0.0.1:8080/upload < note.txt
 # → {"id": "...", "url": "...", "size": ..., "sha256": "...",
+#    "words": "abacus-abdomen-zoology",
 #    "expires_at": "...", "content_type": "...", "filename": ...,
 #    "detection_source": "...", "detection_conflict": null}
 ```
@@ -333,7 +343,8 @@ An append writes only the new bytes. It does not rewrite the base
 object. The text cap applies to this append, not to the total size.
 An expired or missing ID returns 410 or 404 and writes nothing. An
 empty body writes nothing. Use the bare ID form
-`/v1/pastes/<random>/append` if you do not have the date.
+`/v1/pastes/<random>/append` if you do not have the date. A three-word
+alias works in place of the ID.
 
 ### Streaming upload (curl piping, 0x0.st style)
 
@@ -389,6 +400,9 @@ after the file field are not read. Use headers (`X-Filename`,
 ```sh
 # Fetch text (plain curl GET returns the paste):
 curl http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123...
+
+# Fetch by three-word alias (the same route):
+curl http://127.0.0.1:8080/v1/pastes/abacus-abdomen-zoology
 
 # Fetch a byte range (206, streaming, never the whole object):
 curl -H 'Range: bytes=0-999' http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123...
@@ -500,8 +514,8 @@ object and leaves the base object unchanged.
   overlap in each object. It does not read the whole paste for a small
   range.
 - `fetch_metadata` reports the total size: base plus segments.
-- `delete` removes the base object and every object under its segment
-  prefix.
+- `delete` removes the base object, every object under its segment
+  prefix, and the alias object.
 - An append keeps the `expires-at` value of the base object. It does
   not extend the TTL.
 - An append to an expired or missing ID returns an error and writes no
@@ -534,6 +548,46 @@ Limits:
   to 1,000 keys. Bare-ID resolution scans up to 10 pages. Segment keys
   consume that budget, so keep the full ID for a paste with many
   segments.
+
+## Three-word alias
+
+Every new paste gets a three-word alias, for example
+`abacus-abdomen-zoology`. The alias is a second name for the paste,
+not a second object. Use the canonical ID or the alias in every
+operation that takes an ID: fetch, metadata, append, and delete.
+
+- The words come from the bundled EFF large wordlist in
+  `src/wordlist.txt` (7,776 words). The source and the CC BY 3.0
+  attribution are in `src/wordlist.LICENSE`. No external service is
+  called. Four wordlist entries contain a hyphen; the parser matches
+  each one as a single word.
+- An alias is three words joined by hyphens. The store returns the
+  hyphen form. Input is case-insensitive; spaces and hyphens are
+  accepted as separators. A phrase with the wrong word count or an
+  unknown word is rejected.
+- The alias object is `words/<phrase>`. Its body is the canonical key
+  `pastes/<date>/<id>`. Its metadata holds `target`, `expires-at`, and
+  `kind=alias`. Lookup is O(1): one GetObject, then a HeadObject of
+  the target.
+- Uniqueness: the store checks `words/<phrase>` before it writes the
+  alias. It retries up to 8 random phrases. If every attempt collides,
+  the store returns an error and writes no paste. The store does not
+  overwrite an existing alias.
+- Expiry: the alias inherits the paste `expires-at`. It does not
+  extend the TTL. An expired or missing paste does not resolve through
+  its alias.
+- Delete: delete by ID or by alias. Either form removes the base
+  object, every segment, and the alias object.
+- Legacy objects have no alias. They keep working by ID, and `words`
+  is absent or null.
+- Entropy: three words give about 38.8 bits. The uniqueness check
+  prevents collisions, not guessing. Treat the alias as a name, not a
+  secret. The bearer token and the private bucket remain the access
+  control.
+- The alias object is small. It has the same expiry as the paste.
+  A lifecycle rule for `pastes/` does not cover `words/`. Add a
+  `words/` rule if you want the storage sweeper to remove expired
+  alias objects. Lookup still rejects an expired target.
 
 ## Content-Type detection
 
@@ -871,6 +925,11 @@ and asynchronous, and it can run after the TTL. Objects are already
 unreadable through the API when `expires-at` passes, regardless of
 when the sweeper runs.
 
+The example rule covers `pastes/` only. An alias object lives under
+`words/`. Add a second rule with the `words/` prefix to sweep expired
+alias objects. Lookup rejects an expired target even when the alias
+object remains.
+
 ## Known limitations (v1)
 
 These were found by running the binary against a Garage 1.3.1 bucket,
@@ -896,6 +955,9 @@ honest.
   appends can choose the same sequence. Both survive, because the
   segment names have random suffixes. A read orders one sequence by
   suffix. See "Append and segmented storage".
+- **A three-word alias is guessable.** Three words from the 7,776-word
+  list give about 38.8 bits. The alias is a second name, not a bearer
+  token. Use the bearer token and the private network.
 - **The HTTP endpoint is internal-only in the weakest sense.** The
   bearer token comparison is constant time for equal-length tokens.
   A length difference still leaks through timing. The write-route origin
