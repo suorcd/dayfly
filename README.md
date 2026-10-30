@@ -680,15 +680,16 @@ cargo build --release
 ```
 
 `cargo test` runs the unit tests in the modules and the integration suite in
-`tests/`. The integration suite is hermetic. It starts an in-process fake S3
-service on an ephemeral localhost port, points a real `Store` at it with dummy
-credentials, and needs no network and no Garage.
+`tests/`. The integration suite is hermetic. All S3-backed tests use the one
+in-process fake S3 service in `tests/common/mod.rs`. It listens on an
+ephemeral localhost port, and a real `Store` points at it with dummy
+credentials. The suite needs no network and no Garage.
 
 | File | Covers |
 | --- | --- |
-| `tests/common/mod.rs` | Stateful fake S3 service, request helpers, multipart bodies, temporary files |
-| `tests/store_s3.rs` | `store_text`, `store_file_path`, `store_stream`, multipart abort paths, caps, `head_metadata`, `fetch_text`, `fetch_range_by_key`, `download_file`, `delete`, `list_recent`, error mapping |
-| `tests/http_routes.rs` | Raw and multipart uploads, bearer auth, download, `HEAD`, `Range`, metadata, delete, list, failed uploads |
+| `tests/common/mod.rs` | The single fake S3 service, request helpers, multipart bodies, temporary files |
+| `tests/store_s3.rs` | `store_text`, `store_file_path`, `store_stream`, multipart abort paths, caps, `head_metadata`, `fetch_text`, `fetch_range_by_key`, `download_file`, `delete`, `list_recent`, error mapping, append and segment reads |
+| `tests/http_routes.rs` | Raw and multipart uploads, bearer auth, download, `HEAD`, `Range`, metadata, delete, list, append, failed uploads |
 | `tests/web_handlers.rs` | Index, text submit, upload submit, list, view, delete, auth, error pages |
 | `tests/mcp_stdio.rs` | The real binary over MCP stdio: all tools and their error paths |
 | `tests/config_env.rs` | `Config::from_env` defaults, overrides, and error text |
@@ -748,7 +749,7 @@ where `cargo --version`, `rustc --version`, and
 `rust-analyzer --version` all succeed.
 
 **Nix validation result:** `nix build` and the test suite were run on
-`x86_64-linux` against `nixos-unstable`: 269 passed and 2 ignored. On the stable
+`x86_64-linux` against `nixos-unstable`: 276 passed and 2 ignored. On the stable
 `nixos-25.11` branch the build fails before compilation with a
 rustc-too-old error naming 23 AWS crates, which is why the flake
 tracks unstable. Before this was built on a machine with Nix, an
@@ -767,12 +768,16 @@ streaming part buffering, chunked and multi-part-sized uploads,
 disconnect/part-failure/oversize abort (no URL material), empty
 uploads, the write-route origin guard, HTML escaping, human sizes,
 days-remaining math, MCP HTTP bearer auth, two independent concurrent
-MCP sessions, the unchanged stdio initialize path, suffixed segment
-key format, suffix shape, segment order, segment range mapping, total
-size, listing and bare-ID skipping of segment keys, delete of segments,
+MCP sessions, and the unchanged stdio initialize path.
+
+The append tests in `tests/store_s3.rs` cover suffixed segment key
+format, suffix shape, segment order, segment range mapping, total size,
+listing and bare-ID skipping of segment keys, delete of segments,
 append cost (only the new bytes), same-sequence appends that both
-survive a read, and append errors before a write. The store tests use a
-small test-only fake S3 server for Put, Get (with Range), Head, List
+survive a read, and append errors before a write. The append tests in
+`tests/http_routes.rs` cover the append endpoint and the HTTP MCP
+append tool. All S3-backed tests use the single fake S3 harness in
+`tests/common/mod.rs`. It implements Put, Get (with Range), Head, List
 and Delete.
 
 ### Optional tests against a real Garage or S3-compatible endpoint

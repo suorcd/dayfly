@@ -70,9 +70,10 @@ cargo build --release
   rather than leaving them, or say plainly why one is left.
 - Tests live in the modules they cover (`src/store.rs`,
   `src/stream.rs`, `src/content_type.rs`, `src/web.rs`) and in the
-  hermetic integration suite in `tests/`. The suite uses an in-process
-  fake S3 service. Do not make the default test run depend on Garage or
-  a network service.
+  hermetic integration suite in `tests/`. All S3-backed tests use the
+  one in-process fake S3 harness in `tests/common/mod.rs`. Do not add a
+  second fake S3 implementation. Do not make the default test run
+  depend on Garage or a network service.
 - Add a test for any new detection, range, expiry, or streaming
   behaviour — especially: a failed upload must return no URL material,
   and peeked bytes must be forwarded exactly once.
@@ -99,7 +100,7 @@ What a pass looks like, on a machine with Nix:
 ## Nix build status (read this before claiming anything)
 
 The flake builds and its test suite passes on `x86_64-linux` against
-`nixos-unstable`: 269 passed and 2 ignored. That is a real result from
+`nixos-unstable`: 276 passed and 2 ignored. That is a real result from
 a real run, not an assumption.
 
 It does **not** build on the `nixos-25.11` stable branch. The AWS SDK
