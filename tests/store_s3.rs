@@ -5,6 +5,7 @@ mod common;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use axum::http::StatusCode;
 use bytes::Bytes;
 use chrono::{Duration, Utc};
 use common::{FailOp, FakeS3, Gate};
@@ -1456,7 +1457,7 @@ async fn list_recent_rejects_an_invalid_date() {
 }
 
 #[tokio::test]
-async fn list_recent_drops_objects_whose_head_fails() {
+async fn list_recent_skips_an_object_deleted_between_list_and_head() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
     let today = Utc::now().format("%Y-%m-%d").to_string();
@@ -1479,9 +1480,63 @@ async fn list_recent_drops_objects_whose_head_fails() {
     let items = store
         .list_recent(Some(&today), 10)
         .await
-        .expect("listing must not fail when one head fails");
+        .expect("listing must not fail when one head is a 404");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].id, format!("{today}/here"));
+}
+
+#[tokio::test]
+async fn list_recent_propagates_a_head_access_denied_error() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let metadata = future_metadata(5);
+    let key = format!("pastes/{today}/denied");
+    fake.seed(
+        &key,
+        b"abcde",
+        "text/plain",
+        &common::metadata_refs(&metadata),
+    );
+    fake.fail_head_with(&key, StatusCode::FORBIDDEN, "AccessDenied");
+
+    let error = store
+        .list_recent(Some(&today), 10)
+        .await
+        .expect_err("a non-404 head error must fail the listing");
+    assert!(
+        matches!(error, StoreError::S3(_)),
+        "a head error must reach the caller, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_recent_propagates_a_segment_list_error() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let metadata = future_metadata(5);
+    let key = format!("pastes/{today}/segments");
+    fake.seed(
+        &key,
+        b"abcde",
+        "text/plain",
+        &common::metadata_refs(&metadata),
+    );
+    fake.fail_list_prefix(
+        &format!("{key}/"),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "InternalError",
+    );
+
+    let error = store
+        .list_recent(Some(&today), 10)
+        .await
+        .expect_err("a segment-list error must fail the listing");
+    assert!(
+        matches!(error, StoreError::S3(_)),
+        "a segment-list error must reach the caller, got {error:?}"
+    );
 }
 
 #[tokio::test]

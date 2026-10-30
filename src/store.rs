@@ -2140,11 +2140,13 @@ impl Store {
                     }
                     let id = key.strip_prefix("pastes/").unwrap_or(key).to_string();
                     // HeadObject per key: ListObjectsV2 returns no user
-                    // metadata. A head failure (e.g. deleted between list
-                    // and head) drops the entry instead of failing the
-                    // whole listing.
-                    let Some(meta) = self.head_metadata(&id).await.ok() else {
-                        continue;
+                    // metadata. An object deleted between list and head
+                    // is skipped. Any other error fails the listing, so
+                    // an S3 outage does not look like an empty bucket.
+                    let meta = match self.head_metadata(&id).await {
+                        Ok(meta) => meta,
+                        Err(StoreError::NotFound(_)) => continue,
+                        Err(e) => return Err(e),
                     };
                     if meta.expired {
                         continue;
