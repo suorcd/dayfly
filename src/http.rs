@@ -101,6 +101,7 @@ fn status_for(e: &StoreError) -> StatusCode {
             StatusCode::BAD_REQUEST
         }
         StoreError::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
+        StoreError::AliasUnavailable { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         StoreError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         StoreError::S3(_) => StatusCode::BAD_GATEWAY,
         StoreError::BucketUnavailable(_) => StatusCode::BAD_GATEWAY,
@@ -141,6 +142,7 @@ fn upload_error_response(e: StoreError, text_paste: bool) -> Response {
 #[derive(Serialize)]
 struct UploadEnvelope {
     id: String,
+    words: Option<String>,
     url: String,
     size: u64,
     sha256: String,
@@ -155,6 +157,7 @@ struct UploadEnvelope {
 struct MetaEnvelope {
     id: String,
     key: String,
+    words: Option<String>,
     filename: Option<String>,
     content_type: String,
     detection_source: Option<String>,
@@ -265,6 +268,7 @@ fn upload_response(
             StatusCode::CREATED,
             Json(UploadEnvelope {
                 id: stored.id.clone(),
+                words: stored.words.clone(),
                 url,
                 size: stored.size,
                 sha256: stored.sha256.clone(),
@@ -437,6 +441,7 @@ async fn meta_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
             Json(MetaEnvelope {
                 id: meta.id,
                 key: meta.key,
+                words: meta.words,
                 filename: meta.filename,
                 content_type: meta.content_type,
                 detection_source: meta.detection_source,
@@ -613,6 +618,7 @@ async fn list_handler(
             "items": items.iter().map(|i| serde_json::json!({
                 "id": i.id,
                 "key": i.key,
+                "words": i.words,
                 "size": i.size,
                 "last_modified": i.last_modified.map(|d| d.to_rfc3339()),
                 "expires_at": i.expires_at.map(|d| d.to_rfc3339()),
@@ -778,6 +784,7 @@ async fn append_inner(state: &AppState, headers: &HeaderMap, id: &str, req: Requ
     match state.store.append_text(id, &bytes).await {
         Ok(appended) => Json(serde_json::json!({
             "id": appended.meta.id,
+            "words": appended.meta.words,
             "url": paste_url(headers, &appended.meta.id),
             "appended_bytes": appended.appended_bytes,
             "segment_key": appended.segment_key,

@@ -298,6 +298,7 @@ fn error_page(e: StoreError) -> Response {
         StoreError::TooLarge { .. } => (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()),
         StoreError::NotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
         StoreError::Expired(_) => (StatusCode::GONE, e.to_string()),
+        StoreError::AliasUnavailable { .. } => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         _ => (StatusCode::BAD_REQUEST, e.to_string()),
     };
     (
