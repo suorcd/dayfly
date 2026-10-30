@@ -45,7 +45,9 @@ use axum::{Form, Router};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use crate::http::{check_auth, AppState};
+use crate::http::{
+    check_auth, read_metadata_field, AppState, MultipartFieldError, MULTIPART_METADATA_MAX_BYTES,
+};
 use crate::store::{parse_list_window_request, ListWindowRequest, StoreError, Ttl};
 
 /// Adapted base look from suorcd.us/style.css, palette cyberpunkNeon
@@ -381,10 +383,18 @@ async fn upload_submit_handler(
             };
         }
         if name == "ttl_days" {
-            if let Ok(text) = field.text().await {
-                match Ttl::parse_days(&text) {
+            match read_metadata_field(field).await {
+                Ok(text) => match Ttl::parse_days(&text) {
                     Ok(parsed) => ttl = Some(parsed),
                     Err(e) => return bad_request_page(&e.to_string()),
+                },
+                Err(MultipartFieldError::TooLarge) => {
+                    return error_page(StoreError::TooLarge {
+                        limit: MULTIPART_METADATA_MAX_BYTES as u64,
+                    });
+                }
+                Err(MultipartFieldError::Malformed(message)) => {
+                    return bad_request_page(&format!("invalid multipart body: {message}"));
                 }
             }
         }
