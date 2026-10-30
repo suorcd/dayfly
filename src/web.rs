@@ -222,8 +222,8 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
 <hr>
 <h2>Upload a file</h2>
 <form method="post" action="/ui/upload" enctype="multipart/form-data">
-<p><label>File <input type="file" name="file" required></label></p>
 <p><label>Keep for <select name="ttl_days">{}</select></label></p>
+<p><label>File <input type="file" name="file" required></label></p>
 <p><button type="submit">Upload file</button></p>
 </form>
 <p class="muted">The selector uses whole days. API clients can send a sub-day TTL with X-TTL. Expiry is checked on read; the bucket sweeper is day-rounded. The bucket itself is private; only this binary talks to Garage.</p>"#,
