@@ -485,8 +485,10 @@ multi-part-sized uploads, disconnect/part-failure/oversize abort (no URL
 material), empty uploads, HTML escaping, human sizes, and days-remaining math.
 
 `.github/workflows/ci.yml` runs `cargo fmt --check`, clippy with warnings
-denied, `cargo test`, and `cargo build` on every push and pull request. A
-coverage job runs `cargo llvm-cov` on pushes to `main` and on manual dispatch.
+denied, `cargo test`, and `cargo build` on every push to `main` and on every
+pull request. A coverage job runs `cargo llvm-cov` on pushes to `main` and on
+manual dispatch. A separate flake job runs `nix flake check` and
+`nix build -L`.
 
 ### Nix build path (additional, not a replacement for Cargo)
 
