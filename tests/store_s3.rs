@@ -300,7 +300,7 @@ async fn store_stream_small_known_length_uses_one_put() {
 }
 
 #[tokio::test]
-async fn store_stream_chunked_upload_uses_multipart_and_copy() {
+async fn store_stream_chunked_upload_uses_multipart_without_a_copy() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
     let body = common::pattern_bytes(6 * 1024 * 1024);
@@ -324,16 +324,21 @@ async fn store_stream_chunked_upload_uses_multipart_and_copy() {
     assert_eq!(stored.sha256, sha256_hex(&body));
     let object = fake.object(&stored.key).expect("object must exist");
     assert_eq!(object.body, body);
-    assert_eq!(
-        object.metadata.get("sha256").map(String::as_str),
-        Some(stored.sha256.as_str())
-    );
-    let body_size = body.len().to_string();
-    assert_eq!(
-        object.metadata.get("size").map(String::as_str),
-        Some(body_size.as_str())
-    );
+    // S3 takes metadata only at CreateMultipartUpload. The hash and size
+    // are not known then, so the object omits both. The stored record
+    // still returns them.
+    assert!(!object.metadata.contains_key("sha256"));
+    assert!(!object.metadata.contains_key("size"));
     assert!(object.metadata.contains_key("expires-at"));
+    assert!(
+        !fake.requests().iter().any(|request| {
+            request
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-amz-copy-source"))
+        }),
+        "multipart must set metadata at create time, not with a copy"
+    );
 }
 
 #[tokio::test]
@@ -828,11 +833,13 @@ async fn resolve_key_finds_a_bare_id_by_scanning_the_prefix() {
 }
 
 #[tokio::test]
-async fn multipart_copy_failure_leaves_the_object_stored() {
+async fn multipart_metadata_is_set_at_create_time_without_a_copy() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
     let body = common::pattern_bytes(MULTIPART_CHUNK_BYTES + 1);
-    let path = common::write_temp_file("copy-fails.bin", &body);
+    let path = common::write_temp_file("metadata-at-create.bin", &body);
+    // A copy failure must not matter, because the multipart path does not
+    // use a copy to attach metadata.
     fake.fail(FailOp::CopyObject);
 
     let stored = store
@@ -841,9 +848,24 @@ async fn multipart_copy_failure_leaves_the_object_stored() {
         .expect("the upload itself must succeed");
     let object = fake.object(&stored.key).expect("object must exist");
     assert_eq!(object.body, body);
+    assert_eq!(
+        object.metadata.get("sha256").map(String::as_str),
+        Some(stored.sha256.as_str())
+    );
+    let size = stored.size.to_string();
+    assert_eq!(
+        object.metadata.get("size").map(String::as_str),
+        Some(size.as_str())
+    );
+    assert!(object.metadata.contains_key("expires-at"));
     assert!(
-        !object.metadata.contains_key("expires-at"),
-        "a failed best-effort copy leaves the initial metadata"
+        !fake.requests().iter().any(|request| {
+            request
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-amz-copy-source"))
+        }),
+        "multipart must set metadata at create time, not with a copy"
     );
     let _ = std::fs::remove_file(path);
 }
