@@ -182,6 +182,7 @@ fn tools_list_exposes_every_dayfly_tool() {
     for expected in [
         "store_text",
         "store_file",
+        "append_text",
         "fetch_text",
         "fetch_file",
         "fetch_metadata",
