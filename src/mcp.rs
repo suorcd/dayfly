@@ -32,8 +32,38 @@ fn result_json(value: serde_json::Value) -> Result<CallToolResult, rmcp::ErrorDa
     )]))
 }
 
-fn err_json(e: StoreError) -> rmcp::ErrorData {
-    rmcp::ErrorData::new(rmcp::model::ErrorCode::INTERNAL_ERROR, e.to_string(), None)
+/// Map a store error to the value that a tool method returns.
+///
+/// A routine domain result is a tool result with `isError` set, so a
+/// missing or expired paste does not look like a transport fault. A bad
+/// argument is a JSON-RPC `-32602` error. Only an internal fault is a
+/// `-32603` error.
+fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> {
+    match e {
+        StoreError::NotFound(_)
+        | StoreError::Expired(_)
+        | StoreError::TooLarge { .. }
+        | StoreError::RangeNotSatisfiable => Ok(CallToolResult::error(vec![ContentBlock::text(
+            e.to_string(),
+        )])),
+        StoreError::InvalidId(_) | StoreError::InvalidDate(_) | StoreError::InvalidRange(_) => {
+            Err(rmcp::ErrorData::invalid_params(e.to_string(), None))
+        }
+        StoreError::Io(_) | StoreError::S3(_) | StoreError::BucketUnavailable(_) => {
+            Err(rmcp::ErrorData::internal_error(e.to_string(), None))
+        }
+    }
+}
+
+/// Await a store call. If the call fails, return the mapped value to the
+/// client from the tool method.
+macro_rules! try_store {
+    ($call:expr) => {
+        match $call {
+            Ok(value) => value,
+            Err(e) => return store_error_result(e),
+        }
+    };
 }
 
 fn invalid_ttl(message: impl Into<String>) -> rmcp::ErrorData {
