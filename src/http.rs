@@ -100,6 +100,10 @@ fn status_for(e: &StoreError) -> StatusCode {
         StoreError::InvalidId(_) | StoreError::InvalidDate(_) | StoreError::InvalidRange(_) => {
             StatusCode::BAD_REQUEST
         }
+        StoreError::InvalidPath(_) => StatusCode::BAD_REQUEST,
+        // The local-path tools are MCP-only. If one of these reaches an
+        // HTTP route, the caller asked for something it does not offer.
+        StoreError::LocalFilesDisabled | StoreError::PathOutsideRoot(_) => StatusCode::FORBIDDEN,
         StoreError::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
         StoreError::AliasUnavailable { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         StoreError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -748,7 +752,7 @@ async fn require_bearer(State(state): State<AppState>, request: Request, next: N
 pub fn mcp_router(state: AppState) -> Router<AppState> {
     let store = state.store.clone();
     let service = StreamableHttpService::new(
-        move || Ok(crate::mcp::Pastebin::new(store.clone())),
+        move || Ok(crate::mcp::Pastebin::http(store.clone())),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default().disable_allowed_hosts(),
     );
@@ -885,6 +889,7 @@ mod tests {
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
             http_bearer_token: None,
+            mcp_local_root: None,
         }
     }
 

@@ -8,7 +8,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use dayfly::config::{Config, ConfigError};
 
-const VARS: [&str; 11] = [
+const VARS: [&str; 12] = [
     "S3_ENDPOINT",
     "S3_BUCKET",
     "S3_REGION",
@@ -20,6 +20,7 @@ const VARS: [&str; 11] = [
     "DAYFLY_MAX_FILE_BYTES",
     "DAYFLY_DEFAULT_TTL_DAYS",
     "DAYFLY_HTTP_BIND",
+    "DAYFLY_MCP_LOCAL_ROOT",
 ];
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -64,6 +65,7 @@ fn minimal_environment_applies_documented_defaults() {
     assert_eq!(config.default_ttl_days, 7);
     assert_eq!(config.http_bind, "127.0.0.1:8080");
     assert_eq!(config.http_bearer_token, None);
+    assert_eq!(config.mcp_local_root, None);
 }
 
 #[test]
@@ -282,4 +284,48 @@ fn safe_summary_omits_credentials_and_token_presence() {
         );
     }
     assert!(!summary.contains("bearer"));
+}
+
+#[test]
+fn mcp_local_root_is_canonical_and_must_exist() {
+    let _guard = lock_env();
+    clear_env();
+    set_required();
+
+    let dir = env::temp_dir().join(format!("dayfly-root-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("test directory must be creatable");
+
+    env::set_var("DAYFLY_MCP_LOCAL_ROOT", &dir);
+    let config = Config::from_env().expect("an existing directory must parse");
+    let root = config.mcp_local_root.expect("the root must be set");
+    assert!(root.is_absolute(), "the root must be canonical");
+    assert_eq!(
+        root,
+        dir.canonicalize()
+            .expect("the test directory must canonicalize"),
+        "the stored root must be the canonical path"
+    );
+
+    // A path that does not exist is a startup error, not a silent no-op.
+    env::set_var(
+        "DAYFLY_MCP_LOCAL_ROOT",
+        dir.join("missing").to_string_lossy().to_string(),
+    );
+    match Config::from_env() {
+        Err(ConfigError::Invalid(name, _)) => assert_eq!(name, "DAYFLY_MCP_LOCAL_ROOT"),
+        Err(other) => panic!("a missing root must fail startup: {other:?}"),
+        Ok(_) => panic!("a missing root must fail startup"),
+    }
+
+    // A file is not a directory.
+    let file = dir.join("not-a-dir.txt");
+    std::fs::write(&file, b"x").expect("test file must be writable");
+    env::set_var("DAYFLY_MCP_LOCAL_ROOT", &file);
+    match Config::from_env() {
+        Err(ConfigError::Invalid(name, _)) => assert_eq!(name, "DAYFLY_MCP_LOCAL_ROOT"),
+        Err(other) => panic!("a file must not pass as a root: {other:?}"),
+        Ok(_) => panic!("a file must not pass as a root"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
