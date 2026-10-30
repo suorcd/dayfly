@@ -1,9 +1,13 @@
-//! Shared test support: an in-process fake S3 service.
+//! Shared test support: the one in-process fake S3 service.
 //!
-//! The fake listens on an ephemeral localhost port and implements the S3
-//! operations that the AWS SDK calls from this crate. Integration tests
-//! point a real [`Store`] at it with dummy credentials. No network access
-//! and no Garage instance are needed.
+//! Every S3-backed test uses this harness. The fake listens on an ephemeral
+//! localhost port and implements the S3 operations that the AWS SDK calls
+//! from this crate. Tests point a real [`Store`] at it with dummy
+//! credentials. No network access and no Garage instance are needed.
+//!
+//! The fake records each PutObject body and each GetObject range. A test can
+//! therefore assert that an append writes only the new bytes, and that a
+//! range read asks for only the bytes it needs.
 
 #![allow(dead_code)]
 
@@ -66,6 +70,8 @@ pub struct FakeState {
     pub uploads: BTreeMap<String, Multipart>,
     pub next_upload: u64,
     pub requests: Vec<RecordedRequest>,
+    pub puts: Vec<(String, Vec<u8>)>,
+    pub gets: Vec<(String, Option<String>)>,
     pub aborted: Vec<String>,
     pub fail_ops: Vec<FailOp>,
     pub fail_part_number: Option<i32>,
@@ -194,6 +200,30 @@ impl FakeS3 {
 
     pub fn requests(&self) -> Vec<RecordedRequest> {
         self.state.lock().expect("fake state lock").requests.clone()
+    }
+
+    /// Every stored PutObject key and body, in request order.
+    pub fn puts(&self) -> Vec<(String, Vec<u8>)> {
+        self.state.lock().expect("fake state lock").puts.clone()
+    }
+
+    /// Every GetObject key and Range header, in request order.
+    pub fn gets(&self) -> Vec<(String, Option<String>)> {
+        self.state.lock().expect("fake state lock").gets.clone()
+    }
+
+    /// Replace one metadata value on a stored object. Tests use this to
+    /// make a paste expired without waiting.
+    pub fn set_metadata(&self, key: &str, name: &str, value: &str) {
+        if let Some(object) = self
+            .state
+            .lock()
+            .expect("fake state lock")
+            .objects
+            .get_mut(key)
+        {
+            object.metadata.insert(name.to_string(), value.to_string());
+        }
     }
 
     pub fn aborted_uploads(&self) -> Vec<String> {
@@ -452,6 +482,7 @@ fn put_object(
         etag: etag_for(&body),
     };
     let etag = object.etag.clone();
+    state.puts.push((key.clone(), body.to_vec()));
     state.objects.insert(key, object);
     (
         StatusCode::OK,
@@ -467,7 +498,7 @@ fn get_object(
     headers: &HeaderMap,
     is_head: bool,
 ) -> Response {
-    let state = state.lock().expect("fake state lock");
+    let mut state = state.lock().expect("fake state lock");
     let Some(key) = key else {
         return s3_error(
             StatusCode::BAD_REQUEST,
@@ -475,6 +506,13 @@ fn get_object(
             "missing object key",
         );
     };
+    let range_header = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if !is_head {
+        state.gets.push((key.clone(), range_header.clone()));
+    }
     let Some(object) = state.objects.get(&key) else {
         if is_head {
             return (StatusCode::NOT_FOUND, HeaderMap::new(), Body::empty()).into_response();
@@ -492,10 +530,7 @@ fn get_object(
     if is_head {
         return (StatusCode::OK, resp_headers, Body::empty()).into_response();
     }
-    let range = headers
-        .get(header::RANGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|value| parse_range(value, object.body.len() as u64));
+    let range = range_header.and_then(|value| parse_range(&value, object.body.len() as u64));
     match range {
         Some((start, end)) => {
             let slice = object.body[start as usize..=end as usize].to_vec();
