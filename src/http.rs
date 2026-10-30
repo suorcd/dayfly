@@ -843,7 +843,7 @@ pub fn api_router() -> Router<AppState> {
 mod tests {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::task::Poll;
 
     use axum::body::Body;
@@ -857,8 +857,6 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
-
-    type CapturedMetadata = Arc<std::sync::Mutex<Option<HashMap<String, String>>>>;
 
     type McpClient = Client<HttpConnector, Full<Bytes>>;
 
@@ -1115,44 +1113,6 @@ mod tests {
         );
     }
 
-    /// A mock S3 endpoint that records the user metadata of the last
-    /// PutObject request and accepts it.
-    async fn mock_s3() -> (String, CapturedMetadata) {
-        async fn capture_put(
-            State(captured): State<CapturedMetadata>,
-            headers: HeaderMap,
-            _body: axum::body::Bytes,
-        ) -> impl IntoResponse {
-            let mut meta = HashMap::new();
-            for (name, value) in headers.iter() {
-                if let Some(key) = name.as_str().strip_prefix("x-amz-meta-") {
-                    if let Ok(value) = value.to_str() {
-                        meta.insert(key.to_string(), value.to_string());
-                    }
-                }
-            }
-            *captured.lock().expect("metadata lock must not be poisoned") = Some(meta);
-            (
-                StatusCode::OK,
-                [(axum::http::header::ETAG, "\"test-etag\"")],
-            )
-        }
-        let captured = Arc::new(std::sync::Mutex::new(None));
-        let app = Router::new()
-            .fallback(capture_put)
-            .with_state(captured.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("mock S3 listener must bind");
-        let addr = listener.local_addr().expect("mock S3 address must exist");
-        tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("mock S3 server must run");
-        });
-        (format!("http://{addr}"), captured)
-    }
-
     fn query(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
             .iter()
@@ -1262,61 +1222,6 @@ mod tests {
         );
     }
 
-    /// A sub-day TTL must reach S3 as an exact duration. The mock S3
-    /// endpoint records the stored user metadata, so this test observes
-    /// what the object would carry, not only the HTTP status.
-    #[tokio::test]
-    async fn x_ttl_header_stores_exact_hour_expiry() {
-        let (endpoint, captured) = mock_s3().await;
-        let mut config = test_config(10 * 1024 * 1024, 1024 * 1024 * 1024);
-        config.endpoint = endpoint;
-        let state = AppState {
-            store: Store::from_config(config)
-                .await
-                .expect("test S3 config must build without network access"),
-        };
-        let app = api_router().with_state(state);
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/upload")
-            .header(CONTENT_TYPE, "text/plain")
-            .header(CONTENT_LENGTH, "5")
-            .header("x-ttl", "1h")
-            .body(Body::from("hello"))
-            .expect("request must build");
-        let resp = app.oneshot(req).await.expect("router call must complete");
-        assert_eq!(
-            resp.status(),
-            StatusCode::CREATED,
-            "a valid X-TTL header must be accepted"
-        );
-
-        let meta = captured
-            .lock()
-            .expect("metadata lock must not be poisoned")
-            .take()
-            .expect("the upload must reach S3");
-        assert_eq!(
-            meta.get("ttl-seconds").map(String::as_str),
-            Some("3600"),
-            "ttl-seconds must hold the exact sub-day duration"
-        );
-        let created = meta
-            .get("created-at")
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .expect("created-at must be stored");
-        let expires = meta
-            .get("expires-at")
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .expect("expires-at must be stored");
-        assert_eq!(
-            expires - created,
-            chrono::Duration::hours(1),
-            "expires-at must be exactly one hour after created-at"
-        );
-    }
-
     #[tokio::test]
     async fn mixed_x_ttl_and_x_ttl_days_are_rejected_at_the_http_boundary() {
         let state = test_state(10 * 1024 * 1024, 1024 * 1024 * 1024).await;
@@ -1337,47 +1242,6 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "both TTL forms must be rejected, not silently resolved"
         );
-    }
-
-    #[tokio::test]
-    async fn x_ttl_days_still_stores_whole_day_expiry() {
-        let (endpoint, captured) = mock_s3().await;
-        let mut config = test_config(10 * 1024 * 1024, 1024 * 1024 * 1024);
-        config.endpoint = endpoint;
-        let state = AppState {
-            store: Store::from_config(config)
-                .await
-                .expect("test S3 config must build without network access"),
-        };
-        let app = api_router().with_state(state);
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/upload")
-            .header(CONTENT_TYPE, "text/plain")
-            .header(CONTENT_LENGTH, "5")
-            .header("x-ttl-days", "7")
-            .body(Body::from("hello"))
-            .expect("request must build");
-        let resp = app.oneshot(req).await.expect("router call must complete");
-        assert_eq!(resp.status(), StatusCode::CREATED);
-
-        let meta = captured
-            .lock()
-            .expect("metadata lock must not be poisoned")
-            .take()
-            .expect("the upload must reach S3");
-        assert_eq!(meta.get("ttl-seconds").map(String::as_str), Some("604800"));
-        assert_eq!(meta.get("ttl-days").map(String::as_str), Some("7"));
-        let created = meta
-            .get("created-at")
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .expect("created-at must be stored");
-        let expires = meta
-            .get("expires-at")
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .expect("expires-at must be stored");
-        assert_eq!(expires - created, chrono::Duration::days(7));
     }
 
     #[tokio::test]
@@ -1832,106 +1696,6 @@ mod tests {
             "concurrent initializations must not share a session"
         );
         server.abort();
-    }
-
-    /// A minimal PutObject sink. `store_text` sends one PutObject, so a
-    /// 200 with an ETag is enough to complete the call.
-    async fn mock_s3_put(
-        State(keys): State<Arc<Mutex<Vec<String>>>>,
-        request: Request<Body>,
-    ) -> Response {
-        if request.method() != axum::http::Method::PUT {
-            return (StatusCode::NOT_IMPLEMENTED, "only PUT is mocked").into_response();
-        }
-        let path = request.uri().path().trim_start_matches('/');
-        let (_, key) = path.split_once('/').unwrap_or(("", path));
-        keys.lock()
-            .expect("mock S3 lock must not be poisoned")
-            .push(key.to_string());
-        (
-            StatusCode::OK,
-            [(axum::http::header::ETAG, "\"mock-etag\"")],
-        )
-            .into_response()
-    }
-
-    async fn start_mock_s3() -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
-        let keys = Arc::new(Mutex::new(Vec::new()));
-        let app = Router::new().fallback(mock_s3_put).with_state(keys.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("mock S3 listener must bind");
-        let addr = listener.local_addr().expect("bound address must exist");
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("mock S3 server must run");
-        });
-        (format!("http://{addr}"), keys, handle)
-    }
-
-    async fn test_state_at_endpoint(endpoint: &str) -> AppState {
-        let mut config = test_config(10 * 1024 * 1024, 1024 * 1024 * 1024);
-        config.endpoint = endpoint.to_string();
-        AppState {
-            store: Store::from_config(config)
-                .await
-                .expect("test S3 config must build without network access"),
-        }
-    }
-
-    fn store_text_body(id: u64, text: &str) -> Value {
-        json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "tools/call",
-            "params": {"name": "store_text", "arguments": {"text": text}}
-        })
-    }
-
-    fn stored_paste(payload: &Value) -> Value {
-        let text = payload["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap_or_else(|| panic!("store_text must return JSON text, got: {payload}"));
-        serde_json::from_str(text).expect("store_text result must be JSON")
-    }
-
-    /// Two clients must store text through one HTTP MCP endpoint and one
-    /// shared store. The mock S3 records two distinct object keys.
-    #[tokio::test]
-    async fn two_mcp_clients_store_text_through_one_shared_store() {
-        let (endpoint, keys, mock_s3) = start_mock_s3().await;
-        let state = test_state_at_endpoint(&endpoint).await;
-        let (addr, server) = start_mcp_server(state).await;
-        let client_a = mcp_http_client();
-        let client_b = mcp_http_client();
-        let (session_a, _) = initialize_session(&client_a, addr).await;
-        let (session_b, _) = initialize_session(&client_b, addr).await;
-
-        let body_a = store_text_body(10, "paste from client a");
-        let body_b = store_text_body(11, "paste from client b");
-        let (response_a, response_b) = tokio::join!(
-            mcp_request(&client_a, addr, "POST", &body_a, Some(&session_a)),
-            mcp_request(&client_b, addr, "POST", &body_b, Some(&session_b))
-        );
-        assert_eq!(response_a.status, StatusCode::OK);
-        assert_eq!(response_b.status, StatusCode::OK);
-        let payload_a = sse_json(&response_a);
-        let payload_b = sse_json(&response_b);
-        assert_eq!(payload_a["result"]["isError"], false);
-        assert_eq!(payload_b["result"]["isError"], false);
-        let paste_a = stored_paste(&payload_a);
-        let paste_b = stored_paste(&payload_b);
-        assert_ne!(
-            paste_a["id"], paste_b["id"],
-            "each store_text call must create a new paste"
-        );
-
-        let keys = keys.lock().expect("mock S3 lock must not be poisoned");
-        assert_eq!(keys.len(), 2, "one PutObject per store_text call");
-        assert_ne!(keys[0], keys[1], "each paste must use a distinct key");
-        server.abort();
-        mock_s3.abort();
     }
 
     #[tokio::test]

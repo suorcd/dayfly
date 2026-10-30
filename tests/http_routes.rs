@@ -1161,12 +1161,8 @@ fn stored_paste(payload: &Value) -> Value {
     serde_json::from_str(text).expect("store_text result must be JSON")
 }
 
-#[tokio::test]
-async fn append_text_works_through_the_http_mcp_endpoint() {
-    let (state, _fake) = fake_state(1024).await;
-    let app = app_router(state.clone());
-
-    let (status, headers, body) = mcp_post(&app, &initialize_body(), None).await;
+async fn initialize_mcp_session(app: &Router) -> String {
+    let (status, headers, body) = mcp_post(app, &initialize_body(), None).await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -1180,13 +1176,21 @@ async fn append_text_works_through_the_http_mcp_endpoint() {
         .expect("session id must be ASCII")
         .to_string();
 
-    let (status, _, body) = mcp_post(&app, &initialized_body(), Some(&session)).await;
+    let (status, _, body) = mcp_post(app, &initialized_body(), Some(&session)).await;
     assert_eq!(
         status,
         StatusCode::ACCEPTED,
         "the initialized notification must be accepted, got: {}",
         String::from_utf8_lossy(&body)
     );
+    session
+}
+
+#[tokio::test]
+async fn append_text_works_through_the_http_mcp_endpoint() {
+    let (state, _fake) = fake_state(1024).await;
+    let app = app_router(state.clone());
+    let session = initialize_mcp_session(&app).await;
 
     let (status, _, body) = mcp_post(&app, &store_text_body(10, "hello"), Some(&session)).await;
     assert_eq!(status, StatusCode::OK);
@@ -1213,4 +1217,124 @@ async fn append_text_works_through_the_http_mcp_endpoint() {
         .await
         .expect("fetch must succeed");
     assert_eq!(slice.text, "hello world");
+}
+
+#[tokio::test]
+async fn x_ttl_header_stores_exact_hour_expiry() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+
+    let request = common::request(
+        "POST",
+        "/upload",
+        &[
+            ("content-type", "text/plain".to_string()),
+            ("content-length", "5".to_string()),
+            ("x-ttl", "1h".to_string()),
+        ],
+        b"hello".to_vec(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a valid X-TTL header must be accepted"
+    );
+
+    let key = fake.puts().pop().expect("the upload must reach S3").0;
+    let meta = fake
+        .object(&key)
+        .expect("the upload must be stored")
+        .metadata;
+    assert_eq!(
+        meta.get("ttl-seconds").map(String::as_str),
+        Some("3600"),
+        "ttl-seconds must hold the exact sub-day duration"
+    );
+    let created = meta
+        .get("created-at")
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .expect("created-at must be stored");
+    let expires = meta
+        .get("expires-at")
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .expect("expires-at must be stored");
+    assert_eq!(
+        expires - created,
+        chrono::Duration::hours(1),
+        "expires-at must be exactly one hour after created-at"
+    );
+}
+
+#[tokio::test]
+async fn x_ttl_days_still_stores_whole_day_expiry() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+
+    let request = common::request(
+        "POST",
+        "/upload",
+        &[
+            ("content-type", "text/plain".to_string()),
+            ("content-length", "5".to_string()),
+            ("x-ttl-days", "7".to_string()),
+        ],
+        b"hello".to_vec(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let key = fake.puts().pop().expect("the upload must reach S3").0;
+    let meta = fake
+        .object(&key)
+        .expect("the upload must be stored")
+        .metadata;
+    assert_eq!(meta.get("ttl-seconds").map(String::as_str), Some("604800"));
+    assert_eq!(meta.get("ttl-days").map(String::as_str), Some("7"));
+    let created = meta
+        .get("created-at")
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .expect("created-at must be stored");
+    let expires = meta
+        .get("expires-at")
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .expect("expires-at must be stored");
+    assert_eq!(expires - created, chrono::Duration::days(7));
+}
+
+#[tokio::test]
+async fn two_mcp_clients_store_text_through_one_shared_store() {
+    let fake = FakeS3::start().await;
+    let app = app_router(AppState {
+        store: fake.store().await,
+    });
+    let session_a = initialize_mcp_session(&app).await;
+    let session_b = initialize_mcp_session(&app).await;
+    assert_ne!(
+        session_a, session_b,
+        "each initialize must create a distinct session"
+    );
+
+    let request_a = store_text_body(10, "paste from client a");
+    let request_b = store_text_body(11, "paste from client b");
+    let ((status_a, _, body_a), (status_b, _, body_b)) = tokio::join!(
+        mcp_post(&app, &request_a, Some(&session_a)),
+        mcp_post(&app, &request_b, Some(&session_b))
+    );
+    assert_eq!(status_a, StatusCode::OK);
+    assert_eq!(status_b, StatusCode::OK);
+    let payload_a = sse_json(&body_a);
+    let payload_b = sse_json(&body_b);
+    assert_eq!(payload_a["result"]["isError"], false);
+    assert_eq!(payload_b["result"]["isError"], false);
+    let paste_a = stored_paste(&payload_a);
+    let paste_b = stored_paste(&payload_b);
+    assert_ne!(
+        paste_a["id"], paste_b["id"],
+        "each store_text call must create a new paste"
+    );
+
+    let puts = fake.puts();
+    assert_eq!(puts.len(), 2, "one PutObject per store_text call");
+    assert_ne!(puts[0].0, puts[1].0, "each paste must use a distinct key");
 }

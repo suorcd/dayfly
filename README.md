@@ -689,7 +689,7 @@ credentials. The suite needs no network and no Garage.
 | --- | --- |
 | `tests/common/mod.rs` | The single fake S3 service, request helpers, multipart bodies, temporary files |
 | `tests/store_s3.rs` | `store_text`, `store_file_path`, `store_stream`, multipart abort paths, caps, `head_metadata`, `fetch_text`, `fetch_range_by_key`, `download_file`, `delete`, `list_recent`, error mapping, append and segment reads |
-| `tests/http_routes.rs` | Raw and multipart uploads, bearer auth, download, `HEAD`, `Range`, metadata, delete, list, append, failed uploads |
+| `tests/http_routes.rs` | Raw and multipart uploads, bearer auth, download, `HEAD`, `Range`, metadata, delete, list, append, MCP shared store, failed uploads |
 | `tests/web_handlers.rs` | Index, text submit, upload submit, list, view, delete, auth, error pages |
 | `tests/mcp_stdio.rs` | The real binary over MCP stdio: all tools and their error paths |
 | `tests/config_env.rs` | `Config::from_env` defaults, overrides, and error text |
