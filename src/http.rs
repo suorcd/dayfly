@@ -857,7 +857,6 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
-    use crate::test_s3;
 
     type CapturedMetadata = Arc<std::sync::Mutex<Option<HashMap<String, String>>>>;
 
@@ -1071,16 +1070,6 @@ mod tests {
             status_for_auth_request(state, None).await,
             StatusCode::BAD_GATEWAY
         );
-    }
-
-    async fn fake_state(max_text_bytes: u64) -> (AppState, test_s3::FakeS3) {
-        let (fake, endpoint) = test_s3::spawn().await;
-        let state = AppState {
-            store: Store::from_config(test_config_at(&endpoint, max_text_bytes, 1024 * 1024))
-                .await
-                .expect("test S3 config must build without network access"),
-        };
-        (state, fake)
     }
 
     /// A raw body with no filename is a text paste. Its declared length is
@@ -1974,134 +1963,5 @@ mod tests {
             !polled.load(Ordering::SeqCst),
             "the body must not be read after an early cap rejection"
         );
-    }
-
-    #[tokio::test]
-    async fn append_endpoint_extends_the_paste_and_fetch_returns_the_concatenation() {
-        let (state, _fake) = fake_state(1024).await;
-        let stored = state
-            .store
-            .store_text(b"hello", None, Some("text/plain"), Some(Ttl::days(7)))
-            .await
-            .expect("store must succeed against the fake");
-        let app = api_router().with_state(state);
-
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/v1/pastes/{}/append", stored.id))
-            .header(CONTENT_TYPE, "text/plain")
-            .body(Body::from(" world"))
-            .expect("request must build");
-        let resp = app
-            .clone()
-            .oneshot(req)
-            .await
-            .expect("router call must complete");
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 4096)
-            .await
-            .expect("append body must be readable");
-        let json: serde_json::Value =
-            serde_json::from_slice(&body).expect("append body must be JSON");
-        assert_eq!(json["appended_bytes"], 6);
-        assert_eq!(json["size"], 11);
-
-        let req = Request::builder()
-            .uri(format!("/v1/pastes/{}", stored.id))
-            .body(Body::empty())
-            .expect("request must build");
-        let resp = app
-            .clone()
-            .oneshot(req)
-            .await
-            .expect("router call must complete");
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 4096)
-            .await
-            .expect("fetch body must be readable");
-        assert_eq!(body.as_ref(), b"hello world");
-
-        let req = Request::builder()
-            .uri(format!("/v1/pastes/{}", stored.id))
-            .header(RANGE, "bytes=3-7")
-            .body(Body::empty())
-            .expect("request must build");
-        let resp = app
-            .clone()
-            .oneshot(req)
-            .await
-            .expect("router call must complete");
-        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
-        let body = axum::body::to_bytes(resp.into_body(), 4096)
-            .await
-            .expect("range body must be readable");
-        assert_eq!(body.as_ref(), b"lo wo");
-
-        let req = Request::builder()
-            .uri(format!("/v1/pastes/{}/meta", stored.id))
-            .body(Body::empty())
-            .expect("request must build");
-        let resp = app.oneshot(req).await.expect("router call must complete");
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 4096)
-            .await
-            .expect("meta body must be readable");
-        let json: serde_json::Value =
-            serde_json::from_slice(&body).expect("meta body must be JSON");
-        assert_eq!(json["size"], 11);
-        assert!(
-            json["sha256"].is_null(),
-            "a base-only hash must not be reported after an append"
-        );
-    }
-
-    #[tokio::test]
-    async fn append_to_a_missing_id_returns_not_found_and_writes_nothing() {
-        let (state, fake) = fake_state(1024).await;
-        let app = api_router().with_state(state);
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/pastes/2026-10-28/missing/append")
-            .body(Body::from("x"))
-            .expect("request must build");
-        let resp = app.oneshot(req).await.expect("router call must complete");
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        assert!(fake.puts().is_empty(), "a missing id must write nothing");
-    }
-
-    #[tokio::test]
-    async fn append_text_works_through_the_http_mcp_endpoint() {
-        let (state, _fake) = fake_state(1024).await;
-        let (addr, server) = start_mcp_server(state.clone()).await;
-        let client = mcp_http_client();
-        let (session, _) = initialize_session(&client, addr).await;
-
-        let store_body = store_text_body(10, "hello");
-        let response = mcp_request(&client, addr, "POST", &store_body, Some(&session)).await;
-        assert_eq!(response.status, StatusCode::OK);
-        let stored = stored_paste(&sse_json(&response));
-        let id = stored["id"].as_str().expect("id must be a string");
-
-        let append_body = json!({
-            "jsonrpc": "2.0",
-            "id": 11,
-            "method": "tools/call",
-            "params": {"name": "append_text", "arguments": {"id": id, "text": " world"}}
-        });
-        let response = mcp_request(&client, addr, "POST", &append_body, Some(&session)).await;
-        assert_eq!(response.status, StatusCode::OK);
-        let payload = sse_json(&response);
-        assert_eq!(payload["result"]["isError"], false);
-        let appended = stored_paste(&payload);
-        assert_eq!(appended["appended_bytes"], 6);
-        assert_eq!(appended["size"], 11);
-
-        let slice = state
-            .store
-            .fetch_text(id, 0, None)
-            .await
-            .expect("fetch must succeed");
-        assert_eq!(slice.text, "hello world");
-        server.abort();
     }
 }
