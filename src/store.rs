@@ -11,7 +11,8 @@
 //!   (`If-None-Match`) are deliberately NOT relied on: some S3-compatible
 //!   stores, including Garage, accept that header but ignore it and
 //!   overwrite. Two concurrent appends can therefore choose the same
-//!   sequence. See the README for that limit.
+//!   sequence. Their random suffixes keep the object keys distinct, so
+//!   both appends survive. See the README for the read order.
 //! * Expiry is enforced on read by comparing stored `expires-at` metadata
 //!   with now. A TTL can be shorter than one day. An append inherits the
 //!   base expiry and does not extend it. S3 lifecycle deletion, if
@@ -394,7 +395,7 @@ pub struct PasteMetadata {
     /// Size of the base object alone. The first segment starts at this
     /// offset in the paste.
     pub base_size: u64,
-    /// Appended segments in sequence order.
+    /// Appended segments in sequence then suffix order.
     pub segments: Vec<Segment>,
     /// SHA-256 of the base object. None when segments exist, because no
     /// stored value describes the concatenated paste.
@@ -516,11 +517,29 @@ pub fn key_for(date: &str, random_id: &str) -> String {
 /// lexicographic key order are the same for every possible sequence.
 pub const SEGMENT_SEQUENCE_DIGITS: usize = 20;
 
+/// Number of characters in the random suffix of a segment name.
+pub const SEGMENT_SUFFIX_LEN: usize = 12;
+
+/// Generate a random URL-safe suffix for a segment name.
+///
+/// The suffix has 12 base62 characters. Two appends that choose the same
+/// sequence get different object keys.
+pub fn generate_segment_suffix() -> String {
+    rand::rng()
+        .sample_iter(&rand::distr::Alphanumeric)
+        .take(SEGMENT_SUFFIX_LEN)
+        .map(char::from)
+        .collect()
+}
+
 /// Key for one appended segment. The base object is segment 0, so the
 /// first appended segment has sequence 0.
-pub fn segment_key(base_key: &str, sequence: u64) -> String {
+///
+/// The name is `<20-digit sequence>-<suffix>`. The suffix makes the key
+/// unique when two appends choose the same sequence.
+pub fn segment_key(base_key: &str, sequence: u64, suffix: &str) -> String {
     format!(
-        "{base_key}/{sequence:0width$}",
+        "{base_key}/{sequence:0width$}-{suffix}",
         width = SEGMENT_SEQUENCE_DIGITS
     )
 }
@@ -532,14 +551,21 @@ pub fn segment_prefix(base_key: &str) -> String {
 
 /// Parse a segment key that belongs directly to `base_key`.
 ///
-/// Returns `None` for a nested key, a short name, or a non-digit name.
-/// Such keys are not part of the paste and must not change its size.
-pub fn parse_segment_key(base_key: &str, key: &str) -> Option<u64> {
+/// Returns the sequence and the suffix. Returns `None` for a nested key,
+/// a short sequence, a non-digit sequence, or an empty or non-base62
+/// suffix. Such keys are not part of the paste and must not change its
+/// size.
+pub fn parse_segment_key<'a>(base_key: &str, key: &'a str) -> Option<(u64, &'a str)> {
     let name = key.strip_prefix(&segment_prefix(base_key))?;
-    if name.len() != SEGMENT_SEQUENCE_DIGITS || !name.bytes().all(|b| b.is_ascii_digit()) {
+    let (sequence, suffix) = name.split_once('-')?;
+    if sequence.len() != SEGMENT_SEQUENCE_DIGITS || !sequence.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    name.parse::<u64>().ok()
+    if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let sequence = sequence.parse::<u64>().ok()?;
+    Some((sequence, suffix))
 }
 
 /// True when the key has the paste shape `pastes/<date>/<id>`.
@@ -560,11 +586,21 @@ pub fn is_paste_key(key: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
     pub sequence: u64,
+    /// Random part of the segment name. It orders segments that share a
+    /// sequence.
+    pub suffix: String,
     pub key: String,
     pub size: u64,
 }
 
-/// Base object plus appended segments, in sequence order.
+/// Order segments by sequence, then by suffix.
+fn compare_segments(a: &Segment, b: &Segment) -> std::cmp::Ordering {
+    a.sequence
+        .cmp(&b.sequence)
+        .then_with(|| a.suffix.cmp(&b.suffix))
+}
+
+/// Base object plus appended segments, in sequence then suffix order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentPlan {
     pub base_key: String,
@@ -574,7 +610,7 @@ pub struct SegmentPlan {
 
 impl SegmentPlan {
     pub fn new(base_key: impl Into<String>, base_size: u64, mut segments: Vec<Segment>) -> Self {
-        segments.sort_by_key(|s| s.sequence);
+        segments.sort_by(compare_segments);
         Self {
             base_key: base_key.into(),
             base_size,
@@ -626,19 +662,21 @@ impl SegmentPlan {
     }
 }
 
-/// Keep only well-formed segment keys for `base_key`, in sequence order.
+/// Keep only well-formed segment keys for `base_key`, in sequence then
+/// suffix order.
 pub fn segments_from_listing(base_key: &str, entries: &[(String, u64)]) -> Vec<Segment> {
     let mut segments: Vec<Segment> = entries
         .iter()
         .filter_map(|(key, size)| {
-            parse_segment_key(base_key, key).map(|sequence| Segment {
+            parse_segment_key(base_key, key).map(|(sequence, suffix)| Segment {
                 sequence,
+                suffix: suffix.to_string(),
                 key: key.clone(),
                 size: *size,
             })
         })
         .collect();
-    segments.sort_by_key(|s| s.sequence);
+    segments.sort_by(compare_segments);
     segments
 }
 
@@ -1388,10 +1426,10 @@ impl Store {
 
     /// List every object under the segment prefix of `base_key`.
     ///
-    /// The list is paginated. Keys that do not have the exact
-    /// 20-digit segment shape stay in the result: `delete` removes them
-    /// too, so a stray key cannot keep storage forever. The read path
-    /// uses [`segments_from_listing`], which ignores them.
+    /// The list is paginated. Keys that do not have the exact suffixed
+    /// segment shape stay in the result: `delete` removes them too, so a
+    /// stray key cannot keep storage forever. The read path uses
+    /// [`segments_from_listing`], which ignores them.
     async fn list_segment_entries(&self, base_key: &str) -> Result<Vec<(String, u64)>, StoreError> {
         let prefix = segment_prefix(base_key);
         let mut entries = Vec::new();
@@ -1439,9 +1477,9 @@ impl Store {
     ///
     /// Sequence assignment lists the segment prefix and uses max + 1.
     /// Two concurrent appends to the same id can choose the same
-    /// sequence, and the second write wins. This is documented in the
-    /// README; the store does not rely on a conditional write, because
-    /// Garage ignores `If-None-Match`.
+    /// sequence. A random suffix in the segment name keeps the object
+    /// keys distinct, so both appends survive. The store does not rely on
+    /// a conditional write, because Garage ignores `If-None-Match`.
     pub async fn append_text(&self, id: &str, text: &[u8]) -> Result<AppendResult, StoreError> {
         if u64::try_from(text.len()).unwrap_or(u64::MAX) > self.config.max_text_bytes {
             return Err(StoreError::TooLarge {
@@ -1463,7 +1501,8 @@ impl Store {
                 .ok_or_else(|| StoreError::S3("segment sequence exhausted".into()))?,
             None => 0,
         };
-        let key = segment_key(&meta.key, sequence);
+        let suffix = generate_segment_suffix();
+        let key = segment_key(&meta.key, sequence, &suffix);
         let mut object_meta = HashMap::new();
         object_meta.insert("sequence".to_string(), sequence.to_string());
         object_meta.insert("size".to_string(), text.len().to_string());
@@ -1485,6 +1524,7 @@ impl Store {
         let appended_bytes = text.len() as u64;
         meta.segments.push(Segment {
             sequence,
+            suffix,
             key: key.clone(),
             size: appended_bytes,
         });
@@ -2055,6 +2095,14 @@ mod tests {
             .segment_key
             .as_ref()
             .expect("append must name a segment");
+        let (sequence, suffix) =
+            parse_segment_key(&stored.key, segment).expect("an append must write a suffixed key");
+        assert_eq!(sequence, 0);
+        assert_eq!(suffix.len(), SEGMENT_SUFFIX_LEN);
+        assert!(
+            segment.starts_with(&format!("{}/{:020}-", stored.key, 0)),
+            "the segment key must start with the sequence: {segment:?}"
+        );
         assert_eq!(
             fake.object(segment)
                 .expect("the segment must exist")
@@ -2086,6 +2134,29 @@ mod tests {
             .await
             .expect("range fetch by key must succeed");
         assert_eq!(by_key, b"lo wo".to_vec());
+    }
+
+    #[tokio::test]
+    async fn append_writes_a_suffixed_segment_key() {
+        let (store, _fake) = fake_store(1024).await;
+        let stored = store
+            .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(7)))
+            .await
+            .expect("store must succeed against the fake");
+        let appended = store
+            .append_text(&stored.id, b"more")
+            .await
+            .expect("append must succeed");
+        let key = appended.segment_key.expect("an append must name a segment");
+        let (sequence, suffix) =
+            parse_segment_key(&stored.key, &key).expect("the segment key must have a suffix");
+        assert_eq!(sequence, 0);
+        assert_eq!(suffix.len(), SEGMENT_SUFFIX_LEN);
+        assert!(
+            key.starts_with(&format!("{}/{:020}-", stored.key, 0)),
+            "the segment key must start with the sequence: {key:?}"
+        );
+        assert!(suffix.bytes().all(|b| b.is_ascii_alphanumeric()));
     }
 
     #[tokio::test]
@@ -2228,12 +2299,19 @@ mod tests {
             .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(7)))
             .await
             .expect("store must succeed against the fake");
-        store
+        let appended = store
             .append_text(&stored.id, b"more")
             .await
             .expect("append must succeed");
-        let sequence = format!("{:020}", 0);
-        let result = store.resolve_key(&sequence).await;
+        let segment_name = appended
+            .segment_key
+            .as_ref()
+            .expect("append must name a segment")
+            .rsplit('/')
+            .next()
+            .expect("a segment key must have a name")
+            .to_string();
+        let result = store.resolve_key(&segment_name).await;
         assert!(
             matches!(result, Err(StoreError::NotFound(_))),
             "a segment key must not resolve as a bare paste id: {result:?}"
@@ -2314,86 +2392,241 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn same_sequence_segments_with_distinct_suffixes_both_survive_a_read() {
+        let (store, fake) = fake_store(1024).await;
+        let stored = store
+            .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(7)))
+            .await
+            .expect("store must succeed against the fake");
+        let seeded = [
+            ("AAAAAAAAAAAA", &b" first"[..]),
+            ("BBBBBBBBBBBB", &b" second"[..]),
+        ];
+        for (suffix, body) in seeded {
+            let key = format!("{}/{:020}-{suffix}", stored.key, 0);
+            store
+                .client
+                .put_object()
+                .bucket(&store.bucket)
+                .key(&key)
+                .body(ByteStream::from(body.to_vec()))
+                .send()
+                .await
+                .expect("seeding a same-sequence segment must succeed");
+            assert!(fake.object(&key).is_some(), "the seeded segment must exist");
+        }
+
+        let slice = store
+            .fetch_text(&stored.id, 0, None)
+            .await
+            .expect("fetch must succeed");
+        assert_eq!(
+            slice.text, "base first second",
+            "a read must return both same-sequence chunks in suffix order"
+        );
+        assert_eq!(slice.total_bytes, 17);
+    }
+
+    #[tokio::test]
+    async fn concurrent_appends_write_distinct_segments_and_both_read_back() {
+        let (store, fake) = fake_store(1024).await;
+        let stored = store
+            .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(7)))
+            .await
+            .expect("store must succeed against the fake");
+        let (first, second) = tokio::join!(
+            store.append_text(&stored.id, b" first"),
+            store.append_text(&stored.id, b" second"),
+        );
+        let first = first.expect("the first concurrent append must succeed");
+        let second = second.expect("the second concurrent append must succeed");
+        let first_key = first
+            .segment_key
+            .expect("the first append must name a segment");
+        let second_key = second
+            .segment_key
+            .expect("the second append must name a segment");
+        assert_ne!(
+            first_key, second_key,
+            "concurrent appends must write distinct objects"
+        );
+        assert!(fake.object(&first_key).is_some());
+        assert!(fake.object(&second_key).is_some());
+
+        let mut chunks = [
+            (first_key, b" first".to_vec()),
+            (second_key, b" second".to_vec()),
+        ];
+        chunks.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut expected = String::from("base");
+        for (_, body) in chunks {
+            expected.push_str(std::str::from_utf8(&body).expect("test text is UTF-8"));
+        }
+        let slice = store
+            .fetch_text(&stored.id, 0, None)
+            .await
+            .expect("fetch must succeed");
+        assert_eq!(slice.text, expected);
+        assert_eq!(slice.total_bytes, 17);
+    }
+
     #[test]
-    fn segment_key_format_and_order() {
+    fn segment_suffix_has_a_fixed_base62_shape() {
+        for _ in 0..32 {
+            let suffix = generate_segment_suffix();
+            assert_eq!(suffix.len(), SEGMENT_SUFFIX_LEN);
+            assert!(
+                suffix.bytes().all(|b| b.is_ascii_alphanumeric()),
+                "the suffix must be URL-safe base62: {suffix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn segment_key_format() {
         let base = "pastes/2026-10-28/abcXYZ";
+        let suffix = "Ab3dE6gH9jK2";
         assert_eq!(
-            segment_key(base, 0),
-            "pastes/2026-10-28/abcXYZ/00000000000000000000"
+            segment_key(base, 0, suffix),
+            "pastes/2026-10-28/abcXYZ/00000000000000000000-Ab3dE6gH9jK2"
         );
         assert_eq!(
-            segment_key(base, 7),
-            "pastes/2026-10-28/abcXYZ/00000000000000000007"
-        );
-        assert_eq!(parse_segment_key(base, &segment_key(base, 7)), Some(7));
-        assert!(segment_key(base, 2) < segment_key(base, 10));
-        assert_eq!(parse_segment_key(base, &format!("{base}/short")), None);
-        assert_eq!(
-            parse_segment_key(base, &format!("{base}/0000000000000000000x")),
-            None
+            segment_key(base, 7, suffix),
+            "pastes/2026-10-28/abcXYZ/00000000000000000007-Ab3dE6gH9jK2"
         );
         assert_eq!(
-            parse_segment_key(base, &format!("{base}/00000000000000000000/extra")),
-            None
+            parse_segment_key(base, &segment_key(base, 7, suffix)),
+            Some((7, suffix))
         );
         assert!(is_paste_key(base));
-        assert!(!is_paste_key(&segment_key(base, 0)));
+        assert!(!is_paste_key(&segment_key(base, 0, "abc")));
         assert!(!is_paste_key("pastes/2026-10-28"));
         assert!(!is_paste_key("other/2026-10-28/abc"));
     }
 
     #[test]
+    fn segment_key_order_uses_sequence_then_suffix() {
+        let base = "pastes/2026-10-28/abcXYZ";
+        assert!(segment_key(base, 2, "zzz") < segment_key(base, 10, "aaa"));
+        assert!(segment_key(base, 0, "aaa") < segment_key(base, 0, "zzz"));
+    }
+
+    #[test]
+    fn parse_segment_key_rejects_malformed_names() {
+        let base = "pastes/2026-10-28/abcXYZ";
+        assert_eq!(parse_segment_key(base, &format!("{base}/short-abc")), None);
+        assert_eq!(
+            parse_segment_key(base, &format!("{base}/0000000000000000000x-abc")),
+            None
+        );
+        assert_eq!(
+            parse_segment_key(base, &format!("{base}/00000000000000000000")),
+            None
+        );
+        assert_eq!(
+            parse_segment_key(base, &format!("{base}/00000000000000000000-")),
+            None
+        );
+        assert_eq!(
+            parse_segment_key(base, &format!("{base}/00000000000000000000-ab/cd")),
+            None
+        );
+        assert_eq!(
+            parse_segment_key(base, &format!("{base}/00000000000000000000-abc/extra")),
+            None
+        );
+    }
+
+    #[test]
     fn segment_plan_totals_and_maps_ranges_across_base_and_segments() {
         let base = "pastes/2026-10-28/abc";
+        let segment_0 = segment_key(base, 0, "aaa");
+        let segment_1 = segment_key(base, 1, "aaa");
         let plan = SegmentPlan::new(
             base,
             10,
             vec![
                 Segment {
                     sequence: 1,
-                    key: segment_key(base, 1),
+                    suffix: "aaa".into(),
+                    key: segment_1.clone(),
                     size: 7,
                 },
                 Segment {
                     sequence: 0,
-                    key: segment_key(base, 0),
+                    suffix: "aaa".into(),
+                    key: segment_0.clone(),
                     size: 5,
                 },
             ],
         );
         assert_eq!(plan.total_size(), 22);
         assert_eq!(plan.object_ranges(0, 9), vec![(base.to_string(), 0, 9)]);
-        assert_eq!(
-            plan.object_ranges(10, 14),
-            vec![(segment_key(base, 0), 0, 4)]
-        );
+        assert_eq!(plan.object_ranges(10, 14), vec![(segment_0.clone(), 0, 4)]);
         assert_eq!(
             plan.object_ranges(8, 12),
-            vec![(base.to_string(), 8, 9), (segment_key(base, 0), 0, 2),]
+            vec![(base.to_string(), 8, 9), (segment_0.clone(), 0, 2),]
+        );
+        assert_eq!(plan.object_ranges(16, 21), vec![(segment_1.clone(), 1, 6)]);
+        assert!(plan.object_ranges(22, 30).is_empty());
+    }
+
+    #[test]
+    fn segment_plan_orders_same_sequence_segments_by_suffix() {
+        let base = "pastes/2026-10-28/abc";
+        let first = segment_key(base, 0, "aaa");
+        let second = segment_key(base, 0, "zzz");
+        let plan = SegmentPlan::new(
+            base,
+            4,
+            vec![
+                Segment {
+                    sequence: 0,
+                    suffix: "zzz".into(),
+                    key: second.clone(),
+                    size: 2,
+                },
+                Segment {
+                    sequence: 0,
+                    suffix: "aaa".into(),
+                    key: first.clone(),
+                    size: 3,
+                },
+            ],
         );
         assert_eq!(
-            plan.object_ranges(16, 21),
-            vec![(segment_key(base, 1), 1, 6)]
+            plan.segments
+                .iter()
+                .map(|s| s.suffix.as_str())
+                .collect::<Vec<_>>(),
+            vec!["aaa", "zzz"]
         );
-        assert!(plan.object_ranges(22, 30).is_empty());
+        assert_eq!(
+            plan.object_ranges(4, 8),
+            vec![(first, 0, 2), (second, 0, 1)]
+        );
     }
 
     #[test]
     fn segment_listing_keeps_only_direct_well_formed_keys_in_order() {
         let base = "pastes/2026-10-28/abc";
         let entries = vec![
-            (segment_key(base, 2), 3),
+            (segment_key(base, 2, "aaa"), 3),
+            (segment_key(base, 0, "zzz"), 5),
+            (segment_key(base, 0, "aaa"), 4),
             (format!("{base}/not-a-sequence"), 9),
-            (segment_key(base, 0), 4),
-            (format!("{base}/00000000000000000000/nested"), 8),
+            (format!("{base}/00000000000000000000"), 8),
+            (format!("{base}/00000000000000000000-"), 8),
+            (format!("{base}/00000000000000000000-aaa/nested"), 8),
         ];
         let segments = segments_from_listing(base, &entries);
         assert_eq!(
             segments
                 .iter()
-                .map(|s| (s.sequence, s.size))
+                .map(|s| (s.sequence, s.suffix.as_str(), s.size))
                 .collect::<Vec<_>>(),
-            vec![(0, 4), (2, 3)]
+            vec![(0, "aaa", 4), (0, "zzz", 5), (2, "aaa", 3)]
         );
     }
 
