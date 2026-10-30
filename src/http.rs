@@ -1945,4 +1945,128 @@ mod tests {
         server.abort();
         mock_s3.abort();
     }
+
+    #[tokio::test]
+    async fn append_over_the_text_cap_is_rejected_before_body_read() {
+        let state = test_state(10 * 1024 * 1024, 1024 * 1024 * 1024).await;
+        let app = api_router().with_state(state);
+
+        let polled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&polled);
+        let body = Body::from_stream(futures::stream::poll_fn(move |_| {
+            flag.store(true, Ordering::SeqCst);
+            Poll::<Option<Result<Bytes, std::io::Error>>>::Ready(None)
+        }));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/pastes/2026-10-28/abc/append")
+            .header(CONTENT_LENGTH, (64u64 * 1024 * 1024).to_string())
+            .body(body)
+            .expect("request must build");
+
+        let resp = app.oneshot(req).await.expect("router call must complete");
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "an append over the text cap must be 413"
+        );
+        assert!(
+            !polled.load(Ordering::SeqCst),
+            "the body must not be read after an early cap rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_endpoint_extends_the_paste_and_fetch_returns_the_concatenation() {
+        let (state, _fake) = fake_state(1024).await;
+        let stored = state
+            .store
+            .store_text(b"hello", None, Some("text/plain"), Some(7))
+            .await
+            .expect("store must succeed against the fake");
+        let app = api_router().with_state(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/pastes/{}/append", stored.id))
+            .header(CONTENT_TYPE, "text/plain")
+            .body(Body::from(" world"))
+            .expect("request must build");
+        let resp = app
+            .clone()
+            .oneshot(req)
+            .await
+            .expect("router call must complete");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("append body must be readable");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("append body must be JSON");
+        assert_eq!(json["appended_bytes"], 6);
+        assert_eq!(json["size"], 11);
+
+        let req = Request::builder()
+            .uri(format!("/v1/pastes/{}", stored.id))
+            .body(Body::empty())
+            .expect("request must build");
+        let resp = app
+            .clone()
+            .oneshot(req)
+            .await
+            .expect("router call must complete");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("fetch body must be readable");
+        assert_eq!(body.as_ref(), b"hello world");
+
+        let req = Request::builder()
+            .uri(format!("/v1/pastes/{}", stored.id))
+            .header(RANGE, "bytes=3-7")
+            .body(Body::empty())
+            .expect("request must build");
+        let resp = app
+            .clone()
+            .oneshot(req)
+            .await
+            .expect("router call must complete");
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        let body = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("range body must be readable");
+        assert_eq!(body.as_ref(), b"lo wo");
+
+        let req = Request::builder()
+            .uri(format!("/v1/pastes/{}/meta", stored.id))
+            .body(Body::empty())
+            .expect("request must build");
+        let resp = app.oneshot(req).await.expect("router call must complete");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("meta body must be readable");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("meta body must be JSON");
+        assert_eq!(json["size"], 11);
+        assert!(
+            json["sha256"].is_null(),
+            "a base-only hash must not be reported after an append"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_to_a_missing_id_returns_not_found_and_writes_nothing() {
+        let (state, fake) = fake_state(1024).await;
+        let app = api_router().with_state(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/pastes/2026-10-28/missing/append")
+            .body(Body::from("x"))
+            .expect("request must build");
+        let resp = app.oneshot(req).await.expect("router call must complete");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(fake.puts().is_empty(), "a missing id must write nothing");
+    }
 }

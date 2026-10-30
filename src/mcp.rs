@@ -243,11 +243,11 @@ impl Pastebin {
         &self,
         Parameters(params): Parameters<AppendTextParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let appended = self
-            .store
-            .append_text(&params.id, params.text.as_bytes())
-            .await
-            .map_err(err_json)?;
+        let appended = try_store!(
+            self.store
+                .append_text(&params.id, params.text.as_bytes())
+                .await
+        );
         result_json(serde_json::json!({
             "id": appended.meta.id,
             "key": appended.meta.key,

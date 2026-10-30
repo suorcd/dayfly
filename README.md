@@ -25,10 +25,12 @@ is needed. See "No database in v1" below.
 
 ## What it is
 
-- One S3 object per paste/file. Key layout:
+- One base S3 object per paste/file. Key layout:
   `pastes/<yyyy-mm-dd>/<random-id>`, where the random ID has at least
   128 bits of entropy (base62). A user-supplied filename is never put
-  in the key.
+  in the key. An append adds one segment object under
+  `pastes/<yyyy-mm-dd>/<random-id>/<sequence>`; see "Append and
+  segmented storage".
 - Filename, content-type, created date, and TTL are stored in object
   metadata. The S3 `Content-Length` gives the size. A `sha256` value is
   stored when the hash is known before the object is created. A
@@ -105,6 +107,7 @@ Operations, in both MCP tools and HTTP endpoints:
 | --- | --- | --- |
 | Store text | `store_text` | `POST /upload` or `POST /v1/pastes` (raw body, no filename) |
 | Store file (multipart for large files) | `store_file` (local path) | `POST /upload` (raw body with `X-Filename`, or `-F file=@...`) |
+| Append text | `append_text` | `POST /v1/pastes/<id>/append` (plain text body) |
 | Fetch text (offset/limit) | `fetch_text` | `GET /v1/pastes/<id>` (raw; use `Range` for slices) |
 | Fetch file (streaming, Range) | `fetch_file` (downloads to a local path) | `GET /v1/pastes/<id>` with `Range` → 206 |
 | Fetch metadata (HeadObject equivalent) | `fetch_metadata` | `GET /v1/pastes/<id>/meta`, or `HEAD /v1/pastes/<id>` |
@@ -114,6 +117,9 @@ Operations, in both MCP tools and HTTP endpoints:
 IDs may be full (`2026-10-28/abc123…`) or bare random IDs. Bare IDs
 are resolved by scanning the `pastes/` prefix (up to 10 pages of
 1,000 keys) — clients should keep the full ID returned at store time.
+An ID has one or two components after `pastes/`. A segment key has a
+third component and is never a paste ID. Listing and bare-ID
+resolution skip segment keys.
 
 ### Explicitly OUT of v1
 
@@ -125,9 +131,10 @@ invented in v1.
 
 ### No database in v1 — the honest tradeoff
 
-Listing is O(n) in objects scanned, plus one HeadObject per listed
-key (needed to recover expiry, content-type, and filename, which
-ListObjectsV2 does not return, and to filter expired objects out).
+Listing is O(n) in objects scanned, plus one HeadObject and one
+segment-prefix listing per paste (needed to recover expiry,
+content-type, filename, and the total size, which ListObjectsV2 does
+not return, and to filter expired objects out).
 For a small internal bucket that is fine. As the bucket grows,
 listing gets slower — that slowdown, not a guessed threshold, is
 exactly the trigger for adding a database later. The date prefix
@@ -239,9 +246,9 @@ every agent can read must not hold the key values.
 Logging goes to stderr only, never stdout, so the JSON-RPC stream is
 not corrupted.
 
-MCP tools: `store_text`, `store_file`, `fetch_text`, `fetch_file`
-(downloads to a local path and returns metadata — binary content is
-never sent over JSON-RPC), `fetch_metadata`, `delete_paste`,
+MCP tools: `store_text`, `store_file`, `append_text`, `fetch_text`,
+`fetch_file` (downloads to a local path and returns metadata — binary
+content is never sent over JSON-RPC), `fetch_metadata`, `delete_paste`,
 `list_recent`.
 
 ## Running HTTP mode
@@ -310,6 +317,23 @@ cat notes.txt | curl --data-binary @- \
   -H 'X-TTL-Days: 7' \
   http://127.0.0.1:8080/upload
 ```
+
+### Append text
+
+```sh
+printf 'another line\n' | curl --data-binary @- \
+  -H 'Content-Type: text/plain' \
+  http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123.../append
+# → {"id": "...", "url": "...", "appended_bytes": 13,
+#    "segment_key": "pastes/2026-10-28/AbC123.../00000000000000000000",
+#    "size": ..., "sha256": null, "expires_at": "..."}
+```
+
+An append writes only the new bytes. It does not rewrite the base
+object. The text cap applies to this append, not to the total size.
+An expired or missing ID returns 410 or 404 and writes nothing. An
+empty body writes nothing. Use the bare ID form
+`/v1/pastes/<random>/append` if you do not have the date.
 
 ### Streaming upload (curl piping, 0x0.st style)
 
@@ -449,6 +473,56 @@ example uses the common `mcpServers` shape:
 
 Remove the `headers` block when the token is unset. Start the server
 with `dayfly serve` before the client connects.
+
+## Append and segmented storage
+
+S3 has no append primitive. dayfly stores each append as a new segment
+object and leaves the base object unchanged.
+
+- The base object stays at `pastes/<date>/<id>`. It is segment 0.
+- An append writes `pastes/<date>/<id>/<sequence>`. The sequence is a
+  20-digit zero-padded number. The first append has sequence 0. A
+  segment stays under the base date prefix, so the paste belongs to
+  its creation date, not to the append date.
+- An append lists the segment prefix and takes max + 1. It writes only
+  the new bytes. The cost is the new bytes plus metadata calls that
+  scale with the segment count, not with the total size. It does not
+  copy or rewrite the base object.
+- An ID has at most two components after `pastes/`. A segment key has
+  a third component, so listing and bare-ID resolution skip it.
+- Reads join the base object and the segments in sequence order.
+- A range read maps the global byte range to the base object and to
+  the segments that hold it. It sends one range request for the
+  overlap in each object. It does not read the whole paste for a small
+  range.
+- `fetch_metadata` reports the total size: base plus segments.
+- `delete` removes the base object and every object under its segment
+  prefix.
+- An append keeps the `expires-at` value of the base object. It does
+  not extend the TTL.
+- An append to an expired or missing ID returns an error and writes no
+  object.
+- A stored `sha256` covers the base object only. When segments exist,
+  the API returns `sha256: null`. No stored value covers the joined
+  paste.
+- `list_recent` reports the total size and does not show a segment as
+  a paste.
+
+Limits:
+
+- **Concurrent appends can race.** Two appends to the same ID can
+  choose the same sequence. The second write wins and the first append
+  is lost. The store does not use a conditional write, because Garage
+  accepts `If-None-Match` and ignores it. A delete that races an append
+  can leave an orphan segment; a later delete of the full ID removes it.
+- **A segment key is not a paste ID.** The API rejects an ID with three
+  components after `pastes/`.
+- **An empty append is a no-op.** It writes no object and keeps the
+  base `sha256`.
+- **Segments count toward scan limits.** A listing scans one page of up
+  to 1,000 keys. Bare-ID resolution scans up to 10 pages. Segment keys
+  consume that budget, so keep the full ID for a paste with many
+  segments.
 
 ## Content-Type detection
 
@@ -670,10 +744,10 @@ earlier version of this note said the flake was unvalidated. That is
 no longer true and is corrected here rather than left standing.
 
 Unit tests cover: key generation, ID validation (including
-traversal rejection), range parsing, offset/limit windows, UTF-8
-prefix truncation, metadata/expiry round-trip, content-type
-detection (PNG, JPEG, GIF, WebP, PDF, ZIP, whole-payload UTF-8
-text for buffered pastes, truncated-sample fallback, binary
+traversal and segment-key rejection), range parsing, offset/limit
+windows, UTF-8 prefix truncation, metadata/expiry round-trip,
+content-type detection (PNG, JPEG, GIF, WebP, PDF, ZIP, whole-payload
+UTF-8 text for buffered pastes, truncated-sample fallback, binary
 fallback, curl's `x-www-form-urlencoded` default ignored, explicit
 type overriding a generic one, sniffed-signature conflict, extension
 fallback), peeked-byte forwarding (neither lost nor duplicated),
@@ -681,7 +755,12 @@ streaming part buffering, chunked and multi-part-sized uploads,
 disconnect/part-failure/oversize abort (no URL material), empty
 uploads, the write-route origin guard, HTML escaping, human sizes,
 days-remaining math, MCP HTTP bearer auth, two independent concurrent
-MCP sessions, and the unchanged stdio initialize path.
+MCP sessions, the unchanged stdio initialize path, segment key format
+and order, segment range mapping, total size, listing and bare-ID
+skipping of segment keys, delete of segments, append cost (only the
+new bytes), and append errors before a write. The store tests use a
+small test-only fake S3 server for Put, Get (with Range), Head, List
+and Delete.
 
 ### Optional tests against a real Garage or S3-compatible endpoint
 
@@ -705,7 +784,10 @@ Use the same checklist for a real Garage instance:
 - [ ] Create a test bucket (or test prefix) separate from any
       production data.
 - [ ] Store a text paste, fetch it back, fetch a byte range, fetch
-      metadata, delete it, and confirm the delete.
+      metadata, append text, fetch the joined text and a range across
+      the base/segment boundary, confirm the total size and a null
+      `sha256`, delete it, and confirm that the base and segments are
+      gone.
 - [ ] Verify path-style requests work (Garage uses path-style URLs,
       not virtual-hosted style; the binary sets
       `force_path_style = true`).
@@ -776,6 +858,12 @@ honest.
 - **Some zip-based documents still report as `application/zip`.** The
   mapping covers the common Office, OpenDocument, and EPUB extensions
   only. Other zip-based formats keep the plain ZIP type.
+- **An append removes the total-file `sha256`.** The stored hash covers
+  the base object only, so `fetch_metadata` returns `sha256: null`
+  after the first append. See "Append and segmented storage".
+- **Concurrent appends to one paste can overwrite each other.** Two
+  appends can choose the same sequence. See "Append and segmented
+  storage".
 - **The HTTP endpoint is internal-only in the weakest sense.** The
   bearer token comparison is constant time for equal-length tokens.
   A length difference still leaks through timing. The write-route origin
