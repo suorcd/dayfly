@@ -35,10 +35,12 @@ pub struct AppState {
     pub store: Store,
 }
 
+/// Check the bearer token for a route. The API routes and the human UI
+/// routes share this one function, so both use the constant-time compare.
 // Axum handlers return `Response` directly; boxing it here would only add
 // indirection at every call site.
 #[allow(clippy::result_large_err)]
-fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+pub(crate) fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
     let Some(token) = state.store.config.http_bearer_token.as_deref() else {
         return Ok(());
     };

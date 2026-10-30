@@ -43,7 +43,7 @@ use axum::{Form, Router};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use crate::http::AppState;
+use crate::http::{check_auth, AppState};
 use crate::store::StoreError;
 
 /// Adapted base look from suorcd.us/style.css, palette cyberpunkNeon
@@ -142,30 +142,6 @@ fn ttl_options(selected: u32) -> String {
         ));
     }
     out
-}
-
-// Axum handlers return `Response` directly; boxing it here would only add
-// indirection at every call site.
-#[allow(clippy::result_large_err)]
-fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
-    let Some(token) = state.store.config.http_bearer_token.as_deref() else {
-        return Ok(());
-    };
-    let expected = format!("Bearer {token}");
-    let ok = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == expected)
-        .unwrap_or(false);
-    if ok {
-        Ok(())
-    } else {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Html("<p>Unauthorized. This deployment requires an Authorization header; see README.</p>".to_string()),
-        )
-            .into_response())
-    }
 }
 
 async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -486,7 +462,86 @@ pub fn ui_router() -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
     use super::*;
+    use crate::config::Config;
+    use crate::store::Store;
+
+    const TEST_TOKEN: &str = "correct-horse-battery-staple";
+
+    fn test_config() -> Config {
+        Config {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key_id: "test-access-key".to_string(),
+            secret_access_key: "test-secret-key".to_string(),
+            max_text_bytes: 10 * 1024 * 1024,
+            max_file_bytes: 1024 * 1024 * 1024,
+            default_ttl_days: 7,
+            http_bind: "127.0.0.1:0".to_string(),
+            http_bearer_token: None,
+        }
+    }
+
+    async fn test_state(token: Option<&str>) -> AppState {
+        let mut config = test_config();
+        config.http_bearer_token = token.map(str::to_string);
+        AppState {
+            store: Store::from_config(config)
+                .await
+                .expect("test S3 config must build without network access"),
+        }
+    }
+
+    /// Call the UI list route. A passing token reaches the unreachable test
+    /// S3 endpoint, and the UI maps that S3 error to 400. A 401 means the
+    /// auth check rejected the request.
+    async fn ui_list_status(state: AppState, auth: Option<&str>) -> StatusCode {
+        let app = ui_router().with_state(state);
+        let mut builder = Request::builder().method("GET").uri("/pastes");
+        if let Some(auth) = auth {
+            builder = builder.header(axum::http::header::AUTHORIZATION, auth);
+        }
+        let request = builder.body(Body::empty()).expect("request must build");
+        app.oneshot(request)
+            .await
+            .expect("router call must complete")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn ui_wrong_bearer_token_returns_401() {
+        let state = test_state(Some(TEST_TOKEN)).await;
+        assert_eq!(
+            ui_list_status(state, Some("Bearer wrong-horse-battery-staple")).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn ui_right_bearer_token_passes_auth_and_reaches_the_store() {
+        let state = test_state(Some(TEST_TOKEN)).await;
+        let auth = format!("Bearer {TEST_TOKEN}");
+        assert_eq!(
+            ui_list_status(state, Some(&auth)).await,
+            StatusCode::BAD_REQUEST,
+            "the right token must pass auth and reach the S3 sink"
+        );
+    }
+
+    #[tokio::test]
+    async fn ui_without_configured_token_passes_auth_and_reaches_the_store() {
+        let state = test_state(None).await;
+        assert_eq!(
+            ui_list_status(state, None).await,
+            StatusCode::BAD_REQUEST,
+            "an unset token must leave the UI routes open"
+        );
+    }
 
     #[test]
     fn html_escape_covers_script() {
