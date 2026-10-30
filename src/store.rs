@@ -2040,6 +2040,33 @@ mod tests {
             b" world".to_vec(),
             "append must write only the new bytes"
         );
+        assert!(
+            fake.gets().is_empty(),
+            "append must not read the base object or any segment body"
+        );
+        assert_eq!(
+            fake.object(&stored.key)
+                .expect("the base object must still exist")
+                .body,
+            b"hello".to_vec(),
+            "append must not rewrite the base object"
+        );
+        let segment = appended
+            .segment_key
+            .as_ref()
+            .expect("append must name a segment");
+        assert_eq!(
+            fake.object(segment)
+                .expect("the segment must exist")
+                .metadata
+                .get("expires-at"),
+            Some(
+                &expires_before
+                    .expect("the stored paste must have an expiry")
+                    .to_rfc3339()
+            ),
+            "the segment must inherit the base expiry"
+        );
 
         let slice = store
             .fetch_text(&stored.id, 0, None)
