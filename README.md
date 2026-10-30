@@ -389,6 +389,14 @@ EOF, `AbortMultipartUpload` on client disconnect or any error.
 any error, no URL is returned and any multipart upload is aborted.**
 An empty upload becomes a single empty PutObject.
 
+The local-file path (`store_file`) reads one open handle for the size,
+the hash, and the uploaded bytes, so the recorded metadata describes the
+bytes that were uploaded. If a large file changes while it is uploaded,
+the store deletes the object and returns an error, rather than keeping a
+paste whose hash and content disagree. A file that grows past
+`DAYFLY_MAX_FILE_BYTES` after the first size check is rejected, not
+uploaded.
+
 Note on multipart forms: text fields (`filename`, `ttl`, `ttl_days`)
 must come before the `file` field if you want them honored; fields
 after the file field are not read. Use headers (`X-Filename`,

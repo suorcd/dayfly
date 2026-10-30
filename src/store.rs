@@ -20,6 +20,7 @@
 //!   expiry.
 
 use std::collections::{HashMap, HashSet};
+use std::io::SeekFrom;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
@@ -39,7 +40,7 @@ use rand::Rng;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::config::Config;
 use crate::content_type::{detect_content_type, detect_content_type_sample, Detection};
@@ -910,18 +911,23 @@ fn sha256_hex(data: &[u8]) -> String {
 /// Hash a file in fixed-size reads, so a large file is never held whole
 /// in memory. S3 takes object metadata only at CreateMultipartUpload, so
 /// the hash must exist before that call.
-async fn sha256_file(path: &Path) -> Result<String, StoreError> {
-    let mut file = File::open(path).await?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; MULTIPART_CHUNK_BYTES];
-    loop {
-        let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
+/// Read one open file as a byte stream, for
+/// [`crate::stream::run_streaming_upload`].
+///
+/// The handle is the caller's, so the stream reads the same file that the
+/// hash and the size describe.
+fn file_stream(file: File) -> impl futures::Stream<Item = Result<Bytes, StoreError>> {
+    futures::stream::unfold(file, |mut file| async move {
+        let mut buf = vec![0u8; MULTIPART_CHUNK_BYTES];
+        match file.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok(Bytes::from(buf)), file))
+            }
+            Err(e) => Some((Err(StoreError::Io(e.to_string())), file)),
         }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex_encode(&hasher.finalize()))
+    })
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -1432,7 +1438,12 @@ impl Store {
 
     /// Store a local file. Files up to one multipart chunk use a single
     /// PutObject; larger files use S3 multipart upload, reading the file
-    /// in 8 MiB chunks so a large file is never loaded whole into memory.
+    /// in chunks so a large file is never loaded whole into memory.
+    ///
+    /// One open handle serves every read. The size, the hash, and the
+    /// uploaded bytes therefore describe the same file: a path-based
+    /// second read could see a file that changed, and the stored metadata
+    /// would then describe bytes that were never uploaded.
     pub async fn store_file_path(
         &self,
         path: &Path,
@@ -1440,15 +1451,17 @@ impl Store {
         content_type: Option<&str>,
         ttl: Option<Ttl>,
     ) -> Result<StoredPaste, StoreError> {
-        let file_meta = tokio::fs::metadata(path).await?;
+        let mut file = File::open(path).await?;
+        // Metadata from the handle, not the path: one file, one view.
+        let file_meta = file.metadata().await?;
         if !file_meta.is_file() {
             return Err(StoreError::Io(format!(
                 "not a regular file: {}",
                 path.display()
             )));
         }
-        let size = file_meta.len();
-        if size > self.config.max_file_bytes {
+        let len = file_meta.len();
+        if len > self.config.max_file_bytes {
             return Err(StoreError::TooLarge {
                 limit: self.config.max_file_bytes,
             });
@@ -1464,10 +1477,22 @@ impl Store {
                 .and_then(|n| n.to_str())
                 .map(|s| s.to_string())
         });
-        if size as usize <= MULTIPART_CHUNK_BYTES {
-            // One read gives the whole payload for both detection and
-            // upload, so text detection sees every byte.
-            let bytes = tokio::fs::read(path).await?;
+        if len as usize <= MULTIPART_CHUNK_BYTES {
+            // One bounded read gives the body, the hash, and the size, so
+            // text detection sees every byte. The read stops one byte past
+            // the cap: a file that grew after the metadata call is
+            // rejected instead of loaded whole.
+            let mut bytes: Vec<u8> = Vec::with_capacity(len as usize);
+            let read = file
+                .take(self.config.max_file_bytes.saturating_add(1))
+                .read_to_end(&mut bytes)
+                .await?;
+            let size = read as u64;
+            if size > self.config.max_file_bytes {
+                return Err(StoreError::TooLarge {
+                    limit: self.config.max_file_bytes,
+                });
+            }
             let detection = detection_for(display_name.as_deref(), content_type, &bytes);
             let ct = detection.content_type.clone();
             let sha = sha256_hex(&bytes);
@@ -1508,17 +1533,37 @@ impl Store {
             });
         }
 
-        // Multipart path: S3 takes the object metadata on
-        // CreateMultipartUpload. Hash the file first, because the hash is
-        // part of that metadata, then upload the parts. A later CopyObject
-        // would cost a second put and could fail after the object exists.
-        // The prefetch is only a sample, so plain-text detection cannot
-        // prove that the whole file is text. A specific explicit type
-        // or a specific filename extension still wins.
-        let prefix: Vec<u8> = {
-            let mut f = File::open(path).await?;
+        // Multipart path. S3 takes the object metadata at
+        // CreateMultipartUpload, so the hash must be known first: hash the
+        // bytes from this handle, then upload from the same handle and
+        // require the uploaded bytes to match that hash. A file that
+        // changes in between fails the comparison, and the object is
+        // deleted before any alias is written.
+        let sha = {
+            let mut hasher = Sha256::new();
+            let mut buf = vec![0u8; MULTIPART_CHUNK_BYTES];
+            let mut hashed: u64 = 0;
+            loop {
+                let n = file.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                hashed += n as u64;
+            }
+            if hashed != len {
+                return Err(StoreError::Io(format!(
+                    "the file changed while it was read: expected {len} bytes, read {hashed}"
+                )));
+            }
+            hex_encode(&hasher.finalize())
+        };
+        // The detection sample comes from the same handle, so the recorded
+        // type describes the bytes that are uploaded.
+        file.seek(SeekFrom::Start(0)).await?;
+        let prefix = {
             let mut buf = vec![0u8; crate::content_type::PEEK_BYTES];
-            let n = f.read(&mut buf).await?;
+            let n = file.read(&mut buf).await?;
             buf.truncate(n);
             buf
         };
@@ -1526,114 +1571,39 @@ impl Store {
             content_type,
             display_name.as_deref(),
             &prefix,
-            size <= crate::content_type::PEEK_BYTES as u64,
+            len <= crate::content_type::PEEK_BYTES as u64,
         );
         let ct = detection.content_type.clone();
-        let sha = sha256_file(path).await?;
         let (meta, expires_at) = metadata_for(
             display_name.as_deref(),
             Some(&sha),
-            Some(size),
+            Some(len),
             Some(&words),
             ttl,
             created_at,
             &detection,
         );
-        let create = self
-            .client
-            .create_multipart_upload()
-            .bucket(&self.bucket)
-            .key(&key)
-            .content_type(ct.clone())
-            .set_metadata(Some(meta))
-            .send()
-            .await
-            .map_err(|e| map_sdk_error(e, &key))?;
-        let upload_id = create.upload_id().unwrap_or("").to_string();
-        if upload_id.is_empty() {
-            return Err(StoreError::S3(
-                "multipart upload returned no upload id".into(),
-            ));
-        }
-        let result: Result<Vec<CompletedPart>, StoreError> = async {
-            let mut file = File::open(path).await?;
-            let mut parts: Vec<CompletedPart> = Vec::new();
-            let mut part_number: i32 = 1;
-            let mut buf = vec![0u8; MULTIPART_CHUNK_BYTES];
-            loop {
-                let mut filled = 0usize;
-                while filled < buf.len() {
-                    let n = file.read(&mut buf[filled..]).await?;
-                    if n == 0 {
-                        break;
-                    }
-                    filled += n;
-                }
-                if filled == 0 {
-                    break;
-                }
-                let chunk = buf[..filled].to_vec();
-                let part = self
-                    .client
-                    .upload_part()
-                    .bucket(&self.bucket)
-                    .key(&key)
-                    .upload_id(&upload_id)
-                    .part_number(part_number)
-                    .body(ByteStream::from(chunk))
-                    .send()
-                    .await
-                    .map_err(|e| map_sdk_error(e, &key))?;
-                parts.push(
-                    CompletedPart::builder()
-                        .part_number(part_number)
-                        .e_tag(part.e_tag().unwrap_or(""))
-                        .build(),
-                );
-                part_number += 1;
-                if filled < MULTIPART_CHUNK_BYTES {
-                    break;
-                }
-            }
-            Ok(parts)
-        }
-        .await;
-        let parts = match result {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = self
-                    .client
-                    .abort_multipart_upload()
-                    .bucket(&self.bucket)
-                    .key(&key)
-                    .upload_id(&upload_id)
-                    .send()
-                    .await;
-                return Err(e);
-            }
+        file.seek(SeekFrom::Start(0)).await?;
+        let mut sink = AwsUploadSink {
+            client: self.client.clone(),
+            bucket: self.bucket.clone(),
+            key: key.clone(),
+            content_type: ct.clone(),
+            metadata: meta,
         };
-        let completed = CompletedMultipartUpload::builder()
-            .set_parts(Some(parts))
-            .build();
-        if let Err(e) = self
-            .client
-            .complete_multipart_upload()
-            .bucket(&self.bucket)
-            .key(&key)
-            .upload_id(&upload_id)
-            .multipart_upload(completed)
-            .send()
-            .await
-        {
-            let _ = self
-                .client
-                .abort_multipart_upload()
-                .bucket(&self.bucket)
-                .key(&key)
-                .upload_id(&upload_id)
-                .send()
-                .await;
-            return Err(map_sdk_error(e, &key));
+        let outcome = crate::stream::run_streaming_upload(
+            Box::pin(file_stream(file)),
+            &mut sink,
+            Some(len),
+            self.config.max_file_bytes,
+        )
+        .await?;
+        if outcome.total_bytes != len || outcome.sha256 != sha {
+            self.cleanup_failed_store(&key, &words).await;
+            return Err(StoreError::Io(format!(
+                "the file changed during the upload: expected {len} bytes with sha256 {sha}, uploaded {} bytes with sha256 {}",
+                outcome.total_bytes, outcome.sha256
+            )));
         }
         if let Err(e) = self.write_alias(&words, &key, expires_at).await {
             self.cleanup_failed_store(&key, &words).await;
@@ -1643,8 +1613,8 @@ impl Store {
             id: format!("{date}/{random_id}"),
             key,
             words: Some(words),
-            size,
-            sha256: sha,
+            size: outcome.total_bytes,
+            sha256: outcome.sha256,
             content_type: ct,
             filename: display_name,
             detection_source: Some(detection.source.to_string()),
@@ -2738,18 +2708,6 @@ mod tests {
             ),
             "the paste must be expired after the one-hour expiry"
         );
-    }
-
-    #[tokio::test]
-    async fn sha256_file_hashes_the_whole_file() {
-        let dir = std::env::temp_dir().join(format!("dayfly-sha256-{}", generate_random_id()));
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let path = dir.join("blob.bin");
-        // More than one read, so the loop boundary is exercised.
-        let data = vec![0x5au8; MULTIPART_CHUNK_BYTES + 17];
-        tokio::fs::write(&path, &data).await.unwrap();
-        assert_eq!(sha256_file(&path).await.unwrap(), sha256_hex(&data));
-        tokio::fs::remove_dir_all(&dir).await.unwrap();
     }
 
     #[test]
