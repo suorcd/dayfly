@@ -79,7 +79,8 @@ As a simple, optional extra for the binary's own endpoint (not a
 replacement for the S3 credentials), set
 `DAYFLY_HTTP_BEARER_TOKEN`: HTTP mode then requires
 `Authorization: Bearer <token>` on every route, including the human
-pages. Note the limitation this creates: a plain browser form cannot
+pages. The token must not contain ASCII whitespace; startup fails if
+it does. Note the limitation this creates: a plain browser form cannot
 send an `Authorization` header, so for browser use of the frontend,
 run on a private network / localhost without the token set, and use
 the token for API clients. Do not put the token in a URL query
