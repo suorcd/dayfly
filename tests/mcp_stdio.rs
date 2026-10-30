@@ -253,6 +253,60 @@ fn store_text_fetch_metadata_list_and_delete_round_trip() {
 }
 
 #[test]
+fn word_alias_round_trip_through_mcp() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let mut client = McpClient::spawn(&fake, &[]);
+
+    let stored = client
+        .call_tool("store_text", json!({"text": "hello alias", "ttl_days": 1}))
+        .expect("store_text must succeed");
+    let id = stored["id"]
+        .as_str()
+        .expect("id must be a string")
+        .to_string();
+    let words = stored["words"]
+        .as_str()
+        .expect("store_text must return words")
+        .to_string();
+    assert!(
+        fake.object(&format!("words/{words}")).is_some(),
+        "the alias object must exist"
+    );
+
+    let meta = client
+        .call_tool("fetch_metadata", json!({"id": words}))
+        .expect("fetch_metadata must resolve the alias");
+    assert_eq!(meta["id"], id);
+    assert_eq!(meta["words"], words);
+
+    let slice = client
+        .call_tool("fetch_text", json!({"id": words}))
+        .expect("fetch_text must resolve the alias");
+    assert_eq!(slice["text"], "hello alias");
+
+    client
+        .call_tool("append_text", json!({"id": words, "text": "!"}))
+        .expect("append_text must resolve the alias");
+    let slice = client
+        .call_tool("fetch_text", json!({"id": words}))
+        .expect("fetch_text must resolve the alias after an append");
+    assert_eq!(slice["text"], "hello alias!");
+
+    let date = id.split_once('/').expect("dated id").0;
+    let listed = client
+        .call_tool("list_recent", json!({"date": date}))
+        .expect("list_recent must succeed");
+    assert_eq!(listed["items"][0]["words"], words);
+
+    client
+        .call_tool("delete_paste", json!({"id": words}))
+        .expect("delete_paste must resolve the alias");
+    assert!(fake.object(&format!("pastes/{id}")).is_none());
+    assert!(fake.object(&format!("words/{words}")).is_none());
+}
+
+#[test]
 fn store_file_and_fetch_file_move_bytes_without_json_payloads() {
     let runtime = runtime();
     let fake = runtime.block_on(FakeS3::start());

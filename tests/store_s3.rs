@@ -9,7 +9,7 @@ use bytes::Bytes;
 use chrono::{Duration, Utc};
 use common::{FailOp, FakeS3};
 use dayfly::store::{
-    parse_segment_key, StoreError, Ttl, MULTIPART_CHUNK_BYTES, SEGMENT_SUFFIX_LEN,
+    normalize_words, parse_segment_key, StoreError, Ttl, MULTIPART_CHUNK_BYTES, SEGMENT_SUFFIX_LEN,
 };
 use futures::stream;
 use sha2::{Digest, Sha256};
@@ -96,6 +96,422 @@ async fn store_text_round_trip_through_the_s3_sdk() {
     assert_eq!(meta.detection_source.as_deref(), Some("extension"));
     assert!(meta.sha256.is_some());
     assert!(!meta.expired);
+}
+
+#[tokio::test]
+async fn store_text_returns_words_and_fetch_text_accepts_them() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+
+    let stored = store
+        .store_text(
+            b"three word body",
+            None,
+            Some("text/plain"),
+            Some(Ttl::days(1)),
+        )
+        .await
+        .expect("store_text must succeed against the fake");
+
+    let words = stored
+        .words
+        .as_deref()
+        .expect("a new paste must have a three-word alias");
+    assert!(
+        words.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
+        "the alias must be lowercase hyphen form: {words}"
+    );
+
+    let alias = fake
+        .object(&format!("words/{words}"))
+        .expect("the alias object must exist");
+    assert_eq!(
+        alias.body,
+        stored.key.as_bytes(),
+        "the alias body must hold the canonical key"
+    );
+    assert_eq!(alias.content_type, "text/plain");
+    assert_eq!(
+        alias.metadata.get("target").map(String::as_str),
+        Some(stored.key.as_str())
+    );
+    assert_eq!(
+        alias.metadata.get("kind").map(String::as_str),
+        Some("alias")
+    );
+    assert_eq!(
+        alias.metadata.get("expires-at").map(String::as_str),
+        Some(stored.expires_at.to_rfc3339().as_str())
+    );
+
+    let fetched = store
+        .fetch_text(words, 0, None)
+        .await
+        .expect("fetch_text must resolve the word alias");
+    assert_eq!(fetched.text, "three word body");
+    assert_eq!(
+        normalize_words(words).as_deref(),
+        Some(words),
+        "the stored alias must be the canonical hyphen form"
+    );
+}
+
+/// A phrase that is valid and different from `taken`.
+fn other_phrase(taken: &str) -> String {
+    for candidate in [
+        "abacus-abdomen-zoology",
+        "abacus-abdomen-abdominal",
+        "abacus-abdomen-abide",
+    ] {
+        if candidate != taken {
+            return candidate.to_string();
+        }
+    }
+    panic!("no unused test phrase");
+}
+
+#[tokio::test]
+async fn word_alias_resolves_fetch_metadata_append_and_delete() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"hello", None, Some("text/plain"), Some(Ttl::days(1)))
+        .await
+        .expect("store_text must succeed");
+    let words = stored
+        .words
+        .clone()
+        .expect("a new paste must have an alias");
+
+    let meta = store
+        .head_metadata(&words)
+        .await
+        .expect("metadata by words must resolve");
+    assert_eq!(meta.id, stored.id);
+    assert_eq!(meta.words.as_deref(), Some(words.as_str()));
+
+    let appended = store
+        .append_text(&words, b" world")
+        .await
+        .expect("append by words must resolve");
+    assert_eq!(appended.meta.id, stored.id);
+    assert_eq!(appended.meta.words.as_deref(), Some(words.as_str()));
+
+    let fetched = store
+        .fetch_text(&words, 0, None)
+        .await
+        .expect("fetch by words must resolve after an append");
+    assert_eq!(fetched.text, "hello world");
+
+    let spaced = words.replace('-', " ").to_uppercase();
+    let meta = store
+        .head_metadata(&spaced)
+        .await
+        .expect("a phrase with spaces and capitals must resolve");
+    assert_eq!(meta.id, stored.id);
+
+    store
+        .delete(&words)
+        .await
+        .expect("delete by words must remove the paste");
+    assert!(fake.object(&stored.key).is_none(), "the base must be gone");
+    assert!(
+        fake.object(&format!("words/{words}")).is_none(),
+        "the alias must be gone"
+    );
+    assert!(
+        fake.keys().is_empty(),
+        "segments must be gone: {:?}",
+        fake.keys()
+    );
+
+    let error = store
+        .fetch_text(&words, 0, None)
+        .await
+        .expect_err("a deleted alias must not resolve");
+    assert!(matches!(error, StoreError::NotFound(_)), "got {error:?}");
+}
+
+#[tokio::test]
+async fn delete_by_canonical_id_removes_the_alias() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"delete me", None, None, Some(Ttl::days(1)))
+        .await
+        .expect("store_text must succeed");
+    let words = stored
+        .words
+        .clone()
+        .expect("a new paste must have an alias");
+
+    store
+        .delete(&stored.id)
+        .await
+        .expect("delete by canonical id must succeed");
+    assert!(fake.object(&stored.key).is_none(), "the base must be gone");
+    assert!(
+        fake.object(&format!("words/{words}")).is_none(),
+        "delete by canonical id must remove the alias"
+    );
+}
+
+#[tokio::test]
+async fn missing_expired_and_stale_aliases_do_not_resolve() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"live body", None, None, Some(Ttl::days(1)))
+        .await
+        .expect("store_text must succeed");
+    let words = stored
+        .words
+        .clone()
+        .expect("a new paste must have an alias");
+    let unused = other_phrase(&words);
+
+    let error = store
+        .fetch_text(&unused, 0, None)
+        .await
+        .expect_err("a phrase with no alias object must not resolve");
+    assert!(matches!(error, StoreError::NotFound(_)), "got {error:?}");
+
+    let past = (Utc::now() - Duration::days(1)).to_rfc3339();
+    fake.set_metadata(&stored.key, "expires-at", &past);
+    let error = store
+        .fetch_text(&words, 0, None)
+        .await
+        .expect_err("an expired paste must not resolve through its alias");
+    assert!(matches!(error, StoreError::Expired(_)), "got {error:?}");
+
+    let stale_target = "pastes/2026-10-28/stalemissing";
+    fake.seed(
+        &format!("words/{unused}"),
+        stale_target.as_bytes(),
+        "text/plain",
+        &[
+            ("kind", "alias"),
+            ("target", stale_target),
+            ("expires-at", "2999-01-01T00:00:00+00:00"),
+        ],
+    );
+    let error = store
+        .fetch_text(&unused, 0, None)
+        .await
+        .expect_err("an alias with a missing target must not resolve");
+    assert!(matches!(error, StoreError::NotFound(_)), "got {error:?}");
+}
+
+#[tokio::test]
+async fn alias_collision_retries_until_a_new_phrase_is_chosen() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let taken = "abacus-abdomen-zoology";
+    let target = "pastes/2026-10-28/taken";
+    fake.seed(
+        &format!("words/{taken}"),
+        target.as_bytes(),
+        "text/plain",
+        &[
+            ("kind", "alias"),
+            ("target", target),
+            ("expires-at", "2999-01-01T00:00:00+00:00"),
+        ],
+    );
+
+    let chosen = store
+        .choose_alias_from(vec![
+            taken.to_string(),
+            taken.to_string(),
+            "abacus-abdomen-abdominal".to_string(),
+        ])
+        .await
+        .expect("the allocator must skip a taken phrase");
+    assert_eq!(chosen, "abacus-abdomen-abdominal");
+    assert_eq!(
+        fake.object(&format!("words/{taken}"))
+            .expect("the taken alias must remain")
+            .body,
+        target.as_bytes(),
+        "the allocator must not overwrite an existing alias"
+    );
+}
+
+#[tokio::test]
+async fn alias_allocation_fails_when_every_candidate_collides() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let taken = "abacus-abdomen-zoology";
+    let target = "pastes/2026-10-28/taken";
+    fake.seed(
+        &format!("words/{taken}"),
+        target.as_bytes(),
+        "text/plain",
+        &[
+            ("kind", "alias"),
+            ("target", target),
+            ("expires-at", "2999-01-01T00:00:00+00:00"),
+        ],
+    );
+
+    let error = store
+        .choose_alias_from(std::iter::repeat_n(taken.to_string(), 8))
+        .await
+        .expect_err("eight collisions must stop the allocator");
+    assert!(
+        matches!(error, StoreError::AliasUnavailable { attempts: 8 }),
+        "got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn alias_write_failure_removes_the_text_base_object() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    fake.fail_put_prefix("words/");
+
+    let error = store
+        .store_text(b"no alias", None, None, Some(Ttl::days(1)))
+        .await
+        .expect_err("a failed alias write must fail the store");
+    assert!(matches!(error, StoreError::S3(_)), "got {error:?}");
+    assert!(
+        fake.keys().is_empty(),
+        "the base object must be cleaned up: {:?}",
+        fake.keys()
+    );
+}
+
+#[tokio::test]
+async fn alias_write_failure_after_a_stream_removes_the_base_object() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    fake.fail_put_prefix("words/");
+    let body = Bytes::from_static(b"stream body");
+    let length = body.len() as u64;
+    let upload = stream::iter(vec![Ok::<Bytes, StoreError>(body)]);
+
+    let error = store
+        .store_stream(
+            upload,
+            Some("stream.bin"),
+            None,
+            Some(Ttl::days(1)),
+            Some(length),
+            1024,
+        )
+        .await
+        .expect_err("a failed alias write must fail the stream store");
+    assert!(matches!(error, StoreError::S3(_)), "got {error:?}");
+    assert!(
+        fake.keys().is_empty(),
+        "the streamed base object must be cleaned up: {:?}",
+        fake.keys()
+    );
+}
+
+#[tokio::test]
+async fn alias_write_failure_after_a_multipart_upload_removes_the_base_object() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let path = common::write_temp_file(
+        "alias-multipart.bin",
+        &common::pattern_bytes(MULTIPART_CHUNK_BYTES + 1),
+    );
+    fake.fail_put_prefix("words/");
+
+    let error = store
+        .store_file_path(&path, Some("large.bin"), None, Some(Ttl::days(1)))
+        .await
+        .expect_err("a failed alias write must fail the multipart store");
+    assert!(matches!(error, StoreError::S3(_)), "got {error:?}");
+    assert!(
+        fake.keys().is_empty(),
+        "the multipart base object must be cleaned up: {:?}",
+        fake.keys()
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn store_file_path_returns_words_and_writes_the_alias() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let path = common::write_temp_file("alias-file.txt", b"file body");
+
+    let stored = store
+        .store_file_path(&path, None, Some("text/plain"), Some(Ttl::days(1)))
+        .await
+        .expect("store_file_path must succeed");
+    let words = stored.words.clone().expect("a file must have an alias");
+    let alias = fake
+        .object(&format!("words/{words}"))
+        .expect("the alias object must exist");
+    assert_eq!(alias.body, stored.key.as_bytes());
+
+    let fetched = store
+        .fetch_text(&words, 0, None)
+        .await
+        .expect("fetch by words must resolve the file");
+    assert_eq!(fetched.text, "file body");
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn legacy_object_without_an_alias_still_works() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let key = "pastes/2026-10-28/legacy123";
+    fake.seed(
+        key,
+        b"legacy body",
+        "text/plain",
+        &common::metadata_refs(&future_metadata(11)),
+    );
+
+    let meta = store
+        .head_metadata("2026-10-28/legacy123")
+        .await
+        .expect("a legacy object must resolve by id");
+    assert_eq!(meta.words, None);
+    let fetched = store
+        .fetch_text("2026-10-28/legacy123", 0, None)
+        .await
+        .expect("a legacy object must be readable");
+    assert_eq!(fetched.text, "legacy body");
+
+    let items = store
+        .list_recent(Some("2026-10-28"), 10)
+        .await
+        .expect("a legacy object must list");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].words, None);
+}
+
+#[tokio::test]
+async fn list_recent_includes_the_word_alias() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"listed", None, None, Some(Ttl::days(1)))
+        .await
+        .expect("store_text must succeed");
+    let words = stored
+        .words
+        .clone()
+        .expect("a new paste must have an alias");
+    let date = stored.id.split_once('/').expect("dated id").0;
+
+    let items = store
+        .list_recent(Some(date), 10)
+        .await
+        .expect("list_recent must succeed");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].words.as_deref(), Some(words.as_str()));
+    assert!(
+        items.iter().all(|item| !item.key.starts_with("words/")),
+        "an alias object must not appear as a paste"
+    );
 }
 
 #[tokio::test]
@@ -1467,6 +1883,11 @@ async fn append_errors_before_write_for_missing_expired_or_oversize() {
         .store_text(b"base", None, None, Some(Ttl::days(7)))
         .await
         .expect("store must succeed against the fake");
+    let puts_after_store = fake.puts().len();
+    assert_eq!(
+        puts_after_store, 2,
+        "the store writes the base object and its alias"
+    );
     let past = (Utc::now() - Duration::days(1)).to_rfc3339();
     fake.set_metadata(&stored.key, "expires-at", &past);
     let expired = store.append_text(&stored.id, b"x").await;
@@ -1474,14 +1895,22 @@ async fn append_errors_before_write_for_missing_expired_or_oversize() {
         matches!(expired, Err(StoreError::Expired(_))),
         "an expired id must be an error: {expired:?}"
     );
-    assert_eq!(fake.puts().len(), 1, "the expired append must not write");
+    assert_eq!(
+        fake.puts().len(),
+        puts_after_store,
+        "the expired append must not write"
+    );
 
     let oversize = store.append_text(&stored.id, b"01234567890").await;
     assert!(
         matches!(oversize, Err(StoreError::TooLarge { limit: 10 })),
         "the append cap must apply to the appended bytes: {oversize:?}"
     );
-    assert_eq!(fake.puts().len(), 1, "the oversize append must not write");
+    assert_eq!(
+        fake.puts().len(),
+        puts_after_store,
+        "the oversize append must not write"
+    );
 }
 
 #[tokio::test]

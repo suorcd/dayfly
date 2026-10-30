@@ -19,8 +19,9 @@
 //!   configured, is only a day-rounded storage sweeper and may run after
 //!   expiry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use aws_config::BehaviorVersion;
@@ -67,6 +68,8 @@ pub enum StoreError {
     InvalidRange(String),
     #[error("range not satisfiable")]
     RangeNotSatisfiable,
+    #[error("could not allocate a three-word alias after {attempts} attempts")]
+    AliasUnavailable { attempts: usize },
     #[error("io error: {0}")]
     Io(String),
     #[error("s3 error: {0}")]
@@ -371,6 +374,8 @@ pub struct StoredPaste {
     /// Full paste ID returned to clients: "<yyyy-mm-dd>/<random-id>".
     pub id: String,
     pub key: String,
+    /// Three-word alias, when the store wrote one.
+    pub words: Option<String>,
     pub size: u64,
     pub sha256: String,
     pub content_type: String,
@@ -386,6 +391,8 @@ pub struct StoredPaste {
 pub struct PasteMetadata {
     pub id: String,
     pub key: String,
+    /// Three-word alias, when the base object records one.
+    pub words: Option<String>,
     pub filename: Option<String>,
     pub content_type: String,
     pub detection_source: Option<String>,
@@ -434,6 +441,8 @@ pub struct AppendResult {
 pub struct PasteSummary {
     pub id: String,
     pub key: String,
+    /// Three-word alias, when the base object records one.
+    pub words: Option<String>,
     pub size: u64,
     pub last_modified: Option<DateTime<Utc>>,
     /// From HeadObject, when available. `None` means the object has no
@@ -509,6 +518,102 @@ pub fn validate_id(id: &str) -> Result<(), StoreError> {
 
 pub fn key_for(date: &str, random_id: &str) -> String {
     format!("pastes/{date}/{random_id}")
+}
+
+/// Number of words in a three-word alias.
+pub const WORDS_IN_PHRASE: usize = 3;
+
+/// Number of alias candidates to try before the store reports failure.
+pub const ALIAS_ATTEMPTS: usize = 8;
+
+/// Prefix for alias objects. An alias object holds one canonical key.
+pub const ALIAS_PREFIX: &str = "words/";
+
+static WORDLIST: OnceLock<Vec<&'static str>> = OnceLock::new();
+static WORD_SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+
+/// The bundled EFF large wordlist, parsed once.
+fn wordlist() -> &'static [&'static str] {
+    WORDLIST.get_or_init(|| {
+        include_str!("wordlist.txt")
+            .lines()
+            .map(str::trim)
+            .filter(|word| !word.is_empty())
+            .collect()
+    })
+}
+
+fn word_set() -> &'static HashSet<&'static str> {
+    WORD_SET.get_or_init(|| wordlist().iter().copied().collect())
+}
+
+/// Normalize a three-word alias to the lowercase hyphen form.
+///
+/// The function accepts spaces or hyphens between words and trims the
+/// input. It returns `None` when the input is not exactly three known
+/// words. Four wordlist entries contain a hyphen, so the parser tests
+/// every split of the input into three wordlist entries.
+pub fn normalize_words(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let chunks: Vec<&str> = lower
+        .split(|c: char| c == '-' || c.is_whitespace())
+        .filter(|chunk| !chunk.is_empty())
+        .collect();
+    if chunks.len() < WORDS_IN_PHRASE || !is_three_words(&chunks) {
+        return None;
+    }
+    Some(chunks.join("-"))
+}
+
+fn is_three_words(chunks: &[&str]) -> bool {
+    fn search(chunks: &[&str], index: usize, words_left: usize) -> bool {
+        if words_left == 0 {
+            return index == chunks.len();
+        }
+        if chunks.len().saturating_sub(index) < words_left {
+            return false;
+        }
+        let mut candidate = String::new();
+        for end in index..chunks.len() {
+            if !candidate.is_empty() {
+                candidate.push('-');
+            }
+            candidate.push_str(chunks[end]);
+            if word_set().contains(candidate.as_str()) && search(chunks, end + 1, words_left - 1) {
+                return true;
+            }
+        }
+        false
+    }
+    search(chunks, 0, WORDS_IN_PHRASE)
+}
+
+/// True when the input is a valid three-word alias.
+pub fn is_word_phrase(input: &str) -> bool {
+    normalize_words(input).is_some()
+}
+
+/// Generate one random three-word alias in the hyphen form.
+pub fn generate_words() -> String {
+    let words = wordlist();
+    let mut rng = rand::rng();
+    let mut phrase = String::new();
+    for index in 0..WORDS_IN_PHRASE {
+        if index > 0 {
+            phrase.push('-');
+        }
+        phrase.push_str(words[rng.random_range(0..words.len())]);
+    }
+    phrase
+}
+
+/// Key for the alias object of a normalized phrase.
+pub fn alias_key(phrase: &str) -> String {
+    format!("{ALIAS_PREFIX}{phrase}")
 }
 
 /// Number of decimal digits in a segment sequence number.
@@ -831,6 +936,7 @@ fn metadata_for(
     filename: Option<&str>,
     sha256: Option<&str>,
     size: Option<u64>,
+    words: Option<&str>,
     ttl: Ttl,
     created_at: DateTime<Utc>,
     detection: &Detection,
@@ -852,6 +958,9 @@ fn metadata_for(
     }
     if let Some(bytes) = size {
         meta.insert("size".to_string(), bytes.to_string());
+    }
+    if let Some(words) = words {
+        meta.insert("words".to_string(), words.to_string());
     }
     meta.insert("ttl-seconds".to_string(), ttl.num_seconds().to_string());
     if let Some(days) = ttl.whole_days() {
@@ -1023,14 +1132,206 @@ impl Store {
         })
     }
 
+    /// True when an alias object already holds this phrase.
+    async fn alias_object_exists(&self, phrase: &str) -> Result<bool, StoreError> {
+        let key = alias_key(phrase);
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| map_sdk_error(e, &key))
+        {
+            Ok(_) => Ok(true),
+            Err(StoreError::NotFound(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Choose an unused alias from a small set of random candidates.
+    async fn choose_alias(&self) -> Result<String, StoreError> {
+        self.choose_alias_from(std::iter::repeat_with(generate_words).take(ALIAS_ATTEMPTS))
+            .await
+    }
+
+    /// Choose the first alias in `candidates` that no alias object holds.
+    ///
+    /// Production code calls [`Self::choose_alias`]. The collision test
+    /// uses this method to supply a fixed candidate order.
+    #[doc(hidden)]
+    pub async fn choose_alias_from<I>(&self, candidates: I) -> Result<String, StoreError>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut attempts = 0;
+        for candidate in candidates {
+            attempts += 1;
+            let Some(phrase) = normalize_words(&candidate) else {
+                continue;
+            };
+            if !self.alias_object_exists(&phrase).await? {
+                return Ok(phrase);
+            }
+        }
+        Err(StoreError::AliasUnavailable { attempts })
+    }
+
+    /// Write the alias object that maps a phrase to a canonical key.
+    async fn write_alias(
+        &self,
+        phrase: &str,
+        target_key: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let key = alias_key(phrase);
+        let mut meta = HashMap::new();
+        meta.insert("target".to_string(), target_key.to_string());
+        meta.insert("expires-at".to_string(), expires_at.to_rfc3339());
+        meta.insert("kind".to_string(), "alias".to_string());
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .body(ByteStream::from(target_key.as_bytes().to_vec()))
+            .content_type("text/plain")
+            .set_metadata(Some(meta))
+            .send()
+            .await
+            .map_err(|e| map_sdk_error(e, &key))?;
+        Ok(())
+    }
+
+    async fn delete_alias_object(&self, phrase: &str) -> Result<(), StoreError> {
+        let key = alias_key(phrase);
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| map_sdk_error(e, &key))?;
+        Ok(())
+    }
+
+    /// Remove the base object and segments after a failed alias write.
+    async fn cleanup_failed_store(&self, base_key: &str, phrase: &str) {
+        let _ = self.delete_alias_object(phrase).await;
+        let _ = self.delete_base_and_segments(base_key).await;
+    }
+
+    /// Read the canonical key from an alias object.
+    ///
+    /// The body must equal the stored `target` metadata, and the target
+    /// must be a valid paste key. A stale or corrupt alias is not trusted.
+    async fn read_alias(&self, phrase: &str) -> Result<String, StoreError> {
+        let key = alias_key(phrase);
+        let out = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| match map_sdk_error(e, &key) {
+                StoreError::NotFound(_) => StoreError::NotFound(phrase.to_string()),
+                other => other,
+            })?;
+        let meta = out.metadata().cloned().unwrap_or_default();
+        let bytes = out
+            .body
+            .collect()
+            .await
+            .map_err(|e| StoreError::S3(e.to_string()))?
+            .to_vec();
+        let target =
+            String::from_utf8(bytes).map_err(|_| StoreError::NotFound(phrase.to_string()))?;
+        if meta.get("kind").map(String::as_str) != Some("alias")
+            || meta.get("target").map(String::as_str) != Some(target.as_str())
+            || !target.starts_with("pastes/")
+            || validate_id(&target).is_err()
+        {
+            return Err(StoreError::NotFound(phrase.to_string()));
+        }
+        Ok(target)
+    }
+
+    /// Resolve a phrase to a live canonical key.
+    async fn resolve_alias(&self, phrase: &str) -> Result<String, StoreError> {
+        let target = self.read_alias(phrase).await?;
+        let meta = match self.head_metadata_by_key(&target, phrase).await {
+            Ok(meta) => meta,
+            Err(StoreError::NotFound(_)) => return Err(StoreError::NotFound(phrase.to_string())),
+            Err(e) => return Err(e),
+        };
+        if meta.expired {
+            return Err(StoreError::Expired(phrase.to_string()));
+        }
+        Ok(meta.key)
+    }
+
+    /// Read the `words` value from a base object, when it has one.
+    async fn base_words(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let out = match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| map_sdk_error(e, key))
+        {
+            Ok(out) => out,
+            Err(StoreError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        Ok(out
+            .metadata()
+            .and_then(|meta| meta.get("words").cloned())
+            .and_then(|words| normalize_words(&words)))
+    }
+
+    /// Delete the base object and every object under its segment prefix.
+    async fn delete_base_and_segments(&self, base_key: &str) -> Result<(), StoreError> {
+        let segments = self.list_segment_entries(base_key).await?;
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(base_key)
+            .send()
+            .await
+            .map_err(|e| map_sdk_error(e, base_key))?;
+        for (key, _) in segments {
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await
+                .map_err(|e| map_sdk_error(e, &key))?;
+        }
+        Ok(())
+    }
+
+    async fn delete_by_words(&self, phrase: &str) -> Result<(), StoreError> {
+        let target = self.read_alias(phrase).await?;
+        self.delete_base_and_segments(&target).await?;
+        self.delete_alias_object(phrase).await
+    }
+
     /// Resolve a client ID to an S3 key.
     ///
     /// Full IDs (`yyyy-mm-dd/<random>`) resolve directly. Bare random IDs
     /// are resolved by scanning the `pastes/` prefix (at most
-    /// [`LIST_SCAN_MAX_PAGES`] pages of 1,000 keys). That scan is the cost
+    /// [`LIST_SCAN_MAX_PAGES`] pages of 1,000 keys). A valid three-word
+    /// alias resolves through its `words/` object. That scan is the cost
     /// of not having an index: clients should keep the full ID returned
     /// at store time.
     pub async fn resolve_key(&self, id: &str) -> Result<String, StoreError> {
+        if let Some(phrase) = normalize_words(id) {
+            return self.resolve_alias(&phrase).await;
+        }
         validate_id(id)?;
         let stripped = id.strip_prefix("pastes/").unwrap_or(id);
         if stripped.contains('/') {
@@ -1080,6 +1381,7 @@ impl Store {
             });
         }
         let ttl = ttl.unwrap_or_else(|| Ttl::days(self.config.default_ttl_days));
+        let words = self.choose_alias().await?;
         let created_at = Utc::now();
         let random_id = generate_random_id();
         let date = created_at.format("%Y-%m-%d").to_string();
@@ -1095,6 +1397,7 @@ impl Store {
             filename,
             Some(&sha),
             Some(text.len() as u64),
+            Some(&words),
             ttl,
             created_at,
             &detection,
@@ -1109,9 +1412,14 @@ impl Store {
             .send()
             .await
             .map_err(|e| map_sdk_error(e, &key))?;
+        if let Err(e) = self.write_alias(&words, &key, expires_at).await {
+            self.cleanup_failed_store(&key, &words).await;
+            return Err(e);
+        }
         Ok(StoredPaste {
             id: format!("{date}/{random_id}"),
             key,
+            words: Some(words),
             size: text.len() as u64,
             sha256: sha,
             content_type: ct,
@@ -1146,6 +1454,7 @@ impl Store {
             });
         }
         let ttl = ttl.unwrap_or_else(|| Ttl::days(self.config.default_ttl_days));
+        let words = self.choose_alias().await?;
         let created_at = Utc::now();
         let random_id = generate_random_id();
         let date = created_at.format("%Y-%m-%d").to_string();
@@ -1166,6 +1475,7 @@ impl Store {
                 display_name.as_deref(),
                 Some(&sha),
                 Some(size),
+                Some(&words),
                 ttl,
                 created_at,
                 &detection,
@@ -1180,9 +1490,14 @@ impl Store {
                 .send()
                 .await
                 .map_err(|e| map_sdk_error(e, &key))?;
+            if let Err(e) = self.write_alias(&words, &key, expires_at).await {
+                self.cleanup_failed_store(&key, &words).await;
+                return Err(e);
+            }
             return Ok(StoredPaste {
                 id: format!("{date}/{random_id}"),
                 key,
+                words: Some(words),
                 size,
                 sha256: sha,
                 content_type: ct,
@@ -1219,6 +1534,7 @@ impl Store {
             display_name.as_deref(),
             Some(&sha),
             Some(size),
+            Some(&words),
             ttl,
             created_at,
             &detection,
@@ -1319,9 +1635,14 @@ impl Store {
                 .await;
             return Err(map_sdk_error(e, &key));
         }
+        if let Err(e) = self.write_alias(&words, &key, expires_at).await {
+            self.cleanup_failed_store(&key, &words).await;
+            return Err(e);
+        }
         Ok(StoredPaste {
             id: format!("{date}/{random_id}"),
             key,
+            words: Some(words),
             size,
             sha256: sha,
             content_type: ct,
@@ -1379,6 +1700,7 @@ impl Store {
             let body = collect_stream_body(stream, max_bytes).await?;
             return self.store_text(&body, None, content_type, Some(ttl)).await;
         }
+        let words = self.choose_alias().await?;
         let created_at = Utc::now();
         let random_id = generate_random_id();
         let date = created_at.format("%Y-%m-%d").to_string();
@@ -1397,6 +1719,7 @@ impl Store {
             display_name.as_deref(),
             None,
             None,
+            Some(&words),
             ttl,
             created_at,
             &detection,
@@ -1411,9 +1734,14 @@ impl Store {
         let outcome =
             crate::stream::run_streaming_upload(wrapped, &mut sink, known_length, max_bytes)
                 .await?;
+        if let Err(e) = self.write_alias(&words, &key, expires_at).await {
+            self.cleanup_failed_store(&key, &words).await;
+            return Err(e);
+        }
         Ok(StoredPaste {
             id: format!("{date}/{random_id}"),
             key,
+            words: Some(words),
             size: outcome.total_bytes,
             sha256: outcome.sha256,
             content_type: ct,
@@ -1539,11 +1867,16 @@ impl Store {
 
     pub async fn head_metadata(&self, id: &str) -> Result<PasteMetadata, StoreError> {
         let key = self.resolve_key(id).await?;
+        self.head_metadata_by_key(&key, id).await
+    }
+
+    /// Read metadata for a canonical key without another alias lookup.
+    async fn head_metadata_by_key(&self, key: &str, id: &str) -> Result<PasteMetadata, StoreError> {
         let out = self
             .client
             .head_object()
             .bucket(&self.bucket)
-            .key(&key)
+            .key(key)
             .send()
             .await
             .map_err(|e| map_sdk_error(e, id))?;
@@ -1558,11 +1891,12 @@ impl Store {
             .or_else(|| meta.get("content-type").cloned())
             .unwrap_or_else(|| "application/octet-stream".to_string());
         let base_size = u64::try_from(out.content_length().unwrap_or(0)).unwrap_or(0);
-        let plan = self.load_plan(&key, base_size).await?;
+        let plan = self.load_plan(key, base_size).await?;
         let has_segments = !plan.segments.is_empty();
         Ok(PasteMetadata {
-            id: key.strip_prefix("pastes/").unwrap_or(&key).to_string(),
-            key,
+            id: key.strip_prefix("pastes/").unwrap_or(key).to_string(),
+            key: key.to_string(),
+            words: meta.get("words").and_then(|words| normalize_words(words)),
             filename: meta.get("filename").map(|s| decode_filename(s)),
             content_type,
             detection_source: meta.get("detection-source").cloned(),
@@ -1747,28 +2081,21 @@ impl Store {
         Ok(meta)
     }
 
-    /// Delete the base object and every object under its segment prefix.
+    /// Delete the base object, every object under its segment prefix, and
+    /// the alias object.
     ///
-    /// The prefix listing runs first, so a listing failure leaves the
-    /// paste intact rather than deleting only the base object.
+    /// The input can be a canonical ID or a three-word alias. The prefix
+    /// listing runs first, so a listing failure leaves the paste intact
+    /// rather than deleting only the base object.
     pub async fn delete(&self, id: &str) -> Result<(), StoreError> {
+        if let Some(phrase) = normalize_words(id) {
+            return self.delete_by_words(&phrase).await;
+        }
         let key = self.resolve_key(id).await?;
-        let segments = self.list_segment_entries(&key).await?;
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .send()
-            .await
-            .map_err(|e| map_sdk_error(e, id))?;
-        for (segment_key, _) in segments {
-            self.client
-                .delete_object()
-                .bucket(&self.bucket)
-                .key(&segment_key)
-                .send()
-                .await
-                .map_err(|e| map_sdk_error(e, &segment_key))?;
+        let words = self.base_words(&key).await?;
+        self.delete_base_and_segments(&key).await?;
+        if let Some(words) = words {
+            self.delete_alias_object(&words).await?;
         }
         Ok(())
     }
@@ -1849,6 +2176,7 @@ impl Store {
                     summaries.push(PasteSummary {
                         id,
                         key: key.to_string(),
+                        words: meta.words,
                         size: meta.size,
                         last_modified: obj
                             .last_modified()
@@ -1940,6 +2268,66 @@ mod tests {
         assert!(
             validate_id("2026-10-28/abcXYZ0123/00000000000000000000").is_err(),
             "a segment key must not be a paste id"
+        );
+    }
+
+    #[test]
+    fn wordlist_has_7776_lowercase_words() {
+        let words = wordlist();
+        assert_eq!(words.len(), 7_776);
+        let unique: HashSet<&str> = words.iter().copied().collect();
+        assert_eq!(unique.len(), 7_776, "wordlist entries must be unique");
+        for word in words {
+            assert!(!word.is_empty(), "wordlist entries must not be empty");
+            assert!(
+                word.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
+                "wordlist entry must be lowercase ASCII: {word:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn word_phrase_normalization_accepts_case_spaces_and_hyphens() {
+        assert_eq!(
+            normalize_words(" Abacus Abdomen-Zoology ").as_deref(),
+            Some("abacus-abdomen-zoology")
+        );
+        assert!(is_word_phrase("abacus abdomen zoology"));
+        assert!(is_word_phrase("ABACUS-ABDOMEN-ZOOLOGY"));
+        assert!(is_word_phrase("drop-down abacus zoology"));
+        assert_eq!(
+            normalize_words("drop-down abacus zoology").as_deref(),
+            Some("drop-down-abacus-zoology")
+        );
+    }
+
+    #[test]
+    fn word_phrase_normalization_rejects_wrong_count_and_unknown_words() {
+        assert!(!is_word_phrase(""));
+        assert!(!is_word_phrase("abacus"));
+        assert!(!is_word_phrase("abacus-abdomen"));
+        assert!(!is_word_phrase("abacus-abdomen-zoology-extra"));
+        assert!(!is_word_phrase("abacus-abdomen-notaword"));
+        assert!(!is_word_phrase("abacus/abdomen/zoology"));
+    }
+
+    #[test]
+    fn generated_words_have_three_known_lowercase_words() {
+        for _ in 0..100 {
+            let phrase = generate_words();
+            assert!(
+                is_word_phrase(&phrase),
+                "generated phrase must parse: {phrase}"
+            );
+            assert_eq!(normalize_words(&phrase).as_deref(), Some(phrase.as_str()));
+        }
+    }
+
+    #[test]
+    fn alias_key_uses_the_words_prefix() {
+        assert_eq!(
+            alias_key("abacus-abdomen-zoology"),
+            "words/abacus-abdomen-zoology"
         );
     }
 
@@ -2214,6 +2602,7 @@ mod tests {
             Some("a b.txt"),
             Some("deadbeef"),
             Some(3),
+            None,
             Ttl::days(7),
             created,
             &detection,
@@ -2290,6 +2679,7 @@ mod tests {
             None,
             Some("deadbeef"),
             Some(3),
+            None,
             Ttl::parse("1h").unwrap(),
             created,
             &detection,
@@ -2316,6 +2706,7 @@ mod tests {
             None,
             Some("deadbeef"),
             Some(3),
+            None,
             Ttl::parse("1h").unwrap(),
             created,
             &detection,
@@ -2323,6 +2714,7 @@ mod tests {
         let paste = |now: DateTime<Utc>| PasteMetadata {
             id: "2026-10-28/abc".to_string(),
             key: "pastes/2026-10-28/abc".to_string(),
+            words: None,
             filename: None,
             content_type: "text/plain".to_string(),
             detection_source: Some("text".to_string()),
@@ -2372,6 +2764,7 @@ mod tests {
             Some("note.txt"),
             Some("abc123"),
             Some(42),
+            None,
             Ttl::days(3),
             created,
             &detection,
@@ -2399,7 +2792,15 @@ mod tests {
         // The streaming multipart path builds this map before the hash
         // and the final size are known. An empty string or a zero must
         // not appear, because HeadObject would report them as real.
-        let (meta, _) = metadata_for(Some("a.bin"), None, None, Ttl::days(7), created, &detection);
+        let (meta, _) = metadata_for(
+            Some("a.bin"),
+            None,
+            None,
+            None,
+            Ttl::days(7),
+            created,
+            &detection,
+        );
         assert!(
             !meta.contains_key("sha256"),
             "unknown sha256 must be absent, not empty"

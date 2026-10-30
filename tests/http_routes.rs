@@ -7,7 +7,7 @@ use axum::Router;
 use chrono::{DateTime, Duration, Utc};
 use common::{FailOp, FakeS3};
 use dayfly::http::{api_router, app_router, AppState};
-use dayfly::store::{Store, Ttl};
+use dayfly::store::{normalize_words, Store, Ttl};
 use serde_json::{json, Value};
 
 fn id_from_plain_url(body: &[u8]) -> String {
@@ -701,6 +701,87 @@ async fn metadata_and_delete_routes_work_for_dated_and_bare_ids() {
 }
 
 #[tokio::test]
+async fn word_alias_works_on_fetch_metadata_append_delete_and_list() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let app = common::app(store);
+
+    let body = b"alias over http".to_vec();
+    let request = common::request(
+        "POST",
+        "/upload?format=json",
+        &[
+            ("content-type", "text/plain".to_string()),
+            content_length(body.len()),
+        ],
+        body,
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let json = common::json_body(&body);
+    let id = json["id"]
+        .as_str()
+        .expect("id must be a string")
+        .to_string();
+    let words = json["words"]
+        .as_str()
+        .expect("the upload JSON must include words")
+        .to_string();
+    assert_eq!(
+        normalize_words(&words).as_deref(),
+        Some(words.as_str()),
+        "the response must use the canonical hyphen form"
+    );
+
+    let request = common::request("GET", &format!("/v1/pastes/{words}"), &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_slice(), b"alias over http");
+
+    let spaced = words.replace('-', "%20");
+    let request = common::request("GET", &format!("/v1/pastes/{spaced}"), &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_slice(), b"alias over http");
+
+    let request = common::request("GET", &format!("/v1/pastes/{words}/meta"), &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let meta = common::json_body(&body);
+    assert_eq!(meta["id"], id);
+    assert_eq!(meta["words"], words);
+
+    let request = common::request(
+        "POST",
+        &format!("/v1/pastes/{words}/append"),
+        &[("content-type", "text/plain".to_string())],
+        b"!".to_vec(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let appended = common::json_body(&body);
+    assert_eq!(appended["id"], id);
+    assert_eq!(appended["words"], words);
+
+    let date = id.split_once('/').expect("dated id").0;
+    let request = common::request("GET", &format!("/v1/pastes?date={date}"), &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = common::json_body(&body);
+    assert_eq!(listed["items"][0]["words"], words);
+
+    let request = common::request("DELETE", &format!("/v1/pastes/{words}"), &[], Vec::new());
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(fake.object(&format!("pastes/{id}")).is_none());
+    assert!(fake.object(&format!("words/{words}")).is_none());
+
+    let request = common::request("GET", &format!("/v1/pastes/{words}"), &[], Vec::new());
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn list_route_filters_expired_objects_and_validates_dates() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
@@ -1241,7 +1322,12 @@ async fn x_ttl_header_stores_exact_hour_expiry() {
         "a valid X-TTL header must be accepted"
     );
 
-    let key = fake.puts().pop().expect("the upload must reach S3").0;
+    let key = fake
+        .puts()
+        .into_iter()
+        .find(|(key, _)| key.starts_with("pastes/"))
+        .expect("the upload must reach S3")
+        .0;
     let meta = fake
         .object(&key)
         .expect("the upload must be stored")
@@ -1284,7 +1370,12 @@ async fn x_ttl_days_still_stores_whole_day_expiry() {
     let (status, _, _) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::CREATED);
 
-    let key = fake.puts().pop().expect("the upload must reach S3").0;
+    let key = fake
+        .puts()
+        .into_iter()
+        .find(|(key, _)| key.starts_with("pastes/"))
+        .expect("the upload must reach S3")
+        .0;
     let meta = fake
         .object(&key)
         .expect("the upload must be stored")
@@ -1335,6 +1426,19 @@ async fn two_mcp_clients_store_text_through_one_shared_store() {
     );
 
     let puts = fake.puts();
-    assert_eq!(puts.len(), 2, "one PutObject per store_text call");
-    assert_ne!(puts[0].0, puts[1].0, "each paste must use a distinct key");
+    assert_eq!(
+        puts.len(),
+        4,
+        "each store_text call writes the paste and its alias"
+    );
+    let paste_keys: Vec<&str> = puts
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .filter(|key| key.starts_with("pastes/"))
+        .collect();
+    assert_eq!(paste_keys.len(), 2, "each store_text call writes one paste");
+    assert_ne!(
+        paste_keys[0], paste_keys[1],
+        "each paste must use a distinct key"
+    );
 }

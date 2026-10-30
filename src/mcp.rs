@@ -51,7 +51,10 @@ fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> 
         StoreError::InvalidId(_) | StoreError::InvalidDate(_) | StoreError::InvalidRange(_) => {
             Err(rmcp::ErrorData::invalid_params(e.to_string(), None))
         }
-        StoreError::Io(_) | StoreError::S3(_) | StoreError::BucketUnavailable(_) => {
+        StoreError::Io(_)
+        | StoreError::S3(_)
+        | StoreError::BucketUnavailable(_)
+        | StoreError::AliasUnavailable { .. } => {
             Err(rmcp::ErrorData::internal_error(e.to_string(), None))
         }
     }
@@ -119,7 +122,7 @@ pub struct StoreFileParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AppendTextParams {
-    /// Full or bare paste ID.
+    /// Full or bare paste ID, or a three-word alias.
     pub id: String,
     /// Text to append. The text cap applies to this append only.
     pub text: String,
@@ -127,6 +130,7 @@ pub struct AppendTextParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FetchTextParams {
+    /// Full or bare paste ID, or a three-word alias.
     pub id: String,
     pub offset: Option<u64>,
     pub limit: Option<u64>,
@@ -134,6 +138,7 @@ pub struct FetchTextParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FetchFileParams {
+    /// Full or bare paste ID, or a three-word alias.
     pub id: String,
     /// Local destination path for the downloaded file.
     pub dest_path: String,
@@ -143,6 +148,7 @@ pub struct FetchFileParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IdParams {
+    /// Full or bare paste ID, or a three-word alias.
     pub id: String,
 }
 
@@ -195,6 +201,7 @@ impl Pastebin {
         result_json(serde_json::json!({
             "id": stored.id,
             "key": stored.key,
+            "words": stored.words,
             "size": stored.size,
             "sha256": stored.sha256,
             "content_type": stored.content_type,
@@ -226,6 +233,7 @@ impl Pastebin {
         result_json(serde_json::json!({
             "id": stored.id,
             "key": stored.key,
+            "words": stored.words,
             "size": stored.size,
             "sha256": stored.sha256,
             "content_type": stored.content_type,
@@ -237,7 +245,7 @@ impl Pastebin {
     }
 
     #[tool(
-        description = "Append text to an existing paste without resending its current contents. Writes one new segment object; reads concatenate the base object and segments. An expired or missing id returns an error and writes nothing. An empty append writes nothing. sha256 is null when segments exist."
+        description = "Append text to an existing paste without resending its current contents. Writes one new segment object; reads concatenate the base object and segments. An expired or missing id or alias returns an error and writes nothing. An empty append writes nothing. sha256 is null when segments exist."
     )]
     async fn append_text(
         &self,
@@ -251,6 +259,7 @@ impl Pastebin {
         result_json(serde_json::json!({
             "id": appended.meta.id,
             "key": appended.meta.key,
+            "words": appended.meta.words,
             "appended_bytes": appended.appended_bytes,
             "segment_key": appended.segment_key,
             "size": appended.meta.size,
@@ -264,7 +273,7 @@ impl Pastebin {
     }
 
     #[tool(
-        description = "Fetch a text paste by id, with optional byte offset and limit. Large pastes should be read in slices, not whole."
+        description = "Fetch a text paste by id or three-word alias, with optional byte offset and limit. Large pastes should be read in slices, not whole."
     )]
     async fn fetch_text(
         &self,
@@ -284,7 +293,7 @@ impl Pastebin {
     }
 
     #[tool(
-        description = "Download a paste/file by id to a local path (streamed in chunks, never loaded whole into memory, binary safe). Returns the object's metadata, not its bytes."
+        description = "Download a paste/file by id or three-word alias to a local path (streamed in chunks, never loaded whole into memory, binary safe). Returns the object's metadata, not its bytes."
     )]
     async fn fetch_file(
         &self,
@@ -307,6 +316,7 @@ impl Pastebin {
         result_json(serde_json::json!({
             "dest_path": params.dest_path,
             "id": meta.id,
+            "words": meta.words,
             "size": meta.size,
             "content_type": meta.content_type,
             "filename": meta.filename,
@@ -318,7 +328,7 @@ impl Pastebin {
     }
 
     #[tool(
-        description = "Fetch metadata for a paste by id (exists, size, content_type, detection_source, filename, sha256, expiry). Equivalent to HeadObject, plus the expiry check."
+        description = "Fetch metadata for a paste by id or three-word alias (exists, size, content_type, detection_source, filename, sha256, expiry). Equivalent to HeadObject, plus the expiry check."
     )]
     async fn fetch_metadata(
         &self,
@@ -328,6 +338,7 @@ impl Pastebin {
         result_json(serde_json::json!({
             "id": meta.id,
             "key": meta.key,
+            "words": meta.words,
             "filename": meta.filename,
             "content_type": meta.content_type,
             "detection_source": meta.detection_source,
@@ -340,7 +351,7 @@ impl Pastebin {
         }))
     }
 
-    #[tool(description = "Delete a paste by id.")]
+    #[tool(description = "Delete a paste by id or three-word alias.")]
     async fn delete_paste(
         &self,
         Parameters(params): Parameters<IdParams>,
@@ -376,6 +387,7 @@ impl Pastebin {
             "items": items.iter().map(|i| serde_json::json!({
                 "id": i.id,
                 "key": i.key,
+                "words": i.words,
                 "size": i.size,
                 "last_modified": i.last_modified.map(|d| d.to_rfc3339()),
                 "expires_at": i.expires_at.map(|d| d.to_rfc3339()),
@@ -398,7 +410,8 @@ impl rmcp::handler::server::ServerHandler for Pastebin {
                  credentials and no presigned URL is issued. The TTL accepts \
                  seconds or a duration such as 90m, 1h30m, or 2d. A bare \
                  integer is seconds; use 7d for seven days. Use ttl or \
-                 ttl_days, not both. Expiry is enforced on read.",
+                 ttl_days, not both. Expiry is enforced on read. A three-word \
+                 alias is a second name for a paste; use the ID or the alias.",
             )
     }
 }
@@ -453,6 +466,7 @@ mod tests {
             StoreError::Io("disk full".into()),
             StoreError::S3("s3 failure".into()),
             StoreError::BucketUnavailable("bucket missing".into()),
+            StoreError::AliasUnavailable { attempts: 8 },
         ] {
             let err =
                 store_error_result(e).expect_err("an internal fault must be a protocol error");
