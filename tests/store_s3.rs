@@ -263,6 +263,74 @@ async fn store_file_path_enforces_caps_and_rejects_directories() {
 }
 
 #[tokio::test]
+async fn store_stream_no_filename_long_text_is_stored_and_fetched_as_text() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let body = vec![b'a'; 20 * 1024];
+    let chunks: Vec<Result<Bytes, StoreError>> = body
+        .chunks(4096)
+        .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+        .collect();
+
+    let stored = store
+        .store_stream(
+            stream::iter(chunks),
+            None,
+            None,
+            None,
+            None,
+            10 * 1024 * 1024,
+        )
+        .await
+        .expect("a long text paste must store");
+
+    assert_eq!(stored.content_type, "text/plain; charset=utf-8");
+    assert_eq!(stored.detection_source.as_deref(), Some("text"));
+    assert_eq!(stored.size, body.len() as u64);
+    let object = fake.object(&stored.key).expect("object must exist");
+    assert_eq!(object.body, body);
+
+    let fetched = store
+        .fetch_text(&stored.id, 0, None)
+        .await
+        .expect("the stored text must be fetchable");
+    assert_eq!(
+        fetched.text,
+        String::from_utf8(body).expect("ASCII is UTF-8")
+    );
+}
+
+#[tokio::test]
+async fn store_stream_no_filename_late_nul_is_not_text() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let mut body = vec![b'a'; 8 * 1024];
+    body.push(0);
+    let chunks: Vec<Result<Bytes, StoreError>> = body
+        .chunks(4096)
+        .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+        .collect();
+
+    let stored = store
+        .store_stream(
+            stream::iter(chunks),
+            None,
+            None,
+            None,
+            None,
+            10 * 1024 * 1024,
+        )
+        .await
+        .expect("a binary paste must store");
+
+    assert_eq!(stored.content_type, "application/octet-stream");
+    assert_eq!(stored.detection_source.as_deref(), Some("fallback"));
+    assert_eq!(stored.size, body.len() as u64);
+    let object = fake.object(&stored.key).expect("object must exist");
+    assert_eq!(object.body, body);
+}
+
+#[tokio::test]
 async fn store_stream_small_known_length_uses_one_put() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
@@ -373,7 +441,14 @@ async fn store_stream_disconnect_aborts_and_returns_no_url_material() {
         Err(StoreError::Io("client disconnected".into())),
     ];
     let error = store
-        .store_stream(stream::iter(items), None, None, None, None, u64::MAX)
+        .store_stream(
+            stream::iter(items),
+            Some("large.bin"),
+            None,
+            None,
+            None,
+            u64::MAX,
+        )
         .await
         .expect_err("a disconnected stream must fail");
     assert!(matches!(error, StoreError::Io(_)));
@@ -399,7 +474,14 @@ async fn store_stream_part_failure_aborts() {
         vec![Ok(Bytes::from(common::pattern_bytes(6 * 1024 * 1024)))];
 
     let error = store
-        .store_stream(stream::iter(items), None, None, None, None, u64::MAX)
+        .store_stream(
+            stream::iter(items),
+            Some("large.bin"),
+            None,
+            None,
+            None,
+            u64::MAX,
+        )
         .await
         .expect_err("an injected part failure must fail the upload");
     assert!(matches!(error, StoreError::S3(_)));
@@ -416,7 +498,14 @@ async fn store_stream_completion_failure_aborts() {
         vec![Ok(Bytes::from(common::pattern_bytes(6 * 1024 * 1024)))];
 
     let error = store
-        .store_stream(stream::iter(items), None, None, None, None, u64::MAX)
+        .store_stream(
+            stream::iter(items),
+            Some("large.bin"),
+            None,
+            None,
+            None,
+            u64::MAX,
+        )
         .await
         .expect_err("an injected completion failure must fail the upload");
     assert!(matches!(error, StoreError::S3(_)));
@@ -432,11 +521,36 @@ async fn store_stream_oversize_aborts() {
         vec![Ok(Bytes::from(common::pattern_bytes(6 * 1024 * 1024)))];
 
     let error = store
-        .store_stream(stream::iter(items), None, None, None, None, 5 * 1024 * 1024)
+        .store_stream(
+            stream::iter(items),
+            Some("large.bin"),
+            None,
+            None,
+            None,
+            5 * 1024 * 1024,
+        )
         .await
-        .expect_err("an oversize chunked body must fail");
+        .expect_err("an oversize chunked file must fail");
     assert!(matches!(error, StoreError::TooLarge { .. }));
     assert_eq!(fake.aborted_uploads().len(), 1);
+    assert!(fake.keys().is_empty());
+}
+
+#[tokio::test]
+async fn store_stream_no_filename_oversize_body_is_rejected_before_s3() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_caps(10, 1024).await;
+    let items: Vec<Result<Bytes, StoreError>> = vec![Ok(Bytes::from_static(b"12345678901"))];
+
+    let error = store
+        .store_stream(stream::iter(items), None, None, None, None, 10)
+        .await
+        .expect_err("a chunked text body over the cap must fail");
+    assert!(matches!(error, StoreError::TooLarge { limit: 10 }));
+    assert!(
+        fake.requests().is_empty(),
+        "an oversize text paste must be rejected before any S3 write"
+    );
     assert!(fake.keys().is_empty());
 }
 

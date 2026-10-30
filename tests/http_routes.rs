@@ -654,12 +654,17 @@ async fn failed_uploads_return_an_error_and_never_a_paste_url() {
 
     fake.fail(FailOp::CompleteMultipartUpload);
     let body = common::pattern_bytes(6 * 1024 * 1024);
-    let request = common::request("POST", "/upload?format=json", &[], body);
+    let request = common::request(
+        "POST",
+        "/upload?format=json",
+        &[("x-filename", "large.bin".to_string())],
+        body,
+    );
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(
         status,
         StatusCode::BAD_GATEWAY,
-        "chunked write must fail through multipart"
+        "chunked file write must fail through multipart"
     );
     assert!(!String::from_utf8_lossy(&body).contains("/v1/pastes"));
     assert_eq!(fake.aborted_uploads().len(), 1);
@@ -673,7 +678,12 @@ async fn multipart_part_failure_over_http_aborts_and_returns_no_url() {
     fake.fail_part(1);
 
     let body = common::pattern_bytes(6 * 1024 * 1024);
-    let request = common::request("POST", "/upload", &[], body);
+    let request = common::request(
+        "POST",
+        "/upload",
+        &[("x-filename", "large.bin".to_string())],
+        body,
+    );
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert!(!String::from_utf8_lossy(&body).contains("/v1/pastes"));
@@ -682,7 +692,7 @@ async fn multipart_part_failure_over_http_aborts_and_returns_no_url() {
 }
 
 #[tokio::test]
-async fn chunked_text_upload_over_cap_is_rejected_and_aborted() {
+async fn chunked_text_upload_over_cap_is_rejected_before_s3() {
     let fake = FakeS3::start().await;
     let store = fake
         .store_with_caps(5 * 1024 * 1024, 1024 * 1024 * 1024)
@@ -696,7 +706,11 @@ async fn chunked_text_upload_over_cap_is_rejected_and_aborted() {
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("send X-Filename"), "got: {text}");
     assert!(!text.contains("/v1/pastes"));
-    assert_eq!(fake.aborted_uploads().len(), 1);
+    assert!(
+        fake.requests().is_empty(),
+        "an oversize text paste must be rejected before any S3 write"
+    );
+    assert!(fake.keys().is_empty());
 }
 
 #[tokio::test]
@@ -760,26 +774,30 @@ async fn content_type_detection_and_disposition_are_applied() {
 }
 
 #[tokio::test]
-async fn chunked_body_without_content_length_uses_multipart_s3() {
+async fn chunked_text_body_without_content_length_uses_one_put() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
     let app = common::app(store);
 
-    let body = b"five!".to_vec();
-    let request = common::request("POST", "/upload?format=json", &[], body);
-    let (status, _, body) = common::send(&app, request).await;
+    let body = vec![b'a'; 20 * 1024];
+    let request = common::request("POST", "/upload?format=json", &[], body.clone());
+    let (status, _, response_body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::CREATED);
-    let json = common::json_body(&body);
-    assert_eq!(json["size"], 5);
+    let json = common::json_body(&response_body);
+    assert_eq!(json["size"], 20 * 1024);
+    assert_eq!(json["content_type"], "text/plain; charset=utf-8");
     let id = json["id"].as_str().unwrap();
     let object = fake
         .object(&format!("pastes/{id}"))
-        .expect("multipart object must exist");
-    assert_eq!(object.body, b"five!");
-    assert!(fake
-        .requests()
-        .iter()
-        .any(|request| request.query == "uploads"));
+        .expect("buffered text object must exist");
+    assert_eq!(object.body, body);
+    assert!(
+        !fake
+            .requests()
+            .iter()
+            .any(|request| request.query.contains("uploads")),
+        "a buffered text paste must use one PutObject"
+    );
 }
 
 #[tokio::test]

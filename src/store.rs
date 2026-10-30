@@ -26,6 +26,7 @@ use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client;
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDate, Utc};
+use futures::StreamExt;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use rand::Rng;
 use sha2::{Digest, Sha256};
@@ -304,6 +305,24 @@ fn decode_filename(encoded: &str) -> String {
 /// live stream; both paths go through the same precedence rules.
 fn detection_for(filename: Option<&str>, supplied: Option<&str>, payload: &[u8]) -> Detection {
     detect_content_type(supplied, filename, payload)
+}
+
+/// Collect a stream into memory and stop with `TooLarge` as soon as the
+/// body exceeds `max_bytes`. A read error returns before any S3 call.
+async fn collect_stream_body<S>(mut stream: S, max_bytes: u64) -> Result<Vec<u8>, StoreError>
+where
+    S: futures::Stream<Item = Result<Bytes, StoreError>> + Unpin,
+{
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let new_len = body.len() as u64 + chunk.len() as u64;
+        if new_len > max_bytes {
+            return Err(StoreError::TooLarge { limit: max_bytes });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -828,9 +847,17 @@ impl Store {
         })
     }
 
-    /// Streaming upload: detect Content-Type from the first peeked chunk
-    /// (via [`crate::content_type::detect_and_wrap`]), then drive the
-    /// S3 sink. The peeked bytes are forwarded exactly once by the
+    /// Store a streamed upload.
+    ///
+    /// A text paste (no filename) is buffered up to `max_bytes`. The
+    /// text cap bounds that buffer, so detection sees the whole body and
+    /// an oversize body is rejected before any S3 write. The buffered
+    /// body goes through [`Store::store_text`], which keeps the text
+    /// cap, TTL, metadata, and detection rules.
+    ///
+    /// A file upload streams. Detection peeks at the first chunk (via
+    /// [`crate::content_type::detect_and_wrap`]), then drives the S3
+    /// sink. The peeked bytes are forwarded exactly once by the
     /// wrapper, so detection never loses or duplicates data. A plain
     /// text candidate needs the whole body. When the peek is a
     /// truncated sample, the candidate falls back to
@@ -857,6 +884,14 @@ impl Store {
             if len > max_bytes {
                 return Err(StoreError::TooLarge { limit: max_bytes });
             }
+        }
+        // A text paste has no filename. Buffer the whole body, bounded
+        // by the text cap, so detection sees every byte and text is
+        // served inline. A file upload keeps the streaming path, because
+        // its cap can be much larger.
+        if filename.is_none_or(|name| name.trim().is_empty()) {
+            let body = collect_stream_body(stream, max_bytes).await?;
+            return self.store_text(&body, None, content_type, ttl_days).await;
         }
         let ttl = ttl_days.unwrap_or(self.config.default_ttl_days);
         let created_at = Utc::now();
