@@ -138,6 +138,29 @@ fn read_credential_file(file_variable: &str, path: &str) -> Result<String, Confi
     Ok(value.to_string())
 }
 
+/// Parse the optional HTTP bearer token.
+///
+/// An unset value or a value with only ASCII whitespace means "no token".
+/// A non-empty value that contains ASCII whitespace is invalid: the
+/// `Authorization` parser rejects such a credential, so startup must fail
+/// instead of locking out every request at runtime. The value is not
+/// trimmed into a different token.
+fn bearer_token(value: Option<String>) -> Result<Option<String>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    if value.contains(|c: char| c.is_ascii_whitespace()) {
+        return Err(ConfigError::Invalid(
+            "DAYFLY_HTTP_BEARER_TOKEN".to_string(),
+            "expected a token with no ASCII whitespace".to_string(),
+        ));
+    }
+    Ok(Some(value))
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|name| env::var(name).ok())
@@ -171,10 +194,7 @@ impl Config {
             max_file_bytes: optional_u64(&lookup, "DAYFLY_MAX_FILE_BYTES", 1024 * 1024 * 1024)?,
             default_ttl_days: optional_u32(&lookup, "DAYFLY_DEFAULT_TTL_DAYS", 7)?,
             http_bind: lookup("DAYFLY_HTTP_BIND").unwrap_or_else(|| "127.0.0.1:8080".to_string()),
-            http_bearer_token: match lookup("DAYFLY_HTTP_BEARER_TOKEN") {
-                Some(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
-                _ => None,
-            },
+            http_bearer_token: bearer_token(lookup("DAYFLY_HTTP_BEARER_TOKEN"))?,
         })
     }
 
@@ -416,5 +436,78 @@ mod tests {
             !error.to_string().contains("test-access-key"),
             "message: {error}"
         );
+    }
+
+    const BASE_ENV: &[(&str, &str)] = &[
+        ("S3_ENDPOINT", "http://127.0.0.1:1"),
+        ("S3_BUCKET", "test-bucket"),
+        ("S3_ACCESS_KEY_ID", "test-access-key"),
+        ("S3_SECRET_ACCESS_KEY", "test-secret-key"),
+    ];
+
+    fn lookup<'a>(entries: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            entries
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        }
+    }
+
+    fn load_with_token(token: Option<&str>) -> Result<Config, ConfigError> {
+        let mut entries = BASE_ENV.to_vec();
+        if let Some(token) = token {
+            entries.push(("DAYFLY_HTTP_BEARER_TOKEN", token));
+        }
+        Config::from_lookup(lookup(&entries))
+    }
+
+    #[test]
+    fn token_with_whitespace_is_rejected() {
+        for token in [
+            "sekrit token",
+            "sekrit\ttoken",
+            "sekrit\ntoken",
+            " sekrit",
+            "sekrit ",
+        ] {
+            let err = match load_with_token(Some(token)) {
+                Ok(_) => panic!("token with ASCII whitespace must be rejected: {token:?}"),
+                Err(e) => e,
+            };
+            match err {
+                ConfigError::Invalid(name, message) => {
+                    assert_eq!(name, "DAYFLY_HTTP_BEARER_TOKEN");
+                    assert!(
+                        !message.contains("sekrit"),
+                        "error message must not contain the token"
+                    );
+                }
+                other => panic!("expected ConfigError::Invalid, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn token_without_whitespace_is_preserved() {
+        let config = match load_with_token(Some("sekrit-token")) {
+            Ok(config) => config,
+            Err(e) => panic!("a normal token must load: {e}"),
+        };
+        assert_eq!(config.http_bearer_token.as_deref(), Some("sekrit-token"));
+    }
+
+    #[test]
+    fn absent_or_empty_token_disables_auth() {
+        for token in [None, Some(""), Some("   "), Some("\t")] {
+            let config = match load_with_token(token) {
+                Ok(config) => config,
+                Err(e) => panic!("token {token:?} must mean no auth: {e}"),
+            };
+            assert_eq!(
+                config.http_bearer_token, None,
+                "token {token:?} must mean no auth"
+            );
+        }
     }
 }
