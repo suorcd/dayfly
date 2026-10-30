@@ -722,7 +722,7 @@ async fn delete_bare(
 pub fn app_router(state: AppState) -> Router {
     api_router()
         .merge(mcp_router(state.clone()))
-        .merge(crate::web::ui_router())
+        .merge(crate::web::ui_router(state.store.config.max_text_bytes))
         .with_state(state)
 }
 
