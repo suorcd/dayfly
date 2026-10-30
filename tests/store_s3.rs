@@ -8,7 +8,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use chrono::{Duration, Utc};
 use common::{FailOp, FakeS3};
-use dayfly::store::{StoreError, Ttl, MULTIPART_CHUNK_BYTES};
+use dayfly::store::{
+    parse_segment_key, StoreError, Ttl, MULTIPART_CHUNK_BYTES, SEGMENT_SUFFIX_LEN,
+};
 use futures::stream;
 use sha2::{Digest, Sha256};
 
@@ -1136,4 +1138,443 @@ async fn multipart_metadata_is_set_at_create_time_without_a_copy() {
         "multipart must set metadata at create time, not with a copy"
     );
     let _ = std::fs::remove_file(path);
+}
+
+// --- Append tests that need a fake S3 service -----------------------------
+
+#[tokio::test]
+async fn store_and_fetch_roundtrip_against_fake_s3() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_caps(1024, 1024 * 1024).await;
+    let stored = store
+        .store_text(b"hello", None, Some("text/plain"), Some(Ttl::days(7)))
+        .await
+        .expect("store must succeed against the fake");
+    let slice = store
+        .fetch_text(&stored.id, 0, None)
+        .await
+        .expect("fetch must succeed against the fake");
+    assert_eq!(slice.text, "hello");
+    assert!(fake.object(&stored.key).is_some());
+}
+
+#[tokio::test]
+async fn append_writes_only_new_bytes_and_fetch_concatenates() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_caps(1024, 1024 * 1024).await;
+    let stored = store
+        .store_text(b"hello", None, Some("text/plain"), Some(Ttl::days(7)))
+        .await
+        .expect("store must succeed against the fake");
+    let expires_before = store
+        .head_metadata(&stored.id)
+        .await
+        .expect("head must succeed")
+        .expires_at;
+    let puts_before = fake.puts().len();
+
+    let appended = store
+        .append_text(&stored.id, b" world")
+        .await
+        .expect("append must succeed");
+
+    assert_eq!(appended.appended_bytes, 6);
+    assert!(appended.segment_key.is_some());
+    assert_eq!(appended.meta.size, 11);
+    assert_eq!(appended.meta.expires_at, expires_before);
+    let puts = fake.puts();
+    assert_eq!(puts.len(), puts_before + 1, "append must write one object");
+    assert_eq!(
+        puts.last().expect("append must record a put").1,
+        b" world".to_vec(),
+        "append must write only the new bytes"
+    );
+    assert!(
+        fake.gets().is_empty(),
+        "append must not read the base object or any segment body"
+    );
+    assert_eq!(
+        fake.object(&stored.key)
+            .expect("the base object must still exist")
+            .body,
+        b"hello".to_vec(),
+        "append must not rewrite the base object"
+    );
+    let segment = appended
+        .segment_key
+        .as_ref()
+        .expect("append must name a segment");
+    let (sequence, suffix) =
+        parse_segment_key(&stored.key, segment).expect("an append must write a suffixed key");
+    assert_eq!(sequence, 0);
+    assert_eq!(suffix.len(), SEGMENT_SUFFIX_LEN);
+    assert!(
+        segment.starts_with(&format!("{}/{:020}-", stored.key, 0)),
+        "the segment key must start with the sequence: {segment:?}"
+    );
+    assert_eq!(
+        fake.object(segment)
+            .expect("the segment must exist")
+            .metadata
+            .get("expires-at"),
+        Some(
+            &expires_before
+                .expect("the stored paste must have an expiry")
+                .to_rfc3339()
+        ),
+        "the segment must inherit the base expiry"
+    );
+
+    let slice = store
+        .fetch_text(&stored.id, 0, None)
+        .await
+        .expect("fetch must succeed");
+    assert_eq!(slice.text, "hello world");
+    assert_eq!(slice.total_bytes, 11);
+
+    let middle = store
+        .fetch_text(&stored.id, 3, Some(5))
+        .await
+        .expect("range fetch must succeed");
+    assert_eq!(middle.text, "lo wo");
+
+    let by_key = store
+        .fetch_range_by_key(&stored.key, Some((3, 7)))
+        .await
+        .expect("range fetch by key must succeed");
+    assert_eq!(by_key, b"lo wo".to_vec());
+}
+
+#[tokio::test]
+async fn append_writes_a_suffixed_segment_key() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_caps(1024, 1024 * 1024).await;
+    let stored = store
+        .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(7)))
+        .await
+        .expect("store must succeed against the fake");
+    let appended = store
+        .append_text(&stored.id, b"more")
+        .await
+        .expect("append must succeed");
+    let key = appended.segment_key.expect("an append must name a segment");
+    let (sequence, suffix) =
+        parse_segment_key(&stored.key, &key).expect("the segment key must have a suffix");
+    assert_eq!(sequence, 0);
+    assert_eq!(suffix.len(), SEGMENT_SUFFIX_LEN);
+    assert!(
+        key.starts_with(&format!("{}/{:020}-", stored.key, 0)),
+        "the segment key must start with the sequence: {key:?}"
+    );
+    assert!(suffix.bytes().all(|b| b.is_ascii_alphanumeric()));
+}
+
+#[tokio::test]
+async fn head_metadata_reports_total_size_and_omits_the_base_hash() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_caps(1024, 1024 * 1024).await;
+    let stored = store
+        .store_text(b"hello", None, Some("text/plain"), Some(Ttl::days(7)))
+        .await
+        .expect("store must succeed against the fake");
+    let before = store
+        .head_metadata(&stored.id)
+        .await
+        .expect("head must succeed");
+    assert_eq!(before.size, 5);
+    assert!(before.sha256.is_some());
+    assert!(before.segments.is_empty());
+
+    store
+        .append_text(&stored.id, b" world")
+        .await
+        .expect("append must succeed");
+    let after = store
+        .head_metadata(&stored.id)
+        .await
+        .expect("head must succeed");
+    assert_eq!(after.base_size, 5);
+    assert_eq!(after.size, 11);
+    assert_eq!(after.segments.len(), 1);
+    assert_eq!(
+        after.sha256, None,
+        "a base-only hash must not describe the concatenated paste"
+    );
+}
+
+#[tokio::test]
+async fn range_fetch_reads_only_the_objects_it_touches() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_caps(1024, 1024 * 1024).await;
+    let stored = store
+        .store_text(b"hello", None, Some("text/plain"), Some(Ttl::days(7)))
+        .await
+        .expect("store must succeed against the fake");
+    let appended = store
+        .append_text(&stored.id, b" world")
+        .await
+        .expect("append must succeed");
+    let segment = appended.segment_key.expect("append must name a segment");
+
+    let before = fake.gets().len();
+    let inside = store
+        .fetch_text(&stored.id, 6, Some(3))
+        .await
+        .expect("segment range must succeed");
+    assert_eq!(inside.text, "wor");
+    assert_eq!(
+        fake.gets()[before..].to_vec(),
+        vec![(segment.clone(), Some("bytes=1-3".to_string()))],
+        "a range inside a segment must not read the base object"
+    );
+
+    let before = fake.gets().len();
+    let spanned = store
+        .fetch_text(&stored.id, 3, Some(5))
+        .await
+        .expect("spanning range must succeed");
+    assert_eq!(spanned.text, "lo wo");
+    assert_eq!(
+        fake.gets()[before..].to_vec(),
+        vec![
+            (stored.key.clone(), Some("bytes=3-4".to_string())),
+            (segment, Some("bytes=0-2".to_string())),
+        ],
+        "each object must get a local range request"
+    );
+}
+
+#[tokio::test]
+async fn download_file_concatenates_base_and_segments() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_caps(1024, 1024 * 1024).await;
+    let stored = store
+        .store_text(b"hello", None, Some("text/plain"), Some(Ttl::days(7)))
+        .await
+        .expect("store must succeed against the fake");
+    store
+        .append_text(&stored.id, b" world")
+        .await
+        .expect("append must succeed");
+    let path = common::temp_path("append-download");
+    store
+        .download_file(&stored.id, &path, None)
+        .await
+        .expect("full download must succeed");
+    assert_eq!(
+        tokio::fs::read(&path).await.expect("download must exist"),
+        b"hello world".to_vec()
+    );
+    store
+        .download_file(&stored.id, &path, Some((3, 7)))
+        .await
+        .expect("range download must succeed");
+    assert_eq!(
+        tokio::fs::read(&path).await.expect("download must exist"),
+        b"lo wo".to_vec()
+    );
+    let _ = tokio::fs::remove_file(&path).await;
+}
+
+#[tokio::test]
+async fn list_recent_skips_segment_keys() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_caps(1024, 1024 * 1024).await;
+    let stored = store
+        .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(7)))
+        .await
+        .expect("store must succeed against the fake");
+    store
+        .append_text(&stored.id, b"+more")
+        .await
+        .expect("append must succeed");
+    let date = stored
+        .id
+        .split_once('/')
+        .expect("full id must contain a date")
+        .0;
+    let items = store
+        .list_recent(Some(date), 100)
+        .await
+        .expect("list must succeed");
+    assert_eq!(items.len(), 1, "a segment must not appear as a paste");
+    assert_eq!(items[0].id, stored.id);
+    assert_eq!(items[0].size, 9, "the listing must report the total size");
+}
+
+#[tokio::test]
+async fn bare_id_resolution_skips_segment_keys() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_caps(1024, 1024 * 1024).await;
+    let stored = store
+        .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(7)))
+        .await
+        .expect("store must succeed against the fake");
+    let appended = store
+        .append_text(&stored.id, b"more")
+        .await
+        .expect("append must succeed");
+    let segment_name = appended
+        .segment_key
+        .as_ref()
+        .expect("append must name a segment")
+        .rsplit('/')
+        .next()
+        .expect("a segment key must have a name")
+        .to_string();
+    let result = store.resolve_key(&segment_name).await;
+    assert!(
+        matches!(result, Err(StoreError::NotFound(_))),
+        "a segment key must not resolve as a bare paste id: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_removes_the_base_object_and_every_segment() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_caps(1024, 1024 * 1024).await;
+    let stored = store
+        .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(7)))
+        .await
+        .expect("store must succeed against the fake");
+    let first = store
+        .append_text(&stored.id, b"one")
+        .await
+        .expect("first append must succeed");
+    let second = store
+        .append_text(&stored.id, b"two")
+        .await
+        .expect("second append must succeed");
+    store.delete(&stored.id).await.expect("delete must succeed");
+    assert!(fake.object(&stored.key).is_none());
+    assert!(fake
+        .object(first.segment_key.as_ref().expect("first segment"))
+        .is_none());
+    assert!(fake
+        .object(second.segment_key.as_ref().expect("second segment"))
+        .is_none());
+}
+
+#[tokio::test]
+async fn append_errors_before_write_for_missing_expired_or_oversize() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_caps(10, 1024 * 1024).await;
+    let missing = store.append_text("2026-10-28/missing", b"x").await;
+    assert!(missing.is_err(), "a missing id must be an error");
+    assert!(fake.puts().is_empty(), "a missing id must write nothing");
+
+    let stored = store
+        .store_text(b"base", None, None, Some(Ttl::days(7)))
+        .await
+        .expect("store must succeed against the fake");
+    let past = (Utc::now() - Duration::days(1)).to_rfc3339();
+    fake.set_metadata(&stored.key, "expires-at", &past);
+    let expired = store.append_text(&stored.id, b"x").await;
+    assert!(
+        matches!(expired, Err(StoreError::Expired(_))),
+        "an expired id must be an error: {expired:?}"
+    );
+    assert_eq!(fake.puts().len(), 1, "the expired append must not write");
+
+    let oversize = store.append_text(&stored.id, b"01234567890").await;
+    assert!(
+        matches!(oversize, Err(StoreError::TooLarge { limit: 10 })),
+        "the append cap must apply to the appended bytes: {oversize:?}"
+    );
+    assert_eq!(fake.puts().len(), 1, "the oversize append must not write");
+}
+
+#[tokio::test]
+async fn empty_append_writes_nothing_and_keeps_the_base_hash() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_caps(1024, 1024 * 1024).await;
+    let stored = store
+        .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(7)))
+        .await
+        .expect("store must succeed against the fake");
+    let puts_before = fake.puts().len();
+    let result = store
+        .append_text(&stored.id, b"")
+        .await
+        .expect("an empty append is a no-op");
+    assert_eq!(result.appended_bytes, 0);
+    assert!(result.segment_key.is_none());
+    assert_eq!(fake.puts().len(), puts_before);
+    assert!(
+        result.meta.sha256.is_some(),
+        "a no-op must not drop the base hash"
+    );
+}
+
+#[tokio::test]
+async fn same_sequence_segments_with_distinct_suffixes_both_survive_a_read() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_caps(1024, 1024 * 1024).await;
+    let stored = store
+        .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(7)))
+        .await
+        .expect("store must succeed against the fake");
+    let seeded = [
+        ("AAAAAAAAAAAA", &b" first"[..]),
+        ("BBBBBBBBBBBB", &b" second"[..]),
+    ];
+    for (suffix, body) in seeded {
+        let key = format!("{}/{:020}-{suffix}", stored.key, 0);
+        fake.seed(&key, body, "", &[]);
+        assert!(fake.object(&key).is_some(), "the seeded segment must exist");
+    }
+
+    let slice = store
+        .fetch_text(&stored.id, 0, None)
+        .await
+        .expect("fetch must succeed");
+    assert_eq!(
+        slice.text, "base first second",
+        "a read must return both same-sequence chunks in suffix order"
+    );
+    assert_eq!(slice.total_bytes, 17);
+}
+
+#[tokio::test]
+async fn concurrent_appends_write_distinct_segments_and_both_read_back() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_caps(1024, 1024 * 1024).await;
+    let stored = store
+        .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(7)))
+        .await
+        .expect("store must succeed against the fake");
+    let (first, second) = tokio::join!(
+        store.append_text(&stored.id, b" first"),
+        store.append_text(&stored.id, b" second"),
+    );
+    let first = first.expect("the first concurrent append must succeed");
+    let second = second.expect("the second concurrent append must succeed");
+    let first_key = first
+        .segment_key
+        .expect("the first append must name a segment");
+    let second_key = second
+        .segment_key
+        .expect("the second append must name a segment");
+    assert_ne!(
+        first_key, second_key,
+        "concurrent appends must write distinct objects"
+    );
+    assert!(fake.object(&first_key).is_some());
+    assert!(fake.object(&second_key).is_some());
+
+    let mut chunks = [
+        (first_key, b" first".to_vec()),
+        (second_key, b" second".to_vec()),
+    ];
+    chunks.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut expected = String::from("base");
+    for (_, body) in chunks {
+        expected.push_str(std::str::from_utf8(&body).expect("test text is UTF-8"));
+    }
+    let slice = store
+        .fetch_text(&stored.id, 0, None)
+        .await
+        .expect("fetch must succeed");
+    assert_eq!(slice.text, expected);
+    assert_eq!(slice.total_bytes, 17);
 }

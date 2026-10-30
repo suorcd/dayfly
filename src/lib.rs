@@ -10,6 +10,4 @@ pub mod http;
 pub mod mcp;
 pub mod store;
 pub mod stream;
-#[cfg(test)]
-mod test_s3;
 pub mod web;
