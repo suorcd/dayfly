@@ -314,14 +314,18 @@ mod tests {
     use rmcp::model::ErrorCode;
 
     fn assert_tool_error(e: StoreError) {
+        let expected = e.to_string();
         let result =
             store_error_result(e).expect("a routine result must not become a protocol error");
         assert_eq!(result.is_error, Some(true));
         assert_eq!(result.content.len(), 1);
-        assert!(matches!(
-            &result.content[0],
-            ContentBlock::Text(t) if !t.text.is_empty()
-        ));
+        assert!(
+            matches!(
+                &result.content[0],
+                ContentBlock::Text(t) if t.text == expected
+            ),
+            "the store message must survive the mapping: {expected}"
+        );
     }
 
     #[test]
