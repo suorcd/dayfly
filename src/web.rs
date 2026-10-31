@@ -569,21 +569,38 @@ async fn view_bare(
 
 /// UI routes, without state attached. `main` merges these with the
 /// API routes and attaches a single shared [`AppState`].
-pub fn ui_router() -> Router<AppState> {
+pub fn ui_router(max_text_bytes: u64) -> Router<AppState> {
     // See http.rs: the store caps streams while it reads them. The 2 MiB
     // axum default would reject real file uploads early. Keep the limit on
     // the form routes, which buffer their bodies in memory.
     let upload_routes = Router::new()
         .route("/ui/upload", post(upload_submit_handler))
         .layer(DefaultBodyLimit::disable());
+    // The text form is URL-encoded, so one decoded byte can take three
+    // percent-encoded bytes. Give the body enough room for the encoded
+    // text plus the small field names, filename, and TTL. The decoded
+    // text still goes through the exact max_text_bytes check.
+    let text_routes = Router::new()
+        .route("/ui/text", post(text_submit_handler))
+        .layer(DefaultBodyLimit::max(text_form_body_limit(max_text_bytes)));
     Router::new()
         .merge(upload_routes)
+        .merge(text_routes)
         .route("/", get(index_handler))
-        .route("/ui/text", post(text_submit_handler))
         .route("/ui/delete", post(delete_submit_handler))
         .route("/pastes", get(list_handler))
         .route("/view/{date}/{random}", get(view_dated))
         .route("/view/{random}", get(view_bare))
+}
+
+/// Raw-body limit for the URL-encoded text form.
+///
+/// The worst case is three bytes on the wire for every decoded byte.
+/// The extra margin covers the form field names, the filename, and the
+/// TTL. The decoded text is still capped exactly by `max_text_bytes`.
+fn text_form_body_limit(max_text_bytes: u64) -> usize {
+    let encoded = max_text_bytes.saturating_mul(3);
+    usize::try_from(encoded.saturating_add(8 * 1024)).unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]
@@ -629,7 +646,8 @@ mod tests {
     /// S3 endpoint, and the UI maps that S3 error to 400. A 401 means the
     /// auth check rejected the request.
     async fn ui_list_status(state: AppState, auth: Option<&str>) -> StatusCode {
-        let app = ui_router().with_state(state);
+        let max_text_bytes = state.store.config.max_text_bytes;
+        let app = ui_router(max_text_bytes).with_state(state);
         let mut builder = Request::builder().method("GET").uri("/pastes");
         if let Some(auth) = auth {
             builder = builder.header(axum::http::header::AUTHORIZATION, auth);
@@ -795,7 +813,7 @@ mod tests {
                 .await
                 .expect("test S3 config must build without network access"),
         };
-        let app = ui_router().with_state(state);
+        let app = ui_router(state.store.config.max_text_bytes).with_state(state);
         let request = Request::builder()
             .method("POST")
             .uri("/ui/delete")

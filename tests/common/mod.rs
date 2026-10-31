@@ -1109,8 +1109,9 @@ pub fn metadata_refs(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
 
 /// Build the full HTTP app: API routes plus the human UI routes.
 pub fn app(store: Store) -> Router {
+    let max_text_bytes = store.config.max_text_bytes;
     dayfly::http::api_router()
-        .merge(dayfly::web::ui_router())
+        .merge(dayfly::web::ui_router(max_text_bytes))
         .with_state(AppState { store })
 }
 

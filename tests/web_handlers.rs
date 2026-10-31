@@ -23,6 +23,20 @@ fn form_headers(body_len: usize) -> Vec<(&'static str, String)> {
     ]
 }
 
+/// Percent-encode only the non-alphanumeric bytes, so an ASCII form body
+/// stays close to the decoded size.
+fn text_form_body(text: &str) -> Vec<u8> {
+    let mut body = String::from("text=");
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            body.push(byte as char);
+        } else {
+            body.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    body.into_bytes()
+}
+
 fn multipart_headers(boundary: &str, body_len: usize) -> Vec<(&'static str, String)> {
     vec![
         ("host", TEST_HOST.to_string()),
@@ -123,6 +137,72 @@ async fn text_submit_creates_a_paste_and_shows_links() {
         object.metadata.get("ttl-days").map(String::as_str),
         Some("1")
     );
+}
+
+#[tokio::test]
+async fn text_submit_accepts_a_paste_above_the_axum_default_limit() {
+    let fake = FakeS3::start().await;
+    let cap = 3 * 1024 * 1024;
+    let app = common::app(fake.store_with_caps(cap, 1024 * 1024 * 1024).await);
+    let text = "a".repeat(2 * 1024 * 1024 + 1);
+    let body = text_form_body(&text);
+
+    let request = common::request("POST", "/ui/text", &form_headers(body.len()), body);
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a paste above 2 MiB but below the text cap must succeed: {}",
+        html_text(&body)
+    );
+    let id = id_from_success(&html_text(&body));
+    let object = fake
+        .object(&format!("pastes/{id}"))
+        .expect("the paste must be stored");
+    assert_eq!(object.body, text.as_bytes());
+}
+
+#[tokio::test]
+async fn text_submit_accepts_url_encoded_non_ascii_above_the_default_limit() {
+    let fake = FakeS3::start().await;
+    let cap = 3 * 1024 * 1024;
+    let app = common::app(fake.store_with_caps(cap, 1024 * 1024 * 1024).await);
+    // 2.4 MiB decoded, 7.2 MiB after percent-encoding.
+    let text = "é".repeat(1_200_000);
+    let body = text_form_body(&text);
+    assert!(body.len() > 2 * 1024 * 1024);
+
+    let request = common::request("POST", "/ui/text", &form_headers(body.len()), body);
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "encoded text above 2 MiB but below the cap must succeed: {}",
+        html_text(&body)
+    );
+    let id = id_from_success(&html_text(&body));
+    let object = fake
+        .object(&format!("pastes/{id}"))
+        .expect("the paste must be stored");
+    assert_eq!(object.body, text.as_bytes());
+}
+
+#[tokio::test]
+async fn text_submit_over_the_configured_cap_returns_413_without_storing() {
+    let fake = FakeS3::start().await;
+    let cap = 1024 * 1024;
+    let app = common::app(fake.store_with_caps(cap, 1024 * 1024 * 1024).await);
+    let text = "a".repeat(1024 * 1024 + 1);
+    let body = text_form_body(&text);
+
+    let request = common::request("POST", "/ui/text", &form_headers(body.len()), body);
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(
+        html_text(&body).contains("payload too large"),
+        "the error page must name the size limit"
+    );
+    assert!(fake.keys().is_empty());
 }
 
 #[tokio::test]
