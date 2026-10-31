@@ -843,6 +843,41 @@ async fn list_route_filters_expired_objects_and_validates_dates() {
 }
 
 #[tokio::test]
+async fn list_route_returns_502_when_the_metadata_scan_fails() {
+    let fake = FakeS3::start().await;
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let metadata = common::stored_metadata(
+        &(Utc::now() + Duration::days(1)).to_rfc3339(),
+        "text/plain",
+        3,
+        "abc",
+    );
+    let key = format!("pastes/{today}/denied");
+    fake.seed(
+        &key,
+        b"abc",
+        "text/plain",
+        &common::metadata_refs(&metadata),
+    );
+    fake.fail_head_with(&key, StatusCode::FORBIDDEN, "AccessDenied");
+    let app = common::app(fake.store().await);
+
+    let request = common::request("GET", &format!("/v1/pastes?date={today}"), &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "an S3 metadata failure must be a 502, got: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        String::from_utf8_lossy(&body).contains("s3 error"),
+        "the error must name the S3 failure: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
 async fn failed_uploads_return_an_error_and_never_a_paste_url() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;

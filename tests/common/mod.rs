@@ -76,6 +76,8 @@ pub struct FakeState {
     pub fail_ops: Vec<FailOp>,
     pub fail_part_number: Option<i32>,
     pub fail_head_keys: Vec<String>,
+    pub fail_head_errors: Vec<(String, StatusCode, String)>,
+    pub fail_list_prefixes: Vec<(String, StatusCode, String)>,
     pub fail_put_prefixes: Vec<String>,
     pub missing_bucket: bool,
 }
@@ -342,6 +344,24 @@ impl FakeS3 {
             .expect("fake state lock")
             .fail_head_keys
             .push(key.to_string());
+    }
+
+    /// Make HeadObject for `key` fail with a specific S3 error.
+    pub fn fail_head_with(&self, key: &str, status: StatusCode, code: &str) {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .fail_head_errors
+            .push((key.to_string(), status, code.to_string()));
+    }
+
+    /// Make ListObjectsV2 for `prefix` fail with a specific S3 error.
+    pub fn fail_list_prefix(&self, prefix: &str, status: StatusCode, code: &str) {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .fail_list_prefixes
+            .push((prefix.to_string(), status, code.to_string()));
     }
 
     /// Make every PutObject whose key starts with `prefix` fail.
@@ -642,6 +662,15 @@ fn get_object(
     if is_head && state.fail_head_keys.contains(&key) {
         return (StatusCode::NOT_FOUND, HeaderMap::new(), Body::empty()).into_response();
     }
+    if is_head {
+        if let Some((_, status, code)) = state
+            .fail_head_errors
+            .iter()
+            .find(|(failed_key, _, _)| failed_key == &key)
+        {
+            return s3_error(*status, code, "injected HeadObject failure");
+        }
+    }
     let mut resp_headers = object_headers(object);
     if is_head {
         return (StatusCode::OK, resp_headers, Body::empty()).into_response();
@@ -915,6 +944,13 @@ fn list_objects(state: &Arc<Mutex<FakeState>>, uri: &Uri) -> Response {
         );
     }
     let prefix = query_param(uri, "prefix").unwrap_or_default();
+    if let Some((_, status, code)) = state
+        .fail_list_prefixes
+        .iter()
+        .find(|(failed_prefix, _, _)| failed_prefix == &prefix)
+    {
+        return s3_error(*status, code, "injected ListObjectsV2 failure");
+    }
     let max_keys = query_param(uri, "max-keys")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1000);
