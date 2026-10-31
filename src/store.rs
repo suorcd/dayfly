@@ -40,11 +40,11 @@ use rand::Rng;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::Config;
-use crate::content_type::{detect_content_type, detect_content_type_sample, Detection};
+use crate::content_type::{detect_content_type, detect_content_type_sample, Detection, PEEK_BYTES};
 
 pub const MULTIPART_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 pub const LIST_SCAN_MAX_PAGES: usize = 10;
@@ -917,9 +917,41 @@ fn sha256_hex(data: &[u8]) -> String {
     hex_encode(&hasher.finalize())
 }
 
-/// Hash a file in fixed-size reads, so a large file is never held whole
-/// in memory. S3 takes object metadata only at CreateMultipartUpload, so
-/// the hash must exist before that call.
+/// Hash and sample one file without reading past `len + 1` bytes.
+///
+/// S3 takes object metadata only at CreateMultipartUpload, so the hash must
+/// exist before that call. The first [`PEEK_BYTES`] come from this same read,
+/// so content detection describes the bytes that are hashed and uploaded. A
+/// file that grew past `len` is rejected before the upload starts.
+async fn hash_file_prefix<R>(reader: &mut R, len: u64) -> Result<(String, Vec<u8>), StoreError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; MULTIPART_CHUNK_BYTES];
+    let mut hashed: u64 = 0;
+    let mut prefix = Vec::with_capacity(PEEK_BYTES);
+    let mut limited = (&mut *reader).take(len.saturating_add(1));
+    loop {
+        let n = limited.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        if prefix.len() < PEEK_BYTES {
+            let take = (PEEK_BYTES - prefix.len()).min(n);
+            prefix.extend_from_slice(&buf[..take]);
+        }
+        hasher.update(&buf[..n]);
+        hashed += n as u64;
+    }
+    if hashed != len {
+        return Err(StoreError::Io(format!(
+            "the file changed while it was read: expected {len} bytes, read {hashed}"
+        )));
+    }
+    Ok((hex_encode(&hasher.finalize()), prefix))
+}
+
 /// Read one open file as a byte stream, for
 /// [`crate::stream::run_streaming_upload`].
 ///
@@ -1544,7 +1576,7 @@ impl Store {
                 path.display()
             )));
         }
-        let len = file_meta.len();
+        let mut len = file_meta.len();
         if len > self.config.max_file_bytes {
             return Err(StoreError::TooLarge {
                 limit: self.config.max_file_bytes,
@@ -1561,73 +1593,106 @@ impl Store {
                 .map(|s| s.to_string())
         });
         let expires_at = expires_at_for(created_at, ttl);
+        let mut words: Option<String> = None;
         if len as usize <= MULTIPART_CHUNK_BYTES {
             // One bounded read gives the body, the hash, and the size, so
             // text detection sees every byte. The read stops one byte past
-            // the cap: a file that grew after the metadata call is
-            // rejected instead of loaded whole.
+            // the smaller of the file cap and one chunk. A file that grew
+            // past one chunk is re-read on the multipart path. A file that
+            // grew past the cap is rejected before any object is written.
+            let read_cap = self
+                .config
+                .max_file_bytes
+                .min(MULTIPART_CHUNK_BYTES as u64)
+                .saturating_add(1);
             let mut bytes: Vec<u8> = Vec::with_capacity(len as usize);
-            let words = self.claim_alias(&key, expires_at).await?;
-            let read = match file
-                .take(self.config.max_file_bytes.saturating_add(1))
-                .read_to_end(&mut bytes)
-                .await
-            {
+            let claimed = self.claim_alias(&key, expires_at).await?;
+            let read = match (&mut file).take(read_cap).read_to_end(&mut bytes).await {
                 Ok(read) => read,
                 Err(e) => {
-                    self.cleanup_failed_store(&key, &words).await;
+                    self.cleanup_failed_store(&key, &claimed).await;
                     return Err(e.into());
                 }
             };
             let size = read as u64;
             if size > self.config.max_file_bytes {
-                self.cleanup_failed_store(&key, &words).await;
+                self.cleanup_failed_store(&key, &claimed).await;
                 return Err(StoreError::TooLarge {
                     limit: self.config.max_file_bytes,
                 });
             }
-            let detection = detection_for(display_name.as_deref(), content_type, &bytes);
-            let ct = detection.content_type.clone();
-            let sha = sha256_hex(&bytes);
-            let (meta, _) = metadata_for(
-                display_name.as_deref(),
-                Some(&sha),
-                Some(size),
-                Some(&words),
-                ttl,
-                created_at,
-                &detection,
-            );
-            if let Err(e) = self
-                .client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(&key)
-                .body(ByteStream::from(bytes))
-                .content_type(ct.clone())
-                .set_metadata(Some(meta))
-                .send()
-                .await
-            {
-                self.cleanup_failed_store(&key, &words).await;
-                return Err(map_sdk_error(e, &key));
+            if size <= MULTIPART_CHUNK_BYTES as u64 {
+                let detection = detection_for(display_name.as_deref(), content_type, &bytes);
+                let ct = detection.content_type.clone();
+                let sha = sha256_hex(&bytes);
+                let (meta, _) = metadata_for(
+                    display_name.as_deref(),
+                    Some(&sha),
+                    Some(size),
+                    Some(&claimed),
+                    ttl,
+                    created_at,
+                    &detection,
+                );
+                if let Err(e) = self
+                    .client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .body(ByteStream::from(bytes))
+                    .content_type(ct.clone())
+                    .set_metadata(Some(meta))
+                    .send()
+                    .await
+                {
+                    self.cleanup_failed_store(&key, &claimed).await;
+                    return Err(map_sdk_error(e, &key));
+                }
+                if let Err(e) = self.verify_alias(&claimed, &key).await {
+                    self.cleanup_failed_store(&key, &claimed).await;
+                    return Err(e);
+                }
+                return Ok(StoredPaste {
+                    id: format!("{date}/{random_id}"),
+                    key,
+                    words: Some(claimed),
+                    size,
+                    sha256: sha,
+                    content_type: ct,
+                    filename: display_name,
+                    detection_source: Some(detection.source.to_string()),
+                    detection_conflict: detection.conflict,
+                    expires_at,
+                });
             }
-            if let Err(e) = self.verify_alias(&words, &key).await {
-                self.cleanup_failed_store(&key, &words).await;
-                return Err(e);
+
+            // The file grew past one chunk. Re-read it from the start on
+            // the multipart path. The alias was claimed before the read.
+            drop(bytes);
+            words = Some(claimed);
+            if let Err(e) = file.seek(SeekFrom::Start(0)).await {
+                if let Some(words) = words.as_deref() {
+                    self.cleanup_failed_store(&key, words).await;
+                }
+                return Err(e.into());
             }
-            return Ok(StoredPaste {
-                id: format!("{date}/{random_id}"),
-                key,
-                words: Some(words),
-                size,
-                sha256: sha,
-                content_type: ct,
-                filename: display_name,
-                detection_source: Some(detection.source.to_string()),
-                detection_conflict: detection.conflict,
-                expires_at,
-            });
+            len = match file.metadata().await {
+                Ok(meta) => meta.len(),
+                Err(e) => {
+                    if let Some(words) = words.as_deref() {
+                        self.cleanup_failed_store(&key, words).await;
+                    }
+                    return Err(e.into());
+                }
+            };
+            if len > self.config.max_file_bytes {
+                if let Some(words) = words.as_deref() {
+                    self.cleanup_failed_store(&key, words).await;
+                }
+                return Err(StoreError::TooLarge {
+                    limit: self.config.max_file_bytes,
+                });
+            }
         }
 
         // Multipart path. S3 takes the object metadata at
@@ -1636,43 +1701,46 @@ impl Store {
         // require the uploaded bytes to match that hash. A file that
         // changes in between fails the comparison, and the object and its
         // alias are deleted before any paste is returned.
-        let sha = {
-            let mut hasher = Sha256::new();
-            let mut buf = vec![0u8; MULTIPART_CHUNK_BYTES];
-            let mut hashed: u64 = 0;
-            loop {
-                let n = file.read(&mut buf).await?;
-                if n == 0 {
-                    break;
+        //
+        // The hash read stops at len + 1 bytes. A file that grew is rejected
+        // without reading the whole file. The first PEEK_BYTES also come from
+        // this read, so the recorded type describes the bytes that are
+        // hashed and uploaded.
+        let (sha, prefix) = match hash_file_prefix(&mut file, len).await {
+            Ok(value) => value,
+            Err(e) => {
+                if let Some(words) = words.as_deref() {
+                    self.cleanup_failed_store(&key, words).await;
                 }
-                hasher.update(&buf[..n]);
-                hashed += n as u64;
+                // The hash read stops at len + 1. If the file is now past
+                // the cap, report the cap rather than a generic change.
+                if let Ok(meta) = file.metadata().await {
+                    if meta.len() > self.config.max_file_bytes {
+                        return Err(StoreError::TooLarge {
+                            limit: self.config.max_file_bytes,
+                        });
+                    }
+                }
+                return Err(e);
             }
-            if hashed != len {
-                return Err(StoreError::Io(format!(
-                    "the file changed while it was read: expected {len} bytes, read {hashed}"
-                )));
-            }
-            hex_encode(&hasher.finalize())
-        };
-        // The detection sample comes from the same handle, so the recorded
-        // type describes the bytes that are uploaded.
-        file.seek(SeekFrom::Start(0)).await?;
-        let prefix = {
-            let mut buf = vec![0u8; crate::content_type::PEEK_BYTES];
-            let n = file.read(&mut buf).await?;
-            buf.truncate(n);
-            buf
         };
         let detection = detect_content_type_sample(
             content_type,
             display_name.as_deref(),
             &prefix,
-            len <= crate::content_type::PEEK_BYTES as u64,
+            len <= PEEK_BYTES as u64,
         );
         let ct = detection.content_type.clone();
-        file.seek(SeekFrom::Start(0)).await?;
-        let words = self.claim_alias(&key, expires_at).await?;
+        if let Err(e) = file.seek(SeekFrom::Start(0)).await {
+            if let Some(words) = words.as_deref() {
+                self.cleanup_failed_store(&key, words).await;
+            }
+            return Err(e.into());
+        }
+        let words = match words {
+            Some(words) => words,
+            None => self.claim_alias(&key, expires_at).await?,
+        };
         let (meta, _) = metadata_for(
             display_name.as_deref(),
             Some(&sha),
@@ -2337,6 +2405,25 @@ fn _unused(_: SystemTime, _: Duration) {}
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[tokio::test]
+    async fn hash_file_prefix_stops_one_byte_past_the_expected_length() {
+        let data = vec![b'x'; 64];
+        let mut input: &[u8] = &data;
+
+        let error = hash_file_prefix(&mut input, 32)
+            .await
+            .expect_err("a grown file must be rejected");
+        assert!(
+            error.to_string().contains("expected 32 bytes, read 33"),
+            "got: {error}"
+        );
+        assert_eq!(
+            64 - input.len(),
+            33,
+            "the hash must stop at len + 1, not read the whole file"
+        );
+    }
 
     #[test]
     fn base62_roundtrip_shape() {
