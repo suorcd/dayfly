@@ -229,3 +229,170 @@ fn env_file_name_is_gitignored() {
         "the .env name must be ignored"
     );
 }
+
+fn init_file(path: &std::path::Path) {
+    let output = command()
+        .arg("config")
+        .arg("init")
+        .arg("--out")
+        .arg(path)
+        .output()
+        .expect("config init must run");
+    assert!(
+        output.status.success(),
+        "config init must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn config_check_accepts_a_generated_file_and_prints_every_name() {
+    let dir = temp_config_dir("check-valid");
+    let path = dir.join("dayfly.env");
+    init_file(&path);
+
+    let output = command()
+        .arg("--config")
+        .arg(&path)
+        .arg("config")
+        .arg("check")
+        .output()
+        .expect("config check must run");
+    assert!(
+        output.status.success(),
+        "config check must pass: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for name in [
+        "S3_ENDPOINT",
+        "S3_BUCKET",
+        "S3_ACCESS_KEY_ID",
+        "S3_SECRET_ACCESS_KEY",
+        "S3_REGION",
+        "DAYFLY_MAX_TEXT_BYTES",
+    ] {
+        assert!(stdout.contains(name), "missing {name} in output: {stdout}");
+    }
+    assert!(stdout.contains("configuration check: ok"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn config_check_reports_multiple_faults_in_one_run() {
+    let dir = temp_config_dir("check-faults");
+    let path = dir.join("dayfly.env");
+    std::fs::create_dir_all(&dir).expect("the directory must be creatable");
+    std::fs::write(
+        &path,
+        "S3_ENDPOINT=ftp://bad.example\nS3_ACCESS_KEY_ID=key\nS3_SECRET_ACCESS_KEY=secret\n",
+    )
+    .expect("the env file must be writable");
+
+    let output = command()
+        .arg("--config")
+        .arg(&path)
+        .arg("config")
+        .arg("check")
+        .output()
+        .expect("config check must run");
+    assert!(!output.status.success(), "two faults must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("S3_ENDPOINT"), "got: {stderr}");
+    assert!(stderr.contains("S3_BUCKET"), "got: {stderr}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn config_check_strict_turns_a_secret_file_warning_into_a_fault() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_config_dir("check-strict");
+    let path = dir.join("dayfly.env");
+    let secret = dir.join("access-key");
+    std::fs::create_dir_all(&dir).expect("the directory must be creatable");
+    std::fs::write(&secret, "access-key-value").expect("the secret file must be writable");
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644))
+        .expect("the secret file mode must be set");
+    std::fs::write(
+        &path,
+        format!(
+            "S3_ENDPOINT=https://s3.example.invalid\nS3_BUCKET=bucket\nS3_ACCESS_KEY_ID_FILE={}\nS3_SECRET_ACCESS_KEY=secret\n",
+            secret.display()
+        ),
+    )
+    .expect("the env file must be writable");
+
+    let normal = command()
+        .arg("--config")
+        .arg(&path)
+        .arg("config")
+        .arg("check")
+        .output()
+        .expect("config check must run");
+    assert!(
+        normal.status.success(),
+        "a warning must not fail without --strict: {}",
+        String::from_utf8_lossy(&normal.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&normal.stdout).contains("warning:"),
+        "the warning must be printed"
+    );
+
+    let strict = command()
+        .arg("--config")
+        .arg(&path)
+        .arg("config")
+        .arg("check")
+        .arg("--strict")
+        .output()
+        .expect("config check must run");
+    assert!(!strict.status.success(), "--strict must fail on a warning");
+    let stderr = String::from_utf8_lossy(&strict.stderr);
+    assert!(
+        stderr.contains("warnings are faults under --strict"),
+        "got: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn config_check_missing_secret_file_names_the_path_and_not_the_secret() {
+    let dir = temp_config_dir("check-missing-secret");
+    let path = dir.join("dayfly.env");
+    let missing = dir.join("missing-access-key");
+    std::fs::create_dir_all(&dir).expect("the directory must be creatable");
+    std::fs::write(
+        &path,
+        format!(
+            "S3_ENDPOINT=https://s3.example.invalid\nS3_BUCKET=bucket\nS3_ACCESS_KEY_ID_FILE={}\nS3_SECRET_ACCESS_KEY=top-secret-value\n",
+            missing.display()
+        ),
+    )
+    .expect("the env file must be writable");
+
+    let output = command()
+        .arg("--config")
+        .arg(&path)
+        .arg("config")
+        .arg("check")
+        .output()
+        .expect("config check must run");
+    assert!(!output.status.success(), "a missing secret file must fail");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains(missing.to_str().expect("path must be UTF-8")),
+        "the error must name the path: {text}"
+    );
+    assert!(
+        !text.contains("top-secret-value"),
+        "the secret value must never appear: {text}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

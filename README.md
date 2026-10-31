@@ -205,6 +205,15 @@ dayfly config init --out ~/.config/dayfly/dayfly.env
 to replace an existing file unless you add `--force`. It creates a new
 parent directory with mode `0700` and the file with mode `0600`.
 
+```sh
+dayfly --config ~/.config/dayfly/dayfly.env config check
+```
+
+`config check` prints one line per setting with `set`, `unset`, or
+`default`. It prints all faults in one run and exits 1 when a fault is
+present. It never prints a secret value. `--strict` turns credential
+file permission warnings into faults.
+
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
 | `S3_ENDPOINT` | yes | — | Garage endpoint URL, `http://` or `https://` |
@@ -880,7 +889,7 @@ where `cargo --version`, `rustc --version`, and
 `rust-analyzer --version` all succeed.
 
 **Nix validation result:** `nix build` and the test suite were run on
-`x86_64-linux` against `nixos-unstable`: 346 passed and 2 ignored. On the stable
+`x86_64-linux` against `nixos-unstable`: 350 passed and 2 ignored. On the stable
 `nixos-25.11` branch the build fails before compilation with a
 rustc-too-old error naming 23 AWS crates, which is why the flake
 tracks unstable. Before this was built on a machine with Nix, an

@@ -283,6 +283,11 @@ fn read_credential_file(file_variable: &str, path: &str) -> Result<String, Confi
 }
 
 /// Read one environment file.
+pub fn load_env_file(path: &Path) -> Result<HashMap<String, String>, ConfigError> {
+    read_env_file(path)
+}
+
+/// Read one environment file.
 fn read_env_file(path: &Path) -> Result<HashMap<String, String>, ConfigError> {
     let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::ConfigFileRead {
         path: path.display().to_string(),
@@ -331,6 +336,33 @@ fn parse_env_file(contents: &str, path: &Path) -> Result<HashMap<String, String>
         values.insert(name.to_string(), value.to_string());
     }
     Ok(values)
+}
+
+/// Build the mode and owner warnings for one credential file.
+///
+/// The warnings never include the file contents. A missing file returns no
+/// warning; the caller reports the read error separately.
+#[cfg(unix)]
+pub fn credential_warnings(path: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if let Some(warning) = credential_file_warning(path, &metadata) {
+            warnings.push(warning);
+        }
+    }
+    let parent = std::path::Path::new(path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    if let Some(warning) = credential_directory_warning(parent) {
+        warnings.push(warning);
+    }
+    warnings
+}
+
+#[cfg(not(unix))]
+pub fn credential_warnings(_path: &str) -> Vec<String> {
+    Vec::new()
 }
 
 /// Parse the optional HTTP bearer token.

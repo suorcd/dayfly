@@ -11,6 +11,7 @@
 //! stream on stdout is never corrupted. Credentials come from
 //! environment variables or credential files and are never logged.
 
+use std::collections::HashMap;
 use std::env;
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -21,7 +22,7 @@ use rmcp::ServiceExt;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
-use dayfly::config::{Config, CONFIG_FIELDS};
+use dayfly::config::{credential_warnings, load_env_file, Config, CONFIG_FIELDS};
 use dayfly::http;
 use dayfly::http::AppState;
 use dayfly::mcp;
@@ -73,6 +74,135 @@ enum ConfigAction {
         #[arg(long)]
         force: bool,
     },
+    /// Validate the environment file without starting a transport.
+    Check {
+        /// Treat warnings as faults.
+        #[arg(long)]
+        strict: bool,
+    },
+}
+
+/// Validate the environment file and print one line per setting.
+fn check_config_file(path: Option<PathBuf>, explicit: bool, strict: bool) -> anyhow::Result<()> {
+    let file_values = match path.as_deref() {
+        Some(path) if path.exists() => {
+            load_env_file(path).map_err(|error| anyhow::anyhow!("{error}"))?
+        }
+        Some(path) if explicit => {
+            anyhow::bail!(
+                "cannot read config file {}: file does not exist",
+                path.display()
+            )
+        }
+        _ => HashMap::new(),
+    };
+    let lookup = |name: &str| {
+        env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                file_values
+                    .get(name)
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+            })
+    };
+
+    let mut faults = Vec::new();
+    let mut warnings = Vec::new();
+    for field in CONFIG_FIELDS {
+        let file_value = match field.name {
+            "S3_ACCESS_KEY_ID" => lookup("S3_ACCESS_KEY_ID_FILE"),
+            "S3_SECRET_ACCESS_KEY" => lookup("S3_SECRET_ACCESS_KEY_FILE"),
+            _ => None,
+        };
+        let value = lookup(field.name).or_else(|| file_value.clone());
+        let status = match (&value, field.required, field.value) {
+            (Some(_), _, _) => "set",
+            (None, true, _) => {
+                faults.push(format!("{} is missing", field.name));
+                "unset"
+            }
+            (None, false, Some(_)) => "default",
+            (None, false, None) => "unset",
+        };
+        if let Some(path) = &file_value {
+            println!("{}: set (file {path})", field.name);
+        } else {
+            println!("{}: {status}", field.name);
+        }
+        let Some(value) = value else { continue };
+        match field.name {
+            "S3_ENDPOINT" if !(value.starts_with("http://") || value.starts_with("https://")) => {
+                faults.push("S3_ENDPOINT is not an http:// or https:// URL".to_string());
+            }
+            "DAYFLY_MAX_TEXT_BYTES" | "DAYFLY_MAX_FILE_BYTES" => {
+                if value.parse::<u64>().is_err() {
+                    faults.push(format!("{}: expected a non-negative integer", field.name));
+                }
+            }
+            "DAYFLY_DEFAULT_TTL_DAYS" => {
+                if value.parse::<u32>().map(|days| days == 0).unwrap_or(true) {
+                    faults.push("DAYFLY_DEFAULT_TTL_DAYS: expected a positive integer".to_string());
+                }
+            }
+            "DAYFLY_HTTP_BEARER_TOKEN"
+                if value.contains(|character: char| character.is_ascii_whitespace()) =>
+            {
+                faults.push("DAYFLY_HTTP_BEARER_TOKEN: expected no ASCII whitespace".to_string());
+            }
+            _ => {}
+        }
+    }
+
+    for (direct, file) in [
+        ("S3_ACCESS_KEY_ID", "S3_ACCESS_KEY_ID_FILE"),
+        ("S3_SECRET_ACCESS_KEY", "S3_SECRET_ACCESS_KEY_FILE"),
+    ] {
+        let direct_value = lookup(direct);
+        let file_value = lookup(file);
+        if direct_value.is_some() && file_value.is_some() {
+            faults.push(format!("{direct} and {file} are both set"));
+        }
+        if let Some(file_path) = file_value {
+            match std::fs::read_to_string(&file_path) {
+                Ok(contents) if contents.trim().is_empty() => {
+                    faults.push(format!("{file} file {file_path} is empty"));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    faults.push(format!("cannot read {file} file {file_path}: {error}"));
+                }
+            }
+            warnings.extend(credential_warnings(&file_path));
+        }
+    }
+
+    if faults.is_empty() {
+        let result = if path.as_ref().is_some_and(|path| path.exists()) {
+            Config::from_env_file(path.as_deref())
+        } else {
+            Config::from_env()
+        };
+        if let Err(error) = result {
+            faults.push(error.to_string());
+        }
+    }
+
+    for warning in &warnings {
+        println!("warning: {warning}");
+    }
+    if strict && !warnings.is_empty() {
+        faults.push("warnings are faults under --strict".to_string());
+    }
+    if !faults.is_empty() {
+        for fault in &faults {
+            eprintln!("error: {fault}");
+        }
+        anyhow::bail!("configuration check failed");
+    }
+    println!("configuration check: ok");
+    Ok(())
 }
 
 /// Write a new environment file.
@@ -188,6 +318,9 @@ async fn main() -> anyhow::Result<()> {
         return match action {
             ConfigAction::Init { out, force } => {
                 init_config_file(out.clone().or(config_path.clone()), *force)
+            }
+            ConfigAction::Check { strict } => {
+                check_config_file(config_path.clone(), explicit, *strict)
             }
         };
     }
