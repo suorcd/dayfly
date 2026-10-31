@@ -129,7 +129,7 @@ fn bearer_matches(header_value: &str, token: &str) -> bool {
     credential.as_bytes().ct_eq(token.as_bytes()).into()
 }
 
-fn status_for(e: &StoreError) -> StatusCode {
+pub(crate) fn status_for(e: &StoreError) -> StatusCode {
     match e {
         StoreError::NotFound(_) => StatusCode::NOT_FOUND,
         StoreError::Expired(_) => StatusCode::GONE,

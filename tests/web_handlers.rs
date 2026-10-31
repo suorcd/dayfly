@@ -91,6 +91,32 @@ async fn index_page_renders_both_forms_and_the_default_ttl() {
 }
 
 #[tokio::test]
+async fn index_page_selects_a_default_outside_the_fixed_list() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.default_ttl_days = 2;
+    let store = Store::from_config(config)
+        .await
+        .expect("the store must build without network access");
+    let app = common::app(store);
+
+    let request = common::request("GET", "/", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        page.contains("<option value=\"2\" selected>2 days</option>"),
+        "the configured default must be selected: {page}"
+    );
+    assert_eq!(
+        page.matches("<option value=\"2\" selected>2 days</option>")
+            .count(),
+        2,
+        "both forms must select the configured default"
+    );
+}
+
+#[tokio::test]
 async fn text_submit_rejects_zero_ttl_days() {
     let fake = FakeS3::start().await;
     let app = common::app(fake.store().await);
@@ -631,7 +657,11 @@ async fn upload_error_page_never_shows_a_paste_url() {
 
     let request = common::request("POST", "/ui/text", &form_headers(form.len()), form);
     let (status, _, body) = common::send(&app, request).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "an S3 failure must not look like a client error"
+    );
     let page = html_text(&body);
     assert!(!page.contains("/v1/pastes/"));
     assert!(fake.keys().is_empty());
