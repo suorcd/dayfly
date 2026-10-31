@@ -4,6 +4,7 @@
 //! same lock and sets the full variable set it needs.
 
 use std::env;
+use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
 use dayfly::config::{Config, ConfigError};
@@ -51,6 +52,15 @@ fn minimal_config() -> Config {
     Config::from_env().expect("minimal environment must parse")
 }
 
+fn temp_env_file(name: &str) -> PathBuf {
+    let path = env::temp_dir().join(format!(
+        "dayfly-config-file-{}-{name}.env",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
 #[test]
 fn minimal_environment_applies_documented_defaults() {
     let _guard = lock_env();
@@ -66,6 +76,69 @@ fn minimal_environment_applies_documented_defaults() {
     assert_eq!(config.http_bind, "127.0.0.1:8080");
     assert_eq!(config.http_bearer_token, None);
     assert_eq!(config.mcp_local_root, None);
+}
+
+#[test]
+fn env_file_supplies_values_and_the_process_environment_wins() {
+    let _guard = lock_env();
+    clear_env();
+    let path = temp_env_file("precedence");
+    std::fs::write(
+        &path,
+        "# comment\nexport S3_ENDPOINT=\"https://file.example:3900\"\nS3_BUCKET=from-file\nS3_ACCESS_KEY_ID=file-key\nS3_SECRET_ACCESS_KEY='file-secret'\nS3_REGION=from-file\n",
+    )
+    .expect("temporary config file must be writable");
+    env::set_var("S3_BUCKET", "from-env");
+    env::set_var("S3_REGION", "   ");
+
+    let config = Config::from_env_file(Some(&path)).expect("the env file must parse");
+    assert_eq!(config.endpoint, "https://file.example:3900");
+    assert_eq!(config.bucket, "from-env");
+    assert_eq!(config.access_key_id, "file-key");
+    assert_eq!(config.secret_access_key, "file-secret");
+    assert_eq!(
+        config.region, "from-file",
+        "an empty process value must fall back to the file"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn a_named_env_file_must_exist() {
+    let _guard = lock_env();
+    clear_env();
+    let path = temp_env_file("missing");
+    let error = match Config::from_env_file(Some(&path)) {
+        Ok(_) => panic!("a named config file must exist"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains(path.to_str().expect("temporary config path must be UTF-8")),
+        "the error must name the path: {error}"
+    );
+}
+
+#[test]
+fn malformed_env_file_line_names_the_path_and_line() {
+    let _guard = lock_env();
+    clear_env();
+    let path = temp_env_file("malformed");
+    std::fs::write(&path, "S3_ENDPOINT=https://example.invalid\nNO_EQUALS\n")
+        .expect("temporary config file must be writable");
+
+    let error = match Config::from_env_file(Some(&path)) {
+        Ok(_) => panic!("a malformed line must fail"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(message.contains("line 2"), "got: {message}");
+    assert!(
+        message.contains(path.to_str().expect("temporary config path must be UTF-8")),
+        "the error must name the path: {message}"
+    );
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]

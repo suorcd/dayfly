@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::env;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
@@ -78,6 +79,18 @@ pub enum ConfigError {
     },
     #[error("{file_variable} file {path} is empty")]
     EmptyCredentialFile { file_variable: String, path: String },
+    #[error("cannot read config file {path}: {source}")]
+    ConfigFileRead {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("invalid config file {path} at line {line}: {message}")]
+    ConfigFileParse {
+        path: String,
+        line: usize,
+        message: String,
+    },
 }
 
 fn required<F>(lookup: &F, name: &str) -> Result<String, ConfigError>
@@ -168,6 +181,57 @@ fn read_credential_file(file_variable: &str, path: &str) -> Result<String, Confi
         });
     }
     Ok(value.to_string())
+}
+
+/// Read one environment file.
+fn read_env_file(path: &Path) -> Result<HashMap<String, String>, ConfigError> {
+    let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::ConfigFileRead {
+        path: path.display().to_string(),
+        source,
+    })?;
+    parse_env_file(&contents, path)
+}
+
+/// Parse `NAME=VALUE` lines into a map.
+fn parse_env_file(contents: &str, path: &Path) -> Result<HashMap<String, String>, ConfigError> {
+    let mut values = HashMap::new();
+    for (index, raw_line) in contents.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let Some((name, value)) = line.split_once('=') else {
+            return Err(ConfigError::ConfigFileParse {
+                path: path.display().to_string(),
+                line: index + 1,
+                message: "expected NAME=VALUE".to_string(),
+            });
+        };
+        let name = name.trim();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(ConfigError::ConfigFileParse {
+                path: path.display().to_string(),
+                line: index + 1,
+                message: format!("invalid variable name {name:?}"),
+            });
+        }
+        let mut value = value.trim();
+        if value.len() >= 2 {
+            let bytes = value.as_bytes();
+            let quoted = (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
+                || (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'');
+            if quoted {
+                value = &value[1..value.len() - 1];
+            }
+        }
+        values.insert(name.to_string(), value.to_string());
+    }
+    Ok(values)
 }
 
 /// Parse the optional HTTP bearer token.
@@ -335,6 +399,30 @@ fn credential_directory_warning_parts(
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|name| env::var(name).ok())
+    }
+
+    /// Build a configuration from the process environment and an optional
+    /// environment file.
+    ///
+    /// A process environment variable wins over the same name in the file.
+    /// The file format is one `NAME=VALUE` pair per line. Blank lines and
+    /// lines that start with `#` are ignored. A leading `export` and one
+    /// pair of matching single or double quotes are accepted.
+    pub fn from_env_file(path: Option<&Path>) -> Result<Self, ConfigError> {
+        let file_values = match path {
+            Some(path) => Some(read_env_file(path)?),
+            None => None,
+        };
+        Self::from_lookup(|name| {
+            env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    file_values
+                        .as_ref()
+                        .and_then(|values| values.get(name).cloned())
+                })
+        })
     }
 
     /// Build a configuration from a name-to-value lookup.

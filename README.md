@@ -184,9 +184,18 @@ truncation field in v1; use a narrower date range to see older objects.
 
 ## Configuration
 
-All configuration is environment variables. Never commit a real
-`.env`; copy `.env.example` to `.env` (or export directly) with
-placeholder values replaced by your own Garage values.
+All configuration comes from environment variables. A process
+environment variable wins over the same name in an optional environment
+file. Use `--config PATH` or `DAYFLY_CONFIG` to name the file. With
+neither, dayfly reads `$XDG_CONFIG_HOME/dayfly/dayfly.env`, or
+`$HOME/.config/dayfly/dayfly.env` when `XDG_CONFIG_HOME` is unset. A
+missing default file is ignored. A named file must exist.
+
+The file holds one `NAME=VALUE` pair per line. Blank lines and lines
+that start with `#` are ignored. A leading `export` and one pair of
+matching single or double quotes are accepted. Never commit a real
+`.env`; copy `.env.example` to a path you choose and pass it with
+`--config`.
 
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
@@ -213,6 +222,10 @@ Credentials are never logged. `Config` has no `Debug` that prints
 secrets; startup logs only bucket, endpoint scheme, region, and limits.
 A credential file read error names the path only, not the file
 contents. The permission warnings never include the file contents.
+
+`--verbose` sets the log filter to INFO. `RUST_LOG` overrides it.
+Dayfly runs in the foreground. Use systemd or the container runtime to
+supervise it. There is no daemon mode.
 
 ## Running the MCP server
 
@@ -859,7 +872,7 @@ where `cargo --version`, `rustc --version`, and
 `rust-analyzer --version` all succeed.
 
 **Nix validation result:** `nix build` and the test suite were run on
-`x86_64-linux` against `nixos-unstable`: 336 passed and 2 ignored. On the stable
+`x86_64-linux` against `nixos-unstable`: 342 passed and 2 ignored. On the stable
 `nixos-25.11` branch the build fails before compilation with a
 rustc-too-old error naming 23 AWS crates, which is why the flake
 tracks unstable. Before this was built on a machine with Nix, an
