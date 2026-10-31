@@ -155,7 +155,8 @@ fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> 
         | StoreError::InvalidRange(_)
         | StoreError::InvalidPath(_)
         | StoreError::PathOutsideRoot(_)
-        | StoreError::LocalFilesDisabled => {
+        | StoreError::LocalFilesDisabled
+        | StoreError::LengthMismatch { .. } => {
             Err(rmcp::ErrorData::invalid_params(e.to_string(), None))
         }
         StoreError::Io(_)

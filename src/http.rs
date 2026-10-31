@@ -135,9 +135,10 @@ pub(crate) fn status_for(e: &StoreError) -> StatusCode {
         StoreError::NotFound(_) => StatusCode::NOT_FOUND,
         StoreError::Expired(_) => StatusCode::GONE,
         StoreError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
-        StoreError::InvalidId(_) | StoreError::InvalidDate(_) | StoreError::InvalidRange(_) => {
-            StatusCode::BAD_REQUEST
-        }
+        StoreError::InvalidId(_)
+        | StoreError::InvalidDate(_)
+        | StoreError::InvalidRange(_)
+        | StoreError::LengthMismatch { .. } => StatusCode::BAD_REQUEST,
         StoreError::InvalidPath(_) => StatusCode::BAD_REQUEST,
         // The local-path tools are MCP-only. If one of these reaches an
         // HTTP route, the caller asked for something it does not offer.

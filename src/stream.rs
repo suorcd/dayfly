@@ -146,10 +146,16 @@ where
                 }
                 collected.extend_from_slice(&chunk);
             }
+            let total = collected.len() as u64;
+            if total != len {
+                return Err(StoreError::LengthMismatch {
+                    expected: len,
+                    actual: total,
+                });
+            }
             let mut hasher = Sha256::new();
             hasher.update(&collected);
             let sha = hex_encode(&hasher.finalize());
-            let total = collected.len() as u64;
             sink.put_small(collected, &sha).await?;
             return Ok(UploadOutcome {
                 total_bytes: total,
@@ -189,6 +195,16 @@ where
     if let Err(e) = run_result {
         sink.abort(&upload_id).await;
         return Err(e);
+    }
+
+    if let Some(expected) = known_length {
+        if total != expected {
+            sink.abort(&upload_id).await;
+            return Err(StoreError::LengthMismatch {
+                expected,
+                actual: total,
+            });
+        }
     }
 
     // EOF: upload the remainder as the final (possibly small) part.

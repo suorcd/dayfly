@@ -463,7 +463,9 @@ newest objects, so an older date can be omitted.
 Error responses are machine-readable JSON, e.g.
 `{"error": "payload too large: limit is 1073741824 bytes"}` with HTTP
 413 for oversize, 400 for invalid input, 404 for not found, 410 for
-expired, 416 for an unsatisfiable range, and 502 for S3 errors.
+expired, 416 for an unsatisfiable range, and 502 for S3 errors. An
+upload body shorter than its `Content-Length` returns 400 and stores
+nothing.
 
 One status code needs reading carefully, because the current
 behaviour is narrower than the list above suggests. `DELETE` is
