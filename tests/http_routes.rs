@@ -1819,3 +1819,116 @@ async fn http_mcp_rejects_a_local_path_outside_the_configured_root() {
     let _ = std::fs::remove_file(&outside);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+async fn store_text_id(app: &Router, session: &str, request_id: u64, text: &str) -> String {
+    let (status, _, body) = mcp_post(app, &store_text_body(request_id, text), Some(session)).await;
+    assert_eq!(status, StatusCode::OK);
+    stored_paste(&sse_json(&body))["id"]
+        .as_str()
+        .expect("stored paste must carry an id")
+        .to_string()
+}
+
+/// A write through a symlink that leaves the configured root is refused.
+#[tokio::test]
+async fn http_mcp_rejects_a_write_through_a_symlink_outside_the_root() {
+    let fake = FakeS3::start().await;
+    let root = temp_dir("issue73-write-symlink-root");
+    let outside = common::write_temp_file("issue73-write-symlink-target.txt", b"outside payload");
+    let app = app_router(state_with_local_root(&fake, &root).await);
+    let session = initialize_mcp_session(&app).await;
+    let id = store_text_id(&app, &session, 70, "download me").await;
+
+    let link = root.join("escape.txt");
+    std::os::unix::fs::symlink(&outside, &link).expect("test symlink must be creatable");
+    let (status, _, body) = mcp_post(
+        &app,
+        &fetch_file_body(71, &id, link.to_str().expect("path must be UTF-8")),
+        Some(&session),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let payload = sse_json(&body);
+    assert_eq!(
+        rpc_error_code(&payload),
+        Some(-32602),
+        "a symlink out of the root must be refused, got: {payload}"
+    );
+    assert_eq!(
+        std::fs::read(&outside).expect("the outside file must remain readable"),
+        b"outside payload",
+        "a refused write must leave the outside file unchanged"
+    );
+
+    let _ = std::fs::remove_file(&outside);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A write through `..` that leaves the configured root is refused.
+#[tokio::test]
+async fn http_mcp_rejects_a_write_through_parent_traversal() {
+    let fake = FakeS3::start().await;
+    let root = temp_dir("issue73-write-traversal-root");
+    let outside = common::temp_path("issue73-write-traversal-target.txt");
+    let _ = std::fs::remove_file(&outside);
+    let app = app_router(state_with_local_root(&fake, &root).await);
+    let session = initialize_mcp_session(&app).await;
+    let id = store_text_id(&app, &session, 80, "download me").await;
+
+    let traversal = root
+        .join("..")
+        .join(outside.file_name().expect("temporary path has a name"));
+    let (status, _, body) = mcp_post(
+        &app,
+        &fetch_file_body(81, &id, traversal.to_str().expect("path must be UTF-8")),
+        Some(&session),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let payload = sse_json(&body);
+    assert_eq!(
+        rpc_error_code(&payload),
+        Some(-32602),
+        "a traversal out of the root must be refused, got: {payload}"
+    );
+    assert!(
+        !outside.exists(),
+        "a refused traversal must write nothing outside the root"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `fetch_file` writes a destination under the configured root.
+#[tokio::test]
+async fn http_mcp_writes_a_fetch_file_under_the_configured_root() {
+    let fake = FakeS3::start().await;
+    let root = temp_dir("issue73-write-allowed-root");
+    let app = app_router(state_with_local_root(&fake, &root).await);
+    let session = initialize_mcp_session(&app).await;
+    let text = "downloaded payload";
+    let id = store_text_id(&app, &session, 90, text).await;
+
+    let dest = root.join("downloaded.txt");
+    let (status, _, body) = mcp_post(
+        &app,
+        &fetch_file_body(91, &id, dest.to_str().expect("path must be UTF-8")),
+        Some(&session),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let payload = sse_json(&body);
+    assert_eq!(
+        payload["result"]["isError"], false,
+        "a destination under the root must succeed, got: {payload}"
+    );
+    assert_eq!(
+        std::fs::read(&dest).expect("the destination must exist"),
+        text.as_bytes()
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
