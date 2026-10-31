@@ -23,7 +23,6 @@ use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime};
 
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
@@ -1275,10 +1274,11 @@ impl Store {
 
     /// Claim an alias for `key` before the base object is written.
     ///
-    /// One process-wide lock covers the check and the write, so two
-    /// stores in one process cannot choose the same phrase. Garage
-    /// ignores conditional writes, so two processes can still race;
-    /// [`Self::verify_alias`] detects that case before a paste returns.
+    /// One lock on this `Store` instance covers the check and the write,
+    /// so two callers that share the instance cannot choose the same
+    /// phrase. Garage ignores conditional writes, so two stores can still
+    /// race; [`Self::verify_alias`] detects that case before a paste
+    /// returns.
     async fn claim_alias(
         &self,
         key: &str,
@@ -2271,9 +2271,11 @@ impl Store {
     /// [`parse_list_window_request`] documents the range rules.
     ///
     /// The scan starts at the newest date and moves to older dates. The
-    /// `limit` applies to the newest objects in the window, so an older
-    /// date can be omitted when the limit is reached. The returned
-    /// summaries are sorted by date ascending, then by key.
+    /// `limit` applies to the newest dates. Within one date, the limit
+    /// applies in S3 key order. Paste IDs are random, so key order is not
+    /// creation order. An older date can be omitted when the limit is
+    /// reached. The returned summaries are sorted by date ascending, then
+    /// by key.
     ///
     /// The function scans the bucket directly: `ListObjectsV2` for each
     /// `pastes/<date>/` prefix, then one `HeadObject` and a segment-prefix
@@ -2394,12 +2396,6 @@ fn default_list_window(now: DateTime<Utc>) -> (NaiveDate, NaiveDate) {
     let today = now.date_naive();
     (today - chrono::Duration::days(1), today)
 }
-
-/// Parse a `DateTime` from an S3 `LastModified` smithy date without
-/// depending on its exact type in tests. Kept small: production code uses
-/// the `DateTime::from_timestamp` call in `list_recent`.
-#[allow(dead_code)]
-fn _unused(_: SystemTime, _: Duration) {}
 
 #[cfg(test)]
 mod tests {

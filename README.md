@@ -176,10 +176,11 @@ date prefixes. The default window includes both, so the evening
 listing does not go empty.
 
 The scan starts at the newest date and moves to older dates. The
-`limit` applies to the newest objects in the window. An older date can
-be omitted when the limit is reached. Results are sorted by date, then
-by key. The response has no truncation field in v1; use a narrower date
-range to see older objects.
+`limit` applies to the newest dates. Within one date, the limit applies
+in S3 key order. Paste IDs are random, so key order is not creation
+order. An older date can be omitted when the limit is reached. Results
+are sorted by date ascending, then by key. The response has no
+truncation field in v1; use a narrower date range to see older objects.
 
 ## Configuration
 
@@ -458,7 +459,8 @@ curl 'http://127.0.0.1:8080/v1/pastes?start=2026-10-28&end=2026-10-29&limit=100'
 `date` takes precedence over `start` and `end`. Supply both `start` and
 `end` for a range; a one-sided range returns 400. Results are in date
 order, then in S3 key order within each date. The limit applies to the
-newest objects, so an older date can be omitted.
+newest dates first, then to key order within a date. Key order is not
+creation order because IDs are random. An older date can be omitted.
 
 Error responses are machine-readable JSON, e.g.
 `{"error": "payload too large: limit is 1073741824 bytes"}` with HTTP
@@ -601,8 +603,8 @@ operation that takes an ID: fetch, metadata, append, and delete.
   `pastes/<date>/<id>`. Its metadata holds `target`, `expires-at`, and
   `kind=alias`. Lookup is O(1): one GetObject, then a HeadObject of
   the target.
-- Uniqueness: within one process, the store serializes the alias check
-  and write. It retries up to 8 random phrases. If every attempt
+- Uniqueness: one Store instance serializes the alias check and write.
+  It retries up to 8 random phrases. If every attempt
   collides, the store returns an error and writes no paste. Two dayfly
   processes that share one bucket can still race, because Garage
   ignores conditional writes; run one writer per bucket for a strict
@@ -857,7 +859,7 @@ where `cargo --version`, `rustc --version`, and
 `rust-analyzer --version` all succeed.
 
 **Nix validation result:** `nix build` and the test suite were run on
-`x86_64-linux` against `nixos-unstable`: 276 passed and 2 ignored. On the stable
+`x86_64-linux` against `nixos-unstable`: 336 passed and 2 ignored. On the stable
 `nixos-25.11` branch the build fails before compilation with a
 rustc-too-old error naming 23 AWS crates, which is why the flake
 tracks unstable. Before this was built on a machine with Nix, an
