@@ -193,9 +193,12 @@ missing default file is ignored. A named file must exist.
 
 The file holds one `NAME=VALUE` pair per line. Blank lines and lines
 that start with `#` are ignored. A leading `export` and one pair of
-matching single or double quotes are accepted. Never commit a real
-`.env`; copy `.env.example` to a path you choose and pass it with
-`--config`. The `.env` name is in `.gitignore`.
+matching single or double quotes are accepted. A relative secret-file
+path in the file resolves against the directory of the file. An
+exported relative secret-file path resolves against the working
+directory. Never commit a real `.env`; copy `.env.example` to a path
+you choose and pass it with `--config`. The `.env` name is in
+`.gitignore`.
 
 ```sh
 dayfly config init --out ~/.config/dayfly/dayfly.env
@@ -227,13 +230,14 @@ file permission warnings into faults.
 | `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1. The name and meaning are unchanged |
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
-| `DAYFLY_HTTP_BEARER_TOKEN` | no | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model) |
+| `DAYFLY_HTTP_BEARER_TOKEN` | one form | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model); set this variable or `DAYFLY_HTTP_BEARER_TOKEN_FILE` |
+| `DAYFLY_HTTP_BEARER_TOKEN_FILE` | one form | (unset) | Path to a file that contains the bearer token; set this variable or `DAYFLY_HTTP_BEARER_TOKEN` |
 | `DAYFLY_MCP_LOCAL_ROOT` | no | (unset) | Directory for the MCP local-path tools. It must exist, or startup fails. When set, `store_file` and `fetch_file` refuse any path outside it, after resolving symlinks. When unset, the stdio transport accepts any readable path and the HTTP transport refuses both tools |
 
-For each S3 credential, set the direct variable or its `_FILE`
-alternative, not both. If both are set, startup stops with a
-configuration error. The binary trims whitespace from file values and
-rejects an empty file.
+For each S3 credential and for the bearer token, set the direct
+variable or its `_FILE` alternative, not both. If both are set, startup
+stops with a configuration error. The binary trims whitespace from file
+values and rejects an empty file.
 
 Credentials are never logged. `Config` has no `Debug` that prints
 secrets; startup logs only bucket, endpoint scheme, region, and limits.
@@ -889,7 +893,7 @@ where `cargo --version`, `rustc --version`, and
 `rust-analyzer --version` all succeed.
 
 **Nix validation result:** `nix build` and the test suite were run on
-`x86_64-linux` against `nixos-unstable`: 350 passed and 2 ignored. On the stable
+`x86_64-linux` against `nixos-unstable`: 354 passed and 2 ignored. On the stable
 `nixos-25.11` branch the build fails before compilation with a
 rustc-too-old error naming 23 AWS crates, which is why the flake
 tracks unstable. Before this was built on a machine with Nix, an

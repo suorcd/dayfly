@@ -37,6 +37,7 @@ fn clear_env() {
         env::remove_var(name);
     }
     env::remove_var("DAYFLY_HTTP_BEARER_TOKEN");
+    env::remove_var("DAYFLY_HTTP_BEARER_TOKEN_FILE");
 }
 
 fn set_required() {
@@ -59,6 +60,13 @@ fn temp_env_file(name: &str) -> PathBuf {
     ));
     let _ = std::fs::remove_file(&path);
     path
+}
+
+fn temp_env_dir(name: &str) -> PathBuf {
+    let dir = env::temp_dir().join(format!("dayfly-config-dir-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temporary config directory must be creatable");
+    dir
 }
 
 #[test]
@@ -401,4 +409,104 @@ fn mcp_local_root_is_canonical_and_must_exist() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn env_file_relative_secret_path_resolves_against_the_file_directory() {
+    let _guard = lock_env();
+    clear_env();
+    let dir = temp_env_dir("relative-secret");
+    std::fs::write(dir.join("access-key"), "relative-access-key\n")
+        .expect("the secret file must be writable");
+    let path = dir.join("dayfly.env");
+    std::fs::write(
+        &path,
+        "S3_ENDPOINT=https://s3.example.invalid\nS3_BUCKET=bucket\nS3_ACCESS_KEY_ID_FILE=access-key\nS3_SECRET_ACCESS_KEY=secret\n",
+    )
+    .expect("the env file must be writable");
+
+    let config = Config::from_env_file(Some(&path)).expect("the relative secret path must resolve");
+    assert_eq!(config.access_key_id, "relative-access-key");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn bearer_token_file_sets_the_token() {
+    let _guard = lock_env();
+    clear_env();
+    let dir = temp_env_dir("bearer-token");
+    std::fs::write(dir.join("bearer-token"), "file-token\n")
+        .expect("the token file must be writable");
+    let path = dir.join("dayfly.env");
+    std::fs::write(
+        &path,
+        "S3_ENDPOINT=https://s3.example.invalid\nS3_BUCKET=bucket\nS3_ACCESS_KEY_ID=key\nS3_SECRET_ACCESS_KEY=secret\nDAYFLY_HTTP_BEARER_TOKEN_FILE=bearer-token\n",
+    )
+    .expect("the env file must be writable");
+
+    let config = Config::from_env_file(Some(&path)).expect("the token file must parse");
+    assert_eq!(config.http_bearer_token.as_deref(), Some("file-token"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn direct_and_file_bearer_tokens_conflict() {
+    let _guard = lock_env();
+    clear_env();
+    let dir = temp_env_dir("bearer-conflict");
+    std::fs::write(dir.join("bearer-token"), "file-token\n")
+        .expect("the token file must be writable");
+    let path = dir.join("dayfly.env");
+    std::fs::write(
+        &path,
+        "S3_ENDPOINT=https://s3.example.invalid\nS3_BUCKET=bucket\nS3_ACCESS_KEY_ID=key\nS3_SECRET_ACCESS_KEY=secret\nDAYFLY_HTTP_BEARER_TOKEN=direct-token\nDAYFLY_HTTP_BEARER_TOKEN_FILE=bearer-token\n",
+    )
+    .expect("the env file must be writable");
+
+    let error = match Config::from_env_file(Some(&path)) {
+        Ok(_) => panic!("two token sources must fail"),
+        Err(error) => error,
+    };
+    match error {
+        ConfigError::ConflictingCredentialSources {
+            variable,
+            file_variable,
+        } => {
+            assert_eq!(variable, "DAYFLY_HTTP_BEARER_TOKEN");
+            assert_eq!(file_variable, "DAYFLY_HTTP_BEARER_TOKEN_FILE");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn empty_bearer_token_file_names_the_path() {
+    let _guard = lock_env();
+    clear_env();
+    let dir = temp_env_dir("bearer-empty");
+    let token_path = dir.join("bearer-token");
+    std::fs::write(&token_path, "\n").expect("the token file must be writable");
+    let path = dir.join("dayfly.env");
+    std::fs::write(
+        &path,
+        "S3_ENDPOINT=https://s3.example.invalid\nS3_BUCKET=bucket\nS3_ACCESS_KEY_ID=key\nS3_SECRET_ACCESS_KEY=secret\nDAYFLY_HTTP_BEARER_TOKEN_FILE=bearer-token\n",
+    )
+    .expect("the env file must be writable");
+
+    let error = match Config::from_env_file(Some(&path)) {
+        Ok(_) => panic!("an empty token file must fail"),
+        Err(error) => error,
+    };
+    match error {
+        ConfigError::EmptyCredentialFile {
+            file_variable,
+            path: error_path,
+        } => {
+            assert_eq!(file_variable, "DAYFLY_HTTP_BEARER_TOKEN_FILE");
+            assert_eq!(error_path, token_path.display().to_string());
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    let _ = std::fs::remove_dir_all(dir);
 }
