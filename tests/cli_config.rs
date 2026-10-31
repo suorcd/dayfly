@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use dayfly::config::Config;
+
 fn temp_env_file(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
         "dayfly-cli-config-{}-{name}.env",
@@ -115,4 +117,115 @@ fn process_environment_wins_over_the_config_file() {
         "the process environment must win: {stderr}"
     );
     let _ = std::fs::remove_file(path);
+}
+
+fn temp_config_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("dayfly-cli-init-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+#[test]
+fn config_init_writes_a_parseable_private_file() {
+    let dir = temp_config_dir("private");
+    let path = dir.join("dayfly.env");
+
+    let output = command()
+        .arg("config")
+        .arg("init")
+        .arg("--out")
+        .arg(&path)
+        .output()
+        .expect("config init must run");
+    assert!(
+        output.status.success(),
+        "config init must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Wrote"), "got: {stdout}");
+    assert!(stdout.contains("S3_ENDPOINT"), "got: {stdout}");
+    assert!(path.exists());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    let config = Config::from_env_file(Some(&path)).expect("the generated file must parse");
+    assert_eq!(config.bucket, "pastebin-test");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn config_init_refuses_to_replace_without_force() {
+    let dir = temp_config_dir("refuse");
+    let path = dir.join("dayfly.env");
+    let args = ["config", "init", "--out"];
+    let first = command()
+        .args(args)
+        .arg(&path)
+        .output()
+        .expect("config init must run");
+    assert!(first.status.success());
+    let original = std::fs::read_to_string(&path).expect("the file must exist");
+    std::fs::write(&path, "S3_BUCKET=changed\n").expect("the file must be writable");
+
+    let second = command()
+        .args(args)
+        .arg(&path)
+        .output()
+        .expect("config init must run");
+    assert!(!second.status.success(), "a second run must fail");
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(stderr.contains("already exists"), "got: {stderr}");
+    assert_ne!(
+        std::fs::read_to_string(&path).expect("the file must still exist"),
+        original,
+        "the existing file must not be replaced"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn config_init_force_replaces_an_existing_file() {
+    let dir = temp_config_dir("force");
+    let path = dir.join("dayfly.env");
+    std::fs::create_dir_all(&dir).expect("the directory must be creatable");
+    std::fs::write(&path, "S3_BUCKET=changed\n").expect("the file must be writable");
+
+    let output = command()
+        .arg("config")
+        .arg("init")
+        .arg("--out")
+        .arg(&path)
+        .arg("--force")
+        .output()
+        .expect("config init must run");
+    assert!(
+        output.status.success(),
+        "config init --force must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(std::fs::read_to_string(&path)
+        .expect("the file must exist")
+        .contains("S3_BUCKET=pastebin-test"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn env_file_name_is_gitignored() {
+    let ignore = include_str!("../.gitignore");
+    assert!(
+        ignore.lines().any(|line| line.trim() == ".env"),
+        "the .env name must be ignored"
+    );
 }
