@@ -46,7 +46,8 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::http::{
-    check_auth, read_metadata_field, AppState, MultipartFieldError, MULTIPART_METADATA_MAX_BYTES,
+    check_auth, read_metadata_field, status_for, AppState, MultipartFieldError,
+    MULTIPART_METADATA_MAX_BYTES,
 };
 use crate::store::{parse_list_window_request, ListWindowRequest, StoreError, Ttl};
 
@@ -137,8 +138,16 @@ fn days_remaining(expires_at: Option<DateTime<Utc>>) -> String {
 }
 
 fn ttl_options(selected: u32) -> String {
+    let mut days = vec![1u32, 3, 7, 14, 30, 90];
+    if !days.contains(&selected) {
+        // The configured default can be any positive day count. Render it
+        // even when it is not one of the common choices, so the browser
+        // cannot silently fall back to the first option.
+        days.push(selected);
+        days.sort_unstable();
+    }
     let mut out = String::new();
-    for days in [1u32, 3, 7, 14, 30, 90] {
+    for days in days {
         let sel = if days == selected { " selected" } else { "" };
         out.push_str(&format!(
             "<option value=\"{days}\"{sel}>{days} day{}</option>",
@@ -296,13 +305,8 @@ fn success_page(id: &str, content_type: &str, size: u64, expires_at: DateTime<Ut
 }
 
 fn error_page(e: StoreError) -> Response {
-    let (status, msg) = match &e {
-        StoreError::TooLarge { .. } => (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()),
-        StoreError::NotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
-        StoreError::Expired(_) => (StatusCode::GONE, e.to_string()),
-        StoreError::AliasUnavailable { .. } => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        _ => (StatusCode::BAD_REQUEST, e.to_string()),
-    };
+    let status = status_for(&e);
+    let msg = e.to_string();
     (
         status,
         page(
@@ -674,7 +678,7 @@ mod tests {
         let auth = format!("Bearer {TEST_TOKEN}");
         assert_eq!(
             ui_list_status(state, Some(&auth)).await,
-            StatusCode::BAD_REQUEST,
+            StatusCode::BAD_GATEWAY,
             "the right token must pass auth and reach the S3 sink"
         );
     }
@@ -684,8 +688,20 @@ mod tests {
         let state = test_state(None).await;
         assert_eq!(
             ui_list_status(state, None).await,
-            StatusCode::BAD_REQUEST,
+            StatusCode::BAD_GATEWAY,
             "an unset token must leave the UI routes open"
+        );
+    }
+
+    #[test]
+    fn error_page_uses_the_shared_status_mapping() {
+        assert_eq!(
+            error_page(StoreError::Io("disk".to_string())).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            error_page(StoreError::S3("s3".to_string())).status(),
+            StatusCode::BAD_GATEWAY
         );
     }
 
