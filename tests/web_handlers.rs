@@ -224,6 +224,26 @@ async fn text_submit_over_cap_returns_413_error_page() {
 async fn upload_submit_creates_a_paste_with_form_ttl() {
     let fake = FakeS3::start().await;
     let app = common::app(fake.store().await);
+
+    let request = common::request("GET", "/", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let rendered = html_text(&body);
+    let upload_form = rendered
+        .split("action=\"/ui/upload\"")
+        .nth(1)
+        .expect("the upload form must be rendered");
+    let ttl_position = upload_form
+        .find("name=\"ttl_days\"")
+        .expect("the upload form must render the TTL selector");
+    let file_position = upload_form
+        .find("name=\"file\"")
+        .expect("the upload form must render the file input");
+    assert!(
+        ttl_position < file_position,
+        "the TTL selector must come before the file input, so the handler reads it: {upload_form}"
+    );
+
     let boundary = "web-boundary";
     let body = common::multipart_body(
         boundary,
@@ -280,6 +300,34 @@ async fn upload_submit_rejects_an_oversized_ttl_field() {
         fake.keys().is_empty(),
         "an oversized metadata field must store nothing: {:?}",
         fake.keys()
+    );
+}
+
+#[tokio::test]
+async fn upload_submit_uses_the_default_ttl_without_a_form_selection() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let boundary = "web-default-ttl";
+    let body = common::multipart_body(
+        boundary,
+        Some("default.txt"),
+        Some("text/plain"),
+        b"file body",
+        &[],
+    );
+    let headers = multipart_headers(boundary, body.len());
+
+    let request = common::request("POST", "/ui/upload", &headers, body);
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let id = id_from_success(&html_text(&body));
+    let object = fake
+        .object(&format!("pastes/{id}"))
+        .expect("the upload must be stored");
+    assert_eq!(
+        object.metadata.get("ttl-days").map(String::as_str),
+        Some("7"),
+        "an upload without a TTL selection must use the default"
     );
 }
 
