@@ -37,6 +37,7 @@ use crate::store::{
     parse_list_window_request, parse_range_header, ListWindowRequest, Store, StoreError, Ttl,
     TtlParseError, MULTIPART_CHUNK_BYTES,
 };
+use crate::web::api_write_allowed;
 
 /// Maximum bytes for one multipart metadata text field.
 ///
@@ -159,6 +160,17 @@ fn bad_request(message: String) -> Response {
     (
         StatusCode::BAD_REQUEST,
         Json(serde_json::json!({"error": message})),
+    )
+        .into_response()
+}
+
+/// A browser write whose origin does not match the request host.
+fn forbidden_write() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "forbidden: request origin does not match the Host header"
+        })),
     )
         .into_response()
 }
@@ -339,6 +351,9 @@ async fn upload_dispatch(
 ) -> Response {
     if let Err(resp) = check_auth(&state, &headers) {
         return resp;
+    }
+    if !api_write_allowed(&headers) {
+        return forbidden_write();
     }
     let content_type = header_str(&headers, CONTENT_TYPE.as_str()).unwrap_or_default();
     if content_type.starts_with("multipart/form-data") {
@@ -821,6 +836,9 @@ pub fn mcp_router(state: AppState) -> Router<AppState> {
 async fn append_inner(state: &AppState, headers: &HeaderMap, id: &str, req: Request) -> Response {
     if let Err(resp) = check_auth(state, headers) {
         return resp;
+    }
+    if !api_write_allowed(headers) {
+        return forbidden_write();
     }
     let limit = state.store.config.max_text_bytes;
     if let Some(len) =
