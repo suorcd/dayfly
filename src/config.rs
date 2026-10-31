@@ -258,6 +258,25 @@ where
     }
 }
 
+/// Read an optional credential from a direct value or a file.
+fn optional_credential<F>(lookup: &F, name: &str) -> Result<Option<String>, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let file_variable = format!("{name}_FILE");
+    let direct = lookup(name).filter(|value| !value.trim().is_empty());
+    let file_path = lookup(&file_variable).filter(|value| !value.trim().is_empty());
+    match (direct, file_path) {
+        (Some(_), Some(_)) => Err(ConfigError::ConflictingCredentialSources {
+            variable: name.to_string(),
+            file_variable,
+        }),
+        (Some(value), None) => Ok(Some(value)),
+        (None, Some(path)) => read_credential_file(&file_variable, path.trim()).map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
 fn read_credential_file(file_variable: &str, path: &str) -> Result<String, ConfigError> {
     let map_error = |source| ConfigError::CredentialFileRead {
         file_variable: file_variable.to_string(),
@@ -280,6 +299,30 @@ fn read_credential_file(file_variable: &str, path: &str) -> Result<String, Confi
         });
     }
     Ok(value.to_string())
+}
+
+/// Resolve relative secret-file paths against the env file directory.
+fn resolve_secret_paths(values: &mut HashMap<String, String>, base: Option<&Path>) {
+    let Some(base) = base else {
+        return;
+    };
+    let base = if base.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        base
+    };
+    for name in [
+        "S3_ACCESS_KEY_ID_FILE",
+        "S3_SECRET_ACCESS_KEY_FILE",
+        "DAYFLY_HTTP_BEARER_TOKEN_FILE",
+    ] {
+        if let Some(value) = values.get_mut(name) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() && Path::new(trimmed).is_relative() {
+                *value = base.join(trimmed).to_string_lossy().into_owned();
+            }
+        }
+    }
 }
 
 /// Read one environment file.
@@ -538,10 +581,15 @@ impl Config {
     /// A process environment variable wins over the same name in the file.
     /// The file format is one `NAME=VALUE` pair per line. Blank lines and
     /// lines that start with `#` are ignored. A leading `export` and one
-    /// pair of matching single or double quotes are accepted.
+    /// pair of matching single or double quotes are accepted. A relative
+    /// secret-file path in the file resolves against the file directory.
     pub fn from_env_file(path: Option<&Path>) -> Result<Self, ConfigError> {
         let file_values = match path {
-            Some(path) => Some(read_env_file(path)?),
+            Some(path) => {
+                let mut values = read_env_file(path)?;
+                resolve_secret_paths(&mut values, path.parent());
+                Some(values)
+            }
             None => None,
         };
         Self::from_lookup(|name| {
@@ -611,7 +659,10 @@ impl Config {
                 "DAYFLY_HTTP_BIND",
                 field_default("DAYFLY_HTTP_BIND").unwrap_or("127.0.0.1:8080"),
             ),
-            http_bearer_token: bearer_token(lookup("DAYFLY_HTTP_BEARER_TOKEN"))?,
+            http_bearer_token: bearer_token(optional_credential(
+                &lookup,
+                "DAYFLY_HTTP_BEARER_TOKEN",
+            )?)?,
             mcp_local_root: local_root(lookup("DAYFLY_MCP_LOCAL_ROOT"))?,
         })
     }

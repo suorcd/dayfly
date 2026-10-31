@@ -114,6 +114,7 @@ fn check_config_file(path: Option<PathBuf>, explicit: bool, strict: bool) -> any
         let file_value = match field.name {
             "S3_ACCESS_KEY_ID" => lookup("S3_ACCESS_KEY_ID_FILE"),
             "S3_SECRET_ACCESS_KEY" => lookup("S3_SECRET_ACCESS_KEY_FILE"),
+            "DAYFLY_HTTP_BEARER_TOKEN" => lookup("DAYFLY_HTTP_BEARER_TOKEN_FILE"),
             _ => None,
         };
         let value = lookup(field.name).or_else(|| file_value.clone());
@@ -158,6 +159,7 @@ fn check_config_file(path: Option<PathBuf>, explicit: bool, strict: bool) -> any
     for (direct, file) in [
         ("S3_ACCESS_KEY_ID", "S3_ACCESS_KEY_ID_FILE"),
         ("S3_SECRET_ACCESS_KEY", "S3_SECRET_ACCESS_KEY_FILE"),
+        ("DAYFLY_HTTP_BEARER_TOKEN", "DAYFLY_HTTP_BEARER_TOKEN_FILE"),
     ] {
         let direct_value = lookup(direct);
         let file_value = lookup(file);
@@ -254,7 +256,7 @@ fn config_template() -> String {
         }
     }
     out.push_str(
-        "#\n# Secret file alternatives. Do not set both forms for one credential.\n# S3_ACCESS_KEY_ID_FILE=/home/you/.config/dayfly/access-key-id\n# S3_SECRET_ACCESS_KEY_FILE=/home/you/.config/dayfly/secret-access-key\n",
+        "#\n# Secret file alternatives. Do not set both forms for one credential.\n# S3_ACCESS_KEY_ID_FILE=/home/you/.config/dayfly/access-key-id\n# S3_SECRET_ACCESS_KEY_FILE=/home/you/.config/dayfly/secret-access-key\n# DAYFLY_HTTP_BEARER_TOKEN_FILE=/home/you/.config/dayfly/bearer-token\n",
     );
     out
 }
