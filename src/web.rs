@@ -205,6 +205,19 @@ fn same_origin_allowed(headers: &HeaderMap) -> bool {
         && authority.port_u16().unwrap_or(default_port) == host.port_u16().unwrap_or(default_port)
 }
 
+/// Allow API writes from non-browser clients, but reject a browser request
+/// whose `Origin` or `Referer` does not match `Host`.
+///
+/// A request with neither header has no browser origin information, so curl
+/// and other non-browser clients keep working. A browser form normally sends
+/// at least one of the two headers.
+pub(crate) fn api_write_allowed(headers: &HeaderMap) -> bool {
+    if headers.get(ORIGIN).is_none() && headers.get(REFERER).is_none() {
+        return true;
+    }
+    same_origin_allowed(headers)
+}
+
 fn forbidden_page() -> Response {
     (
         StatusCode::FORBIDDEN,

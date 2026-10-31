@@ -1134,6 +1134,105 @@ async fn empty_upload_and_zero_length_download() {
 }
 
 #[tokio::test]
+async fn cross_origin_api_upload_is_forbidden() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let body = b"cross-site paste".to_vec();
+    let request = common::request(
+        "POST",
+        "/upload?format=json",
+        &[
+            ("host", "localhost".to_string()),
+            ("origin", "http://evil.example".to_string()),
+            content_length(body.len()),
+        ],
+        body,
+    );
+
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a cross-origin write must be refused, got: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(fake.keys().is_empty(), "a refused write must store nothing");
+}
+
+#[tokio::test]
+async fn cross_site_referer_api_upload_is_forbidden() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let body = b"cross-site paste".to_vec();
+    let request = common::request(
+        "POST",
+        "/upload?format=json",
+        &[
+            ("host", "localhost".to_string()),
+            ("referer", "http://evil.example/page".to_string()),
+            content_length(body.len()),
+        ],
+        body,
+    );
+
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(fake.keys().is_empty(), "a refused write must store nothing");
+}
+
+#[tokio::test]
+async fn same_origin_api_upload_is_allowed() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let body = b"same-origin paste".to_vec();
+    let request = common::request(
+        "POST",
+        "/upload?format=json",
+        &[
+            ("host", "localhost".to_string()),
+            ("origin", "http://localhost".to_string()),
+            content_length(body.len()),
+        ],
+        body,
+    );
+
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn cross_origin_api_append_is_forbidden() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"base", None, Some("text/plain"), None)
+        .await
+        .expect("the base paste must store");
+    let app = common::app(store);
+    let body = b"cross-site append".to_vec();
+    let request = common::request(
+        "POST",
+        &format!("/v1/pastes/{}/append?format=json", stored.id),
+        &[
+            ("host", "localhost".to_string()),
+            ("origin", "http://evil.example".to_string()),
+            content_length(body.len()),
+        ],
+        body,
+    );
+
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        !fake
+            .keys()
+            .iter()
+            .any(|key| key.starts_with(&format!("{}/", stored.key))),
+        "a refused append must write no segment"
+    );
+}
+
+#[tokio::test]
 async fn cross_origin_preflight_is_not_answered_for_upload() {
     // The API has no CORS layer. This test records the current behaviour so
     // a future CORS change is a deliberate test change.

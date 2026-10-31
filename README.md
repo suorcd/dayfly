@@ -755,8 +755,15 @@ The server returns 403 when both headers are absent. It also returns
 not match `Host`. A scripted client must send `Origin` or `Referer`.
 A reverse proxy must preserve the public `Host` header.
 
-`GET` routes and the `/v1` API routes do not use this check. API
-clients use the bearer token and JSON.
+The API write routes (`POST /upload`, `POST /v1/pastes`, and the append
+routes) reject a request when an `Origin` or `Referer` header is present
+and does not match `Host`. They accept a request with neither header,
+so curl and other non-browser clients still work. A browser write
+normally sends at least one of these headers, so a cross-site form
+normally cannot create a paste or append bytes.
+
+`GET` routes and `DELETE` do not use this check. A browser `DELETE`
+needs a CORS preflight, which the server does not answer.
 
 ## Testing
 
