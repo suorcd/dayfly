@@ -1050,6 +1050,92 @@ async fn store_stream_rejects_known_length_over_cap_before_read() {
 }
 
 #[tokio::test]
+async fn store_stream_rejects_a_short_known_length_text_body() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let chunks: Vec<Result<Bytes, StoreError>> = vec![Ok(Bytes::from_static(b"short"))];
+
+    let error = store
+        .store_stream(stream::iter(chunks), None, None, None, Some(10), 1024)
+        .await
+        .expect_err("a short text body must fail");
+
+    let message = error.to_string();
+    assert!(message.contains("expected 10 bytes"), "got: {message}");
+    assert!(message.contains("received 5 bytes"), "got: {message}");
+    assert!(
+        fake.keys().is_empty(),
+        "a short body must store nothing: {:?}",
+        fake.keys()
+    );
+}
+
+#[tokio::test]
+async fn store_stream_rejects_a_short_known_length_multipart_body() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let expected = 6 * 1024 * 1024;
+    let chunks: Vec<Result<Bytes, StoreError>> = vec![Ok(Bytes::from_static(b"short"))];
+
+    let error = store
+        .store_stream(
+            stream::iter(chunks),
+            Some("short.bin"),
+            None,
+            None,
+            Some(expected),
+            1024 * 1024 * 1024,
+        )
+        .await
+        .expect_err("a short multipart body must fail");
+
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("expected {expected} bytes")),
+        "got: {message}"
+    );
+    assert!(message.contains("received 5 bytes"), "got: {message}");
+    assert!(
+        fake.keys().is_empty(),
+        "a short multipart body must store nothing: {:?}",
+        fake.keys()
+    );
+}
+
+#[tokio::test]
+async fn store_stream_accepts_a_matching_known_length_multipart_body() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let body = common::pattern_bytes(6 * 1024 * 1024);
+    let len = body.len() as u64;
+    let chunks: Vec<Result<Bytes, StoreError>> = body
+        .chunks(64 * 1024)
+        .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+        .collect();
+
+    let stored = store
+        .store_stream(
+            stream::iter(chunks),
+            Some("full.bin"),
+            None,
+            None,
+            Some(len),
+            1024 * 1024 * 1024,
+        )
+        .await
+        .expect("a matching multipart body must store");
+
+    assert_eq!(stored.size, len);
+    assert_eq!(
+        fake.object(&stored.key)
+            .expect("the object must exist")
+            .body
+            .len() as u64,
+        len
+    );
+}
+
+#[tokio::test]
 async fn store_stream_disconnect_aborts_and_returns_no_url_material() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;

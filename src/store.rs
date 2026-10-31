@@ -62,6 +62,8 @@ pub enum StoreError {
     Expired(String),
     #[error("payload too large: limit is {limit} bytes")]
     TooLarge { limit: u64 },
+    #[error("upload length mismatch: expected {expected} bytes, received {actual} bytes")]
+    LengthMismatch { expected: u64, actual: u64 },
     #[error("invalid id: {0}")]
     InvalidId(String),
     #[error("invalid date (expected YYYY-MM-DD): {0}")]
@@ -1771,6 +1773,12 @@ impl Store {
         // its cap can be much larger.
         if filename.is_none_or(|name| name.trim().is_empty()) {
             let body = collect_stream_body(stream, max_bytes).await?;
+            if let Some(expected) = known_length {
+                let actual = body.len() as u64;
+                if actual != expected {
+                    return Err(StoreError::LengthMismatch { expected, actual });
+                }
+            }
             return self.store_text(&body, None, content_type, Some(ttl)).await;
         }
         let created_at = Utc::now();
