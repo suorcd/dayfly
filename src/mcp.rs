@@ -430,9 +430,19 @@ impl Pastebin {
         Parameters(params): Parameters<FetchFileParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let range = match (params.range_start, params.range_end) {
+            (Some(s), Some(e)) if s > e => {
+                return store_error_result(StoreError::InvalidRange(
+                    "range end before start".to_string(),
+                ));
+            }
             (Some(s), Some(e)) => Some((s, e)),
             (Some(s), None) => Some((s, u64::MAX)),
-            _ => None,
+            (None, Some(_)) => {
+                return store_error_result(StoreError::InvalidRange(
+                    "range end requires range start".to_string(),
+                ));
+            }
+            (None, None) => None,
         };
         let dest = match local_write_path(&self.local, &params.dest_path).await {
             Ok(dest) => dest,

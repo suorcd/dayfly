@@ -2022,6 +2022,13 @@ impl Store {
         dest: &Path,
         range: Option<(u64, u64)>,
     ) -> Result<PasteMetadata, StoreError> {
+        if let Some((start, end)) = range {
+            if start > end {
+                return Err(StoreError::InvalidRange(
+                    "range end before start".to_string(),
+                ));
+            }
+        }
         let meta = self.head_metadata(id).await?;
         Self::check_not_expired(&meta)?;
         let (start, end) = match range {
