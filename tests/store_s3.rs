@@ -2372,6 +2372,127 @@ async fn concurrent_appends_write_distinct_segments_and_both_read_back() {
     assert_eq!(slice.total_bytes, 17);
 }
 
+// --- Issue #72: bound local-file reads and detect changes ---
+
+/// A small file that grows past one chunk must switch to multipart instead
+/// of being buffered whole.
+#[tokio::test]
+async fn store_file_path_switches_to_multipart_when_a_file_grows_past_one_chunk() {
+    let fake = FakeS3::start().await;
+    let max_file = (MULTIPART_CHUNK_BYTES + 1024 * 1024) as u64;
+    let store = fake.store_with_caps(1024, max_file).await;
+    let path = common::write_temp_file("grow-past-chunk.bin", &common::pattern_bytes(32));
+
+    fake.hold(Gate::HeadObject);
+    let task = tokio::spawn({
+        let store = store.clone();
+        let path = path.clone();
+        async move {
+            store
+                .store_file_path(&path, Some("grow.bin"), None, None)
+                .await
+        }
+    });
+
+    fake.wait_until_blocked(Gate::HeadObject).await;
+    append_to_file(&path, &common::pattern_bytes(MULTIPART_CHUNK_BYTES + 1));
+    fake.release();
+
+    let stored = task
+        .await
+        .expect("the store task must not panic")
+        .expect("a file that is still under the cap must store");
+    let expected = (32 + MULTIPART_CHUNK_BYTES + 1) as u64;
+    assert_eq!(stored.size, expected);
+    assert!(
+        fake.requests()
+            .iter()
+            .any(|request| request.query.contains("uploads")),
+        "a file that grew past one chunk must use multipart"
+    );
+    assert_eq!(
+        fake.object(&stored.key)
+            .expect("the object must exist")
+            .body
+            .len() as u64,
+        expected
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+/// A same-length overwrite at CreateMultipartUpload must leave no paste.
+#[tokio::test]
+async fn store_file_path_rejects_a_same_length_change_during_a_multipart_upload() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let len = MULTIPART_CHUNK_BYTES + 4096;
+    let path = common::write_temp_file("same-length-change.bin", &common::pattern_bytes(len));
+
+    fake.hold(Gate::CreateMultipartUpload);
+    let task = tokio::spawn({
+        let store = store.clone();
+        let path = path.clone();
+        async move {
+            store
+                .store_file_path(&path, Some("changing.bin"), None, None)
+                .await
+        }
+    });
+
+    fake.wait_until_blocked(Gate::CreateMultipartUpload).await;
+    std::fs::write(&path, vec![b'z'; len]).expect("the same-length overwrite must succeed");
+    fake.release();
+
+    let result = task.await.expect("the store task must not panic");
+    assert!(
+        result.is_err(),
+        "a same-length change must fail, got {result:?}"
+    );
+    assert!(
+        fake.keys().is_empty(),
+        "a same-length change must leave no object and no alias: {:?}",
+        fake.keys()
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+/// A multipart file that grows past the cap at HeadObject must be rejected.
+#[tokio::test]
+async fn store_file_path_rejects_a_multipart_file_that_grows_past_the_cap() {
+    let fake = FakeS3::start().await;
+    let len = MULTIPART_CHUNK_BYTES + 1;
+    let max_file = (len + 1024) as u64;
+    let store = fake.store_with_caps(1024, max_file).await;
+    let path = common::write_temp_file("multipart-grow-past-cap.bin", &common::pattern_bytes(len));
+
+    fake.hold(Gate::HeadObject);
+    let task = tokio::spawn({
+        let store = store.clone();
+        let path = path.clone();
+        async move {
+            store
+                .store_file_path(&path, Some("grow.bin"), None, None)
+                .await
+        }
+    });
+
+    fake.wait_until_blocked(Gate::HeadObject).await;
+    append_to_file(&path, &common::pattern_bytes(4096));
+    fake.release();
+
+    let result = task.await.expect("the store task must not panic");
+    assert!(
+        matches!(result, Err(StoreError::TooLarge { limit }) if limit == max_file),
+        "a multipart file that grew past the cap must be rejected, got {result:?}"
+    );
+    assert!(
+        fake.keys().is_empty(),
+        "a rejected file must store nothing: {:?}",
+        fake.keys()
+    );
+    let _ = std::fs::remove_file(path);
+}
+
 // --- Issue #58: one stable snapshot for size, hash, and bytes ---
 
 /// Append to a file while a store call is parked inside a request.
