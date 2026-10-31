@@ -6,7 +6,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::Router;
 use chrono::{DateTime, Duration, Utc};
 use common::{FailOp, FakeS3};
-use dayfly::http::{api_router, app_router, AppState};
+use dayfly::http::{api_router, app_router, AppState, MULTIPART_METADATA_MAX_BYTES};
 use dayfly::store::{normalize_words, Store, Ttl};
 use serde_json::{json, Value};
 
@@ -355,6 +355,40 @@ async fn multipart_upload_reads_form_fields_and_enforces_caps() {
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(String::from_utf8_lossy(&body).contains("requires a 'file' field"));
+}
+
+#[tokio::test]
+async fn multipart_metadata_fields_are_bounded() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let boundary = "metadata-boundary";
+    let oversized = "a".repeat(MULTIPART_METADATA_MAX_BYTES + 1);
+
+    for field_name in ["filename", "ttl", "ttl_days"] {
+        let body = common::multipart_body(
+            boundary,
+            Some("small.txt"),
+            Some("text/plain"),
+            b"body",
+            &[(field_name, oversized.as_str())],
+        );
+        let mut headers = multipart_headers(boundary);
+        headers.push(content_length(body.len()));
+        headers.push(("host", "dayfly.test".to_string()));
+        let request = common::request("POST", "/upload?format=json", &headers, body);
+        let (status, _, body) = common::send(&app, request).await;
+        assert_eq!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "an oversized {field_name} field must be a 413, got: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            fake.keys().is_empty(),
+            "an oversized {field_name} field must store nothing: {:?}",
+            fake.keys()
+        );
+    }
 }
 
 #[tokio::test]

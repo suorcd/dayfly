@@ -5,6 +5,7 @@ mod common;
 use axum::http::{header, StatusCode};
 use chrono::{Duration, Utc};
 use common::FakeS3;
+use dayfly::http::MULTIPART_METADATA_MAX_BYTES;
 use dayfly::store::Store;
 
 const TEST_HOST: &str = "localhost";
@@ -169,6 +170,36 @@ async fn upload_submit_creates_a_paste_with_form_ttl() {
     assert_eq!(
         object.metadata.get("ttl-days").map(String::as_str),
         Some("3")
+    );
+}
+
+#[tokio::test]
+async fn upload_submit_rejects_an_oversized_ttl_field() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let boundary = "web-metadata-boundary";
+    let oversized = "a".repeat(MULTIPART_METADATA_MAX_BYTES + 1);
+    let body = common::multipart_body(
+        boundary,
+        Some("small.txt"),
+        Some("text/plain"),
+        b"file body",
+        &[("ttl_days", oversized.as_str())],
+    );
+    let headers = multipart_headers(boundary, body.len());
+
+    let request = common::request("POST", "/ui/upload", &headers, body);
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "an oversized ttl_days field must be a 413, got: {}",
+        html_text(&body)
+    );
+    assert!(
+        fake.keys().is_empty(),
+        "an oversized metadata field must store nothing: {:?}",
+        fake.keys()
     );
 }
 

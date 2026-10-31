@@ -38,6 +38,43 @@ use crate::store::{
     TtlParseError, MULTIPART_CHUNK_BYTES,
 };
 
+/// Maximum bytes for one multipart metadata text field.
+///
+/// The upload routes disable the axum body limit, so a metadata field
+/// needs its own bound. The file field keeps the configured file cap.
+pub const MULTIPART_METADATA_MAX_BYTES: usize = 1024;
+
+/// Why a multipart metadata field could not be read.
+pub(crate) enum MultipartFieldError {
+    /// The field exceeded [`MULTIPART_METADATA_MAX_BYTES`].
+    TooLarge,
+    /// The multipart body failed, or the field was not UTF-8.
+    Malformed(String),
+}
+
+/// Read one multipart metadata field through a bounded reader.
+///
+/// `Field::text()` collects the complete field, and the upload routes
+/// disable the axum body limit. This helper stops at the metadata bound
+/// instead of buffering an arbitrary field.
+pub(crate) async fn read_metadata_field(
+    mut field: axum::extract::multipart::Field<'_>,
+) -> Result<String, MultipartFieldError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| MultipartFieldError::Malformed(e.to_string()))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MULTIPART_METADATA_MAX_BYTES {
+            return Err(MultipartFieldError::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| MultipartFieldError::Malformed("multipart field is not UTF-8".to_string()))
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Store,
@@ -415,15 +452,35 @@ async fn multipart_inner(
             };
         }
         if name == "filename" {
-            if let Ok(text) = field.text().await {
-                if !text.trim().is_empty() {
-                    filename = Some(text.trim().to_string());
+            match read_metadata_field(field).await {
+                Ok(text) => {
+                    if !text.trim().is_empty() {
+                        filename = Some(text.trim().to_string());
+                    }
+                }
+                Err(MultipartFieldError::TooLarge) => {
+                    return error_response(StoreError::TooLarge {
+                        limit: MULTIPART_METADATA_MAX_BYTES as u64,
+                    });
+                }
+                Err(MultipartFieldError::Malformed(message)) => {
+                    return bad_request(format!("invalid multipart body: {message}"));
                 }
             }
         } else if name == "ttl" || name == "ttl_days" {
-            if let Ok(text) = field.text().await {
-                if let Err(e) = ttl_selection.set(&name, &text) {
-                    return ttl_error_response(e);
+            match read_metadata_field(field).await {
+                Ok(text) => {
+                    if let Err(e) = ttl_selection.set(&name, &text) {
+                        return ttl_error_response(e);
+                    }
+                }
+                Err(MultipartFieldError::TooLarge) => {
+                    return error_response(StoreError::TooLarge {
+                        limit: MULTIPART_METADATA_MAX_BYTES as u64,
+                    });
+                }
+                Err(MultipartFieldError::Malformed(message)) => {
+                    return bad_request(format!("invalid multipart body: {message}"));
                 }
             }
         }
