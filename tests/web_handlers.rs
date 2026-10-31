@@ -4,7 +4,7 @@ mod common;
 
 use axum::http::{header, StatusCode};
 use chrono::{Duration, Utc};
-use common::{FailOp, FakeS3};
+use common::FakeS3;
 use dayfly::store::Store;
 
 const TEST_HOST: &str = "localhost";
@@ -467,7 +467,7 @@ async fn cross_site_form_post_is_forbidden() {
 async fn upload_error_page_never_shows_a_paste_url() {
     let fake = FakeS3::start().await;
     let app = common::app(fake.store().await);
-    fake.fail(FailOp::PutObject);
+    fake.fail_put_prefix("pastes/");
     let form = b"text=will+fail".to_vec();
 
     let request = common::request("POST", "/ui/text", &form_headers(form.len()), form);

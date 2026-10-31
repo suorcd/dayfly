@@ -366,7 +366,200 @@ async fn alias_allocation_fails_when_every_candidate_collides() {
 }
 
 #[tokio::test]
-async fn alias_write_failure_removes_the_text_base_object() {
+async fn concurrent_stores_cannot_claim_the_same_alias() {
+    let fake = FakeS3::start().await;
+    let candidate = "abacus-abdomen-zoology".to_string();
+    let store = fake
+        .store()
+        .await
+        .with_alias_candidates(vec![candidate.clone()]);
+    fake.hold(Gate::HeadObject);
+
+    let first = tokio::spawn({
+        let store = store.clone();
+        async move { store.store_text(b"first", None, None, None).await }
+    });
+    fake.wait_until_blocked(Gate::HeadObject).await;
+
+    let second = tokio::spawn({
+        let store = store.clone();
+        async move { store.store_text(b"second", None, None, None).await }
+    });
+
+    // On the old code both stores issue an alias HEAD and block. With
+    // the claim lock, the second store waits before its HEAD. Give it
+    // time to reach that point, then release.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    while tokio::time::Instant::now() < deadline {
+        let alias_heads = fake
+            .requests()
+            .iter()
+            .filter(|request| request.method == "HEAD" && request.path.contains("/words/"))
+            .count();
+        if alias_heads >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    fake.release();
+
+    let first = first.await.expect("the first store must not panic");
+    let second = second.await.expect("the second store must not panic");
+    let (winner, loser) = match (first, second) {
+        (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => (winner, loser),
+        (Ok(a), Ok(b)) => panic!("two stores returned aliases: {a:?} {b:?}"),
+        (Err(a), Err(b)) => panic!("both stores failed: {a:?} {b:?}"),
+    };
+    assert_eq!(winner.words.as_deref(), Some(candidate.as_str()));
+    assert!(
+        matches!(loser, StoreError::AliasUnavailable { .. }),
+        "the losing store must fail alias allocation, got {loser:?}"
+    );
+    let bases: Vec<String> = fake
+        .keys()
+        .into_iter()
+        .filter(|key| key.starts_with("pastes/"))
+        .collect();
+    assert_eq!(bases, vec![winner.key.clone()]);
+    let alias = fake
+        .object(&format!("words/{candidate}"))
+        .expect("the winner alias must remain");
+    assert_eq!(alias.body, winner.key.as_bytes());
+}
+
+#[tokio::test]
+async fn a_store_must_not_delete_an_alias_rebound_to_another_paste() {
+    let fake = FakeS3::start().await;
+    let candidate = "abacus-abdomen-zoology".to_string();
+    let store = fake
+        .store()
+        .await
+        .with_alias_candidates(vec![candidate.clone()]);
+    let other_key = "pastes/2026-10-28/other".to_string();
+    let other_meta = future_metadata(5);
+    fake.seed(
+        &other_key,
+        b"abcde",
+        "text/plain",
+        &common::metadata_refs(&other_meta),
+    );
+    let path = common::write_temp_file(
+        "alias-rebound.bin",
+        &common::pattern_bytes(MULTIPART_CHUNK_BYTES + 1),
+    );
+
+    fake.hold(Gate::CreateMultipartUpload);
+    let task = tokio::spawn({
+        let store = store.clone();
+        let path = path.clone();
+        async move {
+            store
+                .store_file_path(&path, Some("rebound.bin"), None, None)
+                .await
+        }
+    });
+    fake.wait_until_blocked(Gate::CreateMultipartUpload).await;
+
+    // The store has claimed the alias before the upload. Rebind it to
+    // another paste, as a second process could.
+    let alias_meta = [
+        ("kind".to_string(), "alias".to_string()),
+        ("target".to_string(), other_key.clone()),
+        (
+            "expires-at".to_string(),
+            "2999-01-01T00:00:00+00:00".to_string(),
+        ),
+    ];
+    fake.seed(
+        &format!("words/{candidate}"),
+        other_key.as_bytes(),
+        "text/plain",
+        &common::metadata_refs(&alias_meta),
+    );
+    fake.release();
+
+    let result = task.await.expect("the store task must not panic");
+    assert!(
+        matches!(result, Err(StoreError::AliasUnavailable { .. })),
+        "a rebound alias must fail the store, got {result:?}"
+    );
+    let alias = fake
+        .object(&format!("words/{candidate}"))
+        .expect("the other paste's alias must remain");
+    assert_eq!(alias.body, other_key.as_bytes());
+    let bases: Vec<String> = fake
+        .keys()
+        .into_iter()
+        .filter(|key| key.starts_with("pastes/"))
+        .collect();
+    assert_eq!(
+        bases,
+        vec![other_key.clone()],
+        "the failed paste must be removed"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn delete_by_id_keeps_an_alias_that_points_to_another_paste() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let date = "2026-10-28";
+    let words = "abacus-abdomen-zoology";
+    let a_key = format!("pastes/{date}/aaa");
+    let b_key = format!("pastes/{date}/bbb");
+    let mut a_meta = future_metadata(3);
+    a_meta.push(("words".to_string(), words.to_string()));
+    let b_meta = future_metadata(3);
+    fake.seed(
+        &a_key,
+        b"aaa",
+        "text/plain",
+        &common::metadata_refs(&a_meta),
+    );
+    fake.seed(
+        &b_key,
+        b"bbb",
+        "text/plain",
+        &common::metadata_refs(&b_meta),
+    );
+    let alias_meta = [
+        ("kind".to_string(), "alias".to_string()),
+        ("target".to_string(), b_key.clone()),
+        (
+            "expires-at".to_string(),
+            "2999-01-01T00:00:00+00:00".to_string(),
+        ),
+    ];
+    fake.seed(
+        &format!("words/{words}"),
+        b_key.as_bytes(),
+        "text/plain",
+        &common::metadata_refs(&alias_meta),
+    );
+
+    store
+        .delete(&format!("{date}/aaa"))
+        .await
+        .expect("delete must succeed");
+    assert!(
+        fake.object(&a_key).is_none(),
+        "the requested paste must be gone"
+    );
+    assert_eq!(
+        fake.object(&b_key)
+            .expect("the other paste must remain")
+            .body,
+        b"bbb"
+    );
+    let alias = fake
+        .object(&format!("words/{words}"))
+        .expect("the alias for the other paste must remain");
+    assert_eq!(alias.body, b_key.as_bytes());
+}
+
+#[tokio::test]
+async fn alias_write_failure_writes_no_text_base_object() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
     fake.fail_put_prefix("words/");
@@ -378,13 +571,13 @@ async fn alias_write_failure_removes_the_text_base_object() {
     assert!(matches!(error, StoreError::S3(_)), "got {error:?}");
     assert!(
         fake.keys().is_empty(),
-        "the base object must be cleaned up: {:?}",
+        "the failed store must write no base object: {:?}",
         fake.keys()
     );
 }
 
 #[tokio::test]
-async fn alias_write_failure_after_a_stream_removes_the_base_object() {
+async fn alias_write_failure_writes_no_stream_base_object() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
     fake.fail_put_prefix("words/");
@@ -406,13 +599,13 @@ async fn alias_write_failure_after_a_stream_removes_the_base_object() {
     assert!(matches!(error, StoreError::S3(_)), "got {error:?}");
     assert!(
         fake.keys().is_empty(),
-        "the streamed base object must be cleaned up: {:?}",
+        "the failed store must write no streamed base object: {:?}",
         fake.keys()
     );
 }
 
 #[tokio::test]
-async fn alias_write_failure_after_a_multipart_upload_removes_the_base_object() {
+async fn alias_write_failure_writes_no_multipart_base_object() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
     let path = common::write_temp_file(
@@ -428,7 +621,7 @@ async fn alias_write_failure_after_a_multipart_upload_removes_the_base_object() 
     assert!(matches!(error, StoreError::S3(_)), "got {error:?}");
     assert!(
         fake.keys().is_empty(),
-        "the multipart base object must be cleaned up: {:?}",
+        "the failed store must write no multipart base object: {:?}",
         fake.keys()
     );
     let _ = std::fs::remove_file(path);
@@ -982,7 +1175,7 @@ async fn store_stream_no_filename_oversize_body_is_rejected_before_s3() {
 async fn store_stream_put_failure_returns_no_url_material() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
-    fake.fail(FailOp::PutObject);
+    fake.fail_put_prefix("pastes/");
     let items: Vec<Result<Bytes, StoreError>> = vec![Ok(Bytes::from_static(b"hello"))];
 
     let error = store
@@ -1671,6 +1864,7 @@ async fn append_writes_only_new_bytes_and_fetch_concatenates() {
         .expect("head must succeed")
         .expires_at;
     let puts_before = fake.puts().len();
+    let gets_before = fake.gets().len();
 
     let appended = store
         .append_text(&stored.id, b" world")
@@ -1688,8 +1882,9 @@ async fn append_writes_only_new_bytes_and_fetch_concatenates() {
         b" world".to_vec(),
         "append must write only the new bytes"
     );
-    assert!(
-        fake.gets().is_empty(),
+    assert_eq!(
+        fake.gets().len(),
+        gets_before,
         "append must not read the base object or any segment body"
     );
     assert_eq!(

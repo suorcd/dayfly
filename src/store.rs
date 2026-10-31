@@ -22,7 +22,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use aws_config::BehaviorVersion;
@@ -41,6 +41,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::Config;
 use crate::content_type::{detect_content_type, detect_content_type_sample, Detection};
@@ -944,6 +945,12 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+fn expires_at_for(created_at: DateTime<Utc>, ttl: Ttl) -> DateTime<Utc> {
+    created_at
+        .checked_add_signed(ttl.duration())
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
+}
+
 fn metadata_for(
     filename: Option<&str>,
     sha256: Option<&str>,
@@ -953,9 +960,7 @@ fn metadata_for(
     created_at: DateTime<Utc>,
     detection: &Detection,
 ) -> (HashMap<String, String>, DateTime<Utc>) {
-    let expires_at = created_at
-        .checked_add_signed(ttl.duration())
-        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+    let expires_at = expires_at_for(created_at, ttl);
     let mut meta = HashMap::new();
     if let Some(f) = filename {
         if !f.is_empty() {
@@ -1007,6 +1012,8 @@ pub struct Store {
     client: Client,
     pub bucket: String,
     pub config: Config,
+    alias_lock: Arc<AsyncMutex<()>>,
+    alias_candidates: Option<Arc<Vec<String>>>,
 }
 
 /// The S3 side of a streaming upload (see [`crate::stream::UploadSink`]).
@@ -1141,7 +1148,19 @@ impl Store {
             client: Client::from_conf(s3_config),
             bucket: config.bucket.clone(),
             config,
+            alias_lock: Arc::new(AsyncMutex::new(())),
+            alias_candidates: None,
         })
+    }
+
+    /// Use a fixed candidate order for alias allocation.
+    ///
+    /// Integration tests use this to force two stores to compete for one
+    /// phrase. Production code uses the random word generator.
+    #[doc(hidden)]
+    pub fn with_alias_candidates(mut self, candidates: Vec<String>) -> Self {
+        self.alias_candidates = Some(Arc::new(candidates));
+        self
     }
 
     /// True when an alias object already holds this phrase.
@@ -1164,8 +1183,13 @@ impl Store {
 
     /// Choose an unused alias from a small set of random candidates.
     async fn choose_alias(&self) -> Result<String, StoreError> {
-        self.choose_alias_from(std::iter::repeat_with(generate_words).take(ALIAS_ATTEMPTS))
-            .await
+        match &self.alias_candidates {
+            Some(candidates) => self.choose_alias_from(candidates.iter().cloned()).await,
+            None => {
+                self.choose_alias_from(std::iter::repeat_with(generate_words).take(ALIAS_ATTEMPTS))
+                    .await
+            }
+        }
     }
 
     /// Choose the first alias in `candidates` that no alias object holds.
@@ -1215,6 +1239,28 @@ impl Store {
         Ok(())
     }
 
+    /// Claim an alias for `key` before the base object is written.
+    ///
+    /// One process-wide lock covers the check and the write, so two
+    /// stores in one process cannot choose the same phrase. Garage
+    /// ignores conditional writes, so two processes can still race;
+    /// [`Self::verify_alias`] detects that case before a paste returns.
+    async fn claim_alias(
+        &self,
+        key: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<String, StoreError> {
+        let _guard = self.alias_lock.lock().await;
+        let words = self.choose_alias().await?;
+        if let Err(e) = self.write_alias(&words, key, expires_at).await {
+            // The write may have reached the bucket even when the SDK
+            // reports an error. Remove the alias only if it points here.
+            let _ = self.delete_alias_if_target(&words, key).await;
+            return Err(e);
+        }
+        Ok(words)
+    }
+
     async fn delete_alias_object(&self, phrase: &str) -> Result<(), StoreError> {
         let key = alias_key(phrase);
         self.client
@@ -1227,9 +1273,9 @@ impl Store {
         Ok(())
     }
 
-    /// Remove the base object and segments after a failed alias write.
+    /// Remove the base object and segments after a failed store.
     async fn cleanup_failed_store(&self, base_key: &str, phrase: &str) {
-        let _ = self.delete_alias_object(phrase).await;
+        let _ = self.delete_alias_if_target(phrase, base_key).await;
         let _ = self.delete_base_and_segments(base_key).await;
     }
 
@@ -1267,6 +1313,31 @@ impl Store {
             return Err(StoreError::NotFound(phrase.to_string()));
         }
         Ok(target)
+    }
+
+    /// Require that `phrase` still points to `key`.
+    ///
+    /// A second process can overwrite an alias because Garage ignores
+    /// conditional writes. Check the binding after the upload, before
+    /// the paste is returned.
+    async fn verify_alias(&self, phrase: &str, key: &str) -> Result<(), StoreError> {
+        match self.read_alias(phrase).await {
+            Ok(target) if target == key => Ok(()),
+            Ok(_) => Err(StoreError::AliasUnavailable { attempts: 1 }),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Delete an alias only when it still points to `target`.
+    ///
+    /// Cleanup and delete must not remove a phrase that another store
+    /// has rebound to a different paste.
+    async fn delete_alias_if_target(&self, phrase: &str, target: &str) -> Result<(), StoreError> {
+        match self.read_alias(phrase).await {
+            Ok(current) if current == target => self.delete_alias_object(phrase).await,
+            Ok(_) | Err(StoreError::NotFound(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Resolve a phrase to a live canonical key.
@@ -1329,7 +1400,7 @@ impl Store {
     async fn delete_by_words(&self, phrase: &str) -> Result<(), StoreError> {
         let target = self.read_alias(phrase).await?;
         self.delete_base_and_segments(&target).await?;
-        self.delete_alias_object(phrase).await
+        self.delete_alias_if_target(phrase, &target).await
     }
 
     /// Resolve a client ID to an S3 key.
@@ -1393,7 +1464,6 @@ impl Store {
             });
         }
         let ttl = ttl.unwrap_or_else(|| Ttl::days(self.config.default_ttl_days));
-        let words = self.choose_alias().await?;
         let created_at = Utc::now();
         let random_id = generate_random_id();
         let date = created_at.format("%Y-%m-%d").to_string();
@@ -1405,7 +1475,9 @@ impl Store {
         // after the first 8 KiB still makes the payload binary.
         let detection = detection_for(filename, content_type, text);
         let ct = detection.content_type.clone();
-        let (meta, expires_at) = metadata_for(
+        let expires_at = expires_at_for(created_at, ttl);
+        let words = self.claim_alias(&key, expires_at).await?;
+        let (meta, _) = metadata_for(
             filename,
             Some(&sha),
             Some(text.len() as u64),
@@ -1414,7 +1486,8 @@ impl Store {
             created_at,
             &detection,
         );
-        self.client
+        if let Err(e) = self
+            .client
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
@@ -1423,8 +1496,11 @@ impl Store {
             .set_metadata(Some(meta))
             .send()
             .await
-            .map_err(|e| map_sdk_error(e, &key))?;
-        if let Err(e) = self.write_alias(&words, &key, expires_at).await {
+        {
+            self.cleanup_failed_store(&key, &words).await;
+            return Err(map_sdk_error(e, &key));
+        }
+        if let Err(e) = self.verify_alias(&words, &key).await {
             self.cleanup_failed_store(&key, &words).await;
             return Err(e);
         }
@@ -1473,7 +1549,6 @@ impl Store {
             });
         }
         let ttl = ttl.unwrap_or_else(|| Ttl::days(self.config.default_ttl_days));
-        let words = self.choose_alias().await?;
         let created_at = Utc::now();
         let random_id = generate_random_id();
         let date = created_at.format("%Y-%m-%d").to_string();
@@ -1483,18 +1558,28 @@ impl Store {
                 .and_then(|n| n.to_str())
                 .map(|s| s.to_string())
         });
+        let expires_at = expires_at_for(created_at, ttl);
         if len as usize <= MULTIPART_CHUNK_BYTES {
             // One bounded read gives the body, the hash, and the size, so
             // text detection sees every byte. The read stops one byte past
             // the cap: a file that grew after the metadata call is
             // rejected instead of loaded whole.
             let mut bytes: Vec<u8> = Vec::with_capacity(len as usize);
-            let read = file
+            let words = self.claim_alias(&key, expires_at).await?;
+            let read = match file
                 .take(self.config.max_file_bytes.saturating_add(1))
                 .read_to_end(&mut bytes)
-                .await?;
+                .await
+            {
+                Ok(read) => read,
+                Err(e) => {
+                    self.cleanup_failed_store(&key, &words).await;
+                    return Err(e.into());
+                }
+            };
             let size = read as u64;
             if size > self.config.max_file_bytes {
+                self.cleanup_failed_store(&key, &words).await;
                 return Err(StoreError::TooLarge {
                     limit: self.config.max_file_bytes,
                 });
@@ -1502,7 +1587,7 @@ impl Store {
             let detection = detection_for(display_name.as_deref(), content_type, &bytes);
             let ct = detection.content_type.clone();
             let sha = sha256_hex(&bytes);
-            let (meta, expires_at) = metadata_for(
+            let (meta, _) = metadata_for(
                 display_name.as_deref(),
                 Some(&sha),
                 Some(size),
@@ -1511,7 +1596,8 @@ impl Store {
                 created_at,
                 &detection,
             );
-            self.client
+            if let Err(e) = self
+                .client
                 .put_object()
                 .bucket(&self.bucket)
                 .key(&key)
@@ -1520,8 +1606,11 @@ impl Store {
                 .set_metadata(Some(meta))
                 .send()
                 .await
-                .map_err(|e| map_sdk_error(e, &key))?;
-            if let Err(e) = self.write_alias(&words, &key, expires_at).await {
+            {
+                self.cleanup_failed_store(&key, &words).await;
+                return Err(map_sdk_error(e, &key));
+            }
+            if let Err(e) = self.verify_alias(&words, &key).await {
                 self.cleanup_failed_store(&key, &words).await;
                 return Err(e);
             }
@@ -1543,8 +1632,8 @@ impl Store {
         // CreateMultipartUpload, so the hash must be known first: hash the
         // bytes from this handle, then upload from the same handle and
         // require the uploaded bytes to match that hash. A file that
-        // changes in between fails the comparison, and the object is
-        // deleted before any alias is written.
+        // changes in between fails the comparison, and the object and its
+        // alias are deleted before any paste is returned.
         let sha = {
             let mut hasher = Sha256::new();
             let mut buf = vec![0u8; MULTIPART_CHUNK_BYTES];
@@ -1580,7 +1669,9 @@ impl Store {
             len <= crate::content_type::PEEK_BYTES as u64,
         );
         let ct = detection.content_type.clone();
-        let (meta, expires_at) = metadata_for(
+        file.seek(SeekFrom::Start(0)).await?;
+        let words = self.claim_alias(&key, expires_at).await?;
+        let (meta, _) = metadata_for(
             display_name.as_deref(),
             Some(&sha),
             Some(len),
@@ -1589,7 +1680,6 @@ impl Store {
             created_at,
             &detection,
         );
-        file.seek(SeekFrom::Start(0)).await?;
         let mut sink = AwsUploadSink {
             client: self.client.clone(),
             bucket: self.bucket.clone(),
@@ -1597,13 +1687,20 @@ impl Store {
             content_type: ct.clone(),
             metadata: meta,
         };
-        let outcome = crate::stream::run_streaming_upload(
+        let outcome = match crate::stream::run_streaming_upload(
             Box::pin(file_stream(file)),
             &mut sink,
             Some(len),
             self.config.max_file_bytes,
         )
-        .await?;
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                self.cleanup_failed_store(&key, &words).await;
+                return Err(e);
+            }
+        };
         if outcome.total_bytes != len || outcome.sha256 != sha {
             self.cleanup_failed_store(&key, &words).await;
             return Err(StoreError::Io(format!(
@@ -1611,7 +1708,7 @@ impl Store {
                 outcome.total_bytes, outcome.sha256
             )));
         }
-        if let Err(e) = self.write_alias(&words, &key, expires_at).await {
+        if let Err(e) = self.verify_alias(&words, &key).await {
             self.cleanup_failed_store(&key, &words).await;
             return Err(e);
         }
@@ -1676,7 +1773,6 @@ impl Store {
             let body = collect_stream_body(stream, max_bytes).await?;
             return self.store_text(&body, None, content_type, Some(ttl)).await;
         }
-        let words = self.choose_alias().await?;
         let created_at = Utc::now();
         let random_id = generate_random_id();
         let date = created_at.format("%Y-%m-%d").to_string();
@@ -1686,12 +1782,14 @@ impl Store {
             crate::content_type::detect_and_wrap(stream, content_type, filename, known_length)
                 .await;
         let ct = detection.content_type.clone();
+        let expires_at = expires_at_for(created_at, ttl);
+        let words = self.claim_alias(&key, expires_at).await?;
         // Metadata for the initial upload: filename, TTL, expiry, final
         // type and detection record. The hash and the final size are not
         // known yet. put_small adds both; for multipart, S3 stores the
         // size in ContentLength. S3 takes metadata only at
         // CreateMultipartUpload, so no later copy updates it.
-        let (initial_meta, expires_at) = metadata_for(
+        let (initial_meta, _) = metadata_for(
             display_name.as_deref(),
             None,
             None,
@@ -1708,9 +1806,16 @@ impl Store {
             metadata: initial_meta,
         };
         let outcome =
-            crate::stream::run_streaming_upload(wrapped, &mut sink, known_length, max_bytes)
-                .await?;
-        if let Err(e) = self.write_alias(&words, &key, expires_at).await {
+            match crate::stream::run_streaming_upload(wrapped, &mut sink, known_length, max_bytes)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    self.cleanup_failed_store(&key, &words).await;
+                    return Err(e);
+                }
+            };
+        if let Err(e) = self.verify_alias(&words, &key).await {
             self.cleanup_failed_store(&key, &words).await;
             return Err(e);
         }
@@ -2078,7 +2183,7 @@ impl Store {
         let words = self.base_words(&key).await?;
         self.delete_base_and_segments(&key).await?;
         if let Some(words) = words {
-            self.delete_alias_object(&words).await?;
+            self.delete_alias_if_target(&words, &key).await?;
         }
         Ok(())
     }
