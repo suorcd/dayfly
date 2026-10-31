@@ -55,6 +55,105 @@ pub struct Config {
     pub mcp_local_root: Option<PathBuf>,
 }
 
+/// One setting that the environment file template and the parser share.
+pub struct ConfigField {
+    pub name: &'static str,
+    /// The default value, or the placeholder for a required field.
+    pub value: Option<&'static str>,
+    pub required: bool,
+    pub help: &'static str,
+}
+
+/// The documented settings, in template order.
+pub const CONFIG_FIELDS: &[ConfigField] = &[
+    ConfigField {
+        name: "S3_ENDPOINT",
+        value: Some("https://s3.example.invalid:3900"),
+        required: true,
+        help: "Garage endpoint URL, http:// or https://",
+    },
+    ConfigField {
+        name: "S3_BUCKET",
+        value: Some("pastebin-test"),
+        required: true,
+        help: "Private bucket name",
+    },
+    ConfigField {
+        name: "S3_ACCESS_KEY_ID",
+        value: Some("EXAMPLE-ACCESS-KEY"),
+        required: true,
+        help: "Garage access key",
+    },
+    ConfigField {
+        name: "S3_SECRET_ACCESS_KEY",
+        value: Some("EXAMPLE-SECRET-KEY"),
+        required: true,
+        help: "Garage secret key",
+    },
+    ConfigField {
+        name: "S3_REGION",
+        value: Some("us-east-1"),
+        required: false,
+        help: "Signing placeholder for Garage",
+    },
+    ConfigField {
+        name: "DAYFLY_MAX_TEXT_BYTES",
+        value: Some("10485760"),
+        required: false,
+        help: "Maximum text paste size in bytes",
+    },
+    ConfigField {
+        name: "DAYFLY_MAX_FILE_BYTES",
+        value: Some("1073741824"),
+        required: false,
+        help: "Maximum file paste size in bytes",
+    },
+    ConfigField {
+        name: "DAYFLY_DEFAULT_TTL_DAYS",
+        value: Some("7"),
+        required: false,
+        help: "Default TTL in whole days",
+    },
+    ConfigField {
+        name: "DAYFLY_HTTP_BIND",
+        value: Some("127.0.0.1:8080"),
+        required: false,
+        help: "HTTP bind address",
+    },
+    ConfigField {
+        name: "DAYFLY_HTTP_BEARER_TOKEN",
+        value: None,
+        required: false,
+        help: "Optional bearer token for the HTTP endpoint",
+    },
+    ConfigField {
+        name: "DAYFLY_MCP_LOCAL_ROOT",
+        value: None,
+        required: false,
+        help: "Optional directory for the MCP local-path tools",
+    },
+];
+
+fn field_default(name: &str) -> Option<&'static str> {
+    CONFIG_FIELDS
+        .iter()
+        .find(|field| field.name == name)
+        .filter(|field| !field.required)
+        .and_then(|field| field.value)
+}
+
+fn field_u64(name: &str, fallback: u64) -> u64 {
+    field_default(name)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(fallback)
+}
+
+fn field_u32(name: &str, fallback: u32) -> u32 {
+    field_default(name)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(fallback)
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("missing required environment variable: {0}")]
@@ -441,7 +540,11 @@ impl Config {
         if bucket.is_empty() {
             return Err(ConfigError::EmptyBucket);
         }
-        let default_ttl_days = optional_u32(&lookup, "DAYFLY_DEFAULT_TTL_DAYS", 7)?;
+        let default_ttl_days = optional_u32(
+            &lookup,
+            "DAYFLY_DEFAULT_TTL_DAYS",
+            field_u32("DAYFLY_DEFAULT_TTL_DAYS", 7),
+        )?;
         if default_ttl_days == 0 {
             return Err(ConfigError::Invalid(
                 "DAYFLY_DEFAULT_TTL_DAYS".to_string(),
@@ -453,13 +556,29 @@ impl Config {
             bucket,
             // Region is a signing placeholder for S3-compatible stores such
             // as Garage. It is not hardcoded: the operator supplies it.
-            region: optional_string(&lookup, "S3_REGION", "us-east-1"),
+            region: optional_string(
+                &lookup,
+                "S3_REGION",
+                field_default("S3_REGION").unwrap_or("us-east-1"),
+            ),
             access_key_id: credential(&lookup, "S3_ACCESS_KEY_ID")?,
             secret_access_key: credential(&lookup, "S3_SECRET_ACCESS_KEY")?,
-            max_text_bytes: optional_u64(&lookup, "DAYFLY_MAX_TEXT_BYTES", 10 * 1024 * 1024)?,
-            max_file_bytes: optional_u64(&lookup, "DAYFLY_MAX_FILE_BYTES", 1024 * 1024 * 1024)?,
+            max_text_bytes: optional_u64(
+                &lookup,
+                "DAYFLY_MAX_TEXT_BYTES",
+                field_u64("DAYFLY_MAX_TEXT_BYTES", 10 * 1024 * 1024),
+            )?,
+            max_file_bytes: optional_u64(
+                &lookup,
+                "DAYFLY_MAX_FILE_BYTES",
+                field_u64("DAYFLY_MAX_FILE_BYTES", 1024 * 1024 * 1024),
+            )?,
             default_ttl_days,
-            http_bind: optional_string(&lookup, "DAYFLY_HTTP_BIND", "127.0.0.1:8080"),
+            http_bind: optional_string(
+                &lookup,
+                "DAYFLY_HTTP_BIND",
+                field_default("DAYFLY_HTTP_BIND").unwrap_or("127.0.0.1:8080"),
+            ),
             http_bearer_token: bearer_token(lookup("DAYFLY_HTTP_BEARER_TOKEN"))?,
             mcp_local_root: local_root(lookup("DAYFLY_MCP_LOCAL_ROOT"))?,
         })

@@ -195,7 +195,15 @@ The file holds one `NAME=VALUE` pair per line. Blank lines and lines
 that start with `#` are ignored. A leading `export` and one pair of
 matching single or double quotes are accepted. Never commit a real
 `.env`; copy `.env.example` to a path you choose and pass it with
-`--config`.
+`--config`. The `.env` name is in `.gitignore`.
+
+```sh
+dayfly config init --out ~/.config/dayfly/dayfly.env
+```
+
+`config init` writes the file and prints the required names. It refuses
+to replace an existing file unless you add `--force`. It creates a new
+parent directory with mode `0700` and the file with mode `0600`.
 
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
@@ -872,7 +880,7 @@ where `cargo --version`, `rustc --version`, and
 `rust-analyzer --version` all succeed.
 
 **Nix validation result:** `nix build` and the test suite were run on
-`x86_64-linux` against `nixos-unstable`: 342 passed and 2 ignored. On the stable
+`x86_64-linux` against `nixos-unstable`: 346 passed and 2 ignored. On the stable
 `nixos-25.11` branch the build fails before compilation with a
 rustc-too-old error naming 23 AWS crates, which is why the flake
 tracks unstable. Before this was built on a machine with Nix, an
