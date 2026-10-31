@@ -599,15 +599,19 @@ operation that takes an ID: fetch, metadata, append, and delete.
   `pastes/<date>/<id>`. Its metadata holds `target`, `expires-at`, and
   `kind=alias`. Lookup is O(1): one GetObject, then a HeadObject of
   the target.
-- Uniqueness: the store checks `words/<phrase>` before it writes the
-  alias. It retries up to 8 random phrases. If every attempt collides,
-  the store returns an error and writes no paste. The store does not
-  overwrite an existing alias.
+- Uniqueness: within one process, the store serializes the alias check
+  and write. It retries up to 8 random phrases. If every attempt
+  collides, the store returns an error and writes no paste. Two dayfly
+  processes that share one bucket can still race, because Garage
+  ignores conditional writes; run one writer per bucket for a strict
+  guarantee.
 - Expiry: the alias inherits the paste `expires-at`. It does not
   extend the TTL. An expired or missing paste does not resolve through
   its alias.
 - Delete: delete by ID or by alias. Either form removes the base
-  object, every segment, and the alias object.
+  object, every segment, and the alias object when the alias still
+  points to that paste. A phrase that another store has rebound is left
+  in place.
 - Legacy objects have no alias. They keep working by ID, and `words`
   is absent or null.
 - Entropy: three words give about 38.8 bits. The uniqueness check

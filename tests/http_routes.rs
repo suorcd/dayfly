@@ -847,7 +847,7 @@ async fn failed_uploads_return_an_error_and_never_a_paste_url() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
     let app = common::app(store);
-    fake.fail(FailOp::PutObject);
+    fake.fail_put_prefix("pastes/");
 
     let body = b"will fail".to_vec();
     let request = common::request(
