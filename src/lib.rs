@@ -2,7 +2,8 @@
 //!
 //! The binary uses this library. Integration tests use the same public
 //! modules to drive the S3 core, the HTTP router, and the human web
-//! router in process. The MCP server remains a stdio process.
+//! router in process. The MCP server is available over stdio and over
+//! streamable HTTP at `/mcp`.
 
 pub mod config;
 pub mod content_type;
