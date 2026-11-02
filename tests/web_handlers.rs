@@ -104,6 +104,7 @@ async fn index_page_renders_the_combined_form_and_the_default_ttl() {
     );
     assert!(page.contains("<option value=\"7\" selected>7 days</option>"));
     assert!(page.contains("The selector uses whole days"));
+    assert!(page.contains("~/dayfly $"));
     assert!(page.contains("&copy; 2026 suorcd"));
 }
 
