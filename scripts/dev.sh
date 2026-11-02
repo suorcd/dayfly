@@ -17,6 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
 BAO_PATH="${DAYFLY_BAO_PATH:-secret/service/lan/dayfly}"
+BAO_ADDR="${BAO_ADDR:-https://bao.k.ser.ink}"
 BIND="${DAYFLY_HTTP_BIND:-127.0.0.1:8080}"
 WATCH=false
 
@@ -35,6 +36,7 @@ Environment:
   DAYFLY_BAO_PATH    OpenBao KV path (default: secret/service/lan/dayfly)
   DAYFLY_HTTP_BIND   Bind address (default: 127.0.0.1:8080)
   RUST_LOG           Log filter (default: dayfly=info)
+  BAO_ADDR           OpenBao address (default: https://bao.k.ser.ink)
   BAO_TOKEN          OpenBao token; falls back to /run/openbao/token
 
 By default this uses the same dayfly-files bucket as the deployed
@@ -67,6 +69,8 @@ for cmd in bao jq cargo; do
     exit 1
   fi
 done
+
+export BAO_ADDR
 
 # The workstation OpenBao agent renews this token. Prefer a working
 # BAO_TOKEN, but fall back to the agent file when the exported token is

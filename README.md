@@ -337,8 +337,8 @@ DAYFLY_HTTP_BIND=127.0.0.1:8090 ./scripts/dev.sh
 
 The script reads `secret/service/lan/dayfly` by default, exports every field
 as an environment variable, and never prints secret values. It uses
-`BAO_TOKEN`, falling back to the workstation OpenBao agent token at
-`/run/openbao/token`.
+`BAO_ADDR` (default `https://bao.k.ser.ink`) and `BAO_TOKEN`, falling back to
+the workstation OpenBao agent token at `/run/openbao/token`.
 
 By default local runs share the same `dayfly-files` bucket as the deployed
 instance, so test pastes appear in the live listing until they expire or are
