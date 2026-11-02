@@ -72,7 +72,7 @@ pub struct Config {
 /// One setting that the environment file template and the parser share.
 pub struct ConfigField {
     pub name: &'static str,
-    /// The default value, or the placeholder for a required field.
+    /// The default value, or an example value for a required field.
     pub value: Option<&'static str>,
     pub required: bool,
     pub help: &'static str,
@@ -108,7 +108,7 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         name: "S3_REGION",
         value: Some("us-east-1"),
         required: false,
-        help: "Signing placeholder for Garage",
+        help: "Signing region for Garage",
     },
     ConfigField {
         name: "DAYFLY_MAX_TEXT_BYTES",
@@ -686,7 +686,7 @@ impl Config {
         Ok(Self {
             endpoint,
             bucket,
-            // Region is a signing placeholder for S3-compatible stores such
+            // Region is a signing parameter for S3-compatible stores such
             // as Garage. It is not hardcoded: the operator supplies it.
             region: optional_string(
                 &lookup,

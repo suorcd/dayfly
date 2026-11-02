@@ -11,7 +11,7 @@ S3 core:
   `/view/<id>`), and the same MCP server over streamable HTTP at
   `/mcp`.
 
-There is **no database in v1, and no SQLite placeholder**. Listing and
+There is **no database in v1 and no SQLite stub**. Listing and
 info come from scanning the bucket directly. Listing uses ListObjectsV2
 for each UTC date in the window, then HeadObject per key where metadata
 is needed. See "No database in v1" below.
@@ -148,7 +148,7 @@ deduplication. These are the future SQLite triggers: they are the
 reasons a database would be added later. No database schema is
 invented in v1.
 
-### No database in v1 — the honest tradeoff
+### No database in v1 — the performance tradeoff
 
 Listing is O(n) in objects scanned, plus one HeadObject and one
 segment-prefix listing per paste (needed to recover expiry,
@@ -218,7 +218,7 @@ file permission warnings into faults.
 | `S3_ACCESS_KEY_ID_FILE` | one form | — | Path to a file that contains the Garage access key; set this variable or `S3_ACCESS_KEY_ID` |
 | `S3_SECRET_ACCESS_KEY` | one form | — | Garage secret key, held only by this binary; set this variable or `S3_SECRET_ACCESS_KEY_FILE` |
 | `S3_SECRET_ACCESS_KEY_FILE` | one form | — | Path to a file that contains the Garage secret key; set this variable or `S3_SECRET_ACCESS_KEY` |
-| `S3_REGION` | no | `us-east-1` | Signing placeholder for Garage; supply your own, do not rely on the default being "yours" |
+| `S3_REGION` | no | `us-east-1` | Signing region for Garage; supply your own, do not rely on the default being "yours" |
 | `DAYFLY_MAX_TEXT_BYTES` | no | 104857600 (100 MiB) | Max text paste size for MCP `store_text`, the human text form, and `POST /upload` without a filename; oversize → 413. A filename (including a multipart filename) uses `DAYFLY_MAX_FILE_BYTES` instead |
 | `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error. The maximum is 52428800000 bytes: 10,000 parts of 5 MiB |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1. The name and meaning are unchanged |
@@ -257,10 +257,9 @@ cargo run
 ./target/release/dayfly mcp
 ```
 
-Example MCP client config (placeholder binary path — replace with the
-real path on the machine where the binary is installed; no real paths
-to the user's machines are in this repo). The config contains paths
-only, not key material:
+Example MCP client config. Replace the binary path with the installed
+path on the machine that runs it. The config contains paths only, not
+key material:
 
 ```json
 {
@@ -621,10 +620,6 @@ object and leaves the base object unchanged.
 - `list_recent` reports the total size and does not show a segment as
   a paste.
 
-An earlier version wrote `pastes/<date>/<id>/<sequence>` with no
-suffix. No old segment data exists. This version does not read the
-unsuffixed name.
-
 Limits:
 
 - **Concurrent appends are lossless but unordered.** Two appends to the
@@ -932,8 +927,9 @@ nix build .#container   # OCI image tar in ./result
 
 The image runs `dayfly serve` on port 8080 as uid 65534. The container
 workflow publishes only `x86_64-linux` images. GitHub runners build that
-platform, and this pass does not add an emulated or native `aarch64-linux`
-builder. The flake still lists `aarch64-linux` for local builds.
+platform. A multi-platform image needs an emulated or native
+`aarch64-linux` builder; this workflow does not add one. The flake still
+lists `aarch64-linux` for local builds.
 
 What a pass looks like, on a machine with Nix: `nix flake check`
 exits 0 with no errors; `nix build` exits 0 and creates a
@@ -947,9 +943,7 @@ where `cargo --version`, `rustc --version`, and
 `x86_64-linux` against `nixos-unstable`: 376 passed and 2 ignored. On the stable
 `nixos-25.11` branch the build fails before compilation with a
 rustc-too-old error naming 23 AWS crates, which is why the flake
-tracks unstable. Before this was built on a machine with Nix, an
-earlier version of this note said the flake was unvalidated. That is
-no longer true and is corrected here rather than left standing.
+tracks unstable.
 
 Unit tests cover: key generation, ID validation (including
 traversal and segment-key rejection), range parsing, offset/limit
@@ -992,58 +986,58 @@ cargo test --test real_garage -- --ignored --test-threads=1
 
 `DAYFLY_TEST_S3_REGION` is optional and defaults to `us-east-1`.
 
-Use the same checklist for a real Garage instance:
+Run these checks against a real Garage instance:
 
-- [ ] Create a test bucket (or test prefix) separate from any
-      production data.
-- [ ] Store a text paste, fetch it back, fetch a byte range, fetch
-      metadata, append text, fetch the joined text and a range across
-      the base/segment boundary, confirm the total size and a null
-      `sha256`, delete it, and confirm that the base and segments are
-      gone.
-- [ ] Run two concurrent appends to one ID. Confirm that two segment
-      objects exist and that a read returns both chunks.
-- [ ] Verify path-style requests work (Garage uses path-style URLs,
-      not virtual-hosted style; the binary sets
-      `force_path_style = true`).
-- [ ] Verify that `If-None-Match` behaviour is **not** relied upon:
-      the binary never sends a conditional write for create-only
-      semantics; a new random ID is created per store.
-- [ ] Verify day TTL: store with `ttl_days=1`, confirm the paste is
-      readable before expiry and returns 410 / expired after the
-      stored `expires-at` passes.
-- [ ] Verify sub-day TTL: store with `X-TTL: 1h`, confirm the stored
-      `expires-at` is one hour after `created-at` and that the paste
-      returns 410 / expired after that time.
-- [ ] Verify a buffered text paste: pipe 20 KiB of text with
-      `cat text | curl --data-binary @- <base>/upload`, confirm
-      `text/plain; charset=utf-8` and an inline download.
-- [ ] Verify streaming file upload: pipe a file larger than 5 MiB with
-      `cat file | curl -H 'X-Filename: large.bin' --data-binary @- <base>/upload`,
-      confirm the returned URL streams back (Range download), and
-      confirm that killing the client mid-upload yields no URL and
-      leaves no completed object (an aborted multipart upload may
-      leave an incomplete upload for the lifecycle sweeper — see
-      below).
-- [ ] Verify content-type tagging: upload a PNG without an explicit
-      Content-Type (curl's default), confirm metadata shows
-      `image/png` with source `sniffed`; upload text with
-      `-H 'Content-Type: text/csv'`, confirm `text/csv` with source
-      `client`; upload a PNG claiming `text/plain`, confirm
-      `image/png` with a recorded conflict.
-- [ ] Verify the human frontend: `GET /` creates a paste, `GET
-      /pastes` lists it with expiry/days remaining, `GET /view/<id>`
-      renders text / an image inline, and delete removes it.
-- [ ] Apply `docs/lifecycle-example.json` manually if desired (it is
-      **not** applied automatically), and confirm it only ever
-      deletes objects past their TTL, plus aborts incomplete
-      multipart uploads.
+- Create a test bucket (or test prefix) separate from any
+  production data.
+- Store a text paste, fetch it back, fetch a byte range, fetch
+  metadata, append text, fetch the joined text and a range across
+  the base/segment boundary, confirm the total size and a null
+  `sha256`, delete it, and confirm that the base and segments are
+  gone.
+- Run two concurrent appends to one ID. Confirm that two segment
+  objects exist and that a read returns both chunks.
+- Verify path-style requests work (Garage uses path-style URLs,
+  not virtual-hosted style; the binary sets
+  `force_path_style = true`).
+- Verify that `If-None-Match` behaviour is **not** relied upon:
+  the binary never sends a conditional write for create-only
+  semantics; a new random ID is created per store.
+- Verify day TTL: store with `ttl_days=1`, confirm the paste is
+  readable before expiry and returns 410 / expired after the
+  stored `expires-at` passes.
+- Verify sub-day TTL: store with `X-TTL: 1h`, confirm the stored
+  `expires-at` is one hour after `created-at` and that the paste
+  returns 410 / expired after that time.
+- Verify a buffered text paste: pipe 20 KiB of text with
+  `cat text | curl --data-binary @- <base>/upload`, confirm
+  `text/plain; charset=utf-8` and an inline download.
+- Verify streaming file upload: pipe a file larger than 5 MiB with
+  `cat file | curl -H 'X-Filename: large.bin' --data-binary @- <base>/upload`,
+  confirm the returned URL streams back (Range download), and
+  confirm that killing the client mid-upload yields no URL and
+  leaves no completed object (an aborted multipart upload may
+  leave an incomplete upload for the lifecycle sweeper — see
+  below).
+- Verify content-type tagging: upload a PNG without an explicit
+  Content-Type (curl's default), confirm metadata shows
+  `image/png` with source `sniffed`; upload text with
+  `-H 'Content-Type: text/csv'`, confirm `text/csv` with source
+  `client`; upload a PNG claiming `text/plain`, confirm
+  `image/png` with a recorded conflict.
+- Verify the human frontend: `GET /` creates a paste, `GET
+  /pastes` lists it with expiry/days remaining, `GET /view/<id>`
+  renders text / an image inline, and delete removes it.
+- Apply `docs/lifecycle-example.json` manually if desired (it is
+  **not** applied automatically), and confirm it only ever
+  deletes objects past their TTL, plus aborts incomplete
+  multipart uploads.
 
 ## Lifecycle example
 
 `docs/lifecycle-example.json` is an **example only**. It is not
 applied automatically. Apply the file manually to a test bucket first.
-Garage lifecycle support is partial and version-dependent. Verify
+Garage lifecycle support depends on the Garage version. Verify
 `Expiration` and `AbortIncompleteMultipartUpload` on the exact Garage
 build before production use.
 
@@ -1062,10 +1056,8 @@ object remains.
 
 ## Known limitations (v1)
 
-These were found by running the binary against a Garage 1.3.1 bucket,
-not by reading the code. They are recorded here so a reader does not
-have to discover them, and so the claims elsewhere in this file stay
-honest.
+These are known limitations of the current implementation. They are
+recorded here so readers can plan around them.
 
 - **A streaming multipart upload has no stored `sha256`.** S3 takes
   object metadata only at `CreateMultipartUpload`, before the hash is
@@ -1088,7 +1080,7 @@ honest.
 - **A three-word alias is guessable.** Three words from the 7,776-word
   list give about 38.8 bits. The alias is a second name, not a bearer
   token. Use the bearer token and the private network.
-- **The HTTP endpoint is internal-only in the weakest sense.** The
+- **The HTTP endpoint is intended for a private network.** The
   bearer token comparison is constant time for equal-length tokens.
   A length difference still leaks through timing. The write-route origin
   check trusts the `Host` header. Run this on a private network rather

@@ -17,8 +17,8 @@ presigned URLs, no `If-None-Match` reliance) without new user input.
 ## Writing standard
 
 All new and changed prose must follow ASD-STE100 Simplified Technical
-English. The current issue is Issue 9, released 2025-01-15. The
-standard is at https://www.asd-ste100.org/.
+English. The standard is Issue 9, released 2025-01-15. The standard is
+at https://www.asd-ste100.org/.
 
 This standard covers this prose:
 
@@ -51,8 +51,7 @@ Do not change code names to obey these rules. Keep the prose term and
 the identifier equal in meaning, so the documents cannot drift from the
 API.
 
-Existing text does not obey these rules yet. Do not rewrite unrelated
-text in a change that has another purpose.
+Do not rewrite unrelated text in a change that has another purpose.
 
 ## Build and test (Cargo — the primary path)
 
@@ -180,20 +179,18 @@ Test standards:
 
 ## Key constraints (do not break these silently)
 
-- **Local only until the user says otherwise.** Do not publish to
-  GitHub, push, create a remote, or contact the user's real Garage
-  instance from a VM where it is out of reach. Do not use or invent
-  real S3 credentials. `.env.example` holds placeholders only; a
-  real `.env` is gitignored and must never be committed.
+- **Secrets.** Do not use or invent real S3 credentials in tests or
+  examples. `.env.example` holds example values only; a real `.env` is
+  gitignored and must never be committed.
 - **The binary is the sole S3 credential holder.** Agents/clients
   never get S3 credentials and never talk to S3 directly. No
   presigned URLs in v1. The bucket stays private, not open, not
   anonymous. No public bucket policy.
-- **No database in v1, no SQLite placeholder, no invented schema.**
+- **No database in v1, no SQLite stub, no invented schema.**
   Listing/info scan the bucket directly (ListObjectsV2 by date
   prefix + HeadObject per key) and filter expired objects. Document
-  the O(n) tradeoff honestly; its slowdown is the trigger for a
-  database later.
+  the O(n) tradeoff; its slowdown is the trigger for a database
+  later.
 - **A three-word alias is a second name, not a second object.** The
   canonical ID and the alias resolve to the same key. A change to one
   form must work for the other.
