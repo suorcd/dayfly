@@ -842,9 +842,9 @@ async fn append_inner(state: &AppState, headers: &HeaderMap, id: &str, req: Requ
         return forbidden_write();
     }
     let limit = state.store.config.max_text_bytes;
-    if let Some(len) =
-        header_str(headers, CONTENT_LENGTH.as_str()).and_then(|s| s.trim().parse::<u64>().ok())
-    {
+    let known_length =
+        header_str(headers, CONTENT_LENGTH.as_str()).and_then(|s| s.trim().parse::<u64>().ok());
+    if let Some(len) = known_length {
         if len > limit {
             return error_response(StoreError::TooLarge { limit });
         }
@@ -860,6 +860,12 @@ async fn append_inner(state: &AppState, headers: &HeaderMap, id: &str, req: Requ
             return error_response(StoreError::TooLarge { limit });
         }
         bytes.extend_from_slice(&chunk);
+    }
+    if let Some(expected) = known_length {
+        let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if actual != expected {
+            return error_response(StoreError::LengthMismatch { expected, actual });
+        }
     }
     match state.store.append_text(id, &bytes).await {
         Ok(appended) => Json(serde_json::json!({

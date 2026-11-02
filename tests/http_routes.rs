@@ -1364,6 +1364,75 @@ async fn append_endpoint_extends_the_paste_and_fetch_returns_the_concatenation()
 }
 
 #[tokio::test]
+async fn append_accepts_a_body_above_the_axum_default_limit() {
+    let cap = 3 * 1024 * 1024;
+    let (state, fake) = fake_state(cap).await;
+    let stored = state
+        .store
+        .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(1)))
+        .await
+        .expect("store must succeed against the fake");
+    let app = api_router().with_state(state);
+    let body = vec![b'a'; 2 * 1024 * 1024 + 1];
+
+    let request = common::request(
+        "POST",
+        &format!("/v1/pastes/{}/append", stored.id),
+        &[content_length(body.len())],
+        body.clone(),
+    );
+    let (status, _, response) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an append above 2 MiB and below the text cap must succeed: {}",
+        String::from_utf8_lossy(&response)
+    );
+    let json = common::json_body(&response);
+    assert_eq!(json["appended_bytes"], body.len());
+    assert_eq!(json["size"], body.len() + 4);
+    let segment_puts = fake
+        .puts()
+        .iter()
+        .filter(|(key, _)| key.starts_with(&format!("{}/", stored.key)))
+        .count();
+    assert_eq!(segment_puts, 1);
+}
+
+#[tokio::test]
+async fn append_rejects_a_body_shorter_than_content_length() {
+    let (state, fake) = fake_state(1024).await;
+    let stored = state
+        .store
+        .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(1)))
+        .await
+        .expect("store must succeed against the fake");
+    let app = api_router().with_state(state);
+    let body = b"short".to_vec();
+    let claimed = body.len() + 5;
+
+    let request = common::request(
+        "POST",
+        &format!("/v1/pastes/{}/append", stored.id),
+        &[("content-length", claimed.to_string())],
+        body,
+    );
+    let (status, _, response) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a short body must fail: {}",
+        String::from_utf8_lossy(&response)
+    );
+    let segment_puts = fake
+        .puts()
+        .iter()
+        .filter(|(key, _)| key.starts_with(&format!("{}/", stored.key)))
+        .count();
+    assert_eq!(segment_puts, 0, "a refused append must write no segment");
+}
+
+#[tokio::test]
 async fn append_to_a_missing_id_returns_not_found_and_writes_nothing() {
     let (state, fake) = fake_state(1024).await;
     let app = api_router().with_state(state);

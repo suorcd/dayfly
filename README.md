@@ -226,8 +226,8 @@ file permission warnings into faults.
 | `S3_SECRET_ACCESS_KEY` | one form | — | Garage secret key, held only by this binary; set this variable or `S3_SECRET_ACCESS_KEY_FILE` |
 | `S3_SECRET_ACCESS_KEY_FILE` | one form | — | Path to a file that contains the Garage secret key; set this variable or `S3_SECRET_ACCESS_KEY` |
 | `S3_REGION` | no | `us-east-1` | Signing placeholder for Garage; supply your own, do not rely on the default being "yours" |
-| `DAYFLY_MAX_TEXT_BYTES` | no | 10485760 (10 MiB) | Max text paste size for MCP `store_text`, the human text form, and `POST /upload` without a filename; oversize → 413. A filename (including a multipart filename) uses `DAYFLY_MAX_FILE_BYTES` instead |
-| `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error |
+| `DAYFLY_MAX_TEXT_BYTES` | no | 104857600 (100 MiB) | Max text paste size for MCP `store_text`, the human text form, and `POST /upload` without a filename; oversize → 413. A filename (including a multipart filename) uses `DAYFLY_MAX_FILE_BYTES` instead |
+| `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error. The maximum is 52428800000 bytes: 10,000 parts of 5 MiB |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1. The name and meaning are unchanged |
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
 | `DAYFLY_HTTP_BEARER_TOKEN` | one form | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model); set this variable or `DAYFLY_HTTP_BEARER_TOKEN_FILE` |

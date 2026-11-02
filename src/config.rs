@@ -5,6 +5,14 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::stream::STREAM_PART_BYTES;
+
+/// Maximum number of parts in one S3 multipart upload.
+pub const MAX_MULTIPART_PARTS: u64 = 10_000;
+
+/// Largest file that one multipart upload can hold at the current part size.
+pub const MAX_MULTIPART_BYTES: u64 = MAX_MULTIPART_PARTS * STREAM_PART_BYTES as u64;
+
 /// Configuration loaded from the environment.
 ///
 /// The S3 credentials come from a direct environment variable or from a
@@ -98,7 +106,7 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
     },
     ConfigField {
         name: "DAYFLY_MAX_TEXT_BYTES",
-        value: Some("10485760"),
+        value: Some("104857600"),
         required: false,
         help: "Maximum text paste size in bytes",
     },
@@ -631,6 +639,17 @@ impl Config {
                 "expected a positive integer".to_string(),
             ));
         }
+        let max_file_bytes = optional_u64(
+            &lookup,
+            "DAYFLY_MAX_FILE_BYTES",
+            field_u64("DAYFLY_MAX_FILE_BYTES", 1024 * 1024 * 1024),
+        )?;
+        if max_file_bytes > MAX_MULTIPART_BYTES {
+            return Err(ConfigError::Invalid(
+                "DAYFLY_MAX_FILE_BYTES".to_string(),
+                format!("expected at most {MAX_MULTIPART_BYTES} bytes: 10,000 parts of 5 MiB"),
+            ));
+        }
         Ok(Self {
             endpoint,
             bucket,
@@ -646,13 +665,9 @@ impl Config {
             max_text_bytes: optional_u64(
                 &lookup,
                 "DAYFLY_MAX_TEXT_BYTES",
-                field_u64("DAYFLY_MAX_TEXT_BYTES", 10 * 1024 * 1024),
+                field_u64("DAYFLY_MAX_TEXT_BYTES", 100 * 1024 * 1024),
             )?,
-            max_file_bytes: optional_u64(
-                &lookup,
-                "DAYFLY_MAX_FILE_BYTES",
-                field_u64("DAYFLY_MAX_FILE_BYTES", 1024 * 1024 * 1024),
-            )?,
+            max_file_bytes,
             default_ttl_days,
             http_bind: optional_string(
                 &lookup,
