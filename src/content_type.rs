@@ -90,6 +90,15 @@ fn extension_type(filename: Option<&str>) -> Option<String> {
     }
 }
 
+/// Extensions that are text by convention even though `mime_guess` has
+/// no entry for them. A known binary signature still wins because
+/// sniffing runs before this check.
+const TEXT_PATCH_EXTENSIONS: &[&str] = &["diff", "patch"];
+
+fn is_text_patch_extension(filename: Option<&str>) -> bool {
+    extension_of(filename).is_some_and(|ext| TEXT_PATCH_EXTENSIONS.contains(&ext.as_str()))
+}
+
 /// Zip-based document extensions. `infer` sees only the ZIP signature,
 /// and the filename names the specific type inside the container.
 /// `mime_guess` returns the exact type for these; the
@@ -195,7 +204,15 @@ pub fn detect_content_type_sample(
         };
     }
 
-    // 3. Filename extension.
+    // 3. Filename extension. A patch or diff is text by convention, even
+    // though `mime_guess` has no entry for it.
+    if is_text_patch_extension(filename) {
+        return Detection {
+            content_type: "text/plain; charset=utf-8".to_string(),
+            source: "extension",
+            conflict: None,
+        };
+    }
     if let Some(ext_type) = extension_type(filename) {
         return Detection {
             content_type: ext_type,
@@ -502,6 +519,24 @@ mod tests {
             assert_eq!(d.content_type, expected, "extension {ext}");
             assert_eq!(d.source, "extension", "extension {ext}");
         }
+    }
+
+    #[test]
+    fn patch_and_diff_extensions_are_text() {
+        let diff = b"--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n";
+        for name in ["change.diff", "change.patch", "CHANGE.DIFF"] {
+            let d = detect_content_type(None, Some(name), diff);
+            assert_eq!(d.content_type, "text/plain; charset=utf-8", "{name}");
+            assert_eq!(d.source, "extension", "{name}");
+            assert!(d.conflict.is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn binary_payload_with_diff_extension_keeps_sniffed_type() {
+        let d = detect_content_type(None, Some("not-a-diff.diff"), &png());
+        assert_eq!(d.content_type, "image/png");
+        assert_eq!(d.source, "sniffed");
     }
 
     #[test]
