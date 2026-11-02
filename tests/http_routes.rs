@@ -912,6 +912,37 @@ async fn list_route_returns_502_when_the_metadata_scan_fails() {
 }
 
 #[tokio::test]
+async fn list_route_does_not_echo_the_s3_error_detail() {
+    let fake = FakeS3::start().await;
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let metadata = common::stored_metadata(
+        &(Utc::now() + Duration::days(1)).to_rfc3339(),
+        "text/plain",
+        3,
+        "abc",
+    );
+    let key = format!("pastes/{today}/denied");
+    fake.seed(
+        &key,
+        b"abc",
+        "text/plain",
+        &common::metadata_refs(&metadata),
+    );
+    fake.fail_head_with(&key, StatusCode::FORBIDDEN, "AccessDenied");
+    let app = common::app(fake.store().await);
+
+    let request = common::request("GET", &format!("/v1/pastes?date={today}"), &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    let text = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(text.contains("s3 error"), "the error must name S3: {text}");
+    assert!(
+        !text.contains("ServiceError") && !text.contains("StatusCode"),
+        "the SDK debug dump must not reach the client: {text}"
+    );
+}
+
+#[tokio::test]
 async fn failed_uploads_return_an_error_and_never_a_paste_url() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
