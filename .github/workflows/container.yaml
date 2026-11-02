@@ -5,9 +5,9 @@ name: container
 # For an annotated tag, pin the peeled `^{}` commit SHA.
 # Builds the OCI image from the flake, proves it runs, then publishes it to
 # ghcr.io. Pull requests build and smoke test only, so a branch cannot publish.
-# Publication is x86_64-linux only: GitHub runners build that platform, and a
-# multi-platform image needs an emulated or native aarch64-linux builder, which
-# this pass does not add.
+# Publication is x86_64-linux only. GitHub runners build that platform. A
+# multi-platform image needs an emulated or native aarch64-linux builder;
+# this workflow does not add one.
 on:
   push:
     branches: [main]
