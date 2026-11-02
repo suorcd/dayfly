@@ -2053,3 +2053,195 @@ async fn http_mcp_writes_a_fetch_file_under_the_configured_root() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[tokio::test]
+async fn download_etag_honors_if_none_match_and_changes_after_append() {
+    let fake = FakeS3::start().await;
+    let store_a = fake.store().await;
+    let store_b = fake.store().await;
+    let stored = store_a
+        .store_text(b"hello", None, Some("text/plain"), Some(Ttl::days(1)))
+        .await
+        .expect("the paste must store");
+    let meta_a = store_a
+        .head_metadata(&stored.id)
+        .await
+        .expect("metadata must load");
+    let meta_b = store_b
+        .head_metadata(&stored.id)
+        .await
+        .expect("a second store must load the same metadata");
+    assert_eq!(
+        meta_a.etag(),
+        meta_b.etag(),
+        "the etag must survive a new store"
+    );
+
+    let app = common::app(store_a);
+    let url = format!("/v1/pastes/{}", stored.id);
+    let request = common::request("GET", &url, &[], Vec::new());
+    let (status, headers, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.is_empty());
+    let etag = headers[header::ETAG]
+        .to_str()
+        .expect("etag must be ASCII")
+        .to_string();
+
+    let request = common::request("HEAD", &url, &[], Vec::new());
+    let (status, head_headers, head_body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(head_headers[header::ETAG], headers[header::ETAG]);
+    assert!(head_body.is_empty());
+
+    let request = common::request("GET", &url, &[("if-none-match", etag.clone())], Vec::new());
+    let (status, not_modified_headers, not_modified_body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert_eq!(not_modified_headers[header::ETAG], headers[header::ETAG]);
+    assert!(not_modified_body.is_empty());
+
+    let append_body = b" world".to_vec();
+    let request = common::request(
+        "POST",
+        &format!("{url}/append"),
+        &[("content-length", append_body.len().to_string())],
+        append_body,
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let request = common::request("GET", &url, &[("if-none-match", etag.clone())], Vec::new());
+    let (status, new_headers, new_body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(new_body, b"hello world");
+    let new_etag = new_headers[header::ETAG]
+        .to_str()
+        .expect("etag must be ASCII")
+        .to_string();
+    assert_ne!(new_etag, etag, "append must change the etag");
+
+    let store_c = fake.store().await;
+    let meta_c = store_c
+        .head_metadata(&stored.id)
+        .await
+        .expect("a third store must load segmented metadata");
+    assert_eq!(
+        meta_c.etag(),
+        new_etag,
+        "the segmented etag must survive a new store"
+    );
+
+    let request = common::request(
+        "GET",
+        &url,
+        &[("range", "bytes=0-1".to_string()), ("if-none-match", etag)],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body, b"he");
+}
+
+#[tokio::test]
+async fn patch_ttl_shortens_and_extends_the_same_paste() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"ttl body", None, Some("text/plain"), Some(Ttl::days(7)))
+        .await
+        .expect("the paste must store");
+    let words = stored
+        .words
+        .clone()
+        .expect("a new paste must have an alias");
+    let app = common::app(store);
+    let url = format!("/v1/pastes/{}", stored.id);
+
+    let request = common::request("PATCH", &url, &[("x-ttl", "1h".to_string())], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let json = common::json_body(&body);
+    assert_eq!(json["id"].as_str(), Some(stored.id.as_str()));
+    assert_eq!(json["words"].as_str(), Some(words.as_str()));
+    let first_expiry = json["expires_at"]
+        .as_str()
+        .expect("expires_at must be a string")
+        .to_string();
+    assert!(
+        (expires_in_seconds(&first_expiry) - 3_600).abs() < 60,
+        "the new expiry must be about one hour away"
+    );
+
+    let request = common::request("GET", &url, &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"ttl body", "set_ttl must not change the bytes");
+
+    let request = common::request(
+        "PATCH",
+        &format!("/v1/pastes/{words}"),
+        &[("x-ttl-days", "30".to_string())],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let json = common::json_body(&body);
+    let second_expiry = json["expires_at"]
+        .as_str()
+        .expect("expires_at must be a string")
+        .to_string();
+    assert!(
+        (expires_in_seconds(&second_expiry) - 30 * 86_400).abs() < 120,
+        "the extension must be about 30 days away"
+    );
+
+    let request = common::request("GET", &format!("{url}/meta"), &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let meta = common::json_body(&body);
+    assert_eq!(meta["expires_at"].as_str(), Some(second_expiry.as_str()));
+
+    let request = common::request("PATCH", &url, &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        common::json_body(&body)["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("TTL")),
+        "a missing TTL must name the TTL requirement"
+    );
+}
+
+#[tokio::test]
+async fn well_known_service_description_reports_live_limits_without_auth() {
+    let fake = FakeS3::start().await;
+    let config = common::config_with_token(fake.config_with_caps(1_234, 5_678), "secret");
+    let store = Store::from_config(config)
+        .await
+        .expect("the test store must build");
+    let app = common::app(store);
+
+    let request = common::request("GET", "/.well-known/dayfly.json", &[], Vec::new());
+    let (status, headers, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers[header::CONTENT_TYPE]
+        .to_str()
+        .expect("content type must be ASCII")
+        .starts_with("application/json"));
+    let json = common::json_body(&body);
+    assert_eq!(json["name"], "dayfly");
+    assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(json["mcp_endpoint"], "/mcp");
+    assert_eq!(json["auth"], "bearer");
+    assert_eq!(json["limits"]["max_text_bytes"], 1_234);
+    assert_eq!(json["limits"]["max_file_bytes"], 5_678);
+    assert_eq!(json["limits"]["default_ttl_seconds"], 7 * 86_400);
+    assert_eq!(json["limits"]["max_ttl_seconds"], 3_650 * 86_400);
+    let routes = json["routes"].as_array().expect("routes must be an array");
+    assert!(routes
+        .iter()
+        .any(|route| { route["method"] == "PATCH" && route["path"] == "/v1/pastes/{random}" }));
+    assert!(routes
+        .iter()
+        .any(|route| { route["method"] == "GET" && route["path"] == "/.well-known/dayfly.json" }));
+}

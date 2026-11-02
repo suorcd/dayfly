@@ -29,7 +29,9 @@ use rmcp::{tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::store::{parse_list_window_request, ListWindowRequest, Store, StoreError, Ttl};
+use crate::store::{
+    parse_list_window_request, ListWindowRequest, PasteMetadata, Store, StoreError, Ttl,
+};
 
 /// How a transport may use server-local paths.
 #[derive(Clone, Debug)]
@@ -136,6 +138,24 @@ fn result_json(value: serde_json::Value) -> Result<CallToolResult, rmcp::ErrorDa
     )]))
 }
 
+/// The metadata shape shared by `fetch_metadata` and `set_ttl`.
+fn metadata_json(meta: PasteMetadata) -> serde_json::Value {
+    serde_json::json!({
+        "id": meta.id,
+        "key": meta.key,
+        "words": meta.words,
+        "filename": meta.filename,
+        "content_type": meta.content_type,
+        "detection_source": meta.detection_source,
+        "detection_conflict": meta.detection_conflict,
+        "size": meta.size,
+        "sha256": meta.sha256,
+        "created_at": meta.created_at.map(|d| d.to_rfc3339()),
+        "expires_at": meta.expires_at.map(|d| d.to_rfc3339()),
+        "expired": meta.expired,
+    })
+}
+
 /// Map a store error to the value that a tool method returns.
 ///
 /// A routine domain result is a tool result with `isError` set, so a
@@ -235,6 +255,18 @@ pub struct AppendTextParams {
     pub id: String,
     /// Text to append. The text cap applies to this append only.
     pub text: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetTtlParams {
+    /// Full or bare paste ID, or a three-word alias.
+    pub id: String,
+    /// New TTL as seconds or a duration such as "1h", "1h30m", or "2d".
+    /// Do not set both `ttl` and `ttl_days`.
+    pub ttl: Option<String>,
+    /// New TTL in whole days, for example 7. Do not set both `ttl` and
+    /// `ttl_days`.
+    pub ttl_days: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -405,6 +437,19 @@ impl Pastebin {
     }
 
     #[tool(
+        description = "Change the expiry of an existing paste, its segments, and its alias. Use ttl for seconds or a duration such as 1h or 1h30m, or ttl_days for whole days. Do not set both. An expired paste is rejected. Returns the same metadata as fetch_metadata."
+    )]
+    async fn set_ttl(
+        &self,
+        Parameters(params): Parameters<SetTtlParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let ttl = resolve_ttl(params.ttl.as_deref(), params.ttl_days)?
+            .ok_or_else(|| invalid_ttl("set_ttl requires ttl or ttl_days"))?;
+        let meta = try_store!(self.store.set_ttl(&params.id, ttl).await);
+        result_json(metadata_json(meta))
+    }
+
+    #[tool(
         description = "Fetch a text paste by id or three-word alias, with optional byte offset and limit. Large pastes should be read in slices, not whole."
     )]
     async fn fetch_text(
@@ -477,20 +522,7 @@ impl Pastebin {
         Parameters(params): Parameters<IdParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let meta = try_store!(self.store.head_metadata(&params.id).await);
-        result_json(serde_json::json!({
-            "id": meta.id,
-            "key": meta.key,
-            "words": meta.words,
-            "filename": meta.filename,
-            "content_type": meta.content_type,
-            "detection_source": meta.detection_source,
-            "detection_conflict": meta.detection_conflict,
-            "size": meta.size,
-            "sha256": meta.sha256,
-            "created_at": meta.created_at.map(|d| d.to_rfc3339()),
-            "expires_at": meta.expires_at.map(|d| d.to_rfc3339()),
-            "expired": meta.expired,
-        }))
+        result_json(metadata_json(meta))
     }
 
     #[tool(description = "Delete a paste by id or three-word alias.")]

@@ -196,7 +196,7 @@ const DROPZONE_SCRIPT: &str = r#"<script>
 
 fn page(title: &str, body: &str) -> Html<String> {
     Html(format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title} — pastebin</title>\n<style>{CSS}</style>\n</head>\n<body>\n<header><nav><span class=\"prompt\">~/dayfly $</span><a href=\"/\">new paste</a><a href=\"/pastes\">current pastes</a></nav></header>\n<h1>{title}</h1>\n{body}\n<footer>pastebin — internal use only · &copy; 2026 suorcd</footer>\n</body>\n</html>\n"
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title} — pastebin</title>\n<style>{CSS}</style>\n</head>\n<body>\n<header><nav><span class=\"prompt\">~/dayfly $</span><a href=\"/\">new paste</a><a href=\"/pastes\">current pastes</a><a href=\"/.well-known/dayfly.json\">api description</a></nav></header>\n<h1>{title}</h1>\n{body}\n<footer>pastebin — internal use only · &copy; 2026 suorcd</footer>\n</body>\n</html>\n"
     ))
 }
 

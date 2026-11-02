@@ -183,6 +183,7 @@ fn tools_list_exposes_every_dayfly_tool() {
         "store_text",
         "store_file",
         "append_text",
+        "set_ttl",
         "fetch_text",
         "fetch_file",
         "fetch_metadata",
@@ -602,4 +603,47 @@ fn fetch_file_missing_object_returns_an_error_without_writing() {
         !dest_path.exists(),
         "a failed fetch must not create the destination file"
     );
+}
+
+#[test]
+fn set_ttl_updates_expiry_and_keeps_alias() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let mut client = McpClient::spawn(&fake, &[]);
+
+    let stored = client
+        .call_tool("store_text", json!({"text": "ttl body", "ttl_days": 1}))
+        .expect("store_text must succeed");
+    let id = stored["id"]
+        .as_str()
+        .expect("id must be a string")
+        .to_string();
+    let words = stored["words"]
+        .as_str()
+        .expect("words must be a string")
+        .to_string();
+
+    let updated = client
+        .call_tool("set_ttl", json!({"id": words, "ttl": "1h"}))
+        .expect("set_ttl must succeed");
+    assert_eq!(updated["id"].as_str(), Some(id.as_str()));
+    assert_eq!(updated["words"].as_str(), Some(words.as_str()));
+    let expires = chrono::DateTime::parse_from_rfc3339(
+        updated["expires_at"]
+            .as_str()
+            .expect("expires_at must be a string"),
+    )
+    .expect("expires_at must be RFC 3339")
+    .with_timezone(&Utc);
+    let seconds = (expires - Utc::now()).num_seconds();
+    assert!(
+        (seconds - 3_600).abs() < 60,
+        "the new expiry must be about one hour away, got {seconds}"
+    );
+
+    let meta = client
+        .call_tool("fetch_metadata", json!({"id": id}))
+        .expect("fetch_metadata must succeed");
+    assert_eq!(meta["expires_at"], updated["expires_at"]);
+    assert_eq!(meta["words"], updated["words"]);
 }
