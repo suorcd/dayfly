@@ -97,6 +97,12 @@
             pkgs.rust-analyzer
             pkgs.clippy
             pkgs.rustfmt
+            # Local dev loop: scripts/dev.sh uses cargo-watch, jq, and the
+            # OpenBao CLI to load the Garage settings from the cluster.
+            pkgs.cargo-watch
+            pkgs.curl
+            pkgs.jq
+            pkgs.openbao
           ];
         };
       });

@@ -317,6 +317,38 @@ content is never sent over JSON-RPC), `fetch_metadata`, `delete_paste`,
 Access model section: the HTTP transport refuses them until
 `DAYFLY_MCP_LOCAL_ROOT` sets a directory.
 
+## Local development
+
+`scripts/dev.sh` runs the HTTP server on localhost with the Garage settings
+pulled from OpenBao. It is the fastest way to iterate on the web UI without
+building, pushing, and rolling out an image.
+
+```sh
+nix develop
+./scripts/dev.sh
+# -> http://127.0.0.1:8080
+
+# Restart on Rust source changes:
+./scripts/dev.sh --watch
+
+# Use another port:
+DAYFLY_HTTP_BIND=127.0.0.1:8090 ./scripts/dev.sh
+```
+
+The script reads `secret/service/lan/dayfly` by default, exports every field
+as an environment variable, and never prints secret values. It uses
+`BAO_TOKEN`, falling back to the workstation OpenBao agent token at
+`/run/openbao/token`.
+
+By default local runs share the same `dayfly-files` bucket as the deployed
+instance, so test pastes appear in the live listing until they expire or are
+deleted. For isolation, create a separate bucket and key and point the script
+at its OpenBao path:
+
+```sh
+DAYFLY_BAO_PATH=secret/service/lan/dayfly-local ./scripts/dev.sh
+```
+
 ## Running HTTP mode
 
 ```sh
