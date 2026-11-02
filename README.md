@@ -750,8 +750,8 @@ comments.
 
 - `GET /` — new paste/upload: paste text directly, or upload a file,
   with a TTL selector in whole days (1, 3, 7, 14, 30, 90 days; the API
-  also accepts sub-day TTLs). On success it shows the resulting URL as
-  a clickable link, plus the paste/file ID.
+  also accepts sub-day TTLs). On success the browser is redirected to
+  `GET /view/<id>` for the new paste.
 - `GET /pastes` — current pastes, built from the bucket scan (no
   database): link/ID, filename if any, content type, size, created
   date, expiry date plus days remaining, and a delete action per

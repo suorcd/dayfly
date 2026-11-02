@@ -287,34 +287,9 @@ async fn text_submit_handler(
         .store_text(form.text.as_bytes(), filename.as_deref(), None, ttl)
         .await
     {
-        Ok(stored) => success_page(
-            &stored.id,
-            &stored.content_type,
-            stored.size,
-            stored.expires_at,
-        ),
+        Ok(stored) => Redirect::to(&format!("/view/{}", stored.id)).into_response(),
         Err(e) => error_page(e),
     }
-}
-
-fn success_page(id: &str, content_type: &str, size: u64, expires_at: DateTime<Utc>) -> Response {
-    let id_esc = html_escape(id);
-    page(
-        "Paste created",
-        &format!(
-            "<p>URL: <a href=\"/view/{id_esc}\">/view/{id_esc}</a></p>\
-             <p>Raw API URL: <a href=\"/v1/pastes/{id_esc}\">/v1/pastes/{id_esc}</a></p>\
-             <p>Paste/file ID: <code>{id_esc}</code></p>\
-             <p>Content-Type: {}</p>\
-             <p>Size: {}</p>\
-             <p>Expires: {}</p>\
-             <p><a href=\"/\">Create another</a> · <a href=\"/pastes\">Current pastes</a></p>",
-            html_escape(content_type),
-            human_size(size),
-            expires_at.format("%Y-%m-%d %H:%M UTC"),
-        ),
-    )
-    .into_response()
 }
 
 fn error_page(e: StoreError) -> Response {
@@ -390,12 +365,7 @@ async fn upload_submit_handler(
                 )
                 .await
             {
-                Ok(stored) => success_page(
-                    &stored.id,
-                    &stored.content_type,
-                    stored.size,
-                    stored.expires_at,
-                ),
+                Ok(stored) => Redirect::to(&format!("/view/{}", stored.id)).into_response(),
                 Err(e) => error_page(e),
             };
         }

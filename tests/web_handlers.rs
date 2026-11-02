@@ -53,12 +53,16 @@ fn html_text(body: &[u8]) -> String {
     String::from_utf8_lossy(body).into_owned()
 }
 
-fn id_from_success(body: &str) -> String {
-    let marker = "<p>Paste/file ID: <code>";
-    let start = body.find(marker).expect("success page must show the id") + marker.len();
-    let rest = &body[start..];
-    let end = rest.find("</code>").expect("id must be in a code element");
-    rest[..end].to_string()
+fn id_from_redirect(headers: &axum::http::HeaderMap) -> String {
+    let location = headers[header::LOCATION]
+        .to_str()
+        .expect("redirect must carry a UTF-8 Location header");
+    let prefix = "/view/";
+    let id = location
+        .strip_prefix(prefix)
+        .unwrap_or_else(|| panic!("unexpected redirect target: {location}"));
+    assert!(!id.is_empty(), "redirect must name a paste id");
+    id.to_string()
 }
 
 fn future_metadata(size: usize) -> Vec<(String, String)> {
@@ -133,23 +137,24 @@ async fn text_submit_rejects_zero_ttl_days() {
 }
 
 #[tokio::test]
-async fn text_submit_creates_a_paste_and_shows_links() {
+async fn text_submit_creates_a_paste_and_redirects_to_the_view() {
     let fake = FakeS3::start().await;
     let app = common::app(fake.store().await);
     let form = b"text=hello+world&filename=note.txt&ttl_days=1".to_vec();
 
     let request = common::request("POST", "/ui/text", &form_headers(form.len()), form);
-    let (status, headers, body) = common::send(&app, request).await;
+    let (status, headers, _body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let id = id_from_redirect(&headers);
+    assert_eq!(
+        headers[header::LOCATION].to_str().unwrap(),
+        format!("/view/{id}")
+    );
+
+    let request = common::request("GET", &format!("/view/{id}"), &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(headers[header::CONTENT_TYPE]
-        .to_str()
-        .unwrap()
-        .starts_with("text/html"));
-    let page = html_text(&body);
-    let id = id_from_success(&page);
-    assert!(page.contains(&format!("href=\"/view/{id}\"")));
-    assert!(page.contains(&format!("href=\"/v1/pastes/{id}\"")));
-    assert!(page.contains("Paste created"));
+    assert!(html_text(&body).contains(&id));
 
     let object = fake
         .object(&format!("pastes/{id}"))
@@ -174,14 +179,14 @@ async fn text_submit_accepts_a_paste_above_the_axum_default_limit() {
     let body = text_form_body(&text);
 
     let request = common::request("POST", "/ui/text", &form_headers(body.len()), body);
-    let (status, _, body) = common::send(&app, request).await;
+    let (status, headers, body) = common::send(&app, request).await;
     assert_eq!(
         status,
-        StatusCode::OK,
+        StatusCode::SEE_OTHER,
         "a paste above 2 MiB but below the text cap must succeed: {}",
         html_text(&body)
     );
-    let id = id_from_success(&html_text(&body));
+    let id = id_from_redirect(&headers);
     let object = fake
         .object(&format!("pastes/{id}"))
         .expect("the paste must be stored");
@@ -199,14 +204,14 @@ async fn text_submit_accepts_url_encoded_non_ascii_above_the_default_limit() {
     assert!(body.len() > 2 * 1024 * 1024);
 
     let request = common::request("POST", "/ui/text", &form_headers(body.len()), body);
-    let (status, _, body) = common::send(&app, request).await;
+    let (status, headers, body) = common::send(&app, request).await;
     assert_eq!(
         status,
-        StatusCode::OK,
+        StatusCode::SEE_OTHER,
         "encoded text above 2 MiB but below the cap must succeed: {}",
         html_text(&body)
     );
-    let id = id_from_success(&html_text(&body));
+    let id = id_from_redirect(&headers);
     let object = fake
         .object(&format!("pastes/{id}"))
         .expect("the paste must be stored");
@@ -281,10 +286,9 @@ async fn upload_submit_creates_a_paste_with_form_ttl() {
     let headers = multipart_headers(boundary, body.len());
 
     let request = common::request("POST", "/ui/upload", &headers, body);
-    let (status, _, body) = common::send(&app, request).await;
-    assert_eq!(status, StatusCode::OK);
-    let page = html_text(&body);
-    let id = id_from_success(&page);
+    let (status, response_headers, _body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let id = id_from_redirect(&response_headers);
     let object = fake
         .object(&format!("pastes/{id}"))
         .expect("the upload must be stored");
@@ -344,9 +348,9 @@ async fn upload_submit_uses_the_default_ttl_without_a_form_selection() {
     let headers = multipart_headers(boundary, body.len());
 
     let request = common::request("POST", "/ui/upload", &headers, body);
-    let (status, _, body) = common::send(&app, request).await;
-    assert_eq!(status, StatusCode::OK);
-    let id = id_from_success(&html_text(&body));
+    let (status, response_headers, _body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let id = id_from_redirect(&response_headers);
     let object = fake
         .object(&format!("pastes/{id}"))
         .expect("the upload must be stored");
@@ -396,14 +400,14 @@ async fn upload_submit_accepts_bodies_above_the_axum_default_limit() {
     );
     let headers = multipart_headers(boundary, body.len());
     let request = common::request("POST", "/ui/upload", &headers, body);
-    let (status, _, body) = common::send(&app, request).await;
+    let (status, response_headers, body) = common::send(&app, request).await;
     assert_eq!(
         status,
-        StatusCode::OK,
+        StatusCode::SEE_OTHER,
         "a 3 MiB web upload must not hit the axum body limit: {}",
         html_text(&body)
     );
-    assert!(id_from_success(&html_text(&body)).contains('/'));
+    assert!(id_from_redirect(&response_headers).contains('/'));
 }
 
 #[tokio::test]
