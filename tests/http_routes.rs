@@ -305,6 +305,27 @@ async fn raw_text_cap_rejects_without_url_and_filename_switches_to_file_cap() {
 }
 
 #[tokio::test]
+async fn multipart_upload_rejects_an_oversized_content_length_before_reading() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let boundary = "api-cap-preflight";
+    let body = common::multipart_fields_only(boundary, &[("ttl_days", "1")]);
+    let mut headers = multipart_headers(boundary);
+    headers.push(content_length(2usize * 1024 * 1024 * 1024));
+    let request = common::request("POST", "/upload?format=json", &headers, body);
+    let (status, _, response_body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let json = common::json_body(&response_body);
+    assert!(
+        json["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("payload too large")),
+        "got: {json}"
+    );
+    assert!(fake.keys().is_empty());
+}
+
+#[tokio::test]
 async fn multipart_upload_reads_form_fields_and_enforces_caps() {
     let fake = FakeS3::start().await;
     let store = fake.store_with_caps(5, 100).await;

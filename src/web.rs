@@ -37,7 +37,7 @@
 use std::collections::HashMap;
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
-use axum::http::header::{HOST, ORIGIN, REFERER};
+use axum::http::header::{CONTENT_LENGTH, HOST, ORIGIN, REFERER};
 use axum::http::uri::{Authority, Uri};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -80,6 +80,7 @@ details form{background:none;border:0;padding:0;border-radius:0;backdrop-filter:
 .dropzone input[type=file]{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 .dropzone-title{display:block;font-weight:bold;color:#ea00d9}
 .dropzone .muted{display:block}
+.dropzone .error{color:#ff6b6b}
 textarea{width:100%;min-height:12rem;box-sizing:border-box;font-family:"Source Code Pro",Hack,ui-monospace,Menlo,Consolas,monospace;background:#133e7c;color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px;padding:.5rem}
 input,select{font-size:1rem;padding:.3rem .5rem;background:#133e7c;color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px}
 button{font-size:1rem;padding:.35rem .8rem;cursor:pointer;background:rgba(19,62,124,.5);color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px}
@@ -103,10 +104,33 @@ const DROPZONE_SCRIPT: &str = r#"<script>
   const clear = document.getElementById('clear-file');
   const text = document.getElementById('text');
   const filename = document.getElementById('filename');
-  if (!zone || !input || !status || !clear || !text || !filename) return;
+  const form = document.querySelector('form[action="/ui/create"]');
+  if (!form || !zone || !input || !status || !clear || !text || !filename) return;
+
+  const maxBytes = Number(form.dataset.maxFileBytes) || 0;
+  const humanSize = (bytes) => {
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+    let value = bytes;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit += 1;
+    }
+    return (unit === 0 ? value : value.toFixed(1)) + ' ' + units[unit];
+  };
 
   const show = () => {
     const file = input.files && input.files[0];
+    if (file && maxBytes > 0 && file.size > maxBytes) {
+      status.textContent = 'File is too large: ' + humanSize(file.size) + ' (limit ' + humanSize(maxBytes) + ')';
+      status.classList.add('error');
+      input.value = '';
+      clear.hidden = true;
+      text.disabled = false;
+      filename.disabled = false;
+      return;
+    }
+    status.classList.remove('error');
     if (file) {
       status.textContent = 'Selected: ' + file.name;
       clear.hidden = false;
@@ -124,6 +148,16 @@ const DROPZONE_SCRIPT: &str = r#"<script>
   clear.addEventListener('click', () => {
     input.value = '';
     show();
+  });
+  form.addEventListener('submit', (event) => {
+    const file = input.files && input.files[0];
+    if (file && maxBytes > 0 && file.size > maxBytes) {
+      event.preventDefault();
+      status.textContent = 'File is too large: ' + humanSize(file.size) + ' (limit ' + humanSize(maxBytes) + ')';
+      status.classList.add('error');
+      text.disabled = false;
+      filename.disabled = false;
+    }
   });
 
   let dragDepth = 0;
@@ -309,9 +343,11 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
         return resp;
     }
     let default_ttl = state.store.config.default_ttl_days;
+    let max_file_bytes = state.store.config.max_file_bytes;
+    let max_file_human = human_size(max_file_bytes);
     let mut body = format!(
         r#"<h2>Paste or upload</h2>
-<form method="post" action="/ui/create" enctype="multipart/form-data">
+<form method="post" action="/ui/create" enctype="multipart/form-data" data-max-file-bytes="{max_file_bytes}">
 <p><label>Keep for <select name="ttl_days">{}</select></label></p>
 <label class="dropzone" id="dropzone">
 <input type="file" name="file" id="file">
@@ -320,6 +356,7 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
 <span class="muted" id="file-status">No file selected</span>
 </label>
 <button type="button" id="clear-file" hidden>Remove file</button>
+<p class="muted">Max file size: {max_file_human}</p>
 <p class="muted">Or paste text below. A selected file takes precedence and disables the text fields.</p>
 <p><label>Text<br><textarea name="text" id="text"></textarea></label></p>
 <p><label>Filename (optional, text only) <input type="text" name="filename" id="filename"></label></p>
@@ -373,7 +410,12 @@ async fn text_submit_handler(
 
 fn error_page(e: StoreError) -> Response {
     let status = status_for(&e);
-    let msg = e.to_string();
+    let msg = match &e {
+        StoreError::TooLarge { limit } => {
+            format!("payload too large: limit is {}", human_size(*limit))
+        }
+        _ => e.to_string(),
+    };
     (
         status,
         page(
@@ -409,6 +451,27 @@ fn stored_view_target(stored: &StoredPaste, show_words: bool) -> String {
         &stored.id
     };
     format!("/view/{name}")
+}
+
+/// Reject an obviously oversized multipart request from its Content-Length
+/// before the handler reads the body. The multipart envelope and text field
+/// add overhead, so this is a coarse upper bound; the streaming cap remains
+/// authoritative.
+fn multipart_length_allows(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(length) = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    else {
+        return true;
+    };
+    let max_request = state
+        .store
+        .config
+        .max_file_bytes
+        .saturating_add(state.store.config.max_text_bytes)
+        .saturating_add(1024 * 1024);
+    length <= max_request
 }
 
 /// Stream one multipart file part into the store. The caller decides the
@@ -473,6 +536,11 @@ async fn upload_submit_handler(
     if !same_origin_allowed(&headers) {
         return forbidden_page();
     }
+    if !multipart_length_allows(&state, &headers) {
+        return error_page(StoreError::TooLarge {
+            limit: state.store.config.max_file_bytes,
+        });
+    }
     let mut ttl: Option<Ttl> = None;
     // Stream the file field inside the loop, not moved out of it: an
     // axum Field borrows its Multipart, so holding it across a
@@ -528,6 +596,11 @@ async fn create_submit_handler(
     }
     if !same_origin_allowed(&headers) {
         return forbidden_page();
+    }
+    if !multipart_length_allows(&state, &headers) {
+        return error_page(StoreError::TooLarge {
+            limit: state.store.config.max_file_bytes,
+        });
     }
 
     let mut ttl: Option<Ttl> = None;

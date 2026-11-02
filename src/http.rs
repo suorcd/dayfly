@@ -413,6 +413,21 @@ async fn multipart_inner(
     query: HashMap<String, String>,
     mut multipart: Multipart,
 ) -> Response {
+    let max_request = state
+        .store
+        .config
+        .max_file_bytes
+        .saturating_add(state.store.config.max_text_bytes)
+        .saturating_add(1024 * 1024);
+    if let Some(length) =
+        header_str(&headers, CONTENT_LENGTH.as_str()).and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        if length > max_request {
+            return error_response(StoreError::TooLarge {
+                limit: state.store.config.max_file_bytes,
+            });
+        }
+    }
     let mut filename: Option<String> =
         header_str(&headers, "x-filename").or_else(|| query.get("filename").cloned());
     let mut ttl_selection = match parse_ttl(&headers, &query) {

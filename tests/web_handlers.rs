@@ -92,6 +92,9 @@ async fn index_page_renders_the_combined_form_and_the_default_ttl() {
     assert!(page.contains("id=\"dropzone\""));
     assert!(page.contains("id=\"file-status\""));
     assert!(page.contains("id=\"clear-file\""));
+    assert!(page.contains("data-max-file-bytes=\"1073741824\""));
+    assert!(page.contains("Max file size: 1.0 GiB"));
+    assert!(page.contains("File is too large"));
     assert!(page.contains("name=\"file\""));
     assert!(page.contains("name=\"text\""));
     assert!(page.contains("name=\"filename\""));
@@ -412,6 +415,30 @@ async fn create_submit_prefers_a_file_when_both_are_supplied() {
         Some("report%2Etxt"),
         "the file name must win over the text filename"
     );
+}
+
+#[tokio::test]
+async fn multipart_over_the_declared_cap_is_rejected_before_reading() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let boundary = "web-cap-preflight";
+    let body = common::multipart_fields_only(boundary, &[("ttl_days", "1")]);
+    let mut headers = multipart_headers(boundary, body.len());
+    for (name, value) in headers.iter_mut() {
+        if *name == "content-length" {
+            *value = (2u64 * 1024 * 1024 * 1024).to_string();
+        }
+    }
+
+    for route in ["/ui/create", "/ui/upload"] {
+        let request = common::request("POST", route, &headers, body.clone());
+        let (status, _, response_body) = common::send(&app, request).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{route}");
+        let page = html_text(&response_body);
+        assert!(page.contains("payload too large"), "{route}: {page}");
+        assert!(page.contains("1.0 GiB"), "{route}: {page}");
+    }
+    assert!(fake.keys().is_empty());
 }
 
 #[tokio::test]

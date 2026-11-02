@@ -793,9 +793,12 @@ comments.
   the API also accepts sub-day TTLs). One "Create paste" button posts
   multipart data to `POST /ui/create`; a selected file takes
   precedence over the text fields. Without JavaScript, the native file
-  picker and textarea still work. On success the browser is redirected
-  to the new paste: the three-word alias when `DAYFLY_SHOW_WORDS` is
-  true (the default), otherwise the canonical ID.
+  picker and textarea still work. The page shows the configured file
+  size limit; with JavaScript, an oversized file is rejected before the
+  upload starts, and the multipart handlers reject an obviously
+  oversized `Content-Length` before reading the body. On success the
+  browser is redirected to the new paste: the three-word alias when
+  `DAYFLY_SHOW_WORDS` is true (the default), otherwise the canonical ID.
 - `GET /pastes` — current pastes, built from the bucket scan (no
   database): alias when enabled (with the canonical ID as secondary
   text), filename if any, content type, size, created date, expiry date
@@ -948,7 +951,7 @@ where `cargo --version`, `rustc --version`, and
 `rust-analyzer --version` all succeed.
 
 **Nix validation result:** `nix build` and the test suite were run on
-`x86_64-linux` against `nixos-unstable`: 374 passed and 2 ignored. On the stable
+`x86_64-linux` against `nixos-unstable`: 376 passed and 2 ignored. On the stable
 `nixos-25.11` branch the build fails before compilation with a
 rustc-too-old error naming 23 AWS crates, which is why the flake
 tracks unstable. Before this was built on a machine with Nix, an
