@@ -375,7 +375,18 @@ where
             _ => {}
         }
     }
-    StoreError::S3(format!("{err:?}"))
+    s3_failure("an object store request failed", err)
+}
+
+/// Log an object store failure and return a client-safe error.
+///
+/// The AWS SDK debug text can contain the endpoint, the response headers,
+/// and the response body. Keep that text in the server log. The client
+/// gets one fixed message, so a bucket name, an error code, or an internal
+/// host does not reach the response.
+fn s3_failure(message: &str, error: impl std::fmt::Debug) -> StoreError {
+    tracing::warn!("{message}: {error:?}");
+    StoreError::S3(message.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -1335,7 +1346,7 @@ impl Store {
             .body
             .collect()
             .await
-            .map_err(|e| StoreError::S3(e.to_string()))?
+            .map_err(|e| s3_failure("cannot read the alias object body", e))?
             .to_vec();
         let target =
             String::from_utf8(bytes).map_err(|_| StoreError::NotFound(phrase.to_string()))?;
@@ -2097,7 +2108,7 @@ impl Store {
             .body
             .collect()
             .await
-            .map_err(|e| StoreError::S3(e.to_string()))?
+            .map_err(|e| s3_failure("cannot read the object body", e))?
             .to_vec();
         Ok(bytes)
     }
