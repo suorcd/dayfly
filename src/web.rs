@@ -70,7 +70,10 @@ a:hover{text-decoration:underline;text-shadow:0 0 8px rgba(234,0,217,.8)}
 table{border-collapse:collapse;width:100%} th,td{text-align:left;padding:.4rem .5rem;border:1px dashed #0abdc6;vertical-align:top}
 th{color:#ea00d9}
 .card,form{background:rgba(19,62,124,.35);border:1px dashed #0abdc6;border-radius:8px;padding:1rem;backdrop-filter:blur(4px)}
+details{background:rgba(19,62,124,.35);border:1px dashed #0abdc6;border-radius:8px;padding:.5rem 1rem;margin-bottom:1rem}
+summary{cursor:pointer;color:#0abdc6}
 td form{display:inline;background:none;border:0;padding:0;border-radius:0;backdrop-filter:none}
+details form{background:none;border:0;padding:0;border-radius:0;backdrop-filter:none;margin:0}
 textarea{width:100%;min-height:12rem;box-sizing:border-box;font-family:"Source Code Pro",Hack,ui-monospace,Menlo,Consolas,monospace;background:#133e7c;color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px;padding:.5rem}
 input,select{font-size:1rem;padding:.3rem .5rem;background:#133e7c;color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px}
 button{font-size:1rem;padding:.35rem .8rem;cursor:pointer;background:rgba(19,62,124,.5);color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px}
@@ -85,7 +88,7 @@ footer{text-align:center;font-size:.85rem;margin-top:2rem;padding-top:1rem;borde
 
 fn page(title: &str, body: &str) -> Html<String> {
     Html(format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title} — pastebin</title>\n<style>{CSS}</style>\n</head>\n<body>\n<header><nav><span class=\"prompt\">~/pastebin $</span><a href=\"/\">new paste</a><a href=\"/pastes\">current pastes</a></nav></header>\n<h1>{title}</h1>\n{body}\n<footer>pastebin — internal use only</footer>\n</body>\n</html>\n"
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title} — pastebin</title>\n<style>{CSS}</style>\n</head>\n<body>\n<header><nav><span class=\"prompt\">~/pastebin $</span><a href=\"/\">new paste</a><a href=\"/pastes\">current pastes</a></nav></header>\n<h1>{title}</h1>\n{body}\n<footer>pastebin — internal use only · &copy; 2026 suorcd</footer>\n</body>\n</html>\n"
     ))
 }
 
@@ -496,7 +499,11 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
     let id_esc = html_escape(&meta.id);
     let main = meta.content_type.split(';').next().unwrap_or("").trim();
     let mut body = format!(
-        "<p>Filename: {}</p><p>Content-Type: {}</p><p>Size: {}</p><p>Created: {}</p><p>Expires: {} ({})</p>",
+        "<details><summary>Metadata &amp; delete</summary>\
+         <p>Filename: {}</p><p>Content-Type: {}</p><p>Size: {}</p><p>Created: {}</p><p>Expires: {} ({})</p>\
+         <form method=\"post\" action=\"/ui/delete\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\"><button type=\"submit\">Delete this paste</button></form>\
+         </details>\
+         <p><a href=\"/v1/pastes/{id_esc}\">Download / raw</a> · <a href=\"/pastes\">Current pastes</a></p>",
         html_escape(meta.filename.as_deref().unwrap_or("—")),
         html_escape(&meta.content_type),
         human_size(meta.size),
@@ -516,7 +523,7 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
             Ok(s) => {
                 body.push_str(&format!("<pre>{}</pre>", html_escape(&s.text)));
                 if s.truncated {
-                    body.push_str("<p class=\"muted\">Text truncated at 1 MiB for this view. Use the raw API URL below for the full paste.</p>");
+                    body.push_str("<p class=\"muted\">Text truncated at 1 MiB for this view. Use the raw API URL above for the full paste.</p>");
                 }
             }
             Err(e) => return error_page(e),
@@ -529,13 +536,6 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
             html_escape(meta.filename.as_deref().unwrap_or("image"))
         ));
     }
-    body.push_str(&format!(
-        "<p><a href=\"/v1/pastes/{id_esc}\">Download / raw</a> · <a href=\"/pastes\">Current pastes</a></p>"
-    ));
-    // Delete from the view page too, as a plain form.
-    body.push_str(&format!(
-        "<form method=\"post\" action=\"/ui/delete\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\"><button type=\"submit\">Delete this paste</button></form>"
-    ));
     page("View paste", &body).into_response()
 }
 

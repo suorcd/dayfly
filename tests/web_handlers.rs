@@ -92,6 +92,7 @@ async fn index_page_renders_both_forms_and_the_default_ttl() {
     assert!(page.contains("enctype=\"multipart/form-data\""));
     assert!(page.contains("<option value=\"7\" selected>7 days</option>"));
     assert!(page.contains("The selector uses whole days"));
+    assert!(page.contains("&copy; 2026 suorcd"));
 }
 
 #[tokio::test]
@@ -494,6 +495,19 @@ async fn view_page_renders_text_escaped_and_images_inline() {
     let page = html_text(&body);
     assert!(page.contains("<pre>a &lt; b &amp; c &gt; d &quot;quoted&quot;</pre>"));
     assert!(page.contains(&format!("/v1/pastes/{}", text.id)));
+    assert!(page.contains("<details><summary>Metadata &amp; delete</summary>"));
+    assert!(page.contains("Delete this paste"));
+    let details_at = page
+        .find("</details>")
+        .expect("the metadata details must close");
+    let download_at = page
+        .find("Download / raw")
+        .expect("the raw link must render");
+    let pre_at = page.find("<pre>").expect("the paste text must render");
+    assert!(
+        details_at < download_at && download_at < pre_at,
+        "metadata must be collapsed above the raw link, and the paste content must come last"
+    );
 
     let request = common::request("GET", &format!("/view/{}", png.id), &[], Vec::new());
     let (status, _, body) = common::send(&app, request).await;

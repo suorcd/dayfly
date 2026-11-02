@@ -789,9 +789,11 @@ comments.
   date, expiry date plus days remaining, and a delete action per
   row. Expired items are filtered out, consistent with the API's
   read-time expiry check. Add `?date=YYYY-MM-DD` for another day.
-- `GET /view/<id>` — one paste: text in `<pre>` (capped at 1 MiB for
-  the page; the API remains the route for full/sliced reads), safe
-  images inline, other types as a download link, plus a delete form.
+- `GET /view/<id>` — one paste: metadata and the delete form in a
+  collapsed `<details>` block, then the raw/download link, then the
+  content: text in `<pre>` (capped at 1 MiB for the page; the API
+  remains the route for full/sliced reads), safe images inline, other
+  types via the download link.
 
 Theme: the pages adapt the base look of the user's own site
 stylesheet, https://suorcd.us/style.css (verified live as the site's
