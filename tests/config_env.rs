@@ -78,7 +78,7 @@ fn minimal_environment_applies_documented_defaults() {
     assert_eq!(config.region, "us-east-1");
     assert_eq!(config.access_key_id, "test-access");
     assert_eq!(config.secret_access_key, "test-secret");
-    assert_eq!(config.max_text_bytes, 10 * 1024 * 1024);
+    assert_eq!(config.max_text_bytes, 100 * 1024 * 1024);
     assert_eq!(config.max_file_bytes, 1024 * 1024 * 1024);
     assert_eq!(config.default_ttl_days, 7);
     assert_eq!(config.http_bind, "127.0.0.1:8080");
@@ -306,6 +306,25 @@ fn default_ttl_days_zero_is_rejected() {
     assert!(
         matches!(error, ConfigError::Invalid(ref field, _) if field == "DAYFLY_DEFAULT_TTL_DAYS"),
         "the error must name DAYFLY_DEFAULT_TTL_DAYS, got {error}"
+    );
+}
+
+#[test]
+fn file_cap_accepts_32_gib_and_rejects_a_part_overflow() {
+    let _guard = lock_env();
+    clear_env();
+    set_required();
+    env::set_var("DAYFLY_MAX_FILE_BYTES", "34359738368");
+    let config = Config::from_env().expect("32 GiB must fit one multipart upload");
+    assert_eq!(config.max_file_bytes, 34_359_738_368);
+
+    env::set_var("DAYFLY_MAX_FILE_BYTES", "60000000000");
+    let error = Config::from_env()
+        .err()
+        .expect("a cap above the part budget must fail");
+    assert!(
+        matches!(error, ConfigError::Invalid(ref field, _) if field == "DAYFLY_MAX_FILE_BYTES"),
+        "the error must name DAYFLY_MAX_FILE_BYTES, got {error}"
     );
 }
 
