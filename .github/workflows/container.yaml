@@ -74,7 +74,11 @@ jobs:
           # It must serve, not merely start. S3 points at a closed port on
           # purpose: the frontend needs no object store, so a 200 proves the
           # binary, the bind address and the runtime user all work.
+          # The image binds 0.0.0.0:8080, so it needs the explicit opt-in:
+          # the container has no bearer token, and the guard refuses an
+          # exposed bind without one.
           docker run -d --name dayfly -p 18080:8080 \
+            -e DAYFLY_ALLOW_UNAUTHENTICATED=1 \
             -e S3_ENDPOINT=http://127.0.0.1:1 \
             -e S3_BUCKET=test \
             -e S3_REGION=us-east-1 \
