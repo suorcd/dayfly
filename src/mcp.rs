@@ -147,6 +147,7 @@ fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> 
         StoreError::NotFound(_)
         | StoreError::Expired(_)
         | StoreError::TooLarge { .. }
+        | StoreError::TooManySegments { .. }
         | StoreError::RangeNotSatisfiable => Ok(CallToolResult::error(vec![ContentBlock::text(
             e.to_string(),
         )])),

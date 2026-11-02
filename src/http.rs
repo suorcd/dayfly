@@ -145,6 +145,7 @@ pub(crate) fn status_for(e: &StoreError) -> StatusCode {
         StoreError::LocalFilesDisabled | StoreError::PathOutsideRoot(_) => StatusCode::FORBIDDEN,
         StoreError::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
         StoreError::AliasUnavailable { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        StoreError::TooManySegments { .. } => StatusCode::CONFLICT,
         StoreError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         StoreError::S3(_) => StatusCode::BAD_GATEWAY,
         StoreError::BucketUnavailable(_) => StatusCode::BAD_GATEWAY,

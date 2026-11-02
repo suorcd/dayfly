@@ -79,6 +79,7 @@ pub struct FakeState {
     pub fail_head_errors: Vec<(String, StatusCode, String)>,
     pub fail_list_prefixes: Vec<(String, StatusCode, String)>,
     pub fail_put_prefixes: Vec<String>,
+    pub fail_get_prefixes: Vec<String>,
     pub missing_bucket: bool,
 }
 
@@ -373,6 +374,15 @@ impl FakeS3 {
             .push(prefix.to_string());
     }
 
+    /// Make every GetObject whose key starts with `prefix` fail.
+    pub fn fail_get_prefix(&self, prefix: &str) {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .fail_get_prefixes
+            .push(prefix.to_string());
+    }
+
     pub fn drop_upload(&self, upload_id: &str) {
         self.state
             .lock()
@@ -648,6 +658,17 @@ fn get_object(
         .map(str::to_string);
     if !is_head {
         state.gets.push((key.clone(), range_header.clone()));
+        if state
+            .fail_get_prefixes
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        {
+            return s3_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                "injected GetObject failure",
+            );
+        }
     }
     let Some(object) = state.objects.get(&key) else {
         if is_head {
