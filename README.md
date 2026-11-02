@@ -16,13 +16,6 @@ info come from scanning the bucket directly. Listing uses ListObjectsV2
 for each UTC date in the window, then HeadObject per key where metadata
 is needed. See "No database in v1" below.
 
-> **Copyright holder is still open.** The LICENSE file says
-> `Copyright (c) 2026 suorcd` and `Cargo.toml` points at
-> `https://github.com/suorcd/dayfly`. The repository URL is now real.
-> The copyright line uses the GitHub handle rather than a full legal
-> name, which is a deliberate placeholder pending the holder's
-> decision. Do not add a legal name without the owner's say.
-
 ## What it is
 
 - One base S3 object per paste/file. Key layout:

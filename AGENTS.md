@@ -222,7 +222,6 @@ Test standards:
   referenced but not bundled (system monospace fallback). Do not
   copy the whole stylesheet, and do not use the file's other
   palettes (`green-dark`, `neon-dark01`).
-- **License / placeholders.** MIT. `LICENSE` and `Cargo.toml` use
-  `suorcd` and `github.com/suorcd/dayfly` as placeholders;
-  the copyright holder line and final repository name/URL must be
-  confirmed before any publish. Do not invent a full legal name.
+- **License.** MIT. The copyright holder is `suorcd`. Do not replace
+  `suorcd` with a legal name unless the owner explicitly says so. The
+  repository URL is `https://github.com/suorcd/dayfly`.
