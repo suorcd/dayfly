@@ -10,7 +10,8 @@ use bytes::Bytes;
 use chrono::{Duration, Utc};
 use common::{FailOp, FakeS3, Gate};
 use dayfly::store::{
-    normalize_words, parse_segment_key, StoreError, Ttl, MULTIPART_CHUNK_BYTES, SEGMENT_SUFFIX_LEN,
+    normalize_words, parse_segment_key, segment_key, StoreError, Ttl, MAX_SEGMENTS_PER_PASTE,
+    MULTIPART_CHUNK_BYTES, SEGMENT_SUFFIX_LEN,
 };
 use futures::stream;
 use sha2::{Digest, Sha256};
@@ -498,6 +499,78 @@ async fn a_store_must_not_delete_an_alias_rebound_to_another_paste() {
         "the failed paste must be removed"
     );
     let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn a_transient_alias_read_failure_keeps_the_stored_paste() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    fake.fail_get_prefix("words/");
+
+    let error = store
+        .store_text(b"keep me", None, None, Some(Ttl::days(1)))
+        .await
+        .expect_err("the alias read must fail");
+    assert!(matches!(error, StoreError::S3(_)), "got {error:?}");
+
+    let bases: Vec<String> = fake
+        .keys()
+        .into_iter()
+        .filter(|key| key.starts_with("pastes/"))
+        .collect();
+    assert_eq!(
+        bases.len(),
+        1,
+        "a transient alias read must keep the new object: {bases:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_paste_over_the_segment_limit_fails_a_metadata_read() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let base_key = "pastes/2026-10-28/manysegments";
+    let meta = future_metadata(1);
+    fake.seed(base_key, b"x", "text/plain", &common::metadata_refs(&meta));
+    for index in 0..=MAX_SEGMENTS_PER_PASTE {
+        let key = segment_key(base_key, index as u64, &format!("seg{index:09}"));
+        fake.seed(&key, b"a", "text/plain", &[]);
+    }
+
+    let error = store
+        .head_metadata("2026-10-28/manysegments")
+        .await
+        .expect_err("a paste over the segment limit must not be read");
+    assert!(
+        matches!(error, StoreError::TooManySegments { .. }),
+        "got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_append_at_the_segment_limit_writes_no_segment() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let base_key = "pastes/2026-10-28/atlimit";
+    let meta = future_metadata(1);
+    fake.seed(base_key, b"x", "text/plain", &common::metadata_refs(&meta));
+    for index in 0..MAX_SEGMENTS_PER_PASTE {
+        let key = segment_key(base_key, index as u64, &format!("seg{index:09}"));
+        fake.seed(&key, b"a", "text/plain", &[]);
+    }
+
+    let error = store
+        .append_text("2026-10-28/atlimit", b"more")
+        .await
+        .expect_err("an append at the segment limit must fail");
+    assert!(
+        matches!(error, StoreError::TooManySegments { .. }),
+        "got {error:?}"
+    );
+    assert!(
+        fake.puts().is_empty(),
+        "a refused append must write no segment"
+    );
 }
 
 #[tokio::test]

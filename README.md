@@ -612,6 +612,13 @@ Limits:
   components after `pastes/`.
 - **An empty append is a no-op.** It writes no object and keeps the
   base `sha256`.
+- **A paste holds at most 4,096 appended segments.** An append at the
+  limit fails and writes no object. A metadata read, download, list, or
+  delete fails when the bucket holds more segments than the limit.
+- **A transient alias check keeps the new object.** The store deletes
+  the new object only when the alias points at another paste or the
+  alias is gone. An S3 error after the upload returns an error and
+  keeps the object.
 - **Segments count toward scan limits.** A listing scans one page of up
   to 1,000 keys. Bare-ID resolution scans up to 10 pages. Segment keys
   consume that budget, so keep the full ID for a paste with many

@@ -50,6 +50,8 @@ pub const LIST_SCAN_MAX_PAGES: usize = 10;
 /// Longest accepted listing window, in days. This cap bounds the number of
 /// date prefixes that one request can scan.
 pub const LIST_WINDOW_MAX_DAYS: usize = 366;
+/// Maximum number of appended segments for one paste.
+pub const MAX_SEGMENTS_PER_PASTE: usize = 4096;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -73,6 +75,8 @@ pub enum StoreError {
     RangeNotSatisfiable,
     #[error("could not allocate a three-word alias after {attempts} attempts")]
     AliasUnavailable { attempts: usize },
+    #[error("paste has more than {limit} appended segments")]
+    TooManySegments { limit: usize },
     #[error("local file access is disabled on this transport: set DAYFLY_MCP_LOCAL_ROOT on the server to allow a directory")]
     LocalFilesDisabled,
     #[error("path outside the allowed root: {0}")]
@@ -1373,6 +1377,18 @@ impl Store {
         }
     }
 
+    /// True when an alias check shows that the object has no alias.
+    ///
+    /// A different target or a missing alias object means the object lost
+    /// its name. Any other error is transient, so the caller keeps the
+    /// object and returns the error.
+    fn alias_is_lost(error: &StoreError) -> bool {
+        matches!(
+            error,
+            StoreError::AliasUnavailable { .. } | StoreError::NotFound(_)
+        )
+    }
+
     /// Delete an alias only when it still points to `target`.
     ///
     /// Cleanup and delete must not remove a phrase that another store
@@ -1546,7 +1562,9 @@ impl Store {
             return Err(map_sdk_error(e, &key));
         }
         if let Err(e) = self.verify_alias(&words, &key).await {
-            self.cleanup_failed_store(&key, &words).await;
+            if Self::alias_is_lost(&e) {
+                self.cleanup_failed_store(&key, &words).await;
+            }
             return Err(e);
         }
         Ok(StoredPaste {
@@ -1660,7 +1678,9 @@ impl Store {
                     return Err(map_sdk_error(e, &key));
                 }
                 if let Err(e) = self.verify_alias(&claimed, &key).await {
-                    self.cleanup_failed_store(&key, &claimed).await;
+                    if Self::alias_is_lost(&e) {
+                        self.cleanup_failed_store(&key, &claimed).await;
+                    }
                     return Err(e);
                 }
                 return Ok(StoredPaste {
@@ -1790,7 +1810,9 @@ impl Store {
             )));
         }
         if let Err(e) = self.verify_alias(&words, &key).await {
-            self.cleanup_failed_store(&key, &words).await;
+            if Self::alias_is_lost(&e) {
+                self.cleanup_failed_store(&key, &words).await;
+            }
             return Err(e);
         }
         Ok(StoredPaste {
@@ -1903,7 +1925,9 @@ impl Store {
                 }
             };
         if let Err(e) = self.verify_alias(&words, &key).await {
-            self.cleanup_failed_store(&key, &words).await;
+            if Self::alias_is_lost(&e) {
+                self.cleanup_failed_store(&key, &words).await;
+            }
             return Err(e);
         }
         Ok(StoredPaste {
@@ -1930,14 +1954,15 @@ impl Store {
         let prefix = segment_prefix(base_key);
         let mut entries = Vec::new();
         let mut token: Option<String> = None;
-        loop {
+        let max_pages = MAX_SEGMENTS_PER_PASTE.div_ceil(1000) + 1;
+        for _ in 0..max_pages {
             let mut req = self
                 .client
                 .list_objects_v2()
                 .bucket(&self.bucket)
                 .prefix(&prefix)
                 .max_keys(1000);
-            if let Some(t) = token {
+            if let Some(t) = token.take() {
                 req = req.continuation_token(t);
             }
             let out = req.send().await.map_err(|e| map_sdk_error(e, base_key))?;
@@ -1949,12 +1974,20 @@ impl Store {
                     ));
                 }
             }
+            if entries.len() > MAX_SEGMENTS_PER_PASTE {
+                return Err(StoreError::TooManySegments {
+                    limit: MAX_SEGMENTS_PER_PASTE,
+                });
+            }
             match out.next_continuation_token() {
                 Some(t) if out.is_truncated().unwrap_or(false) => token = Some(t.to_string()),
-                _ => break,
+                _ => return Ok(entries),
             }
         }
-        Ok(entries)
+        // The page limit is reached while the listing is still truncated.
+        Err(StoreError::TooManySegments {
+            limit: MAX_SEGMENTS_PER_PASTE,
+        })
     }
 
     /// Build the base-plus-segments plan for a known base key and size.
@@ -1989,6 +2022,11 @@ impl Store {
                 appended_bytes: 0,
                 segment_key: None,
                 meta,
+            });
+        }
+        if meta.segments.len() >= MAX_SEGMENTS_PER_PASTE {
+            return Err(StoreError::TooManySegments {
+                limit: MAX_SEGMENTS_PER_PASTE,
             });
         }
         let sequence = match meta.segments.iter().map(|s| s.sequence).max() {
