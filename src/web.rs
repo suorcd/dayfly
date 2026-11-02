@@ -936,6 +936,7 @@ mod tests {
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
             show_words: false,
+            allow_unauthenticated: false,
             http_bearer_token: None,
             mcp_local_root: None,
         }
