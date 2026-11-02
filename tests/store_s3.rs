@@ -2687,3 +2687,132 @@ async fn store_file_path_metadata_describes_the_stored_bytes() {
     );
     let _ = std::fs::remove_file(path);
 }
+
+#[tokio::test]
+async fn set_ttl_moves_base_segments_alias_and_rejects_an_expired_paste() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(7)))
+        .await
+        .expect("the base paste must store");
+    let words = stored
+        .words
+        .clone()
+        .expect("a new paste must have an alias");
+    let appended = store
+        .append_text(&stored.id, b"more")
+        .await
+        .expect("the append must store");
+    let segment_key = appended
+        .segment_key
+        .clone()
+        .expect("a non-empty append must write a segment");
+    let base_sha = fake
+        .object(&stored.key)
+        .expect("the base object must exist")
+        .metadata
+        .get("sha256")
+        .cloned();
+    let before = store
+        .head_metadata(&stored.id)
+        .await
+        .expect("metadata must load");
+    assert!(
+        before.sha256.is_none(),
+        "a segmented paste has no total hash"
+    );
+
+    let updated = store
+        .set_ttl(&stored.id, Ttl::parse("1h").expect("one hour must parse"))
+        .await
+        .expect("set_ttl must succeed");
+    let seconds = (updated.expires_at.expect("expiry must be set") - Utc::now()).num_seconds();
+    assert!(
+        (seconds - 3_600).abs() < 60,
+        "the new expiry must be about one hour away, got {seconds}"
+    );
+    assert_eq!(updated.id, before.id);
+    assert_eq!(updated.words, before.words);
+    assert_eq!(updated.size, before.size);
+    assert!(updated.sha256.is_none());
+
+    let base = fake
+        .object(&stored.key)
+        .expect("the base object must exist");
+    assert_eq!(base.body, b"base");
+    assert_eq!(
+        base.metadata.get("sha256").cloned(),
+        base_sha,
+        "set_ttl must not change the stored hash"
+    );
+    assert_eq!(
+        fake.object(&segment_key)
+            .expect("the segment must exist")
+            .body,
+        b"more"
+    );
+
+    for key in [
+        stored.key.clone(),
+        segment_key.clone(),
+        format!("words/{words}"),
+    ] {
+        let object = fake.object(&key).expect("every object must exist");
+        let expiry = object
+            .metadata
+            .get("expires-at")
+            .expect("every object must carry expiry");
+        let expiry = chrono::DateTime::parse_from_rfc3339(expiry)
+            .expect("expiry must be RFC 3339")
+            .with_timezone(&Utc);
+        let seconds = (expiry - Utc::now()).num_seconds();
+        assert!(
+            (seconds - 3_600).abs() < 60,
+            "{key} must expire in about one hour, got {seconds}"
+        );
+    }
+
+    let extended = store
+        .set_ttl(&words, Ttl::days(30))
+        .await
+        .expect("set_ttl by alias must succeed");
+    let seconds = (extended.expires_at.expect("expiry must be set") - Utc::now()).num_seconds();
+    assert!(
+        (seconds - 30 * 86_400).abs() < 120,
+        "the extension must be about 30 days, got {seconds}"
+    );
+    let by_alias = store
+        .head_metadata(&words)
+        .await
+        .expect("the alias must still resolve");
+    assert_eq!(by_alias.expires_at, extended.expires_at);
+
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let expired_key = format!("pastes/{today}/expired");
+    let expired = common::stored_metadata(
+        &(Utc::now() - Duration::days(1)).to_rfc3339(),
+        "text/plain",
+        3,
+        "abc",
+    );
+    fake.seed(
+        &expired_key,
+        b"abc",
+        "text/plain",
+        &common::metadata_refs(&expired),
+    );
+    let mut keys_before = fake.keys();
+    keys_before.sort();
+    let error = store
+        .set_ttl(&format!("{today}/expired"), Ttl::days(1))
+        .await
+        .expect_err("an expired paste must fail");
+    assert!(matches!(error, StoreError::Expired(_)), "got: {error}");
+    let mut keys_after = fake.keys();
+    keys_after.sort();
+    assert_eq!(
+        keys_after, keys_before,
+        "an expired paste must write nothing"
+    );
+}

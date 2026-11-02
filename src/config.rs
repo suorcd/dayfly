@@ -13,6 +13,16 @@ pub const MAX_MULTIPART_PARTS: u64 = 10_000;
 /// Largest file that one multipart upload can hold at the current part size.
 pub const MAX_MULTIPART_BYTES: u64 = MAX_MULTIPART_PARTS * STREAM_PART_BYTES as u64;
 
+/// Maximum TTL accepted from an API client, in days.
+///
+/// Ten years is a safety bound, not a storage policy. It keeps a mistyped
+/// duration from producing a far-future `expires-at` and keeps the service
+/// description's limit finite.
+pub const MAX_TTL_DAYS: u32 = 3650;
+
+/// Maximum TTL accepted from an API client, in seconds.
+pub const MAX_TTL_SECONDS: i64 = MAX_TTL_DAYS as i64 * 86_400;
+
 /// Configuration loaded from the environment.
 ///
 /// The S3 credentials come from a direct environment variable or from a
@@ -672,6 +682,12 @@ impl Config {
                 "expected a positive integer".to_string(),
             ));
         }
+        if default_ttl_days > MAX_TTL_DAYS {
+            return Err(ConfigError::Invalid(
+                "DAYFLY_DEFAULT_TTL_DAYS".to_string(),
+                format!("expected at most {MAX_TTL_DAYS} days"),
+            ));
+        }
         let max_file_bytes = optional_u64(
             &lookup,
             "DAYFLY_MAX_FILE_BYTES",
@@ -1089,6 +1105,26 @@ mod tests {
             ConfigError::Invalid(name, message) => {
                 assert_eq!(name, "DAYFLY_SHOW_WORDS");
                 assert!(message.contains("true or false"), "{message}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn default_ttl_above_the_maximum_is_rejected() {
+        let mut pairs = base_env();
+        pairs.push((
+            "DAYFLY_DEFAULT_TTL_DAYS".to_string(),
+            (MAX_TTL_DAYS + 1).to_string(),
+        ));
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        match error {
+            ConfigError::Invalid(name, message) => {
+                assert_eq!(name, "DAYFLY_DEFAULT_TTL_DAYS");
+                assert!(
+                    message.contains(&MAX_TTL_DAYS.to_string()),
+                    "message must name the maximum: {message}"
+                );
             }
             other => panic!("unexpected error: {other}"),
         }

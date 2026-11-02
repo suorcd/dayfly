@@ -29,7 +29,7 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{Builder as S3ConfigBuilder, Region};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, MetadataDirective};
 use aws_sdk_s3::Client;
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -42,7 +42,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::config::Config;
+use crate::config::{Config, MAX_TTL_DAYS, MAX_TTL_SECONDS};
 use crate::content_type::{detect_content_type, detect_content_type_sample, Detection, PEEK_BYTES};
 
 pub const MULTIPART_CHUNK_BYTES: usize = 8 * 1024 * 1024;
@@ -152,6 +152,15 @@ impl TtlParseError {
             hint: "Remove either the duration form or the day form.",
         }
     }
+
+    /// A TTL longer than the configured maximum.
+    fn above_max(value: &str, max_days: u32) -> Self {
+        Self {
+            value: Some(value.to_string()),
+            reason: format!("the maximum TTL is {max_days} days"),
+            hint: "Use a shorter TTL.",
+        }
+    }
 }
 
 impl Ttl {
@@ -171,6 +180,9 @@ impl Ttl {
         if days == 0 {
             return Err(TtlParseError::invalid_days("0"));
         }
+        if days > MAX_TTL_DAYS {
+            return Err(TtlParseError::above_max(&days.to_string(), MAX_TTL_DAYS));
+        }
         Ok(Self::days(days))
     }
 
@@ -182,6 +194,9 @@ impl Ttl {
             .map_err(|_| TtlParseError::invalid_days(value))?;
         if days == 0 {
             return Err(TtlParseError::invalid_days(value));
+        }
+        if days > MAX_TTL_DAYS {
+            return Err(TtlParseError::above_max(value, MAX_TTL_DAYS));
         }
         Ok(Self::days(days))
     }
@@ -206,6 +221,9 @@ impl Ttl {
                 .map_err(|_| TtlParseError::new(value, "the number is too large"))?;
             if seconds == 0 {
                 return Err(TtlParseError::new(value, "zero is not allowed"));
+            }
+            if seconds > MAX_TTL_SECONDS {
+                return Err(TtlParseError::above_max(value, MAX_TTL_DAYS));
             }
             let duration = chrono::Duration::try_seconds(seconds)
                 .ok_or_else(|| TtlParseError::new(value, "the duration is too large"))?;
@@ -249,6 +267,9 @@ impl Ttl {
         }
         if total_seconds == 0 {
             return Err(TtlParseError::new(value, "zero is not allowed"));
+        }
+        if total_seconds > MAX_TTL_SECONDS {
+            return Err(TtlParseError::above_max(value, MAX_TTL_DAYS));
         }
         let duration = chrono::Duration::try_seconds(total_seconds)
             .ok_or_else(|| TtlParseError::new(value, "the duration is too large"))?;
@@ -440,6 +461,32 @@ impl PasteMetadata {
     /// Build the range plan for this paste without another S3 call.
     pub fn plan(&self) -> SegmentPlan {
         SegmentPlan::new(self.key.clone(), self.base_size, self.segments.clone())
+    }
+
+    /// A stable validator for the joined paste.
+    ///
+    /// The stored `sha256` covers the base object only, so use it only when
+    /// there are no segments. With segments, the total size and the last
+    /// segment key change on every append, and both come from stored state.
+    pub fn etag(&self) -> String {
+        if self.segments.is_empty() {
+            if let Some(sha256) = &self.sha256 {
+                return format!("\"{sha256}\"");
+            }
+            return format!(
+                "\"{}\"",
+                sha256_hex(format!("{}:{}", self.size, self.key).as_bytes())
+            );
+        }
+        let last_segment = self
+            .segments
+            .last()
+            .map(|segment| segment.key.as_str())
+            .unwrap_or("");
+        format!(
+            "\"{}\"",
+            sha256_hex(format!("{}:{}", self.size, last_segment).as_bytes())
+        )
     }
 }
 
@@ -2130,6 +2177,69 @@ impl Store {
         Ok(())
     }
 
+    /// Replace the expiry metadata on one object, preserving its body and
+    /// all other metadata. A server-side copy avoids downloading the object.
+    async fn rewrite_expiry(
+        &self,
+        key: &str,
+        expires_at: DateTime<Utc>,
+        ttl: Ttl,
+    ) -> Result<(), StoreError> {
+        let out = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| map_sdk_error(e, key))?;
+        let mut meta = out.metadata().cloned().unwrap_or_default();
+        meta.insert("expires-at".to_string(), expires_at.to_rfc3339());
+        meta.insert("ttl-seconds".to_string(), ttl.num_seconds().to_string());
+        if let Some(days) = ttl.whole_days() {
+            meta.insert("ttl-days".to_string(), days.to_string());
+        } else {
+            meta.remove("ttl-days");
+        }
+        let content_type = out
+            .content_type()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        self.client
+            .copy_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .copy_source(format!("{}/{}", self.bucket, key))
+            .metadata_directive(MetadataDirective::Replace)
+            .content_type(content_type)
+            .set_metadata(Some(meta))
+            .send()
+            .await
+            .map_err(|e| map_sdk_error(e, key))?;
+        Ok(())
+    }
+
+    /// Change the expiry of an existing paste, every segment, and the alias.
+    ///
+    /// The new expiry is computed from now, so an extension is real. An
+    /// expired paste is rejected before any object is rewritten.
+    pub async fn set_ttl(&self, id: &str, ttl: Ttl) -> Result<PasteMetadata, StoreError> {
+        let mut meta = self.head_metadata(id).await?;
+        Self::check_not_expired(&meta)?;
+        let expires_at = expires_at_for(Utc::now(), ttl);
+        for segment in &meta.segments {
+            self.rewrite_expiry(&segment.key, expires_at, ttl).await?;
+        }
+        if let Some(words) = &meta.words {
+            self.rewrite_expiry(&alias_key(words), expires_at, ttl)
+                .await?;
+        }
+        self.rewrite_expiry(&meta.key, expires_at, ttl).await?;
+        meta.expires_at = Some(expires_at);
+        meta.expired = false;
+        Ok(meta)
+    }
+
     /// Fetch one object's byte range. This is the only method that issues
     /// a GET against a single key.
     async fn fetch_object_range(
@@ -2863,6 +2973,20 @@ mod tests {
             let ttl = Ttl::parse(value).unwrap_or_else(|e| panic!("{value:?}: {e}"));
             assert_eq!(ttl.num_seconds(), seconds, "value {value:?}");
         }
+    }
+
+    #[test]
+    fn ttl_above_the_maximum_is_rejected() {
+        assert!(Ttl::checked_days(MAX_TTL_DAYS + 1).is_err());
+        assert!(Ttl::parse_days(&(MAX_TTL_DAYS + 1).to_string()).is_err());
+        assert!(Ttl::parse(&(MAX_TTL_SECONDS + 1).to_string()).is_err());
+        assert!(Ttl::parse(&format!("{}d", MAX_TTL_DAYS + 1)).is_err());
+        assert_eq!(
+            Ttl::checked_days(MAX_TTL_DAYS)
+                .expect("the maximum must be accepted")
+                .num_seconds(),
+            MAX_TTL_SECONDS
+        );
     }
 
     #[test]

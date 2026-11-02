@@ -119,6 +119,7 @@ Operations, in both MCP tools and HTTP endpoints:
 | Fetch text (offset/limit) | `fetch_text` | `GET /v1/pastes/<id-or-alias>` (raw; use `Range` for slices) |
 | Fetch file (streaming, Range) | `fetch_file` (downloads to a local path) | `GET /v1/pastes/<id-or-alias>` with `Range` → 206 |
 | Fetch metadata (HeadObject equivalent) | `fetch_metadata` | `GET /v1/pastes/<id-or-alias>/meta`, or `HEAD /v1/pastes/<id-or-alias>` |
+| Change expiry | `set_ttl` | `PATCH /v1/pastes/<id-or-alias>` with `X-TTL` or `X-TTL-Days` |
 | Delete | `delete_paste` | `DELETE /v1/pastes/<id-or-alias>` |
 | List recent (date or inclusive date window) | `list_recent` | `GET /v1/pastes?date=YYYY-MM-DD&limit=N` or `GET /v1/pastes?start=YYYY-MM-DD&end=YYYY-MM-DD&limit=N` |
 
@@ -139,6 +140,15 @@ Every operation that takes an ID also accepts a three-word alias, such
 as `abacus-abdomen-zoology`. The JSON and MCP store responses include
 both forms; the plain-text HTTP response returns only the URL. See
 "Three-word alias".
+
+### Service description
+
+The running service publishes `GET /.well-known/dayfly.json` without
+authentication. The document reports the crate version, the auth mode,
+the limits in force, and every API route. The frontend links to it.
+
+The reference deployment serves it at
+[`/.well-known/dayfly.json`](https://dayfly.k.ser.ink/.well-known/dayfly.json).
 
 ### Explicitly OUT of v1
 
@@ -221,7 +231,7 @@ file permission warnings into faults.
 | `S3_REGION` | no | `us-east-1` | Signing region for Garage; supply your own, do not rely on the default being "yours" |
 | `DAYFLY_MAX_TEXT_BYTES` | no | 104857600 (100 MiB) | Max text paste size for MCP `store_text`, the human text form, and `POST /upload` without a filename; oversize → 413. A filename (including a multipart filename) uses `DAYFLY_MAX_FILE_BYTES` instead |
 | `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error. The maximum is 52428800000 bytes: 10,000 parts of 5 MiB |
-| `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1. The name and meaning are unchanged |
+| `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1 and at most 3650. The name and meaning are unchanged |
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
 | `DAYFLY_SHOW_WORDS` | no | `true` | Show the generated three-word alias in the human UI: create redirects, the view page, and the paste list. Display only; the JSON/MCP responses still include `words`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_HTTP_BEARER_TOKEN` | one form | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model); set this variable or `DAYFLY_HTTP_BEARER_TOKEN_FILE` |
@@ -302,10 +312,10 @@ every agent can read must not hold the key values.
 Logging goes to stderr only, never stdout, so the JSON-RPC stream is
 not corrupted.
 
-MCP tools: `store_text`, `store_file`, `append_text`, `fetch_text`,
-`fetch_file` (downloads to a local path and returns metadata — binary
-content is never sent over JSON-RPC), `fetch_metadata`, `delete_paste`,
-`list_recent`.
+MCP tools: `store_text`, `store_file`, `append_text`, `set_ttl`,
+`fetch_text`, `fetch_file` (downloads to a local path and returns
+metadata — binary content is never sent over JSON-RPC),
+`fetch_metadata`, `delete_paste`, `list_recent`.
 
 `store_file` and `fetch_file` are subject to the transport rule in the
 Access model section: the HTTP transport refuses them until
@@ -387,7 +397,7 @@ one form, a header wins over the query parameter.
 A malformed or zero TTL returns 400 with a JSON error. It does not
 fall back to the default. `DAYFLY_DEFAULT_TTL_DAYS` sets the default
 in positive whole days when no TTL is given; its name and meaning are
-unchanged.
+unchanged. The maximum TTL is 3650 days; a longer value returns 400.
 
 ```sh
 # Sub-day TTL: one hour and thirty minutes.
@@ -410,6 +420,24 @@ cat notes.txt | curl --data-binary @- \
   -H 'X-TTL-Days: 7' \
   http://127.0.0.1:8080/upload
 ```
+
+### Change expiry
+
+`PATCH` the paste with a new TTL. The new expiry is measured from now,
+so a shorter or longer window both work. The call rewrites the base,
+every segment, and the alias, then returns the metadata shape.
+
+```sh
+# Shorten to one hour.
+curl -X PATCH -H 'X-TTL: 1h' \
+  http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123...
+
+# Extend to thirty days.
+curl -X PATCH -H 'X-TTL-Days: 30' \
+  http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123...
+```
+
+An expired paste returns 410, and the call writes nothing.
 
 ### Append text
 
@@ -521,6 +549,10 @@ curl 'http://127.0.0.1:8080/v1/pastes?start=2026-10-28&end=2026-10-29&limit=100'
 order, then in S3 key order within each date. The limit applies to the
 newest dates first, then to key order within a date. Key order is not
 creation order because IDs are random. An older date can be omitted.
+
+Downloads return an `ETag`. Send it as `If-None-Match` to get
+`304 Not Modified` when the paste has not changed. The validator covers
+the joined paste, so an append changes it. `HEAD` returns the same tag.
 
 Error responses are machine-readable JSON, e.g.
 `{"error": "payload too large: limit is 1073741824 bytes"}` with HTTP
@@ -940,7 +972,7 @@ where `cargo --version`, `rustc --version`, and
 `rust-analyzer --version` all succeed.
 
 **Nix validation result:** `nix build` and the test suite were run on
-`x86_64-linux` against `nixos-unstable`: 376 passed and 2 ignored. On the stable
+`x86_64-linux` against `nixos-unstable`: 384 passed and 2 ignored. On the stable
 `nixos-25.11` branch the build fails before compilation with a
 rustc-too-old error naming 23 AWS crates, which is why the flake
 tracks unstable.

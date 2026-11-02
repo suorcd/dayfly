@@ -18,7 +18,8 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State};
 use axum::http::header::{
-    ACCEPT, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, HOST, RANGE,
+    ACCEPT, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST,
+    IF_NONE_MATCH, RANGE,
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
@@ -32,10 +33,11 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
+use crate::config::MAX_TTL_SECONDS;
 use crate::content_type::content_disposition;
 use crate::store::{
-    parse_list_window_request, parse_range_header, ListWindowRequest, Store, StoreError, Ttl,
-    TtlParseError, MULTIPART_CHUNK_BYTES,
+    parse_list_window_request, parse_range_header, ListWindowRequest, PasteMetadata, Store,
+    StoreError, Ttl, TtlParseError, MULTIPART_CHUNK_BYTES,
 };
 use crate::web::api_write_allowed;
 
@@ -224,11 +226,50 @@ struct MetaEnvelope {
     expired: bool,
 }
 
+impl From<PasteMetadata> for MetaEnvelope {
+    fn from(meta: PasteMetadata) -> Self {
+        Self {
+            id: meta.id,
+            key: meta.key,
+            words: meta.words,
+            filename: meta.filename,
+            content_type: meta.content_type,
+            detection_source: meta.detection_source,
+            detection_conflict: meta.detection_conflict,
+            size: meta.size,
+            sha256: meta.sha256,
+            created_at: meta.created_at.map(|d| d.to_rfc3339()),
+            expires_at: meta.expires_at.map(|d| d.to_rfc3339()),
+            expired: meta.expired,
+        }
+    }
+}
+
 fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
+}
+
+/// True when `If-None-Match` names the current entity tag.
+///
+/// S3 clients send a comma-separated list, a weak `W/` prefix, or `*`.
+/// The comparison uses the weak form, as RFC 9110 requires for this header.
+fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
+    let Some(value) = headers
+        .get(IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    value.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        if candidate == "*" {
+            return true;
+        }
+        candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+    })
 }
 
 /// The two TTL forms that a request can supply.
@@ -531,21 +572,7 @@ async fn meta_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
             if meta.expired {
                 return error_response(StoreError::Expired(meta.id));
             }
-            Json(MetaEnvelope {
-                id: meta.id,
-                key: meta.key,
-                words: meta.words,
-                filename: meta.filename,
-                content_type: meta.content_type,
-                detection_source: meta.detection_source,
-                detection_conflict: meta.detection_conflict,
-                size: meta.size,
-                sha256: meta.sha256,
-                created_at: meta.created_at.map(|d| d.to_rfc3339()),
-                expires_at: meta.expires_at.map(|d| d.to_rfc3339()),
-                expired: meta.expired,
-            })
-            .into_response()
+            Json(MetaEnvelope::from(meta)).into_response()
         }
         Err(e) => error_response(e),
     }
@@ -566,6 +593,15 @@ async fn download_inner(
     };
     if meta.expired {
         return error_response(StoreError::Expired(meta.id.clone()));
+    }
+    let etag = meta.etag();
+    if if_none_match_matches(headers, &etag) {
+        let mut not_modified = HeaderMap::new();
+        not_modified.insert(
+            ETAG,
+            HeaderValue::from_str(&etag).unwrap_or_else(|_| HeaderValue::from_static("\"\"")),
+        );
+        return (StatusCode::NOT_MODIFIED, not_modified).into_response();
     }
     let range_header = header_str(headers, RANGE.as_str());
     let range = match &range_header {
@@ -589,6 +625,10 @@ async fn download_inner(
     let (start, end) = range.unwrap_or((0, meta.size.saturating_sub(1)));
     let length = if meta.size == 0 { 0 } else { end - start + 1 };
     let mut resp_headers = HeaderMap::new();
+    resp_headers.insert(
+        ETAG,
+        HeaderValue::from_str(&etag).unwrap_or_else(|_| HeaderValue::from_static("\"\"")),
+    );
     resp_headers.insert(
         CONTENT_TYPE,
         HeaderValue::from_str(&meta.content_type)
@@ -776,6 +816,51 @@ async fn meta_bare(
     meta_inner(&state, &headers, &random).await
 }
 
+async fn set_ttl_dated(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((date, random)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    set_ttl_inner(&state, &headers, &format!("{date}/{random}"), &query).await
+}
+
+async fn set_ttl_bare(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(random): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    set_ttl_inner(&state, &headers, &random, &query).await
+}
+
+async fn set_ttl_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    query: &HashMap<String, String>,
+) -> Response {
+    if let Err(resp) = check_auth(state, headers) {
+        return resp;
+    }
+    if !api_write_allowed(headers) {
+        return forbidden_write();
+    }
+    let selection = match parse_ttl(headers, query) {
+        Ok(selection) => selection,
+        Err(e) => return ttl_error_response(e),
+    };
+    let ttl = match selection.resolve() {
+        Ok(Some(ttl)) => ttl,
+        Ok(None) => return bad_request("a TTL is required".to_string()),
+        Err(e) => return ttl_error_response(e),
+    };
+    match state.store.set_ttl(id, ttl).await {
+        Ok(meta) => Json(MetaEnvelope::from(meta)).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
 async fn delete_dated(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -917,6 +1002,135 @@ async fn append_bare(
     append_inner(&state, &headers, &random, req).await
 }
 
+/// One API route as described by the well-known service document.
+#[derive(Clone, Copy)]
+pub struct ApiRoute {
+    pub method: &'static str,
+    pub path: &'static str,
+    pub purpose: &'static str,
+}
+
+/// The API routes that the service document describes.
+///
+/// The test at the bottom of this module compares this list with the
+/// `.route(...)` calls in `api_router`, because axum does not expose its
+/// route table. Add a route here when you add one there.
+pub const API_ROUTE_DOCS: &[ApiRoute] = &[
+    ApiRoute {
+        method: "POST",
+        path: "/upload",
+        purpose: "Upload a raw body or a multipart file.",
+    },
+    ApiRoute {
+        method: "POST",
+        path: "/v1/pastes",
+        purpose: "Store a paste.",
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/v1/pastes",
+        purpose: "List recent pastes.",
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/v1/pastes/{date}/{random}",
+        purpose: "Download a paste with the full ID.",
+    },
+    ApiRoute {
+        method: "HEAD",
+        path: "/v1/pastes/{date}/{random}",
+        purpose: "Read download headers for a paste with the full ID.",
+    },
+    ApiRoute {
+        method: "DELETE",
+        path: "/v1/pastes/{date}/{random}",
+        purpose: "Delete a paste with the full ID.",
+    },
+    ApiRoute {
+        method: "PATCH",
+        path: "/v1/pastes/{date}/{random}",
+        purpose: "Change the expiry of a paste with the full ID.",
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/v1/pastes/{random}",
+        purpose: "Download a paste with a bare ID or alias.",
+    },
+    ApiRoute {
+        method: "HEAD",
+        path: "/v1/pastes/{random}",
+        purpose: "Read download headers for a bare ID or alias.",
+    },
+    ApiRoute {
+        method: "DELETE",
+        path: "/v1/pastes/{random}",
+        purpose: "Delete a paste with a bare ID or alias.",
+    },
+    ApiRoute {
+        method: "PATCH",
+        path: "/v1/pastes/{random}",
+        purpose: "Change the expiry of a bare ID or alias.",
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/v1/pastes/{date}/{random}/meta",
+        purpose: "Read metadata for a paste with the full ID.",
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/v1/pastes/{random}/meta",
+        purpose: "Read metadata for a bare ID or alias.",
+    },
+    ApiRoute {
+        method: "POST",
+        path: "/v1/pastes/{date}/{random}/append",
+        purpose: "Append bytes to a paste with the full ID.",
+    },
+    ApiRoute {
+        method: "POST",
+        path: "/v1/pastes/{random}/append",
+        purpose: "Append bytes to a bare ID or alias.",
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/.well-known/dayfly.json",
+        purpose: "Read this machine-readable service description.",
+    },
+];
+
+/// Serve the unauthenticated service document.
+async fn service_description(State(state): State<AppState>) -> Response {
+    let config = &state.store.config;
+    let routes: Vec<serde_json::Value> = API_ROUTE_DOCS
+        .iter()
+        .map(|route| {
+            serde_json::json!({
+                "method": route.method,
+                "path": route.path,
+                "purpose": route.purpose,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "name": "dayfly",
+        "version": env!("CARGO_PKG_VERSION"),
+        "mcp_endpoint": "/mcp",
+        "auth": if config.http_bearer_token.is_some() {
+            "bearer"
+        } else {
+            "none"
+        },
+        "limits": {
+            "max_text_bytes": config.max_text_bytes,
+            "max_file_bytes": config.max_file_bytes,
+            "default_ttl_seconds": u64::from(config.default_ttl_days) * 86_400,
+            "max_ttl_seconds": MAX_TTL_SECONDS,
+        },
+        "routes": routes,
+    }))
+    .into_response()
+}
+
 /// API routes, without state attached. [`app_router`] merges these with the
 /// human UI routes and attaches a single shared [`AppState`].
 pub fn api_router() -> Router<AppState> {
@@ -930,17 +1144,20 @@ pub fn api_router() -> Router<AppState> {
         .layer(DefaultBodyLimit::disable());
     Router::new()
         .merge(upload_routes)
+        .route("/.well-known/dayfly.json", get(service_description))
         .route(
             "/v1/pastes/{date}/{random}",
             get(download_dated)
                 .head(download_dated_head)
-                .delete(delete_dated),
+                .delete(delete_dated)
+                .patch(set_ttl_dated),
         )
         .route(
             "/v1/pastes/{random}",
             get(download_bare)
                 .head(download_bare_head)
-                .delete(delete_bare),
+                .delete(delete_bare)
+                .patch(set_ttl_bare),
         )
         .route("/v1/pastes/{date}/{random}/meta", get(meta_dated))
         .route("/v1/pastes/{random}/meta", get(meta_bare))
@@ -950,6 +1167,7 @@ pub fn api_router() -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -1491,6 +1709,57 @@ mod tests {
         assert!(TtlSelection::default().set("ttl", "0").is_err());
         assert!(TtlSelection::default().set("ttl_days", "soon").is_err());
         assert!(TtlSelection::default().set("ttl_days", "0").is_err());
+    }
+
+    #[test]
+    fn service_description_covers_every_api_route() {
+        let source = include_str!("http.rs");
+        let start = source
+            .find("pub fn api_router()")
+            .expect("api_router must exist");
+        let tail = &source[start..];
+        let end = tail.find("\n}\n").expect("api_router must close");
+        let body = &tail[..end];
+
+        let mut actual = HashSet::new();
+        let mut rest = body;
+        while let Some(index) = rest.find(".route(") {
+            let after = &rest[index..];
+            let next = after[1..]
+                .find(".route(")
+                .map(|offset| offset + 1)
+                .unwrap_or(after.len());
+            let segment = &after[..next];
+            let Some(first_quote) = segment.find('"') else {
+                break;
+            };
+            let after_first = &segment[first_quote + 1..];
+            let Some(second_quote) = after_first.find('"') else {
+                break;
+            };
+            let path = &after_first[..second_quote];
+            for (token, method) in [
+                ("get(", "GET"),
+                ("post(", "POST"),
+                ("head(", "HEAD"),
+                ("delete(", "DELETE"),
+                ("patch(", "PATCH"),
+            ] {
+                if segment.contains(token) {
+                    actual.insert(format!("{method} {path}"));
+                }
+            }
+            rest = &after[next..];
+        }
+
+        let expected: HashSet<String> = API_ROUTE_DOCS
+            .iter()
+            .map(|route| format!("{} {}", route.method, route.path))
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "update API_ROUTE_DOCS when api_router changes"
+        );
     }
 
     // --- Streamable HTTP MCP endpoint -------------------------------------
