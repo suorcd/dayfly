@@ -75,7 +75,7 @@ fn future_metadata(size: usize) -> Vec<(String, String)> {
 }
 
 #[tokio::test]
-async fn index_page_renders_both_forms_and_the_default_ttl() {
+async fn index_page_renders_the_combined_form_and_the_default_ttl() {
     let fake = FakeS3::start().await;
     let app = common::app(fake.store().await);
 
@@ -87,9 +87,21 @@ async fn index_page_renders_both_forms_and_the_default_ttl() {
         .unwrap()
         .starts_with("text/html"));
     let page = html_text(&body);
-    assert!(page.contains("action=\"/ui/text\""));
-    assert!(page.contains("action=\"/ui/upload\""));
+    assert!(page.contains("action=\"/ui/create\""));
     assert!(page.contains("enctype=\"multipart/form-data\""));
+    assert!(page.contains("id=\"dropzone\""));
+    assert!(page.contains("id=\"file-status\""));
+    assert!(page.contains("id=\"clear-file\""));
+    assert!(page.contains("name=\"file\""));
+    assert!(page.contains("name=\"text\""));
+    assert!(page.contains("name=\"filename\""));
+    assert!(page.contains("name=\"ttl_days\""));
+    let ttl_at = page.find("name=\"ttl_days\"").expect("TTL selector");
+    let file_at = page.find("name=\"file\"").expect("file input");
+    assert!(
+        ttl_at < file_at,
+        "the TTL field must precede the file field"
+    );
     assert!(page.contains("<option value=\"7\" selected>7 days</option>"));
     assert!(page.contains("The selector uses whole days"));
     assert!(page.contains("&copy; 2026 suorcd"));
@@ -116,8 +128,8 @@ async fn index_page_selects_a_default_outside_the_fixed_list() {
     assert_eq!(
         page.matches("<option value=\"2\" selected>2 days</option>")
             .count(),
-        2,
-        "both forms must select the configured default"
+        1,
+        "the combined form must select the configured default"
     );
 }
 
@@ -253,7 +265,7 @@ async fn text_submit_over_cap_returns_413_error_page() {
 }
 
 #[tokio::test]
-async fn upload_submit_creates_a_paste_with_form_ttl() {
+async fn create_submit_creates_a_file_with_form_ttl() {
     let fake = FakeS3::start().await;
     let app = common::app(fake.store().await);
 
@@ -261,19 +273,19 @@ async fn upload_submit_creates_a_paste_with_form_ttl() {
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::OK);
     let rendered = html_text(&body);
-    let upload_form = rendered
-        .split("action=\"/ui/upload\"")
+    let create_form = rendered
+        .split("action=\"/ui/create\"")
         .nth(1)
-        .expect("the upload form must be rendered");
-    let ttl_position = upload_form
+        .expect("the combined form must be rendered");
+    let ttl_position = create_form
         .find("name=\"ttl_days\"")
-        .expect("the upload form must render the TTL selector");
-    let file_position = upload_form
+        .expect("the combined form must render the TTL selector");
+    let file_position = create_form
         .find("name=\"file\"")
-        .expect("the upload form must render the file input");
+        .expect("the combined form must render the file input");
     assert!(
         ttl_position < file_position,
-        "the TTL selector must come before the file input, so the handler reads it: {upload_form}"
+        "the TTL selector must come before the file input, so the handler reads it: {create_form}"
     );
 
     let boundary = "web-boundary";
@@ -286,7 +298,7 @@ async fn upload_submit_creates_a_paste_with_form_ttl() {
     );
     let headers = multipart_headers(boundary, body.len());
 
-    let request = common::request("POST", "/ui/upload", &headers, body);
+    let request = common::request("POST", "/ui/create", &headers, body);
     let (status, response_headers, _body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let id = id_from_redirect(&response_headers);
@@ -302,6 +314,145 @@ async fn upload_submit_creates_a_paste_with_form_ttl() {
         object.metadata.get("ttl-days").map(String::as_str),
         Some("3")
     );
+}
+
+#[tokio::test]
+async fn create_submit_creates_a_text_paste_with_filename_and_ttl() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let boundary = "web-create-text";
+    let body = common::multipart_fields_only(
+        boundary,
+        &[
+            ("ttl_days", "1"),
+            ("text", "hello world"),
+            ("filename", "note.txt"),
+        ],
+    );
+    let headers = multipart_headers(boundary, body.len());
+
+    let request = common::request("POST", "/ui/create", &headers, body);
+    let (status, response_headers, _body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let id = id_from_redirect(&response_headers);
+    let object = fake
+        .object(&format!("pastes/{id}"))
+        .expect("the text must be stored");
+    assert_eq!(object.body, b"hello world");
+    assert_eq!(
+        object.metadata.get("filename").map(String::as_str),
+        Some("note%2Etxt")
+    );
+    assert_eq!(
+        object.metadata.get("ttl-days").map(String::as_str),
+        Some("1")
+    );
+}
+
+#[tokio::test]
+async fn create_submit_prefers_a_file_when_both_are_supplied() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let boundary = "web-create-both";
+    let body = common::multipart_body(
+        boundary,
+        Some("report.txt"),
+        Some("text/plain"),
+        b"file body",
+        &[
+            ("ttl_days", "3"),
+            ("text", "text that must be ignored"),
+            ("filename", "note.txt"),
+        ],
+    );
+    let headers = multipart_headers(boundary, body.len());
+
+    let request = common::request("POST", "/ui/create", &headers, body);
+    let (status, response_headers, _body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let id = id_from_redirect(&response_headers);
+    let object = fake
+        .object(&format!("pastes/{id}"))
+        .expect("the file must be stored");
+    assert_eq!(object.body, b"file body");
+    assert_eq!(
+        object.metadata.get("filename").map(String::as_str),
+        Some("report%2Etxt"),
+        "the file name must win over the text filename"
+    );
+}
+
+#[tokio::test]
+async fn create_submit_ignores_an_empty_file_part_and_uses_text() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let boundary = "web-create-empty-file";
+    let body = common::multipart_body(
+        boundary,
+        None,
+        None,
+        b"",
+        &[("ttl_days", "1"), ("text", "hello from text")],
+    );
+    let headers = multipart_headers(boundary, body.len());
+
+    let request = common::request("POST", "/ui/create", &headers, body);
+    let (status, response_headers, _body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let id = id_from_redirect(&response_headers);
+    let object = fake
+        .object(&format!("pastes/{id}"))
+        .expect("the text must be stored");
+    assert_eq!(object.body, b"hello from text");
+}
+
+#[tokio::test]
+async fn create_submit_rejects_an_empty_form() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let boundary = "web-create-empty";
+    let body = common::multipart_fields_only(boundary, &[("ttl_days", "1")]);
+    let headers = multipart_headers(boundary, body.len());
+
+    let request = common::request("POST", "/ui/create", &headers, body);
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(html_text(&body).contains("provide text or a file"));
+    assert!(fake.keys().is_empty());
+}
+
+#[tokio::test]
+async fn create_submit_rejects_an_oversized_text_without_storing() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store_with_caps(5, 1024).await);
+    let boundary = "web-create-oversized";
+    let body = common::multipart_fields_only(boundary, &[("ttl_days", "1"), ("text", "123456")]);
+    let headers = multipart_headers(boundary, body.len());
+
+    let request = common::request("POST", "/ui/create", &headers, body);
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(html_text(&body).contains("payload too large"));
+    assert!(fake.keys().is_empty());
+}
+
+#[tokio::test]
+async fn create_submit_rejects_an_oversized_ttl_field() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let boundary = "web-create-ttl";
+    let oversized = "a".repeat(MULTIPART_METADATA_MAX_BYTES + 1);
+    let body = common::multipart_fields_only(
+        boundary,
+        &[("ttl_days", oversized.as_str()), ("text", "hello")],
+    );
+    let headers = multipart_headers(boundary, body.len());
+
+    let request = common::request("POST", "/ui/create", &headers, body);
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(html_text(&body).contains("payload too large"));
+    assert!(fake.keys().is_empty());
 }
 
 #[tokio::test]

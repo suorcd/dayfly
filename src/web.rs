@@ -1,10 +1,11 @@
 //! Simple human web frontend, served by the same binary in HTTP mode.
 //!
-//! Server-rendered HTML only: plain forms and links, no JavaScript
-//! framework and no frontend build step. Two pages, plus a view page
-//! that falls out naturally:
+//! Server-rendered HTML with a small vanilla-JS drag-and-drop
+//! enhancement; no JavaScript framework and no frontend build step.
+//! Two pages, plus a view page that falls out naturally:
 //!
-//! * `GET /` — new paste/upload form (text and file, TTL selector).
+//! * `GET /` — combined new-paste form: drop/choose a file or paste
+//!   text, with a TTL selector.
 //! * `GET /pastes` — current pastes for a date, from the bucket scan
 //!   (no database), with a delete action per row.
 //! * `GET /view/<id>` — one paste: text in `<pre>`, image inline,
@@ -49,7 +50,7 @@ use crate::http::{
     check_auth, read_metadata_field, status_for, AppState, MultipartFieldError,
     MULTIPART_METADATA_MAX_BYTES,
 };
-use crate::store::{parse_list_window_request, ListWindowRequest, StoreError, Ttl};
+use crate::store::{parse_list_window_request, ListWindowRequest, StoreError, StoredPaste, Ttl};
 
 /// Adapted base look from suorcd.us/style.css, palette cyberpunkNeon
 /// (background #091833, text #e3e8fc, accent #ea00d9, code background
@@ -74,6 +75,11 @@ details{background:rgba(19,62,124,.35);border:1px dashed #0abdc6;border-radius:8
 summary{cursor:pointer;color:#0abdc6}
 td form{display:inline;background:none;border:0;padding:0;border-radius:0;backdrop-filter:none}
 details form{background:none;border:0;padding:0;border-radius:0;backdrop-filter:none;margin:0}
+.dropzone{display:block;border:2px dashed #0abdc6;border-radius:8px;padding:1.5rem;margin-bottom:.5rem;text-align:center;cursor:pointer;background:rgba(19,62,124,.2)}
+.dropzone:hover,.dropzone.dragover{border-color:#ea00d9;box-shadow:0 0 12px rgba(234,0,217,.35)}
+.dropzone input[type=file]{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.dropzone-title{display:block;font-weight:bold;color:#ea00d9}
+.dropzone .muted{display:block}
 textarea{width:100%;min-height:12rem;box-sizing:border-box;font-family:"Source Code Pro",Hack,ui-monospace,Menlo,Consolas,monospace;background:#133e7c;color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px;padding:.5rem}
 input,select{font-size:1rem;padding:.3rem .5rem;background:#133e7c;color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px}
 button{font-size:1rem;padding:.35rem .8rem;cursor:pointer;background:rgba(19,62,124,.5);color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px}
@@ -85,6 +91,74 @@ footer{text-align:center;font-size:.85rem;margin-top:2rem;padding-top:1rem;borde
 .muted{opacity:.7} .expired{color:#ff6b6b}
 @media (max-width:768px){body{padding:12px} header{flex-direction:column} nav{flex-direction:column;align-items:flex-start;gap:.5rem} nav a{font-size:.9rem}}
 "#;
+
+/// Progressive enhancement for the combined new-paste form. Without JS the
+/// file input and the textarea both work; with JS, dropping a file fills the
+/// input and disables the text fields so the file is what gets submitted.
+const DROPZONE_SCRIPT: &str = r#"<script>
+(() => {
+  const zone = document.getElementById('dropzone');
+  const input = document.getElementById('file');
+  const status = document.getElementById('file-status');
+  const clear = document.getElementById('clear-file');
+  const text = document.getElementById('text');
+  const filename = document.getElementById('filename');
+  if (!zone || !input || !status || !clear || !text || !filename) return;
+
+  const show = () => {
+    const file = input.files && input.files[0];
+    if (file) {
+      status.textContent = 'Selected: ' + file.name;
+      clear.hidden = false;
+      text.disabled = true;
+      filename.disabled = true;
+    } else {
+      status.textContent = 'No file selected';
+      clear.hidden = true;
+      text.disabled = false;
+      filename.disabled = false;
+    }
+  };
+
+  input.addEventListener('change', show);
+  clear.addEventListener('click', () => {
+    input.value = '';
+    show();
+  });
+
+  let dragDepth = 0;
+  zone.addEventListener('dragenter', (event) => {
+    event.preventDefault();
+    dragDepth += 1;
+    zone.classList.add('dragover');
+  });
+  zone.addEventListener('dragover', (event) => {
+    event.preventDefault();
+  });
+  zone.addEventListener('dragleave', (event) => {
+    event.preventDefault();
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) zone.classList.remove('dragover');
+  });
+  zone.addEventListener('drop', (event) => {
+    event.preventDefault();
+    dragDepth = 0;
+    zone.classList.remove('dragover');
+    const files = event.dataTransfer && event.dataTransfer.files;
+    if (!files || files.length === 0) return;
+    try {
+      const transfer = new DataTransfer();
+      transfer.items.add(files[0]);
+      input.files = transfer.files;
+      show();
+    } catch (error) {
+      status.textContent = 'Drop is not supported here; use the file picker.';
+    }
+  });
+
+  show();
+})();
+</script>"#;
 
 fn page(title: &str, body: &str) -> Html<String> {
     Html(format!(
@@ -164,7 +238,7 @@ fn ttl_options(selected: u32) -> String {
 /// Return true when the request's `Origin`, or its fallback `Referer`,
 /// has the same authority as the `Host` header.
 ///
-/// The three browser write routes use this check. Only absolute
+/// The browser write routes use this check. Only absolute
 /// `http://` and `https://` values are accepted. The authority
 /// comparison ignores ASCII case, and a missing port uses the scheme's
 /// default port.
@@ -235,29 +309,29 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
         return resp;
     }
     let default_ttl = state.store.config.default_ttl_days;
-    page(
-        "New paste",
-        &format!(
-            r#"<h2>Paste text</h2>
-<form method="post" action="/ui/text">
-<p><label>Text<br><textarea name="text" required></textarea></label></p>
-<p><label>Filename (optional) <input type="text" name="filename"></label></p>
+    let mut body = format!(
+        r#"<h2>Paste or upload</h2>
+<form method="post" action="/ui/create" enctype="multipart/form-data">
 <p><label>Keep for <select name="ttl_days">{}</select></label></p>
+<label class="dropzone" id="dropzone">
+<input type="file" name="file" id="file">
+<span class="dropzone-title">Drop a file here</span>
+<span class="muted">or click to choose one</span>
+<span class="muted" id="file-status">No file selected</span>
+</label>
+<button type="button" id="clear-file" hidden>Remove file</button>
+<p class="muted">Or paste text below. A selected file takes precedence and disables the text fields.</p>
+<p><label>Text<br><textarea name="text" id="text"></textarea></label></p>
+<p><label>Filename (optional, text only) <input type="text" name="filename" id="filename"></label></p>
 <p><button type="submit">Create paste</button></p>
-</form>
-<hr>
-<h2>Upload a file</h2>
-<form method="post" action="/ui/upload" enctype="multipart/form-data">
-<p><label>Keep for <select name="ttl_days">{}</select></label></p>
-<p><label>File <input type="file" name="file" required></label></p>
-<p><button type="submit">Upload file</button></p>
-</form>
-<p class="muted">The selector uses whole days. API clients can send a sub-day TTL with X-TTL. Expiry is checked on read; the bucket sweeper is day-rounded. The bucket itself is private; only this binary talks to Garage.</p>"#,
-            ttl_options(default_ttl),
-            ttl_options(default_ttl),
-        ),
-    )
-    .into_response()
+</form>"#,
+        ttl_options(default_ttl),
+    );
+    body.push_str(DROPZONE_SCRIPT);
+    body.push_str(
+        r#"<p class="muted">The selector uses whole days. API clients can send a sub-day TTL with X-TTL. Expiry is checked on read; the bucket sweeper is day-rounded. The bucket itself is private; only this binary talks to Garage.</p>"#,
+    );
+    page("New paste", &body).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -324,6 +398,57 @@ fn bad_request_page(message: &str) -> Response {
         .into_response()
 }
 
+/// Stream one multipart file part into the store. The caller decides the
+/// error page; this keeps the upload and combined-create handlers on one
+/// streaming path.
+async fn store_file_field(
+    state: &AppState,
+    field: axum::extract::multipart::Field<'_>,
+    ttl: Option<Ttl>,
+) -> Result<StoredPaste, StoreError> {
+    let field_content_type = field.content_type().map(|s| s.to_string());
+    let filename = field.file_name().map(|s| s.to_string());
+    let max_bytes = state.store.config.max_bytes_for_upload(filename.as_deref());
+    let stream = futures::stream::unfold(field, |mut f| async move {
+        match f.chunk().await {
+            Ok(Some(chunk)) => Some((Ok(chunk), f)),
+            Ok(None) => None,
+            Err(e) => Some((Err(StoreError::Io(e.to_string())), f)),
+        }
+    });
+    state
+        .store
+        .store_stream(
+            Box::pin(stream),
+            filename.as_deref(),
+            field_content_type.as_deref(),
+            ttl,
+            None,
+            max_bytes,
+        )
+        .await
+}
+
+/// Read a multipart text field into memory, bounded by the same text cap as
+/// the API. This is the combined form's textarea, not a small metadata field.
+async fn read_text_field(
+    mut field: axum::extract::multipart::Field<'_>,
+    limit: usize,
+) -> Result<Vec<u8>, MultipartFieldError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| MultipartFieldError::Malformed(e.to_string()))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(MultipartFieldError::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 async fn upload_submit_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -347,28 +472,7 @@ async fn upload_submit_handler(
         };
         let name = field.name().unwrap_or("").to_string();
         if name == "file" {
-            let field_content_type = field.content_type().map(|s| s.to_string());
-            let filename = field.file_name().map(|s| s.to_string());
-            let max_bytes = state.store.config.max_bytes_for_upload(filename.as_deref());
-            let stream = futures::stream::unfold(field, |mut f| async move {
-                match f.chunk().await {
-                    Ok(Some(chunk)) => Some((Ok(chunk), f)),
-                    Ok(None) => None,
-                    Err(e) => Some((Err(StoreError::Io(e.to_string())), f)),
-                }
-            });
-            return match state
-                .store
-                .store_stream(
-                    Box::pin(stream),
-                    filename.as_deref(),
-                    field_content_type.as_deref(),
-                    ttl,
-                    None,
-                    max_bytes,
-                )
-                .await
-            {
+            return match store_file_field(&state, field, ttl).await {
                 Ok(stored) => Redirect::to(&format!("/view/{}", stored.id)).into_response(),
                 Err(e) => error_page(e),
             };
@@ -393,6 +497,107 @@ async fn upload_submit_handler(
     error_page(StoreError::InvalidId(
         "upload requires a 'file' field".into(),
     ))
+}
+
+/// Combined browser create route: one multipart form carries the TTL, an
+/// optional file, and an optional text body. A selected file wins; otherwise
+/// the text is stored with the same cap as the API.
+async fn create_submit_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Response {
+    if let Err(resp) = check_auth(&state, &headers) {
+        return resp;
+    }
+    if !same_origin_allowed(&headers) {
+        return forbidden_page();
+    }
+
+    let mut ttl: Option<Ttl> = None;
+    let mut text: Option<Vec<u8>> = None;
+    let mut text_filename: Option<String> = None;
+    let text_limit = usize::try_from(state.store.config.max_text_bytes).unwrap_or(usize::MAX);
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(e) => return bad_request_page(&format!("invalid multipart body: {e}")),
+        };
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "ttl_days" => match read_metadata_field(field).await {
+                Ok(value) => match Ttl::parse_days(&value) {
+                    Ok(parsed) => ttl = Some(parsed),
+                    Err(e) => return bad_request_page(&e.to_string()),
+                },
+                Err(MultipartFieldError::TooLarge) => {
+                    return error_page(StoreError::TooLarge {
+                        limit: MULTIPART_METADATA_MAX_BYTES as u64,
+                    });
+                }
+                Err(MultipartFieldError::Malformed(message)) => {
+                    return bad_request_page(&format!("invalid multipart body: {message}"));
+                }
+            },
+            "filename" => match read_metadata_field(field).await {
+                Ok(value) => {
+                    text_filename = if value.trim().is_empty() {
+                        None
+                    } else {
+                        Some(value)
+                    };
+                }
+                Err(MultipartFieldError::TooLarge) => {
+                    return error_page(StoreError::TooLarge {
+                        limit: MULTIPART_METADATA_MAX_BYTES as u64,
+                    });
+                }
+                Err(MultipartFieldError::Malformed(message)) => {
+                    return bad_request_page(&format!("invalid multipart body: {message}"));
+                }
+            },
+            "text" => match read_text_field(field, text_limit).await {
+                Ok(bytes) => text = Some(bytes),
+                Err(MultipartFieldError::TooLarge) => {
+                    return error_page(StoreError::TooLarge {
+                        limit: state.store.config.max_text_bytes,
+                    });
+                }
+                Err(MultipartFieldError::Malformed(message)) => {
+                    return bad_request_page(&format!("invalid multipart body: {message}"));
+                }
+            },
+            "file" => {
+                // An empty file input may arrive as a part with no filename.
+                // Treat that as "no file" so a text paste still works.
+                if !field.file_name().is_some_and(|name| !name.is_empty()) {
+                    continue;
+                }
+                return match store_file_field(&state, field, ttl).await {
+                    Ok(stored) => Redirect::to(&format!("/view/{}", stored.id)).into_response(),
+                    Err(e) => error_page(e),
+                };
+            }
+            _ => {}
+        }
+    }
+
+    let Some(bytes) = text else {
+        return bad_request_page("provide text or a file");
+    };
+    if bytes.is_empty() {
+        return bad_request_page("provide text or a file");
+    }
+    match state
+        .store
+        .store_text(&bytes, text_filename.as_deref(), None, ttl)
+        .await
+    {
+        Ok(stored) => Redirect::to(&format!("/view/{}", stored.id)).into_response(),
+        Err(e) => error_page(e),
+    }
 }
 
 async fn list_handler(
@@ -563,6 +768,7 @@ pub fn ui_router(max_text_bytes: u64) -> Router<AppState> {
     // the form routes, which buffer their bodies in memory.
     let upload_routes = Router::new()
         .route("/ui/upload", post(upload_submit_handler))
+        .route("/ui/create", post(create_submit_handler))
         .layer(DefaultBodyLimit::disable());
     // The text form is URL-encoded, so one decoded byte can take three
     // percent-encoded bytes. Give the body enough room for the encoded

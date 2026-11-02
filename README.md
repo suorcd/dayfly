@@ -775,15 +775,19 @@ revisit this; do not silently flip HTML/SVG to inline.
 
 ## Human frontend
 
-Server-rendered HTML, no JavaScript framework, no build step, plain
-forms and links. Internal use only — same private-network /
+Server-rendered HTML with a small vanilla-JS drag-and-drop
+enhancement; no JavaScript framework, no build step. Plain forms and
+links otherwise. Internal use only — same private-network /
 binary-auth model as the API, no public sharing, accounts, or
 comments.
 
-- `GET /` — new paste/upload: paste text directly, or upload a file,
-  with a TTL selector in whole days (1, 3, 7, 14, 30, 90 days; the API
-  also accepts sub-day TTLs). On success the browser is redirected to
-  `GET /view/<id>` for the new paste.
+- `GET /` — combined new-paste form: drop or choose a file, or paste
+  text, with a TTL selector in whole days (1, 3, 7, 14, 30, 90 days;
+  the API also accepts sub-day TTLs). One "Create paste" button posts
+  multipart data to `POST /ui/create`; a selected file takes
+  precedence over the text fields. Without JavaScript, the native file
+  picker and textarea still work. On success the browser is redirected
+  to `GET /view/<id>` for the new paste.
 - `GET /pastes` — current pastes, built from the bucket scan (no
   database): link/ID, filename if any, content type, size, created
   date, expiry date plus days remaining, and a delete action per
@@ -825,9 +829,10 @@ copied.
 
 ### Write-route origin check
 
-The three browser write routes (`POST /ui/text`, `POST /ui/upload`,
-and `POST /ui/delete`) require an `Origin` header that matches the
-`Host` header. If `Origin` is absent, the server uses `Referer`.
+The browser write routes (`POST /ui/create`, the legacy
+`POST /ui/text` and `POST /ui/upload`, and `POST /ui/delete`) require
+an `Origin` header that matches the `Host` header. If `Origin` is
+absent, the server uses `Referer`.
 
 The server returns 403 when both headers are absent. It also returns
 403 when a value is `null` or malformed, or when the host or port does
@@ -934,7 +939,7 @@ where `cargo --version`, `rustc --version`, and
 `rust-analyzer --version` all succeed.
 
 **Nix validation result:** `nix build` and the test suite were run on
-`x86_64-linux` against `nixos-unstable`: 361 passed and 2 ignored. On the stable
+`x86_64-linux` against `nixos-unstable`: 367 passed and 2 ignored. On the stable
 `nixos-25.11` branch the build fails before compilation with a
 rustc-too-old error naming 23 AWS crates, which is why the flake
 tracks unstable. Before this was built on a machine with Nix, an
