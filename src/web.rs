@@ -70,6 +70,7 @@ a:hover{text-decoration:underline;text-shadow:0 0 8px rgba(234,0,217,.8)}
 table{border-collapse:collapse;width:100%} th,td{text-align:left;padding:.4rem .5rem;border:1px dashed #0abdc6;vertical-align:top}
 th{color:#ea00d9}
 .card,form{background:rgba(19,62,124,.35);border:1px dashed #0abdc6;border-radius:8px;padding:1rem;backdrop-filter:blur(4px)}
+td form{display:inline;background:none;border:0;padding:0;border-radius:0;backdrop-filter:none}
 textarea{width:100%;min-height:12rem;box-sizing:border-box;font-family:"Source Code Pro",Hack,ui-monospace,Menlo,Consolas,monospace;background:#133e7c;color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px;padding:.5rem}
 input,select{font-size:1rem;padding:.3rem .5rem;background:#133e7c;color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px}
 button{font-size:1rem;padding:.35rem .8rem;cursor:pointer;background:rgba(19,62,124,.5);color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px}
@@ -429,7 +430,7 @@ async fn list_handler(
         rows.push_str(&format!(
             "<tr><td><a href=\"/view/{id_esc}\">{id_esc}</a></td>\
              <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
-             <td><form method=\"post\" action=\"/ui/delete\" style=\"display:inline\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\"><button type=\"submit\">Delete</button></form></td></tr>\n",
+             <td><form method=\"post\" action=\"/ui/delete\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\"><button type=\"submit\">Delete</button></form></td></tr>\n",
             html_escape(item.filename.as_deref().unwrap_or("—")),
             html_escape(item.content_type.as_deref().unwrap_or("—")),
             human_size(item.size),
