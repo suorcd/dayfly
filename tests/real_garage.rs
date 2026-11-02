@@ -38,6 +38,7 @@ fn test_config() -> Config {
         max_file_bytes: 1024 * 1024 * 1024,
         default_ttl_days: 1,
         http_bind: "127.0.0.1:0".to_string(),
+        show_words: true,
         http_bearer_token: None,
         mcp_local_root: None,
     }

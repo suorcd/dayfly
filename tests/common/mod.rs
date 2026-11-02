@@ -206,9 +206,18 @@ impl FakeS3 {
             max_file_bytes,
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
+            show_words: false,
             http_bearer_token: None,
             mcp_local_root: None,
         }
+    }
+
+    pub async fn store_with_show_words(&self, show_words: bool) -> Store {
+        let mut config = self.config();
+        config.show_words = show_words;
+        Store::from_config(config)
+            .await
+            .expect("fake S3 config must build without network access")
     }
 
     pub async fn store(&self) -> Store {

@@ -230,6 +230,7 @@ file permission warnings into faults.
 | `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error. The maximum is 52428800000 bytes: 10,000 parts of 5 MiB |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1. The name and meaning are unchanged |
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
+| `DAYFLY_SHOW_WORDS` | no | `true` | Show the generated three-word alias in the human UI: create redirects, the view page, and the paste list. Display only; the JSON/MCP responses still include `words`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_HTTP_BEARER_TOKEN` | one form | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model); set this variable or `DAYFLY_HTTP_BEARER_TOKEN_FILE` |
 | `DAYFLY_HTTP_BEARER_TOKEN_FILE` | one form | (unset) | Path to a file that contains the bearer token; set this variable or `DAYFLY_HTTP_BEARER_TOKEN` |
 | `DAYFLY_MCP_LOCAL_ROOT` | no | (unset) | Directory for the MCP local-path tools. It must exist, or startup fails. When set, `store_file` and `fetch_file` refuse any path outside it, after resolving symlinks. When unset, the stdio transport accepts any readable path and the HTTP transport refuses both tools |
@@ -240,9 +241,10 @@ stops with a configuration error. The binary trims whitespace from file
 values and rejects an empty file.
 
 Credentials are never logged. `Config` has no `Debug` that prints
-secrets; startup logs only bucket, endpoint scheme, region, and limits.
-A credential file read error names the path only, not the file
-contents. The permission warnings never include the file contents.
+secrets; startup logs only bucket, endpoint scheme, region, limits, and
+whether word aliases are shown. A credential file read error names the
+path only, not the file contents. The permission warnings never include
+the file contents.
 
 `--verbose` sets the log filter to INFO. `RUST_LOG` overrides it.
 Dayfly runs in the foreground. Use systemd or the container runtime to
@@ -691,6 +693,11 @@ operation that takes an ID: fetch, metadata, append, and delete.
   in place.
 - Legacy objects have no alias. They keep working by ID, and `words`
   is absent or null.
+- Display: the human UI uses the alias for create redirects, the view
+  page, and the paste list by default. Set `DAYFLY_SHOW_WORDS=false`
+  to use and show the canonical ID instead. The setting is display-only:
+  the alias is still generated and the JSON/MCP responses still return
+  it.
 - Entropy: three words give about 38.8 bits. The uniqueness check
   prevents collisions, not guessing. Treat the alias as a name, not a
   secret. The bearer token and the private bucket remain the access
@@ -775,23 +782,34 @@ revisit this; do not silently flip HTML/SVG to inline.
 
 ## Human frontend
 
-Server-rendered HTML, no JavaScript framework, no build step, plain
-forms and links. Internal use only — same private-network /
+Server-rendered HTML with a small vanilla-JS drag-and-drop
+enhancement; no JavaScript framework, no build step. Plain forms and
+links otherwise. Internal use only — same private-network /
 binary-auth model as the API, no public sharing, accounts, or
 comments.
 
-- `GET /` — new paste/upload: paste text directly, or upload a file,
-  with a TTL selector in whole days (1, 3, 7, 14, 30, 90 days; the API
-  also accepts sub-day TTLs). On success the browser is redirected to
-  `GET /view/<id>` for the new paste.
+- `GET /` — combined new-paste form: drop or choose a file, or paste
+  text, with a TTL selector in whole days (1, 3, 7, 14, 30, 90 days;
+  the API also accepts sub-day TTLs). One "Create paste" button posts
+  multipart data to `POST /ui/create`; a selected file takes
+  precedence over the text fields. Without JavaScript, the native file
+  picker and textarea still work. The page shows the configured file
+  size limit; with JavaScript, an oversized file is rejected before the
+  upload starts, and the multipart handlers reject an obviously
+  oversized `Content-Length` before reading the body. On success the
+  browser is redirected to the new paste: the three-word alias when
+  `DAYFLY_SHOW_WORDS` is true (the default), otherwise the canonical ID.
 - `GET /pastes` — current pastes, built from the bucket scan (no
-  database): link/ID, filename if any, content type, size, created
-  date, expiry date plus days remaining, and a delete action per
-  row. Expired items are filtered out, consistent with the API's
-  read-time expiry check. Add `?date=YYYY-MM-DD` for another day.
-- `GET /view/<id>` — one paste: text in `<pre>` (capped at 1 MiB for
-  the page; the API remains the route for full/sliced reads), safe
-  images inline, other types as a download link, plus a delete form.
+  database): alias when enabled (with the canonical ID as secondary
+  text), filename if any, content type, size, created date, expiry date
+  plus days remaining, and a delete action per row. Expired items are
+  filtered out, consistent with the API's read-time expiry check. Add
+  `?date=YYYY-MM-DD` for another day.
+- `GET /view/<id>` — one paste: the three-word alias when enabled,
+  metadata and the delete form in a collapsed `<details>` block, then
+  the raw/download link, then the content: text in `<pre>` (capped at
+  1 MiB for the page; the API remains the route for full/sliced reads),
+  safe images inline, other types via the download link.
 
 Theme: the pages adapt the base look of the user's own site
 stylesheet, https://suorcd.us/style.css (verified live as the site's
@@ -823,9 +841,10 @@ copied.
 
 ### Write-route origin check
 
-The three browser write routes (`POST /ui/text`, `POST /ui/upload`,
-and `POST /ui/delete`) require an `Origin` header that matches the
-`Host` header. If `Origin` is absent, the server uses `Referer`.
+The browser write routes (`POST /ui/create`, the legacy
+`POST /ui/text` and `POST /ui/upload`, and `POST /ui/delete`) require
+an `Origin` header that matches the `Host` header. If `Origin` is
+absent, the server uses `Referer`.
 
 The server returns 403 when both headers are absent. It also returns
 403 when a value is `null` or malformed, or when the host or port does
@@ -932,7 +951,7 @@ where `cargo --version`, `rustc --version`, and
 `rust-analyzer --version` all succeed.
 
 **Nix validation result:** `nix build` and the test suite were run on
-`x86_64-linux` against `nixos-unstable`: 361 passed and 2 ignored. On the stable
+`x86_64-linux` against `nixos-unstable`: 376 passed and 2 ignored. On the stable
 `nixos-25.11` branch the build fails before compilation with a
 rustc-too-old error naming 23 AWS crates, which is why the flake
 tracks unstable. Before this was built on a machine with Nix, an

@@ -22,7 +22,7 @@ use rmcp::ServiceExt;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
-use dayfly::config::{credential_warnings, load_env_file, Config, CONFIG_FIELDS};
+use dayfly::config::{credential_warnings, load_env_file, parse_bool_flag, Config, CONFIG_FIELDS};
 use dayfly::http;
 use dayfly::http::AppState;
 use dayfly::mcp;
@@ -146,6 +146,9 @@ fn check_config_file(path: Option<PathBuf>, explicit: bool, strict: bool) -> any
                 if value.parse::<u32>().map(|days| days == 0).unwrap_or(true) {
                     faults.push("DAYFLY_DEFAULT_TTL_DAYS: expected a positive integer".to_string());
                 }
+            }
+            "DAYFLY_SHOW_WORDS" if parse_bool_flag(&value).is_none() => {
+                faults.push("DAYFLY_SHOW_WORDS: expected true or false".to_string());
             }
             "DAYFLY_HTTP_BEARER_TOKEN"
                 if value.contains(|character: char| character.is_ascii_whitespace()) =>

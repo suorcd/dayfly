@@ -40,6 +40,12 @@ pub struct Config {
     pub default_ttl_days: u32,
     /// Default bind address for HTTP mode.
     pub http_bind: String,
+    /// Whether the human web UI shows the generated three-word aliases.
+    ///
+    /// Default: `true`. This is a display setting only: aliases are still
+    /// generated and stored, and the JSON/MCP responses still include the
+    /// `words` field. It is not a secrecy control.
+    pub show_words: bool,
     /// Optional bearer token for the binary's own HTTP endpoint.
     /// This is NOT the S3/Garage credential and is not a replacement for
     /// it: the Garage key/secret stay in S3_ACCESS_KEY_ID /
@@ -127,6 +133,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("127.0.0.1:8080"),
         required: false,
         help: "HTTP bind address",
+    },
+    ConfigField {
+        name: "DAYFLY_SHOW_WORDS",
+        value: Some("true"),
+        required: false,
+        help: "Show three-word aliases in the human UI",
     },
     ConfigField {
         name: "DAYFLY_HTTP_BEARER_TOKEN",
@@ -240,6 +252,27 @@ where
         Some(v) if !v.trim().is_empty() => v.trim().parse::<u32>().map_err(|_| {
             ConfigError::Invalid(name.to_string(), "expected a non-negative integer".into())
         }),
+        _ => Ok(default),
+    }
+}
+
+/// Parse a boolean setting. Accepts the usual spellings so an env file can
+/// use `true`/`false`, `1`/`0`, `yes`/`no`, or `on`/`off`.
+pub fn parse_bool_flag(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn optional_bool<F>(lookup: &F, name: &str, default: bool) -> Result<bool, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match lookup(name) {
+        Some(v) if !v.trim().is_empty() => parse_bool_flag(&v)
+            .ok_or_else(|| ConfigError::Invalid(name.to_string(), "expected true or false".into())),
         _ => Ok(default),
     }
 }
@@ -674,6 +707,11 @@ impl Config {
                 "DAYFLY_HTTP_BIND",
                 field_default("DAYFLY_HTTP_BIND").unwrap_or("127.0.0.1:8080"),
             ),
+            show_words: optional_bool(
+                &lookup,
+                "DAYFLY_SHOW_WORDS",
+                field_default("DAYFLY_SHOW_WORDS") == Some("true"),
+            )?,
             http_bearer_token: bearer_token(optional_credential(
                 &lookup,
                 "DAYFLY_HTTP_BEARER_TOKEN",
@@ -700,7 +738,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} default_ttl_days={} mcp_local_root={}",
+            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} default_ttl_days={} show_words={} mcp_local_root={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -711,6 +749,7 @@ impl Config {
             self.max_text_bytes,
             self.max_file_bytes,
             self.default_ttl_days,
+            self.show_words,
             if self.mcp_local_root.is_some() {
                 "set"
             } else {
@@ -970,6 +1009,7 @@ mod tests {
             max_file_bytes,
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
+            show_words: true,
             http_bearer_token: None,
             mcp_local_root: None,
         }
@@ -1013,6 +1053,45 @@ mod tests {
         let config = Config::from_lookup(lookup_from(&pairs)).expect("default config");
         assert_eq!(config.region, "us-east-1");
         assert_eq!(config.http_bind, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn show_words_defaults_to_true() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert!(config.show_words);
+    }
+
+    #[test]
+    fn show_words_accepts_false() {
+        let mut pairs = base_env();
+        pairs.push(("DAYFLY_SHOW_WORDS".to_string(), "false".to_string()));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("false config");
+        assert!(!config.show_words);
+    }
+
+    #[test]
+    fn show_words_accepts_common_bool_spellings() {
+        for (value, expected) in [("1", true), ("0", false), ("yes", true), ("off", false)] {
+            let mut pairs = base_env();
+            pairs.push(("DAYFLY_SHOW_WORDS".to_string(), value.to_string()));
+            let config = Config::from_lookup(lookup_from(&pairs))
+                .unwrap_or_else(|error| panic!("{value}: {error}"));
+            assert_eq!(config.show_words, expected, "value {value}");
+        }
+    }
+
+    #[test]
+    fn show_words_rejects_an_unknown_value() {
+        let mut pairs = base_env();
+        pairs.push(("DAYFLY_SHOW_WORDS".to_string(), "maybe".to_string()));
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        match error {
+            ConfigError::Invalid(name, message) => {
+                assert_eq!(name, "DAYFLY_SHOW_WORDS");
+                assert!(message.contains("true or false"), "{message}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]

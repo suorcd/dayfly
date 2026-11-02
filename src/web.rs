@@ -1,10 +1,11 @@
 //! Simple human web frontend, served by the same binary in HTTP mode.
 //!
-//! Server-rendered HTML only: plain forms and links, no JavaScript
-//! framework and no frontend build step. Two pages, plus a view page
-//! that falls out naturally:
+//! Server-rendered HTML with a small vanilla-JS drag-and-drop
+//! enhancement; no JavaScript framework and no frontend build step.
+//! Two pages, plus a view page that falls out naturally:
 //!
-//! * `GET /` — new paste/upload form (text and file, TTL selector).
+//! * `GET /` — combined new-paste form: drop/choose a file or paste
+//!   text, with a TTL selector.
 //! * `GET /pastes` — current pastes for a date, from the bucket scan
 //!   (no database), with a delete action per row.
 //! * `GET /view/<id>` — one paste: text in `<pre>`, image inline,
@@ -36,7 +37,7 @@
 use std::collections::HashMap;
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
-use axum::http::header::{HOST, ORIGIN, REFERER};
+use axum::http::header::{CONTENT_LENGTH, HOST, ORIGIN, REFERER};
 use axum::http::uri::{Authority, Uri};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -49,7 +50,7 @@ use crate::http::{
     check_auth, read_metadata_field, status_for, AppState, MultipartFieldError,
     MULTIPART_METADATA_MAX_BYTES,
 };
-use crate::store::{parse_list_window_request, ListWindowRequest, StoreError, Ttl};
+use crate::store::{parse_list_window_request, ListWindowRequest, StoreError, StoredPaste, Ttl};
 
 /// Adapted base look from suorcd.us/style.css, palette cyberpunkNeon
 /// (background #091833, text #e3e8fc, accent #ea00d9, code background
@@ -70,6 +71,16 @@ a:hover{text-decoration:underline;text-shadow:0 0 8px rgba(234,0,217,.8)}
 table{border-collapse:collapse;width:100%} th,td{text-align:left;padding:.4rem .5rem;border:1px dashed #0abdc6;vertical-align:top}
 th{color:#ea00d9}
 .card,form{background:rgba(19,62,124,.35);border:1px dashed #0abdc6;border-radius:8px;padding:1rem;backdrop-filter:blur(4px)}
+details{background:rgba(19,62,124,.35);border:1px dashed #0abdc6;border-radius:8px;padding:.5rem 1rem;margin-bottom:1rem}
+summary{cursor:pointer;color:#0abdc6}
+td form{display:inline;background:none;border:0;padding:0;border-radius:0;backdrop-filter:none}
+details form{background:none;border:0;padding:0;border-radius:0;backdrop-filter:none;margin:0}
+.dropzone{display:block;border:2px dashed #0abdc6;border-radius:8px;padding:1.5rem;margin-bottom:.5rem;text-align:center;cursor:pointer;background:rgba(19,62,124,.2)}
+.dropzone:hover,.dropzone.dragover{border-color:#ea00d9;box-shadow:0 0 12px rgba(234,0,217,.35)}
+.dropzone input[type=file]{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.dropzone-title{display:block;font-weight:bold;color:#ea00d9}
+.dropzone .muted{display:block}
+.dropzone .error{color:#ff6b6b}
 textarea{width:100%;min-height:12rem;box-sizing:border-box;font-family:"Source Code Pro",Hack,ui-monospace,Menlo,Consolas,monospace;background:#133e7c;color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px;padding:.5rem}
 input,select{font-size:1rem;padding:.3rem .5rem;background:#133e7c;color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px}
 button{font-size:1rem;padding:.35rem .8rem;cursor:pointer;background:rgba(19,62,124,.5);color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px}
@@ -82,9 +93,110 @@ footer{text-align:center;font-size:.85rem;margin-top:2rem;padding-top:1rem;borde
 @media (max-width:768px){body{padding:12px} header{flex-direction:column} nav{flex-direction:column;align-items:flex-start;gap:.5rem} nav a{font-size:.9rem}}
 "#;
 
+/// Progressive enhancement for the combined new-paste form. Without JS the
+/// file input and the textarea both work; with JS, dropping a file fills the
+/// input and disables the text fields so the file is what gets submitted.
+const DROPZONE_SCRIPT: &str = r#"<script>
+(() => {
+  const zone = document.getElementById('dropzone');
+  const input = document.getElementById('file');
+  const status = document.getElementById('file-status');
+  const clear = document.getElementById('clear-file');
+  const text = document.getElementById('text');
+  const filename = document.getElementById('filename');
+  const form = document.querySelector('form[action="/ui/create"]');
+  if (!form || !zone || !input || !status || !clear || !text || !filename) return;
+
+  const maxBytes = Number(form.dataset.maxFileBytes) || 0;
+  const humanSize = (bytes) => {
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+    let value = bytes;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit += 1;
+    }
+    return (unit === 0 ? value : value.toFixed(1)) + ' ' + units[unit];
+  };
+
+  const show = () => {
+    const file = input.files && input.files[0];
+    if (file && maxBytes > 0 && file.size > maxBytes) {
+      status.textContent = 'File is too large: ' + humanSize(file.size) + ' (limit ' + humanSize(maxBytes) + ')';
+      status.classList.add('error');
+      input.value = '';
+      clear.hidden = true;
+      text.disabled = false;
+      filename.disabled = false;
+      return;
+    }
+    status.classList.remove('error');
+    if (file) {
+      status.textContent = 'Selected: ' + file.name;
+      clear.hidden = false;
+      text.disabled = true;
+      filename.disabled = true;
+    } else {
+      status.textContent = 'No file selected';
+      clear.hidden = true;
+      text.disabled = false;
+      filename.disabled = false;
+    }
+  };
+
+  input.addEventListener('change', show);
+  clear.addEventListener('click', () => {
+    input.value = '';
+    show();
+  });
+  form.addEventListener('submit', (event) => {
+    const file = input.files && input.files[0];
+    if (file && maxBytes > 0 && file.size > maxBytes) {
+      event.preventDefault();
+      status.textContent = 'File is too large: ' + humanSize(file.size) + ' (limit ' + humanSize(maxBytes) + ')';
+      status.classList.add('error');
+      text.disabled = false;
+      filename.disabled = false;
+    }
+  });
+
+  let dragDepth = 0;
+  zone.addEventListener('dragenter', (event) => {
+    event.preventDefault();
+    dragDepth += 1;
+    zone.classList.add('dragover');
+  });
+  zone.addEventListener('dragover', (event) => {
+    event.preventDefault();
+  });
+  zone.addEventListener('dragleave', (event) => {
+    event.preventDefault();
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) zone.classList.remove('dragover');
+  });
+  zone.addEventListener('drop', (event) => {
+    event.preventDefault();
+    dragDepth = 0;
+    zone.classList.remove('dragover');
+    const files = event.dataTransfer && event.dataTransfer.files;
+    if (!files || files.length === 0) return;
+    try {
+      const transfer = new DataTransfer();
+      transfer.items.add(files[0]);
+      input.files = transfer.files;
+      show();
+    } catch (error) {
+      status.textContent = 'Drop is not supported here; use the file picker.';
+    }
+  });
+
+  show();
+})();
+</script>"#;
+
 fn page(title: &str, body: &str) -> Html<String> {
     Html(format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title} — pastebin</title>\n<style>{CSS}</style>\n</head>\n<body>\n<header><nav><span class=\"prompt\">~/pastebin $</span><a href=\"/\">new paste</a><a href=\"/pastes\">current pastes</a></nav></header>\n<h1>{title}</h1>\n{body}\n<footer>pastebin — internal use only</footer>\n</body>\n</html>\n"
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title} — pastebin</title>\n<style>{CSS}</style>\n</head>\n<body>\n<header><nav><span class=\"prompt\">~/dayfly $</span><a href=\"/\">new paste</a><a href=\"/pastes\">current pastes</a></nav></header>\n<h1>{title}</h1>\n{body}\n<footer>pastebin — internal use only · &copy; 2026 suorcd</footer>\n</body>\n</html>\n"
     ))
 }
 
@@ -160,7 +272,7 @@ fn ttl_options(selected: u32) -> String {
 /// Return true when the request's `Origin`, or its fallback `Referer`,
 /// has the same authority as the `Host` header.
 ///
-/// The three browser write routes use this check. Only absolute
+/// The browser write routes use this check. Only absolute
 /// `http://` and `https://` values are accepted. The authority
 /// comparison ignores ASCII case, and a missing port uses the scheme's
 /// default port.
@@ -231,29 +343,32 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
         return resp;
     }
     let default_ttl = state.store.config.default_ttl_days;
-    page(
-        "New paste",
-        &format!(
-            r#"<h2>Paste text</h2>
-<form method="post" action="/ui/text">
-<p><label>Text<br><textarea name="text" required></textarea></label></p>
-<p><label>Filename (optional) <input type="text" name="filename"></label></p>
+    let max_file_bytes = state.store.config.max_file_bytes;
+    let max_file_human = human_size(max_file_bytes);
+    let mut body = format!(
+        r#"<h2>Paste or upload</h2>
+<form method="post" action="/ui/create" enctype="multipart/form-data" data-max-file-bytes="{max_file_bytes}">
 <p><label>Keep for <select name="ttl_days">{}</select></label></p>
+<label class="dropzone" id="dropzone">
+<input type="file" name="file" id="file">
+<span class="dropzone-title">Drop a file here</span>
+<span class="muted">or click to choose one</span>
+<span class="muted" id="file-status">No file selected</span>
+</label>
+<button type="button" id="clear-file" hidden>Remove file</button>
+<p class="muted">Max file size: {max_file_human}</p>
+<p class="muted">Or paste text below. A selected file takes precedence and disables the text fields.</p>
+<p><label>Text<br><textarea name="text" id="text"></textarea></label></p>
+<p><label>Filename (optional, text only) <input type="text" name="filename" id="filename"></label></p>
 <p><button type="submit">Create paste</button></p>
-</form>
-<hr>
-<h2>Upload a file</h2>
-<form method="post" action="/ui/upload" enctype="multipart/form-data">
-<p><label>Keep for <select name="ttl_days">{}</select></label></p>
-<p><label>File <input type="file" name="file" required></label></p>
-<p><button type="submit">Upload file</button></p>
-</form>
-<p class="muted">The selector uses whole days. API clients can send a sub-day TTL with X-TTL. Expiry is checked on read; the bucket sweeper is day-rounded. The bucket itself is private; only this binary talks to Garage.</p>"#,
-            ttl_options(default_ttl),
-            ttl_options(default_ttl),
-        ),
-    )
-    .into_response()
+</form>"#,
+        ttl_options(default_ttl),
+    );
+    body.push_str(DROPZONE_SCRIPT);
+    body.push_str(
+        r#"<p class="muted">The selector uses whole days. API clients can send a sub-day TTL with X-TTL. Expiry is checked on read; the bucket sweeper is day-rounded. The bucket itself is private; only this binary talks to Garage.</p>"#,
+    );
+    page("New paste", &body).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -287,14 +402,20 @@ async fn text_submit_handler(
         .store_text(form.text.as_bytes(), filename.as_deref(), None, ttl)
         .await
     {
-        Ok(stored) => Redirect::to(&format!("/view/{}", stored.id)).into_response(),
+        Ok(stored) => Redirect::to(&stored_view_target(&stored, state.store.config.show_words))
+            .into_response(),
         Err(e) => error_page(e),
     }
 }
 
 fn error_page(e: StoreError) -> Response {
     let status = status_for(&e);
-    let msg = e.to_string();
+    let msg = match &e {
+        StoreError::TooLarge { limit } => {
+            format!("payload too large: limit is {}", human_size(*limit))
+        }
+        _ => e.to_string(),
+    };
     (
         status,
         page(
@@ -320,6 +441,90 @@ fn bad_request_page(message: &str) -> Response {
         .into_response()
 }
 
+/// Pick the three-word alias when the human UI is configured to show words,
+/// otherwise the canonical ID. Legacy objects without an alias fall back to
+/// the ID either way.
+fn stored_view_target(stored: &StoredPaste, show_words: bool) -> String {
+    let name = if show_words {
+        stored.words.as_deref().unwrap_or(&stored.id)
+    } else {
+        &stored.id
+    };
+    format!("/view/{name}")
+}
+
+/// Reject an obviously oversized multipart request from its Content-Length
+/// before the handler reads the body. The multipart envelope and text field
+/// add overhead, so this is a coarse upper bound; the streaming cap remains
+/// authoritative.
+fn multipart_length_allows(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(length) = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    else {
+        return true;
+    };
+    let max_request = state
+        .store
+        .config
+        .max_file_bytes
+        .saturating_add(state.store.config.max_text_bytes)
+        .saturating_add(1024 * 1024);
+    length <= max_request
+}
+
+/// Stream one multipart file part into the store. The caller decides the
+/// error page; this keeps the upload and combined-create handlers on one
+/// streaming path.
+async fn store_file_field(
+    state: &AppState,
+    field: axum::extract::multipart::Field<'_>,
+    ttl: Option<Ttl>,
+) -> Result<StoredPaste, StoreError> {
+    let field_content_type = field.content_type().map(|s| s.to_string());
+    let filename = field.file_name().map(|s| s.to_string());
+    let max_bytes = state.store.config.max_bytes_for_upload(filename.as_deref());
+    let stream = futures::stream::unfold(field, |mut f| async move {
+        match f.chunk().await {
+            Ok(Some(chunk)) => Some((Ok(chunk), f)),
+            Ok(None) => None,
+            Err(e) => Some((Err(StoreError::Io(e.to_string())), f)),
+        }
+    });
+    state
+        .store
+        .store_stream(
+            Box::pin(stream),
+            filename.as_deref(),
+            field_content_type.as_deref(),
+            ttl,
+            None,
+            max_bytes,
+        )
+        .await
+}
+
+/// Read a multipart text field into memory, bounded by the same text cap as
+/// the API. This is the combined form's textarea, not a small metadata field.
+async fn read_text_field(
+    mut field: axum::extract::multipart::Field<'_>,
+    limit: usize,
+) -> Result<Vec<u8>, MultipartFieldError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| MultipartFieldError::Malformed(e.to_string()))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(MultipartFieldError::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 async fn upload_submit_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -330,6 +535,11 @@ async fn upload_submit_handler(
     }
     if !same_origin_allowed(&headers) {
         return forbidden_page();
+    }
+    if !multipart_length_allows(&state, &headers) {
+        return error_page(StoreError::TooLarge {
+            limit: state.store.config.max_file_bytes,
+        });
     }
     let mut ttl: Option<Ttl> = None;
     // Stream the file field inside the loop, not moved out of it: an
@@ -343,29 +553,11 @@ async fn upload_submit_handler(
         };
         let name = field.name().unwrap_or("").to_string();
         if name == "file" {
-            let field_content_type = field.content_type().map(|s| s.to_string());
-            let filename = field.file_name().map(|s| s.to_string());
-            let max_bytes = state.store.config.max_bytes_for_upload(filename.as_deref());
-            let stream = futures::stream::unfold(field, |mut f| async move {
-                match f.chunk().await {
-                    Ok(Some(chunk)) => Some((Ok(chunk), f)),
-                    Ok(None) => None,
-                    Err(e) => Some((Err(StoreError::Io(e.to_string())), f)),
+            return match store_file_field(&state, field, ttl).await {
+                Ok(stored) => {
+                    Redirect::to(&stored_view_target(&stored, state.store.config.show_words))
+                        .into_response()
                 }
-            });
-            return match state
-                .store
-                .store_stream(
-                    Box::pin(stream),
-                    filename.as_deref(),
-                    field_content_type.as_deref(),
-                    ttl,
-                    None,
-                    max_bytes,
-                )
-                .await
-            {
-                Ok(stored) => Redirect::to(&format!("/view/{}", stored.id)).into_response(),
                 Err(e) => error_page(e),
             };
         }
@@ -389,6 +581,116 @@ async fn upload_submit_handler(
     error_page(StoreError::InvalidId(
         "upload requires a 'file' field".into(),
     ))
+}
+
+/// Combined browser create route: one multipart form carries the TTL, an
+/// optional file, and an optional text body. A selected file wins; otherwise
+/// the text is stored with the same cap as the API.
+async fn create_submit_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Response {
+    if let Err(resp) = check_auth(&state, &headers) {
+        return resp;
+    }
+    if !same_origin_allowed(&headers) {
+        return forbidden_page();
+    }
+    if !multipart_length_allows(&state, &headers) {
+        return error_page(StoreError::TooLarge {
+            limit: state.store.config.max_file_bytes,
+        });
+    }
+
+    let mut ttl: Option<Ttl> = None;
+    let mut text: Option<Vec<u8>> = None;
+    let mut text_filename: Option<String> = None;
+    let text_limit = usize::try_from(state.store.config.max_text_bytes).unwrap_or(usize::MAX);
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(e) => return bad_request_page(&format!("invalid multipart body: {e}")),
+        };
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "ttl_days" => match read_metadata_field(field).await {
+                Ok(value) => match Ttl::parse_days(&value) {
+                    Ok(parsed) => ttl = Some(parsed),
+                    Err(e) => return bad_request_page(&e.to_string()),
+                },
+                Err(MultipartFieldError::TooLarge) => {
+                    return error_page(StoreError::TooLarge {
+                        limit: MULTIPART_METADATA_MAX_BYTES as u64,
+                    });
+                }
+                Err(MultipartFieldError::Malformed(message)) => {
+                    return bad_request_page(&format!("invalid multipart body: {message}"));
+                }
+            },
+            "filename" => match read_metadata_field(field).await {
+                Ok(value) => {
+                    text_filename = if value.trim().is_empty() {
+                        None
+                    } else {
+                        Some(value)
+                    };
+                }
+                Err(MultipartFieldError::TooLarge) => {
+                    return error_page(StoreError::TooLarge {
+                        limit: MULTIPART_METADATA_MAX_BYTES as u64,
+                    });
+                }
+                Err(MultipartFieldError::Malformed(message)) => {
+                    return bad_request_page(&format!("invalid multipart body: {message}"));
+                }
+            },
+            "text" => match read_text_field(field, text_limit).await {
+                Ok(bytes) => text = Some(bytes),
+                Err(MultipartFieldError::TooLarge) => {
+                    return error_page(StoreError::TooLarge {
+                        limit: state.store.config.max_text_bytes,
+                    });
+                }
+                Err(MultipartFieldError::Malformed(message)) => {
+                    return bad_request_page(&format!("invalid multipart body: {message}"));
+                }
+            },
+            "file" => {
+                // An empty file input may arrive as a part with no filename.
+                // Treat that as "no file" so a text paste still works.
+                if !field.file_name().is_some_and(|name| !name.is_empty()) {
+                    continue;
+                }
+                return match store_file_field(&state, field, ttl).await {
+                    Ok(stored) => {
+                        Redirect::to(&stored_view_target(&stored, state.store.config.show_words))
+                            .into_response()
+                    }
+                    Err(e) => error_page(e),
+                };
+            }
+            _ => {}
+        }
+    }
+
+    let Some(bytes) = text else {
+        return bad_request_page("provide text or a file");
+    };
+    if bytes.is_empty() {
+        return bad_request_page("provide text or a file");
+    }
+    match state
+        .store
+        .store_text(&bytes, text_filename.as_deref(), None, ttl)
+        .await
+    {
+        Ok(stored) => Redirect::to(&stored_view_target(&stored, state.store.config.show_words))
+            .into_response(),
+        Err(e) => error_page(e),
+    }
 }
 
 async fn list_handler(
@@ -424,12 +726,22 @@ async fn list_handler(
         Err(e) => return error_page(e),
     };
     let mut rows = String::new();
+    let show_words = state.store.config.show_words;
     for item in &items {
         let id_esc = html_escape(&item.id);
+        let link_cell = match (show_words, item.words.as_deref()) {
+            (true, Some(words)) => {
+                let words_esc = html_escape(words);
+                format!(
+                    "<a href=\"/view/{words_esc}\">{words_esc}</a><br><span class=\"muted\">{id_esc}</span>"
+                )
+            }
+            _ => format!("<a href=\"/view/{id_esc}\">{id_esc}</a>"),
+        };
         rows.push_str(&format!(
-            "<tr><td><a href=\"/view/{id_esc}\">{id_esc}</a></td>\
+            "<tr><td>{link_cell}</td>\
              <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
-             <td><form method=\"post\" action=\"/ui/delete\" style=\"display:inline\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\"><button type=\"submit\">Delete</button></form></td></tr>\n",
+             <td><form method=\"post\" action=\"/ui/delete\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\"><button type=\"submit\">Delete</button></form></td></tr>\n",
             html_escape(item.filename.as_deref().unwrap_or("—")),
             html_escape(item.content_type.as_deref().unwrap_or("—")),
             human_size(item.size),
@@ -494,8 +806,23 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
     }
     let id_esc = html_escape(&meta.id);
     let main = meta.content_type.split(';').next().unwrap_or("").trim();
+    let words_line = if state.store.config.show_words {
+        meta.words
+            .as_deref()
+            .map(|words| {
+                let words_esc = html_escape(words);
+                format!("<p>Words: <a href=\"/view/{words_esc}\">{words_esc}</a></p>")
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let mut body = format!(
-        "<p>Filename: {}</p><p>Content-Type: {}</p><p>Size: {}</p><p>Created: {}</p><p>Expires: {} ({})</p>",
+        "{words_line}<details><summary>Metadata &amp; delete</summary>\
+         <p>Filename: {}</p><p>Content-Type: {}</p><p>Size: {}</p><p>Created: {}</p><p>Expires: {} ({})</p>\
+         <form method=\"post\" action=\"/ui/delete\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\"><button type=\"submit\">Delete this paste</button></form>\
+         </details>\
+         <p><a href=\"/v1/pastes/{id_esc}\">Download / raw</a> · <a href=\"/pastes\">Current pastes</a></p>",
         html_escape(meta.filename.as_deref().unwrap_or("—")),
         html_escape(&meta.content_type),
         human_size(meta.size),
@@ -515,7 +842,7 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
             Ok(s) => {
                 body.push_str(&format!("<pre>{}</pre>", html_escape(&s.text)));
                 if s.truncated {
-                    body.push_str("<p class=\"muted\">Text truncated at 1 MiB for this view. Use the raw API URL below for the full paste.</p>");
+                    body.push_str("<p class=\"muted\">Text truncated at 1 MiB for this view. Use the raw API URL above for the full paste.</p>");
                 }
             }
             Err(e) => return error_page(e),
@@ -528,13 +855,6 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
             html_escape(meta.filename.as_deref().unwrap_or("image"))
         ));
     }
-    body.push_str(&format!(
-        "<p><a href=\"/v1/pastes/{id_esc}\">Download / raw</a> · <a href=\"/pastes\">Current pastes</a></p>"
-    ));
-    // Delete from the view page too, as a plain form.
-    body.push_str(&format!(
-        "<form method=\"post\" action=\"/ui/delete\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\"><button type=\"submit\">Delete this paste</button></form>"
-    ));
     page("View paste", &body).into_response()
 }
 
@@ -562,6 +882,7 @@ pub fn ui_router(max_text_bytes: u64) -> Router<AppState> {
     // the form routes, which buffer their bodies in memory.
     let upload_routes = Router::new()
         .route("/ui/upload", post(upload_submit_handler))
+        .route("/ui/create", post(create_submit_handler))
         .layer(DefaultBodyLimit::disable());
     // The text form is URL-encoded, so one decoded byte can take three
     // percent-encoded bytes. Give the body enough room for the encoded
@@ -614,6 +935,7 @@ mod tests {
             max_file_bytes: 1024 * 1024 * 1024,
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
+            show_words: false,
             http_bearer_token: None,
             mcp_local_root: None,
         }
