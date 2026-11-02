@@ -28,6 +28,7 @@ fn command() -> Command {
         "DAYFLY_MAX_FILE_BYTES",
         "DAYFLY_DEFAULT_TTL_DAYS",
         "DAYFLY_HTTP_BIND",
+        "DAYFLY_SHOW_WORDS",
         "DAYFLY_HTTP_BEARER_TOKEN",
         "DAYFLY_HTTP_BEARER_TOKEN_FILE",
         "DAYFLY_MCP_LOCAL_ROOT",
@@ -272,6 +273,7 @@ fn config_check_accepts_a_generated_file_and_prints_every_name() {
         "S3_SECRET_ACCESS_KEY",
         "S3_REGION",
         "DAYFLY_MAX_TEXT_BYTES",
+        "DAYFLY_SHOW_WORDS",
     ] {
         assert!(stdout.contains(name), "missing {name} in output: {stdout}");
     }

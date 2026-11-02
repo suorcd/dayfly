@@ -230,6 +230,7 @@ file permission warnings into faults.
 | `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error. The maximum is 52428800000 bytes: 10,000 parts of 5 MiB |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1. The name and meaning are unchanged |
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
+| `DAYFLY_SHOW_WORDS` | no | `true` | Show the generated three-word alias in the human UI: create redirects, the view page, and the paste list. Display only; the JSON/MCP responses still include `words`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_HTTP_BEARER_TOKEN` | one form | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model); set this variable or `DAYFLY_HTTP_BEARER_TOKEN_FILE` |
 | `DAYFLY_HTTP_BEARER_TOKEN_FILE` | one form | (unset) | Path to a file that contains the bearer token; set this variable or `DAYFLY_HTTP_BEARER_TOKEN` |
 | `DAYFLY_MCP_LOCAL_ROOT` | no | (unset) | Directory for the MCP local-path tools. It must exist, or startup fails. When set, `store_file` and `fetch_file` refuse any path outside it, after resolving symlinks. When unset, the stdio transport accepts any readable path and the HTTP transport refuses both tools |
@@ -240,9 +241,10 @@ stops with a configuration error. The binary trims whitespace from file
 values and rejects an empty file.
 
 Credentials are never logged. `Config` has no `Debug` that prints
-secrets; startup logs only bucket, endpoint scheme, region, and limits.
-A credential file read error names the path only, not the file
-contents. The permission warnings never include the file contents.
+secrets; startup logs only bucket, endpoint scheme, region, limits, and
+whether word aliases are shown. A credential file read error names the
+path only, not the file contents. The permission warnings never include
+the file contents.
 
 `--verbose` sets the log filter to INFO. `RUST_LOG` overrides it.
 Dayfly runs in the foreground. Use systemd or the container runtime to
@@ -691,6 +693,11 @@ operation that takes an ID: fetch, metadata, append, and delete.
   in place.
 - Legacy objects have no alias. They keep working by ID, and `words`
   is absent or null.
+- Display: the human UI uses the alias for create redirects, the view
+  page, and the paste list by default. Set `DAYFLY_SHOW_WORDS=false`
+  to use and show the canonical ID instead. The setting is display-only:
+  the alias is still generated and the JSON/MCP responses still return
+  it.
 - Entropy: three words give about 38.8 bits. The uniqueness check
   prevents collisions, not guessing. Treat the alias as a name, not a
   secret. The bearer token and the private bucket remain the access
@@ -787,17 +794,19 @@ comments.
   multipart data to `POST /ui/create`; a selected file takes
   precedence over the text fields. Without JavaScript, the native file
   picker and textarea still work. On success the browser is redirected
-  to `GET /view/<id>` for the new paste.
+  to the new paste: the three-word alias when `DAYFLY_SHOW_WORDS` is
+  true (the default), otherwise the canonical ID.
 - `GET /pastes` — current pastes, built from the bucket scan (no
-  database): link/ID, filename if any, content type, size, created
-  date, expiry date plus days remaining, and a delete action per
-  row. Expired items are filtered out, consistent with the API's
-  read-time expiry check. Add `?date=YYYY-MM-DD` for another day.
-- `GET /view/<id>` — one paste: metadata and the delete form in a
-  collapsed `<details>` block, then the raw/download link, then the
-  content: text in `<pre>` (capped at 1 MiB for the page; the API
-  remains the route for full/sliced reads), safe images inline, other
-  types via the download link.
+  database): alias when enabled (with the canonical ID as secondary
+  text), filename if any, content type, size, created date, expiry date
+  plus days remaining, and a delete action per row. Expired items are
+  filtered out, consistent with the API's read-time expiry check. Add
+  `?date=YYYY-MM-DD` for another day.
+- `GET /view/<id>` — one paste: the three-word alias when enabled,
+  metadata and the delete form in a collapsed `<details>` block, then
+  the raw/download link, then the content: text in `<pre>` (capped at
+  1 MiB for the page; the API remains the route for full/sliced reads),
+  safe images inline, other types via the download link.
 
 Theme: the pages adapt the base look of the user's own site
 stylesheet, https://suorcd.us/style.css (verified live as the site's
@@ -939,7 +948,7 @@ where `cargo --version`, `rustc --version`, and
 `rust-analyzer --version` all succeed.
 
 **Nix validation result:** `nix build` and the test suite were run on
-`x86_64-linux` against `nixos-unstable`: 367 passed and 2 ignored. On the stable
+`x86_64-linux` against `nixos-unstable`: 374 passed and 2 ignored. On the stable
 `nixos-25.11` branch the build fails before compilation with a
 rustc-too-old error naming 23 AWS crates, which is why the flake
 tracks unstable. Before this was built on a machine with Nix, an

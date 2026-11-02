@@ -365,7 +365,8 @@ async fn text_submit_handler(
         .store_text(form.text.as_bytes(), filename.as_deref(), None, ttl)
         .await
     {
-        Ok(stored) => Redirect::to(&format!("/view/{}", stored.id)).into_response(),
+        Ok(stored) => Redirect::to(&stored_view_target(&stored, state.store.config.show_words))
+            .into_response(),
         Err(e) => error_page(e),
     }
 }
@@ -396,6 +397,18 @@ fn bad_request_page(message: &str) -> Response {
         ),
     )
         .into_response()
+}
+
+/// Pick the three-word alias when the human UI is configured to show words,
+/// otherwise the canonical ID. Legacy objects without an alias fall back to
+/// the ID either way.
+fn stored_view_target(stored: &StoredPaste, show_words: bool) -> String {
+    let name = if show_words {
+        stored.words.as_deref().unwrap_or(&stored.id)
+    } else {
+        &stored.id
+    };
+    format!("/view/{name}")
 }
 
 /// Stream one multipart file part into the store. The caller decides the
@@ -473,7 +486,10 @@ async fn upload_submit_handler(
         let name = field.name().unwrap_or("").to_string();
         if name == "file" {
             return match store_file_field(&state, field, ttl).await {
-                Ok(stored) => Redirect::to(&format!("/view/{}", stored.id)).into_response(),
+                Ok(stored) => {
+                    Redirect::to(&stored_view_target(&stored, state.store.config.show_words))
+                        .into_response()
+                }
                 Err(e) => error_page(e),
             };
         }
@@ -576,7 +592,10 @@ async fn create_submit_handler(
                     continue;
                 }
                 return match store_file_field(&state, field, ttl).await {
-                    Ok(stored) => Redirect::to(&format!("/view/{}", stored.id)).into_response(),
+                    Ok(stored) => {
+                        Redirect::to(&stored_view_target(&stored, state.store.config.show_words))
+                            .into_response()
+                    }
                     Err(e) => error_page(e),
                 };
             }
@@ -595,7 +614,8 @@ async fn create_submit_handler(
         .store_text(&bytes, text_filename.as_deref(), None, ttl)
         .await
     {
-        Ok(stored) => Redirect::to(&format!("/view/{}", stored.id)).into_response(),
+        Ok(stored) => Redirect::to(&stored_view_target(&stored, state.store.config.show_words))
+            .into_response(),
         Err(e) => error_page(e),
     }
 }
@@ -633,10 +653,20 @@ async fn list_handler(
         Err(e) => return error_page(e),
     };
     let mut rows = String::new();
+    let show_words = state.store.config.show_words;
     for item in &items {
         let id_esc = html_escape(&item.id);
+        let link_cell = match (show_words, item.words.as_deref()) {
+            (true, Some(words)) => {
+                let words_esc = html_escape(words);
+                format!(
+                    "<a href=\"/view/{words_esc}\">{words_esc}</a><br><span class=\"muted\">{id_esc}</span>"
+                )
+            }
+            _ => format!("<a href=\"/view/{id_esc}\">{id_esc}</a>"),
+        };
         rows.push_str(&format!(
-            "<tr><td><a href=\"/view/{id_esc}\">{id_esc}</a></td>\
+            "<tr><td>{link_cell}</td>\
              <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
              <td><form method=\"post\" action=\"/ui/delete\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\"><button type=\"submit\">Delete</button></form></td></tr>\n",
             html_escape(item.filename.as_deref().unwrap_or("—")),
@@ -703,8 +733,19 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
     }
     let id_esc = html_escape(&meta.id);
     let main = meta.content_type.split(';').next().unwrap_or("").trim();
+    let words_line = if state.store.config.show_words {
+        meta.words
+            .as_deref()
+            .map(|words| {
+                let words_esc = html_escape(words);
+                format!("<p>Words: <a href=\"/view/{words_esc}\">{words_esc}</a></p>")
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let mut body = format!(
-        "<details><summary>Metadata &amp; delete</summary>\
+        "{words_line}<details><summary>Metadata &amp; delete</summary>\
          <p>Filename: {}</p><p>Content-Type: {}</p><p>Size: {}</p><p>Created: {}</p><p>Expires: {} ({})</p>\
          <form method=\"post\" action=\"/ui/delete\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\"><button type=\"submit\">Delete this paste</button></form>\
          </details>\
@@ -821,6 +862,7 @@ mod tests {
             max_file_bytes: 1024 * 1024 * 1024,
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
+            show_words: false,
             http_bearer_token: None,
             mcp_local_root: None,
         }

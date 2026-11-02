@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use dayfly::config::{Config, ConfigError};
 
-const VARS: [&str; 12] = [
+const VARS: [&str; 13] = [
     "S3_ENDPOINT",
     "S3_BUCKET",
     "S3_REGION",
@@ -21,6 +21,7 @@ const VARS: [&str; 12] = [
     "DAYFLY_MAX_FILE_BYTES",
     "DAYFLY_DEFAULT_TTL_DAYS",
     "DAYFLY_HTTP_BIND",
+    "DAYFLY_SHOW_WORDS",
     "DAYFLY_MCP_LOCAL_ROOT",
 ];
 
@@ -82,6 +83,7 @@ fn minimal_environment_applies_documented_defaults() {
     assert_eq!(config.max_file_bytes, 1024 * 1024 * 1024);
     assert_eq!(config.default_ttl_days, 7);
     assert_eq!(config.http_bind, "127.0.0.1:8080");
+    assert!(config.show_words);
     assert_eq!(config.http_bearer_token, None);
     assert_eq!(config.mcp_local_root, None);
 }
@@ -159,6 +161,7 @@ fn optional_values_override_the_defaults() {
     env::set_var("DAYFLY_MAX_FILE_BYTES", "5678");
     env::set_var("DAYFLY_DEFAULT_TTL_DAYS", "30");
     env::set_var("DAYFLY_HTTP_BIND", "0.0.0.0:9999");
+    env::set_var("DAYFLY_SHOW_WORDS", "false");
     env::set_var("DAYFLY_HTTP_BEARER_TOKEN", "token-value");
 
     let config = Config::from_env().expect("overrides must parse");
@@ -167,6 +170,7 @@ fn optional_values_override_the_defaults() {
     assert_eq!(config.max_file_bytes, 5678);
     assert_eq!(config.default_ttl_days, 30);
     assert_eq!(config.http_bind, "0.0.0.0:9999");
+    assert!(!config.show_words);
     assert_eq!(config.http_bearer_token.as_deref(), Some("token-value"));
     assert_eq!(config.max_bytes_for_upload(None), 1234);
     assert_eq!(config.max_bytes_for_upload(Some("file.bin")), 5678);
@@ -377,6 +381,7 @@ fn safe_summary_omits_credentials_and_token_presence() {
     let summary = config.safe_summary();
     assert!(summary.contains("bucket=dayfly-test"));
     assert!(summary.contains("endpoint_scheme=https"));
+    assert!(summary.contains("show_words=true"));
     for secret in ["test-access", "test-secret", "summary-secret"] {
         assert!(
             !summary.contains(secret),

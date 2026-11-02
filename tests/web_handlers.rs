@@ -350,6 +350,37 @@ async fn create_submit_creates_a_text_paste_with_filename_and_ttl() {
 }
 
 #[tokio::test]
+async fn create_submit_redirects_to_the_words_when_enabled() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store_with_show_words(true).await);
+    let boundary = "web-create-words";
+    let body =
+        common::multipart_fields_only(boundary, &[("ttl_days", "1"), ("text", "word redirect")]);
+    let headers = multipart_headers(boundary, body.len());
+
+    let request = common::request("POST", "/ui/create", &headers, body);
+    let (status, response_headers, _body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let location = response_headers[header::LOCATION].to_str().unwrap();
+    let alias = location.strip_prefix("/view/").expect("view redirect");
+    assert!(
+        !alias.contains('/'),
+        "the redirect must use the alias, not the date/id: {location}"
+    );
+    let alias_object = fake
+        .object(&format!("words/{alias}"))
+        .expect("the alias object must exist");
+    let target = String::from_utf8(alias_object.body.clone()).expect("alias body is UTF-8");
+    assert!(target.starts_with("pastes/"));
+
+    let request = common::request("GET", location, &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(page.contains(&format!("Words: <a href=\"/view/{alias}\">")));
+}
+
+#[tokio::test]
 async fn create_submit_prefers_a_file_when_both_are_supplied() {
     let fake = FakeS3::start().await;
     let app = common::app(fake.store().await);
@@ -683,6 +714,80 @@ async fn view_page_renders_text_escaped_and_images_inline() {
     );
     let (status, _, _) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn view_page_shows_words_when_enabled_and_hides_them_when_disabled() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_show_words(true).await;
+    let stored = store
+        .store_text(b"word view", None, None, None)
+        .await
+        .expect("text must store");
+    let words = stored.words.clone().expect("a new paste must have words");
+    let app = common::app(store);
+
+    let request = common::request("GET", &format!("/view/{}", stored.id), &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(page.contains(&format!("Words: <a href=\"/view/{words}\">")));
+
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_show_words(false).await;
+    let stored = store
+        .store_text(b"word view", None, None, None)
+        .await
+        .expect("text must store");
+    let app = common::app(store);
+
+    let request = common::request("GET", &format!("/view/{}", stored.id), &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!html_text(&body).contains("Words:"));
+}
+
+#[tokio::test]
+async fn list_page_shows_words_when_enabled_and_hides_them_when_disabled() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_show_words(true).await;
+    let stored = store
+        .store_text(b"word list", None, None, None)
+        .await
+        .expect("text must store");
+    let words = stored.words.clone().expect("a new paste must have words");
+    let id = stored.id.clone();
+    let app = common::app(store);
+
+    let request = common::request("GET", "/pastes", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        page.contains(&format!("href=\"/view/{words}\"")),
+        "the alias must be the primary link: {page}"
+    );
+    assert!(
+        page.contains(&format!("<span class=\"muted\">{id}</span>")),
+        "the canonical ID must be shown as secondary text: {page}"
+    );
+
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_show_words(false).await;
+    let stored = store
+        .store_text(b"word list", None, None, None)
+        .await
+        .expect("text must store");
+    let words = stored.words.clone().expect("a new paste must have words");
+    let id = stored.id.clone();
+    let app = common::app(store);
+
+    let request = common::request("GET", "/pastes", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(!page.contains(&format!("href=\"/view/{words}\"")));
+    assert!(page.contains(&format!("href=\"/view/{id}\"")));
 }
 
 #[tokio::test]
