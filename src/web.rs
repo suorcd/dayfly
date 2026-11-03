@@ -39,7 +39,8 @@ use std::collections::HashMap;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::header::{CONTENT_LENGTH, HOST, ORIGIN, REFERER};
 use axum::http::uri::{Authority, Uri};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::middleware::map_response;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
@@ -874,6 +875,22 @@ async fn view_bare(
     view_inner(&state, &headers, &random).await
 }
 
+/// Deny framing for every UI response.
+///
+/// The human pages carry an inline style and script, so a broad
+/// `default-src` policy would break them. Keep the policy to framing.
+async fn deny_framing(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    response
+}
+
 /// UI routes, without state attached. `main` merges these with the
 /// API routes and attaches a single shared [`AppState`].
 pub fn ui_router(max_text_bytes: u64) -> Router<AppState> {
@@ -899,6 +916,7 @@ pub fn ui_router(max_text_bytes: u64) -> Router<AppState> {
         .route("/pastes", get(list_handler))
         .route("/view/{date}/{random}", get(view_dated))
         .route("/view/{random}", get(view_bare))
+        .layer(map_response(deny_framing))
 }
 
 /// Raw-body limit for the URL-encoded text form.
@@ -997,6 +1015,43 @@ mod tests {
             StatusCode::BAD_GATEWAY,
             "an unset token must leave the UI routes open"
         );
+    }
+
+    #[tokio::test]
+    async fn ui_html_responses_deny_framing() {
+        let state = test_state(None).await;
+        let max_text_bytes = state.store.config.max_text_bytes;
+        let app = ui_router(max_text_bytes).with_state(state);
+
+        for uri in ["/", "/pastes", "/view/example"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request must build"),
+                )
+                .await
+                .expect("router call must complete");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-security-policy")
+                    .and_then(|value| value.to_str().ok()),
+                Some("frame-ancestors 'none'"),
+                "{uri}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-frame-options")
+                    .and_then(|value| value.to_str().ok()),
+                Some("DENY"),
+                "{uri}"
+            );
+        }
     }
 
     #[test]
