@@ -86,7 +86,7 @@ table{border-collapse:collapse;width:auto;table-layout:fixed} th,td{text-align:l
 .content-type-cell{display:block;max-width:calc(8rem - 1ch);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .size-cell{text-align:right;white-space:nowrap}
 .size-unit{display:inline-block;min-width:3ch;text-align:left;margin-left:.4ch}
-th:nth-child(4){text-align:right}
+th:nth-child(4){text-align:center}
 .table-wrap{overflow-x:auto}
 .filename-cell{white-space:nowrap}
 th:first-child,td:first-child{white-space:nowrap}
