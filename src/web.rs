@@ -83,7 +83,7 @@ table{border-collapse:collapse;width:auto;table-layout:fixed} th,td{text-align:l
 .col-created{width:22ch}
 .col-ttl{width:9ch}
 .col-action{width:9ch}
-.content-type-cell{display:block;max-width:8rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.content-type-cell{display:block;max-width:calc(8rem - 1ch);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .table-wrap{overflow-x:auto}
 .filename-cell{white-space:nowrap}
 th:first-child,td:first-child{white-space:nowrap}
