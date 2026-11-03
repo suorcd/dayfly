@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use dayfly::config::{Config, ConfigError};
 
-const VARS: [&str; 14] = [
+const VARS: [&str; 15] = [
     "S3_ENDPOINT",
     "S3_BUCKET",
     "S3_REGION",
@@ -20,6 +20,7 @@ const VARS: [&str; 14] = [
     "DAYFLY_MAX_TEXT_BYTES",
     "DAYFLY_MAX_FILE_BYTES",
     "DAYFLY_MAX_PASTE_BYTES",
+    "DAYFLY_ALIAS_WORDS",
     "DAYFLY_DEFAULT_TTL_DAYS",
     "DAYFLY_HTTP_BIND",
     "DAYFLY_SHOW_WORDS",
@@ -83,6 +84,7 @@ fn minimal_environment_applies_documented_defaults() {
     assert_eq!(config.max_text_bytes, 100 * 1024 * 1024);
     assert_eq!(config.max_file_bytes, 1024 * 1024 * 1024);
     assert_eq!(config.max_paste_bytes, 1024 * 1024 * 1024);
+    assert_eq!(config.alias_words, 3);
     assert_eq!(config.default_ttl_days, 7);
     assert_eq!(config.http_bind, "127.0.0.1:8080");
     assert!(config.show_words);
@@ -218,6 +220,7 @@ fn optional_values_override_the_defaults() {
     env::set_var("DAYFLY_MAX_TEXT_BYTES", "1234");
     env::set_var("DAYFLY_MAX_FILE_BYTES", "5678");
     env::set_var("DAYFLY_MAX_PASTE_BYTES", "9012");
+    env::set_var("DAYFLY_ALIAS_WORDS", "4");
     env::set_var("DAYFLY_DEFAULT_TTL_DAYS", "30");
     env::set_var("DAYFLY_HTTP_BIND", "0.0.0.0:9999");
     env::set_var("DAYFLY_SHOW_WORDS", "false");
@@ -228,12 +231,29 @@ fn optional_values_override_the_defaults() {
     assert_eq!(config.max_text_bytes, 1234);
     assert_eq!(config.max_file_bytes, 5678);
     assert_eq!(config.max_paste_bytes, 9012);
+    assert_eq!(config.alias_words, 4);
     assert_eq!(config.default_ttl_days, 30);
     assert_eq!(config.http_bind, "0.0.0.0:9999");
     assert!(!config.show_words);
     assert_eq!(config.http_bearer_token.as_deref(), Some("token-value"));
     assert_eq!(config.max_bytes_for_upload(None), 1234);
     assert_eq!(config.max_bytes_for_upload(Some("file.bin")), 5678);
+}
+
+#[test]
+fn alias_word_count_out_of_range_names_the_range() {
+    let _guard = lock_env();
+    for value in ["2", "7"] {
+        clear_env();
+        set_required();
+        env::set_var("DAYFLY_ALIAS_WORDS", value);
+        let error = Config::from_env()
+            .err()
+            .expect("an out-of-range alias count must fail");
+        let message = error.to_string();
+        assert!(message.contains("DAYFLY_ALIAS_WORDS"), "{message}");
+        assert!(message.contains("3 to 6"), "{message}");
+    }
 }
 
 #[test]

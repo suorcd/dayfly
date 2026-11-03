@@ -23,6 +23,15 @@ pub const MAX_TTL_DAYS: u32 = 3650;
 /// Maximum TTL accepted from an API client, in seconds.
 pub const MAX_TTL_SECONDS: i64 = MAX_TTL_DAYS as i64 * 86_400;
 
+/// Minimum number of words in a generated alias.
+pub const MIN_ALIAS_WORDS: u8 = 3;
+
+/// Maximum number of words in a generated alias.
+pub const MAX_ALIAS_WORDS: u8 = 6;
+
+/// Default number of words in a generated alias.
+pub const DEFAULT_ALIAS_WORDS: u8 = 3;
+
 /// Configuration loaded from the environment.
 ///
 /// The S3 credentials come from a direct environment variable or from a
@@ -50,6 +59,9 @@ pub struct Config {
     /// object and every appended segment. A new paste above this cap
     /// fails with `TooLarge` and writes no object. Default: 1 GiB.
     pub max_paste_bytes: u64,
+    /// Number of words in a new alias. The allowed range is 3 to 6.
+    /// Resolution accepts 3 words up to this value. Default: 3.
+    pub alias_words: u8,
     /// Default TTL in positive whole days when a store call does not
     /// specify one. Zero is invalid because it would create a paste that
     /// is already expired.
@@ -64,7 +76,7 @@ pub struct Config {
     /// proxy that authenticates. The service then logs one warning at
     /// startup. See "Access model" in the README.
     pub allow_unauthenticated: bool,
-    /// Whether the human web UI shows the generated three-word aliases.
+    /// Whether the human web UI shows the generated aliases.
     ///
     /// Default: `true`. This is a display setting only: aliases are still
     /// generated and stored, and the JSON/MCP responses still include the
@@ -153,6 +165,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         help: "Maximum total paste size in bytes, including appends",
     },
     ConfigField {
+        name: "DAYFLY_ALIAS_WORDS",
+        value: Some("3"),
+        required: false,
+        help: "Number of words in a new alias, 3 to 6",
+    },
+    ConfigField {
         name: "DAYFLY_DEFAULT_TTL_DAYS",
         value: Some("7"),
         required: false,
@@ -174,7 +192,7 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         name: "DAYFLY_SHOW_WORDS",
         value: Some("true"),
         required: false,
-        help: "Show three-word aliases in the human UI",
+        help: "Show generated aliases in the human UI",
     },
     ConfigField {
         name: "DAYFLY_HTTP_BEARER_TOKEN",
@@ -820,6 +838,19 @@ impl Config {
                 format!("expected at most {MAX_MULTIPART_BYTES} bytes: 10,000 parts of 5 MiB"),
             ));
         }
+        let alias_words = optional_u32(
+            &lookup,
+            "DAYFLY_ALIAS_WORDS",
+            u32::from(DEFAULT_ALIAS_WORDS),
+        )?;
+        if !(u32::from(MIN_ALIAS_WORDS)..=u32::from(MAX_ALIAS_WORDS)).contains(&alias_words) {
+            return Err(ConfigError::Invalid(
+                "DAYFLY_ALIAS_WORDS".to_string(),
+                format!("expected an integer from {MIN_ALIAS_WORDS} to {MAX_ALIAS_WORDS}"),
+            ));
+        }
+        // The range check above keeps this conversion in bounds.
+        let alias_words = u8::try_from(alias_words).unwrap_or(DEFAULT_ALIAS_WORDS);
         Ok(Self {
             endpoint,
             bucket,
@@ -843,6 +874,7 @@ impl Config {
                 "DAYFLY_MAX_PASTE_BYTES",
                 field_u64("DAYFLY_MAX_PASTE_BYTES", 1024 * 1024 * 1024),
             )?,
+            alias_words,
             default_ttl_days,
             http_bind: optional_string(
                 &lookup,
@@ -904,7 +936,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} default_ttl_days={} show_words={} mcp_local_root={}",
+            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} show_words={} mcp_local_root={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -915,6 +947,7 @@ impl Config {
             self.max_text_bytes,
             self.max_file_bytes,
             self.max_paste_bytes,
+            self.alias_words,
             self.default_ttl_days,
             self.show_words,
             if self.mcp_local_root.is_some() {
@@ -1240,6 +1273,7 @@ mod tests {
             max_text_bytes,
             max_file_bytes,
             max_paste_bytes: 1024 * 1024 * 1024,
+            alias_words: 3,
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
             show_words: true,

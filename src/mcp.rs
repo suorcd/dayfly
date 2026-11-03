@@ -252,7 +252,7 @@ pub struct StoreFileParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AppendTextParams {
-    /// Full or bare paste ID, or a three-word alias.
+    /// Full or bare paste ID, or a word alias.
     pub id: String,
     /// Text to append. The text cap applies to this append only.
     pub text: String,
@@ -260,7 +260,7 @@ pub struct AppendTextParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetTtlParams {
-    /// Full or bare paste ID, or a three-word alias.
+    /// Full or bare paste ID, or a word alias.
     pub id: String,
     /// New TTL as seconds or a duration such as "1h", "1h30m", or "2d".
     /// Do not set both `ttl` and `ttl_days`.
@@ -272,7 +272,7 @@ pub struct SetTtlParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FetchTextParams {
-    /// Full or bare paste ID, or a three-word alias.
+    /// Full or bare paste ID, or a word alias.
     pub id: String,
     pub offset: Option<u64>,
     pub limit: Option<u64>,
@@ -280,7 +280,7 @@ pub struct FetchTextParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FetchFileParams {
-    /// Full or bare paste ID, or a three-word alias.
+    /// Full or bare paste ID, or a word alias.
     pub id: String,
     /// Local destination path for the downloaded file.
     pub dest_path: String,
@@ -290,7 +290,7 @@ pub struct FetchFileParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IdParams {
-    /// Full or bare paste ID, or a three-word alias.
+    /// Full or bare paste ID, or a word alias.
     pub id: String,
 }
 
@@ -459,7 +459,7 @@ impl Pastebin {
     }
 
     #[tool(
-        description = "Fetch a text paste by id or three-word alias, with optional byte offset and limit. A call returns at most 8 MiB. Large pastes should be read in slices, not whole."
+        description = "Fetch a text paste by id or word alias, with optional byte offset and limit. A call returns at most 8 MiB. Large pastes should be read in slices, not whole."
     )]
     async fn fetch_text(
         &self,
@@ -479,7 +479,7 @@ impl Pastebin {
     }
 
     #[tool(
-        description = "Download a paste/file by id or three-word alias to a local path (streamed in chunks, never loaded whole into memory, binary safe). Returns the object's metadata, not its bytes."
+        description = "Download a paste/file by id or word alias to a local path (streamed in chunks, never loaded whole into memory, binary safe). Returns the object's metadata, not its bytes."
     )]
     async fn fetch_file(
         &self,
@@ -524,7 +524,7 @@ impl Pastebin {
     }
 
     #[tool(
-        description = "Fetch metadata for a paste by id or three-word alias (exists, size, content_type, detection_source, filename, sha256, expiry). Equivalent to HeadObject, plus the expiry check."
+        description = "Fetch metadata for a paste by id or word alias (exists, size, content_type, detection_source, filename, sha256, expiry). Equivalent to HeadObject, plus the expiry check."
     )]
     async fn fetch_metadata(
         &self,
@@ -534,7 +534,7 @@ impl Pastebin {
         result_json(metadata_json(meta))
     }
 
-    #[tool(description = "Delete a paste by id or three-word alias.")]
+    #[tool(description = "Delete a paste by id or word alias.")]
     async fn delete_paste(
         &self,
         Parameters(params): Parameters<IdParams>,
@@ -596,7 +596,7 @@ impl Pastebin {
              credentials and no presigned URL is issued. The TTL accepts \
              seconds or a duration such as 90m, 1h30m, or 2d. A bare \
              integer is seconds; use 7d for seven days. Use ttl or \
-             ttl_days, not both. Expiry is enforced on read. A three-word \
+             ttl_days, not both. Expiry is enforced on read. A word \
              alias is a second name for a paste; use the ID or the alias.",
         );
         match &self.local {

@@ -10,8 +10,8 @@ use bytes::Bytes;
 use chrono::{Duration, Utc};
 use common::{FailOp, FakeS3, Gate};
 use dayfly::store::{
-    normalize_words, parse_segment_key, segment_key, StoreError, Ttl, MAX_FETCH_TEXT_BYTES,
-    MAX_SEGMENTS_PER_PASTE, MULTIPART_CHUNK_BYTES, SEGMENT_SUFFIX_LEN,
+    normalize_words, normalize_words_up_to, parse_segment_key, segment_key, StoreError, Ttl,
+    MAX_FETCH_TEXT_BYTES, MAX_SEGMENTS_PER_PASTE, MULTIPART_CHUNK_BYTES, SEGMENT_SUFFIX_LEN,
 };
 use futures::stream;
 use sha2::{Digest, Sha256};
@@ -170,6 +170,47 @@ fn other_phrase(taken: &str) -> String {
         }
     }
     panic!("no unused test phrase");
+}
+
+#[tokio::test]
+async fn alias_word_count_applies_to_new_aliases_and_old_aliases_resolve() {
+    let fake = FakeS3::start().await;
+    let mut store = fake.store().await;
+
+    let three = store
+        .store_text(b"three", None, None, None)
+        .await
+        .expect("a three-word paste must store");
+    let three_words = three.words.expect("a default alias must have words");
+    assert!(normalize_words_up_to(&three_words, 3).is_some());
+
+    store.config.alias_words = 4;
+    let four = store
+        .store_text(b"four", None, None, None)
+        .await
+        .expect("a four-word paste must store");
+    let four_words = four.words.expect("a four-word alias must have words");
+    assert!(normalize_words_up_to(&four_words, 4).is_some());
+
+    store.config.alias_words = 6;
+    let six = store
+        .store_text(b"six", None, None, None)
+        .await
+        .expect("a six-word paste must store");
+    let six_words = six.words.expect("a six-word alias must have words");
+    assert!(normalize_words_up_to(&six_words, 6).is_some());
+
+    for words in [&three_words, &four_words, &six_words] {
+        let fetched = store
+            .fetch_text(words, 0, None)
+            .await
+            .expect("an older alias must keep resolving");
+        assert!(!fetched.text.is_empty());
+    }
+    store
+        .delete(&three_words)
+        .await
+        .expect("an older alias must delete");
 }
 
 #[tokio::test]

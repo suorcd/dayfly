@@ -42,7 +42,9 @@ use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::config::{Config, MAX_TTL_DAYS, MAX_TTL_SECONDS};
+use crate::config::{
+    Config, DEFAULT_ALIAS_WORDS, MAX_ALIAS_WORDS, MAX_TTL_DAYS, MAX_TTL_SECONDS, MIN_ALIAS_WORDS,
+};
 use crate::content_type::{detect_content_type, detect_content_type_sample, Detection, PEEK_BYTES};
 
 pub const MULTIPART_CHUNK_BYTES: usize = 8 * 1024 * 1024;
@@ -78,7 +80,7 @@ pub enum StoreError {
     InvalidRange(String),
     #[error("range not satisfiable")]
     RangeNotSatisfiable,
-    #[error("could not allocate a three-word alias after {attempts} attempts")]
+    #[error("could not allocate a word alias after {attempts} attempts")]
     AliasUnavailable { attempts: usize },
     #[error("paste has more than {limit} appended segments")]
     TooManySegments { limit: usize },
@@ -424,7 +426,7 @@ pub struct StoredPaste {
     /// Full paste ID returned to clients: "<yyyy-mm-dd>/<random-id>".
     pub id: String,
     pub key: String,
-    /// Three-word alias, when the store wrote one.
+    /// Word alias, when the store wrote one.
     pub words: Option<String>,
     pub size: u64,
     pub sha256: String,
@@ -441,7 +443,7 @@ pub struct StoredPaste {
 pub struct PasteMetadata {
     pub id: String,
     pub key: String,
-    /// Three-word alias, when the base object records one.
+    /// Word alias, when the base object records one.
     pub words: Option<String>,
     pub filename: Option<String>,
     pub content_type: String,
@@ -517,7 +519,7 @@ pub struct AppendResult {
 pub struct PasteSummary {
     pub id: String,
     pub key: String,
-    /// Three-word alias, when the base object records one.
+    /// Word alias, when the base object records one.
     pub words: Option<String>,
     pub size: u64,
     pub last_modified: Option<DateTime<Utc>>,
@@ -596,8 +598,8 @@ pub fn key_for(date: &str, random_id: &str) -> String {
     format!("pastes/{date}/{random_id}")
 }
 
-/// Number of words in a three-word alias.
-pub const WORDS_IN_PHRASE: usize = 3;
+/// Default number of words in an alias.
+pub const WORDS_IN_PHRASE: usize = DEFAULT_ALIAS_WORDS as usize;
 
 /// Number of alias candidates to try before the store reports failure.
 pub const ALIAS_ATTEMPTS: usize = 8;
@@ -623,13 +625,22 @@ fn word_set() -> &'static HashSet<&'static str> {
     WORD_SET.get_or_init(|| wordlist().iter().copied().collect())
 }
 
-/// Normalize a three-word alias to the lowercase hyphen form.
+/// Normalize a default three-word alias to the lowercase hyphen form.
+///
+/// This keeps the public helper on the default word count. Store
+/// resolution uses [`normalize_words_up_to`] with the configured count.
+pub fn normalize_words(input: &str) -> Option<String> {
+    normalize_words_up_to(input, DEFAULT_ALIAS_WORDS)
+}
+
+/// Normalize an alias to the lowercase hyphen form.
 ///
 /// The function accepts spaces or hyphens between words and trims the
-/// input. It returns `None` when the input is not exactly three known
-/// words. Four wordlist entries contain a hyphen, so the parser tests
-/// every split of the input into three wordlist entries.
-pub fn normalize_words(input: &str) -> Option<String> {
+/// input. It accepts 3 known words up to `max_words`. Four wordlist
+/// entries contain a hyphen, so the parser tests every split of the input
+/// into wordlist entries.
+pub fn normalize_words_up_to(input: &str, max_words: u8) -> Option<String> {
+    let max_words = max_words.clamp(MIN_ALIAS_WORDS, MAX_ALIAS_WORDS);
     let trimmed = input.trim();
     if trimmed.is_empty() || trimmed.len() > 128 {
         return None;
@@ -639,13 +650,23 @@ pub fn normalize_words(input: &str) -> Option<String> {
         .split(|c: char| c == '-' || c.is_whitespace())
         .filter(|chunk| !chunk.is_empty())
         .collect();
-    if chunks.len() < WORDS_IN_PHRASE || !is_three_words(&chunks) {
+    if chunks.len() < usize::from(MIN_ALIAS_WORDS)
+        || !is_words(
+            &chunks,
+            usize::from(MIN_ALIAS_WORDS),
+            usize::from(max_words),
+        )
+    {
         return None;
     }
     Some(chunks.join("-"))
 }
 
-fn is_three_words(chunks: &[&str]) -> bool {
+fn is_words(chunks: &[&str], min_words: usize, max_words: usize) -> bool {
+    (min_words..=max_words).any(|words| has_word_count(chunks, words))
+}
+
+fn has_word_count(chunks: &[&str], words: usize) -> bool {
     fn search(chunks: &[&str], index: usize, words_left: usize) -> bool {
         if words_left == 0 {
             return index == chunks.len();
@@ -665,20 +686,29 @@ fn is_three_words(chunks: &[&str]) -> bool {
         }
         false
     }
-    search(chunks, 0, WORDS_IN_PHRASE)
+    search(chunks, 0, words)
 }
 
-/// True when the input is a valid three-word alias.
+/// True when the input is a valid default three-word alias.
 pub fn is_word_phrase(input: &str) -> bool {
     normalize_words(input).is_some()
 }
 
-/// Generate one random three-word alias in the hyphen form.
+/// Generate one random default three-word alias in the hyphen form.
 pub fn generate_words() -> String {
+    generate_words_with_count(DEFAULT_ALIAS_WORDS)
+}
+
+/// Generate one random alias with `count` words in the hyphen form.
+///
+/// The count is clamped to the allowed range, so this function cannot
+/// generate an alias that the parser rejects.
+pub fn generate_words_with_count(count: u8) -> String {
+    let count = count.clamp(MIN_ALIAS_WORDS, MAX_ALIAS_WORDS);
     let words = wordlist();
     let mut rng = rand::rng();
     let mut phrase = String::new();
-    for index in 0..WORDS_IN_PHRASE {
+    for index in 0..usize::from(count) {
         if index > 0 {
             phrase.push('-');
         }
@@ -1288,6 +1318,11 @@ impl Store {
         })
     }
 
+    /// Normalize an alias with the configured maximum word count.
+    fn normalize_alias(&self, input: &str) -> Option<String> {
+        normalize_words_up_to(input, self.config.alias_words)
+    }
+
     /// Use a fixed candidate order for alias allocation.
     ///
     /// Integration tests use this to force two stores to compete for one
@@ -1321,8 +1356,12 @@ impl Store {
         match &self.alias_candidates {
             Some(candidates) => self.choose_alias_from(candidates.iter().cloned()).await,
             None => {
-                self.choose_alias_from(std::iter::repeat_with(generate_words).take(ALIAS_ATTEMPTS))
-                    .await
+                let count = self.config.alias_words;
+                self.choose_alias_from(
+                    std::iter::repeat_with(move || generate_words_with_count(count))
+                        .take(ALIAS_ATTEMPTS),
+                )
+                .await
             }
         }
     }
@@ -1339,7 +1378,7 @@ impl Store {
         let mut attempts = 0;
         for candidate in candidates {
             attempts += 1;
-            let Some(phrase) = normalize_words(&candidate) else {
+            let Some(phrase) = self.normalize_alias(&candidate) else {
                 continue;
             };
             if !self.alias_object_exists(&phrase).await? {
@@ -1520,7 +1559,7 @@ impl Store {
         Ok(out
             .metadata()
             .and_then(|meta| meta.get("words").cloned())
-            .and_then(|words| normalize_words(&words)))
+            .and_then(|words| self.normalize_alias(&words)))
     }
 
     /// Delete the base object and every object under its segment prefix.
@@ -1555,12 +1594,12 @@ impl Store {
     ///
     /// Full IDs (`yyyy-mm-dd/<random>`) resolve directly. Bare random IDs
     /// are resolved by scanning the `pastes/` prefix (at most
-    /// [`LIST_SCAN_MAX_PAGES`] pages of 1,000 keys). A valid three-word
+    /// [`LIST_SCAN_MAX_PAGES`] pages of 1,000 keys). A valid word
     /// alias resolves through its `words/` object. That scan is the cost
     /// of not having an index: clients should keep the full ID returned
     /// at store time.
     pub async fn resolve_key(&self, id: &str) -> Result<String, StoreError> {
-        if let Some(phrase) = normalize_words(id) {
+        if let Some(phrase) = self.normalize_alias(id) {
             return self.resolve_alias(&phrase).await;
         }
         validate_id(id)?;
@@ -2211,7 +2250,9 @@ impl Store {
         Ok(PasteMetadata {
             id: key.strip_prefix("pastes/").unwrap_or(key).to_string(),
             key: key.to_string(),
-            words: meta.get("words").and_then(|words| normalize_words(words)),
+            words: meta
+                .get("words")
+                .and_then(|words| self.normalize_alias(words)),
             filename: meta.get("filename").map(|s| decode_filename(s)),
             content_type,
             detection_source: meta.get("detection-source").cloned(),
@@ -2474,11 +2515,11 @@ impl Store {
     /// Delete the base object, every object under its segment prefix, and
     /// the alias object.
     ///
-    /// The input can be a canonical ID or a three-word alias. The prefix
+    /// The input can be a canonical ID or a word alias. The prefix
     /// listing runs first, so a listing failure leaves the paste intact
     /// rather than deleting only the base object.
     pub async fn delete(&self, id: &str) -> Result<(), StoreError> {
-        if let Some(phrase) = normalize_words(id) {
+        if let Some(phrase) = self.normalize_alias(id) {
             return self.delete_by_words(&phrase).await;
         }
         let key = self.resolve_key(id).await?;
@@ -2728,6 +2769,32 @@ mod tests {
             );
             assert_eq!(normalize_words(&phrase).as_deref(), Some(phrase.as_str()));
         }
+    }
+
+    #[test]
+    fn generated_aliases_have_the_requested_word_count() {
+        for count in MIN_ALIAS_WORDS..=MAX_ALIAS_WORDS {
+            let phrase = generate_words_with_count(count);
+            let chunks: Vec<&str> = phrase.split('-').collect();
+            assert!(
+                has_word_count(&chunks, usize::from(count)),
+                "{count} words expected: {phrase}"
+            );
+            assert!(
+                normalize_words_up_to(&phrase, count).is_some(),
+                "{count} words must resolve: {phrase}"
+            );
+        }
+    }
+
+    #[test]
+    fn alias_normalization_accepts_up_to_the_maximum() {
+        let four = "abacus-abdomen-zoology-acorn";
+        assert!(normalize_words_up_to(four, 3).is_none());
+        assert!(normalize_words_up_to(four, 4).is_some());
+        let six = "abacus-abdomen-zoology-acorn-aerosol-album";
+        assert!(normalize_words_up_to(six, 5).is_none());
+        assert!(normalize_words_up_to(six, 6).is_some());
     }
 
     #[test]

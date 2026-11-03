@@ -27,6 +27,7 @@ fn command() -> Command {
         "DAYFLY_MAX_TEXT_BYTES",
         "DAYFLY_MAX_FILE_BYTES",
         "DAYFLY_MAX_PASTE_BYTES",
+        "DAYFLY_ALIAS_WORDS",
         "DAYFLY_DEFAULT_TTL_DAYS",
         "DAYFLY_HTTP_BIND",
         "DAYFLY_SHOW_WORDS",

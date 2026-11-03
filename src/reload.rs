@@ -191,6 +191,9 @@ fn changed_fields(old: &Config, new: &Config) -> Vec<&'static str> {
     if old.max_paste_bytes != new.max_paste_bytes {
         changed.push("DAYFLY_MAX_PASTE_BYTES");
     }
+    if old.alias_words != new.alias_words {
+        changed.push("DAYFLY_ALIAS_WORDS");
+    }
     if old.default_ttl_days != new.default_ttl_days {
         changed.push("DAYFLY_DEFAULT_TTL_DAYS");
     }
