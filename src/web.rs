@@ -75,8 +75,9 @@ hr{border:none;border-top:1px dashed #0abdc6;margin:1.5rem 0;opacity:.6}
 a{color:#ea00d9;text-decoration:none}
 a:hover{text-decoration:underline;text-shadow:0 0 8px rgba(234,0,217,.8)}
 table{border-collapse:collapse;width:100%} th,td{text-align:left;padding:.4rem .5rem;border:1px dashed #0abdc6;vertical-align:top}
-.content-type-cell{display:block;max-width:12rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.content-type-cell{display:block;max-width:9rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .table-wrap{overflow-x:auto}
+.filename-cell{white-space:nowrap}
 th:first-child,td:first-child{white-space:nowrap}
 th:nth-child(4),td:nth-child(4){white-space:nowrap}
 th:nth-child(5),td:nth-child(5){white-space:nowrap}
@@ -260,6 +261,36 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+/// Truncate a filename in the middle and keep the extension.
+///
+/// A name of 25 characters or fewer stays unchanged. A longer name
+/// keeps the first 15 characters, an ellipsis, and the last 10
+/// characters.
+fn middle_truncate_filename(name: &str) -> String {
+    const MAX_CHARS: usize = 25;
+    const HEAD_CHARS: usize = 15;
+    const TAIL_CHARS: usize = 10;
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= MAX_CHARS {
+        return name.to_string();
+    }
+    let head: String = chars[..HEAD_CHARS].iter().collect();
+    let tail: String = chars[chars.len() - TAIL_CHARS..].iter().collect();
+    format!("{head}…{tail}")
+}
+
+/// Render the filename cell: full name in the tooltip, short name on screen.
+fn filename_cell(filename: Option<&str>) -> String {
+    match filename {
+        Some(name) => format!(
+            "<td class=\"filename-cell\" title=\"{}\">{}</td>",
+            html_escape(name),
+            html_escape(&middle_truncate_filename(name))
+        ),
+        None => "<td class=\"filename-cell\">—</td>".to_string(),
+    }
 }
 
 /// Shell examples for the new-paste page.
@@ -1037,11 +1068,11 @@ async fn list_handler(
             _ => format!("<a href=\"/view/{id_esc}\">{id_esc}</a>"),
         };
         let content_type = html_escape(item.content_type.as_deref().unwrap_or("—"));
+        let filename = filename_cell(item.filename.as_deref());
         rows.push_str(&format!(
             "<tr><td>{link_cell}</td>\
-             <td>{}</td><td><span class=\"content-type-cell\" title=\"{content_type}\">{content_type}</span></td><td>{}</td><td>{}</td><td>{}</td>\
+             {filename}<td><span class=\"content-type-cell\" title=\"{content_type}\">{content_type}</span></td><td>{}</td><td>{}</td><td>{}</td>\
              <td><form method=\"post\" action=\"/ui/delete\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\"><button type=\"submit\">Delete</button></form></td></tr>\n",
-            html_escape(item.filename.as_deref().unwrap_or("—")),
             human_size(item.size),
             fmt_dt(item.created_at),
             days_remaining(item.expires_at),
@@ -1643,6 +1674,19 @@ mod tests {
         assert_eq!(
             html_escape("<script>alert(\"x\")</script>"),
             "&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;"
+        );
+    }
+
+    #[test]
+    fn middle_truncate_filename_keeps_the_extension() {
+        assert_eq!(middle_truncate_filename("short.txt"), "short.txt");
+        assert_eq!(
+            middle_truncate_filename("a2345678901234567890123456"),
+            "a23456789012345…7890123456"
+        );
+        assert_eq!(
+            middle_truncate_filename("very-long-report-name-that-keeps-going.xlsx"),
+            "very-long-repor…going.xlsx"
         );
     }
 

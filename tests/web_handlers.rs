@@ -848,6 +848,31 @@ async fn list_page_shows_current_pastes_and_hides_expired_ones() {
 }
 
 #[tokio::test]
+async fn list_page_middle_truncates_long_filenames_with_a_title() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let name = "very-long-report-name-that-keeps-going.xlsx";
+    store
+        .store_text(b"data", Some(name), None, None)
+        .await
+        .expect("text with a filename must store");
+    let app = common::app(store);
+
+    let request = common::request("GET", "/pastes", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        page.contains(&format!("title=\"{name}\"")),
+        "the cell must keep the full filename in a title attribute: {page}"
+    );
+    assert!(
+        page.contains("very-long-repor…going.xlsx"),
+        "the visible name must be truncated in the middle: {page}"
+    );
+}
+
+#[tokio::test]
 async fn list_page_prepopulates_the_configured_default_window() {
     let fake = FakeS3::start().await;
     let mut config = fake.config();
