@@ -460,15 +460,15 @@ async fn multipart_inner(
     let max_request = state
         .store
         .config
-        .max_file_bytes
-        .saturating_add(state.store.config.max_text_bytes)
+        .max_file_paste_bytes()
+        .saturating_add(state.store.config.max_text_paste_bytes())
         .saturating_add(1024 * 1024);
     if let Some(length) =
         header_str(&headers, CONTENT_LENGTH.as_str()).and_then(|s| s.trim().parse::<u64>().ok())
     {
         if length > max_request {
             return error_response(StoreError::TooLarge {
-                limit: state.store.config.max_file_bytes,
+                limit: state.store.config.max_file_paste_bytes(),
             });
         }
     }
@@ -918,7 +918,9 @@ async fn log_failed_auth(request: Request, next: Next) -> Response {
 pub fn app_router(state: AppState) -> Router {
     api_router()
         .merge(mcp_router(state.clone()))
-        .merge(crate::web::ui_router(state.store.config.max_text_bytes))
+        .merge(crate::web::ui_router(
+            state.store.config.max_text_paste_bytes(),
+        ))
         .layer(middleware::from_fn(log_failed_auth))
         .with_state(state)
 }
@@ -965,7 +967,7 @@ async fn append_inner(state: &AppState, headers: &HeaderMap, id: &str, req: Requ
     if !api_write_allowed(headers) {
         return forbidden_write();
     }
-    let limit = state.store.config.max_text_bytes;
+    let limit = state.store.config.max_text_paste_bytes();
     let known_length =
         header_str(headers, CONTENT_LENGTH.as_str()).and_then(|s| s.trim().parse::<u64>().ok());
     if let Some(len) = known_length {

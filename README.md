@@ -233,8 +233,11 @@ dayfly --config ~/.config/dayfly/dayfly.env config check
 
 `config check` prints one line per setting with `set`, `unset`, or
 `default`. It prints all faults in one run and exits 1 when a fault is
-present. It never prints a secret value. `--strict` turns credential
-file permission warnings into faults.
+present. It never prints a secret value. It also prints a warning when
+`DAYFLY_MAX_PASTE_BYTES` is lower than `DAYFLY_MAX_TEXT_BYTES` or
+`DAYFLY_MAX_FILE_BYTES`. The warning names both values and gives the
+winning cap. `--strict` turns warnings into faults: credential file
+permissions and the lower total cap.
 
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
@@ -245,9 +248,9 @@ file permission warnings into faults.
 | `S3_SECRET_ACCESS_KEY` | one form | — | Garage secret key, held only by this binary; set this variable or `S3_SECRET_ACCESS_KEY_FILE` |
 | `S3_SECRET_ACCESS_KEY_FILE` | one form | — | Path to a file that contains the Garage secret key; set this variable or `S3_SECRET_ACCESS_KEY` |
 | `S3_REGION` | no | `us-east-1` | Signing region for Garage; supply your own, do not rely on the default being "yours" |
-| `DAYFLY_MAX_TEXT_BYTES` | no | 104857600 (100 MiB) | Max text paste size for MCP `store_text`, the human text form, and `POST /upload` without a filename; oversize → 413. A filename (including a multipart filename) uses `DAYFLY_MAX_FILE_BYTES` instead |
-| `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error. The maximum is 52428800000 bytes: 10,000 parts of 5 MiB |
-| `DAYFLY_MAX_PASTE_BYTES` | no | 1073741824 (1 GiB) | Max total size for one paste, including the base object and every appended segment. An append that would pass the cap fails and writes no segment |
+| `DAYFLY_MAX_TEXT_BYTES` | no | 104857600 (100 MiB) | Max text paste size for MCP `store_text`, the human text form, and `POST /upload` without a filename; oversize → 413. A new paste must also fit `DAYFLY_MAX_PASTE_BYTES`, so the lower cap wins. A filename (including a multipart filename) uses `DAYFLY_MAX_FILE_BYTES` instead |
+| `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error. A new paste must also fit `DAYFLY_MAX_PASTE_BYTES`, so the lower cap wins. The maximum is 52428800000 bytes: 10,000 parts of 5 MiB |
+| `DAYFLY_MAX_PASTE_BYTES` | no | 1073741824 (1 GiB) | Max total size for one paste, including the base object and every appended segment. A new paste or an append that would exceed the cap fails and writes no object |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1 and at most 3650. The name and meaning are unchanged |
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
 | `DAYFLY_ALLOW_UNAUTHENTICATED` | no | `false` | Accept a non-loopback bind with no bearer token. Startup refuses that bind without this value, and with it the service writes one warning. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
@@ -504,10 +507,13 @@ curl -F file=@photo.png -F ttl=90m http://127.0.0.1:8080/upload
 curl -F file=@photo.png -F ttl_days=30 http://127.0.0.1:8080/upload
 ```
 
-A request with no filename is a text paste and is capped at
-`DAYFLY_MAX_TEXT_BYTES`; supply `X-Filename` (or a multipart filename)
-for larger files. The text/file split is a client-declared convention,
-not a property of the bytes: adding a filename opts into the file cap.
+A request with no filename is a text paste and is capped at the lower
+of `DAYFLY_MAX_TEXT_BYTES` and `DAYFLY_MAX_PASTE_BYTES`; supply
+`X-Filename` (or a multipart filename) for larger files. A file upload
+is capped at the lower of `DAYFLY_MAX_FILE_BYTES` and
+`DAYFLY_MAX_PASTE_BYTES`. The text/file split is a client-declared
+convention, not a property of the bytes: adding a filename opts into
+the file cap.
 The text cap is therefore a guardrail for text-paste traffic, not an
 authorization boundary or a hard bound on stored inline text. Enforcing
 it from the sniffed type would make an ASCII file upload with a
@@ -526,8 +532,9 @@ The local-file path (`store_file`) reads one open handle for the size,
 the hash, and the uploaded bytes, so the recorded metadata describes the
 bytes that were uploaded. If a large file changes while it is uploaded,
 the store deletes the object and returns an error, rather than keeping a
-paste whose hash and content disagree. A file that grows past
-`DAYFLY_MAX_FILE_BYTES` after the first size check is rejected, not
+paste whose hash and content disagree. A file that grows past the
+effective file cap (the lower of `DAYFLY_MAX_FILE_BYTES` and
+`DAYFLY_MAX_PASTE_BYTES`) after the first size check is rejected, not
 uploaded.
 
 Note on multipart forms: text fields (`filename`, `ttl`, `ttl_days`)
@@ -689,8 +696,9 @@ Limits:
 - **An empty append is a no-op.** It writes no object and keeps the
   base `sha256`. It succeeds even when the paste is at the total cap.
 - **A paste holds at most `DAYFLY_MAX_PASTE_BYTES` total bytes.** The
-  default is 1 GiB. An append that would pass the cap fails with
-  `TooLarge` and writes no object. The base object and every segment
+  default is 1 GiB. A new paste or an append that would exceed the cap
+  fails with `TooLarge` and writes no object. A new paste uses the lower
+  of its type cap and the total cap. The base object and every segment
   count toward the cap.
 - **A paste holds at most 4,096 appended segments.** An append at the
   limit fails and writes no object. A metadata read, download, list, or
@@ -788,7 +796,8 @@ sniffed type wins and the conflict is recorded in object metadata as
 `detection-conflict` (e.g. `text/plain -> image/png`).
 
 **Buffering and streaming:** a text paste with no filename is
-buffered up to `DAYFLY_MAX_TEXT_BYTES` before detection and upload.
+buffered up to the lower of `DAYFLY_MAX_TEXT_BYTES` and
+`DAYFLY_MAX_PASTE_BYTES` before detection and upload.
 The text cap bounds this buffer, so text detection is exact and an
 oversize body is rejected before any S3 write. A file upload streams.
 Sniffing peeks at only the first chunk (up to 8 KiB) and then

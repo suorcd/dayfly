@@ -170,7 +170,7 @@ fn check_config_file(path: Option<PathBuf>, explicit: bool, strict: bool) -> any
             "S3_ENDPOINT" if !(value.starts_with("http://") || value.starts_with("https://")) => {
                 faults.push("S3_ENDPOINT is not an http:// or https:// URL".to_string());
             }
-            "DAYFLY_MAX_TEXT_BYTES" | "DAYFLY_MAX_FILE_BYTES" => {
+            "DAYFLY_MAX_TEXT_BYTES" | "DAYFLY_MAX_FILE_BYTES" | "DAYFLY_MAX_PASTE_BYTES" => {
                 if value.parse::<u64>().is_err() {
                     faults.push(format!("{}: expected a non-negative integer", field.name));
                 }
@@ -233,6 +233,24 @@ fn check_config_file(path: Option<PathBuf>, explicit: bool, strict: bool) -> any
                     config.allow_unauthenticated,
                 );
                 println!("bind exposure: {exposure}");
+                if config.max_paste_bytes < config.max_text_bytes {
+                    warnings.push(format!(
+                        "DAYFLY_MAX_PASTE_BYTES ({}) is lower than DAYFLY_MAX_TEXT_BYTES ({}). \
+                         The total paste cap wins: a text paste is limited to {} bytes.",
+                        config.max_paste_bytes,
+                        config.max_text_bytes,
+                        config.max_text_paste_bytes()
+                    ));
+                }
+                if config.max_paste_bytes < config.max_file_bytes {
+                    warnings.push(format!(
+                        "DAYFLY_MAX_PASTE_BYTES ({}) is lower than DAYFLY_MAX_FILE_BYTES ({}). \
+                         The total paste cap wins: a file paste is limited to {} bytes.",
+                        config.max_paste_bytes,
+                        config.max_file_bytes,
+                        config.max_file_paste_bytes()
+                    ));
+                }
                 if let Err(error) = ensure_bind_is_safe(
                     &config.http_bind,
                     config.http_bearer_token.is_some(),
