@@ -107,6 +107,18 @@ the message names the ways out. The rule has three states:
   starts and writes one warning at startup. Set it only on a network
   you trust, or behind a proxy that authenticates.
 
+`DAYFLY_LIST_REQUIRES_TOKEN` separates "public downloads" from "private
+listing". With the default `false`, listing follows the global token
+rule: gated when `DAYFLY_HTTP_BEARER_TOKEN` is set, open when it is not.
+When `true`, `GET /v1/pastes` and the human `/pastes` page require the
+bearer token even if reads are otherwise anonymous. If the setting is on
+and no token is configured, both routes refuse with 401 and a message
+naming the missing variable: there is nothing to check against, and an
+open list is what the setting prevents. The human page renders a 401
+page rather than an empty table. A browser cannot send an
+`Authorization` header, so put an authenticating proxy in front of
+`/pastes`, or use the API with the token.
+
 The MCP stdio transport does not use the bearer token: spawning the
 binary locally is the trust boundary there. The MCP transport over
 HTTP at `/mcp` is part of HTTP mode and uses the same bearer token as
@@ -255,6 +267,7 @@ permissions and the lower total cap.
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1 and at most 3650. The name and meaning are unchanged |
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
 | `DAYFLY_ALLOW_UNAUTHENTICATED` | no | `false` | Accept a non-loopback bind with no bearer token. Startup refuses that bind without this value, and with it the service writes one warning. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
+| `DAYFLY_LIST_REQUIRES_TOKEN` | no | `false` | Require the bearer token for `GET /v1/pastes` and the human `/pastes` page even when reads are anonymous. With this on and no token configured, both routes refuse with 401: there is nothing to check. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_SHOW_WORDS` | no | `true` | Show the generated word alias in the human UI: create redirects, the view page, and the paste list. Display only; the JSON/MCP responses still include `words`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_INLINE_PDF` | no | `true` | Serve a PDF download inline. Set this to `false` on a public instance so a PDF is an attachment. HTML and SVG are always attachments. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_HTTP_BEARER_TOKEN` | one form | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model); set this variable or `DAYFLY_HTTP_BEARER_TOKEN_FILE`. An unset value disables auth; a set empty or whitespace-only value is a startup error |
@@ -309,6 +322,7 @@ first, then the file. These settings take effect on the next request:
 - `DAYFLY_DEFAULT_TTL_DAYS`
 - `DAYFLY_SHOW_WORDS`
 - `DAYFLY_INLINE_PDF`
+- `DAYFLY_LIST_REQUIRES_TOKEN`
 - `DAYFLY_HTTP_BEARER_TOKEN` or `DAYFLY_HTTP_BEARER_TOKEN_FILE`
 
 These settings need a restart:

@@ -612,6 +612,31 @@ async fn upload_named(app: &Router, content_type: &str, filename: &str, body: Ve
 }
 
 #[tokio::test]
+async fn gated_listing_returns_200_with_a_configured_token() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.list_requires_token = true;
+    config.http_bearer_token = Some("list-secret".to_string());
+    let store = Store::from_config(config)
+        .await
+        .expect("gated listing store must build");
+    let app = common::app(store);
+
+    let request = common::request("GET", "/v1/pastes", &[], Vec::new());
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let request = common::request(
+        "GET",
+        "/v1/pastes",
+        &[("authorization", "Bearer list-secret".to_string())],
+        Vec::new(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn pdf_inline_control_and_inline_sandbox_policy() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
