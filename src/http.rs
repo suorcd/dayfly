@@ -36,6 +36,7 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
+use crate::client_addr::{self, ClientAddr};
 use crate::config::MAX_TTL_SECONDS;
 use crate::content_type::content_disposition;
 use crate::store::{
@@ -929,20 +930,53 @@ async fn delete_bare(
     }
 }
 
-/// Write one warning when a request fails the bearer check.
+/// Resolve the client address once, then log a failed bearer check.
 ///
-/// The method, path, and peer address are safe to log. Never log the
+/// The socket peer is the client unless it is a listed trusted proxy; in
+/// that case `X-Forwarded-For` is walked from the right. The resolved
+/// address is attached as [`ClientAddr`] so every later layer and handler
+/// reads the same value. An unusable chain falls back to the socket peer
+/// with one warning.
+///
+/// The method, path, and resolved address are safe to log. Never log the
 /// offered credential or the expected credential.
-async fn log_failed_auth(request: Request, next: Next) -> Response {
-    let method = request.method().clone();
-    let path = request.uri().path().to_string();
+async fn client_context(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|info| info.0);
+    let trusted = {
+        let store = state.store();
+        store.config.trusted_proxies.clone()
+    };
+    let client =
+        peer.map(
+            |peer| match client_addr::resolve(peer.ip(), request.headers(), &trusted) {
+                Ok(address) => address,
+                Err(reason) => {
+                    tracing::warn!(
+                        peer = %peer,
+                        reason = %reason,
+                        method = %request.method(),
+                        path = %request.uri().path(),
+                        "ignoring an unusable X-Forwarded-For chain"
+                    );
+                    peer.ip()
+                }
+            },
+        );
+    if let Some(address) = client {
+        request.extensions_mut().insert(ClientAddr(address));
+    }
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
     let response = next.run(request).await;
     if response.status() == StatusCode::UNAUTHORIZED {
-        tracing::warn!(%method, %path, peer = ?peer, "bearer check failed");
+        tracing::warn!(%method, %path, client = ?client, "bearer check failed");
     }
     response
 }
@@ -955,7 +989,10 @@ pub fn app_router(state: AppState) -> Router {
     api_router()
         .merge(mcp_router(state.clone()))
         .merge(crate::web::ui_router(state.clone()))
-        .layer(middleware::from_fn(log_failed_auth))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            client_context,
+        ))
         .with_state(state)
 }
 
@@ -1237,6 +1274,7 @@ mod tests {
     use std::task::Poll;
 
     use axum::body::Body;
+    use axum::extract::Extension;
     use axum::http::{Request, StatusCode};
     use http_body_util::{BodyExt, Full};
     use hyper_util::client::legacy::connect::HttpConnector;
@@ -1269,6 +1307,7 @@ mod tests {
             alias_words: 3,
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
+            trusted_proxies: Vec::new(),
             show_words: false,
             inline_pdf: true,
             allow_unauthenticated: false,
@@ -1319,6 +1358,116 @@ mod tests {
             StatusCode::BAD_GATEWAY,
             "a lowercase bearer scheme must pass auth and reach the S3 sink"
         );
+    }
+
+    async fn state_with_trusted_proxies(proxies: &[&str]) -> AppState {
+        let mut config = test_config(10 * 1024 * 1024, 1024 * 1024 * 1024);
+        config.trusted_proxies = proxies
+            .iter()
+            .map(|proxy| proxy.parse().expect("test proxy must parse"))
+            .collect();
+        AppState::new(
+            Store::from_config(config)
+                .await
+                .expect("test S3 config must build without network access"),
+        )
+    }
+
+    fn client_echo_router(state: AppState) -> Router {
+        Router::new()
+            .route(
+                "/",
+                get(|Extension(address): Extension<ClientAddr>| async move {
+                    address.0.to_string()
+                }),
+            )
+            .layer(middleware::from_fn_with_state(state.clone(), client_context))
+            .with_state(state)
+    }
+
+    async fn resolved_client(app: Router, peer: SocketAddr, forwarded: Option<&str>) -> String {
+        let mut builder = Request::builder().uri("/");
+        if let Some(value) = forwarded {
+            builder = builder.header("x-forwarded-for", value);
+        }
+        let mut request = builder.body(Body::empty()).expect("request must build");
+        request.extensions_mut().insert(ConnectInfo(peer));
+        let response = app
+            .oneshot(request)
+            .await
+            .expect("router call must complete");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body must collect")
+            .to_bytes();
+        String::from_utf8(body.to_vec()).expect("body must be UTF-8")
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_peer_is_the_client_even_with_a_forwarded_header() {
+        let state = state_with_trusted_proxies(&["10.0.0.0/8"]).await;
+        let app = client_echo_router(state);
+        let client = resolved_client(
+            app,
+            SocketAddr::from(([198, 51, 100, 7], 40000)),
+            Some("203.0.113.9"),
+        )
+        .await;
+        assert_eq!(client, "198.51.100.7");
+    }
+
+    #[tokio::test]
+    async fn a_trusted_proxy_supplies_the_client_address() {
+        let state = state_with_trusted_proxies(&["10.0.0.0/8"]).await;
+        let app = client_echo_router(state);
+        let client = resolved_client(
+            app,
+            SocketAddr::from(([10, 0, 0, 5], 40000)),
+            Some("203.0.113.9"),
+        )
+        .await;
+        assert_eq!(client, "203.0.113.9");
+    }
+
+    #[tokio::test]
+    async fn a_forged_leading_hop_is_ignored() {
+        let state = state_with_trusted_proxies(&["10.0.0.0/8"]).await;
+        let app = client_echo_router(state);
+        let client = resolved_client(
+            app,
+            SocketAddr::from(([10, 0, 0, 5], 40000)),
+            Some("1.2.3.4, 203.0.113.9"),
+        )
+        .await;
+        assert_eq!(client, "203.0.113.9");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_chain_falls_back_to_the_peer() {
+        let state = state_with_trusted_proxies(&["10.0.0.0/8"]).await;
+        let app = client_echo_router(state);
+        let client = resolved_client(
+            app,
+            SocketAddr::from(([10, 0, 0, 5], 40000)),
+            Some("not-an-address"),
+        )
+        .await;
+        assert_eq!(client, "10.0.0.5");
+    }
+
+    #[tokio::test]
+    async fn a_chain_of_only_proxies_falls_back_to_the_peer() {
+        let state = state_with_trusted_proxies(&["10.0.0.0/8"]).await;
+        let app = client_echo_router(state);
+        let client = resolved_client(
+            app,
+            SocketAddr::from(([10, 0, 0, 5], 40000)),
+            Some("10.0.0.6, 10.0.0.7"),
+        )
+        .await;
+        assert_eq!(client, "10.0.0.5");
     }
 
     const TEST_TOKEN: &str = "correct-horse-battery-staple";

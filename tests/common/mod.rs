@@ -208,6 +208,7 @@ impl FakeS3 {
             alias_words: 3,
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
+            trusted_proxies: Vec::new(),
             show_words: false,
             inline_pdf: true,
             allow_unauthenticated: false,

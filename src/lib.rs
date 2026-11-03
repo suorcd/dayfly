@@ -5,6 +5,7 @@
 //! router in process. The MCP server is available over stdio and over
 //! streamable HTTP at `/mcp`.
 
+pub mod client_addr;
 pub mod config;
 pub mod content_type;
 pub mod http;

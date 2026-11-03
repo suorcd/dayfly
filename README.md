@@ -107,6 +107,23 @@ the message names the ways out. The rule has three states:
   starts and writes one warning at startup. Set it only on a network
   you trust, or behind a proxy that authenticates.
 
+`DAYFLY_TRUSTED_PROXIES` names the reverse proxies whose
+`X-Forwarded-For` header is believed. It is a comma-separated list of
+CIDR blocks, and a bare address is a single host. The default is empty:
+the socket peer is the client and every forwarding header is ignored, so
+a request from an unlisted peer that sets `X-Forwarded-For` is
+attributed to that peer. When the socket peer is listed, the chain is
+walked from the right, skipping listed proxies, and the first address
+that is not a listed proxy is the client. A forged hop prepended on the
+left cannot win. A malformed or over-long chain, or one that names only
+trusted proxies, falls back to the socket peer with one warning.
+
+Only the rightmost unlisted address is used, so a proxy must append to
+`X-Forwarded-For`, not replace it. List only the proxies that actually
+front this service, and do not leave a path around them: a direct
+connection from an unlisted address is attributed to that address. This
+setting is what makes a per-client limit meaningful behind an ingress.
+
 The MCP stdio transport does not use the bearer token: spawning the
 binary locally is the trust boundary there. The MCP transport over
 HTTP at `/mcp` is part of HTTP mode and uses the same bearer token as
@@ -254,6 +271,7 @@ permissions and the lower total cap.
 | `DAYFLY_ALIAS_WORDS` | no | 3 | Number of words in a new alias. Allowed range 3 to 6. Resolution accepts 3 words up to this value |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1 and at most 3650. The name and meaning are unchanged |
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
+| `DAYFLY_TRUSTED_PROXIES` | no | (empty) | Comma-separated CIDR blocks (bare addresses are single hosts) of reverse proxies whose `X-Forwarded-For` header is believed. Empty keeps the socket peer as the client and ignores forwarding headers. The chain is walked from the right; a malformed or over-long chain falls back to the peer with one warning. Set this before any per-client limit behind an ingress |
 | `DAYFLY_ALLOW_UNAUTHENTICATED` | no | `false` | Accept a non-loopback bind with no bearer token. Startup refuses that bind without this value, and with it the service writes one warning. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_SHOW_WORDS` | no | `true` | Show the generated word alias in the human UI: create redirects, the view page, and the paste list. Display only; the JSON/MCP responses still include `words`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_INLINE_PDF` | no | `true` | Serve a PDF download inline. Set this to `false` on a public instance so a PDF is an attachment. HTML and SVG are always attachments. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
@@ -309,6 +327,7 @@ first, then the file. These settings take effect on the next request:
 - `DAYFLY_DEFAULT_TTL_DAYS`
 - `DAYFLY_SHOW_WORDS`
 - `DAYFLY_INLINE_PDF`
+- `DAYFLY_TRUSTED_PROXIES`
 - `DAYFLY_HTTP_BEARER_TOKEN` or `DAYFLY_HTTP_BEARER_TOKEN_FILE`
 
 These settings need a restart:
