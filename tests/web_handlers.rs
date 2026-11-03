@@ -517,6 +517,36 @@ async fn create_submit_creates_a_text_paste_with_filename_and_ttl() {
 }
 
 #[tokio::test]
+async fn favicon_route_serves_the_configured_bytes() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.favicon = Some(dayfly::config::Favicon {
+        bytes: std::sync::Arc::from(&b"\x00\x00\x01\x00icon"[..]),
+        content_type: "image/x-icon",
+    });
+    let store = Store::from_config(config)
+        .await
+        .expect("the store must build without network access");
+    let app = common::app(store);
+
+    let request = common::request("GET", "/favicon.ico", &[], Vec::new());
+    let (status, headers, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::CONTENT_TYPE], "image/x-icon");
+    assert_eq!(body, b"\x00\x00\x01\x00icon");
+
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let request = common::request("GET", "/favicon.ico", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body.is_empty(),
+        "an unset favicon must not return the HTML error page"
+    );
+}
+
+#[tokio::test]
 async fn unknown_routes_and_methods_render_error_pages() {
     let fake = FakeS3::start().await;
     let app = common::full_app(fake.store().await);
@@ -537,6 +567,14 @@ async fn unknown_routes_and_methods_render_error_pages() {
         "the page must name the path"
     );
     assert!(page.contains("href=\"/\""), "the page must link home");
+    assert!(
+        page.contains("class=\"not-found-code\">404"),
+        "the page must carry the 404 treatment: {page}"
+    );
+    assert!(
+        page.contains("Sector not found"),
+        "the page must carry the themed heading: {page}"
+    );
 
     let request = common::request("POST", "/", &[], Vec::new());
     let (status, headers, body) = common::send(&app, request).await;

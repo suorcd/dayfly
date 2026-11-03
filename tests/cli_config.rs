@@ -44,6 +44,7 @@ fn command() -> Command {
         "DAYFLY_HTTP_BEARER_TOKEN",
         "DAYFLY_HTTP_BEARER_TOKEN_FILE",
         "DAYFLY_MCP_LOCAL_ROOT",
+        "DAYFLY_FAVICON_PATH",
         "DAYFLY_CONFIG",
         "RUST_LOG",
         "HOME",

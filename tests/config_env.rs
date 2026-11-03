@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use dayfly::config::{Config, ConfigError};
 
-const VARS: [&str; 25] = [
+const VARS: [&str; 26] = [
     "S3_ENDPOINT",
     "S3_BUCKET",
     "S3_REGION",
@@ -35,6 +35,7 @@ const VARS: [&str; 25] = [
     "DAYFLY_SHOW_INTERNAL_PATHS",
     "DAYFLY_INLINE_PDF",
     "DAYFLY_MCP_LOCAL_ROOT",
+    "DAYFLY_FAVICON_PATH",
 ];
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -103,6 +104,7 @@ fn minimal_environment_applies_documented_defaults() {
     assert_eq!(config.http_bind, "127.0.0.1:8080");
     assert!(config.show_words);
     assert!(!config.show_internal_paths);
+    assert!(config.favicon.is_none());
     assert!(config.inline_pdf);
     assert_eq!(config.http_bearer_token, None);
     assert_eq!(config.mcp_local_root, None);
@@ -434,6 +436,39 @@ fn list_default_days_defaults_to_two_and_rejects_zero() {
 }
 
 #[test]
+fn favicon_path_loads_the_file_and_rejects_bad_inputs() {
+    let _guard = lock_env();
+    clear_env();
+    set_required();
+    let path = env::temp_dir().join(format!("dayfly-favicon-{}.png", std::process::id()));
+    std::fs::write(&path, b"png-bytes").expect("the test favicon must write");
+    env::set_var("DAYFLY_FAVICON_PATH", &path);
+    let config = Config::from_env().expect("a favicon must load");
+    let favicon = config.favicon.expect("the favicon must be set");
+    assert_eq!(&*favicon.bytes, b"png-bytes");
+    assert_eq!(favicon.content_type, "image/png");
+
+    std::fs::write(&path, b"").expect("the empty favicon must write");
+    let error = Config::from_env()
+        .err()
+        .expect("an empty favicon must fail config load");
+    assert!(
+        matches!(error, ConfigError::Invalid(ref field, _) if field == "DAYFLY_FAVICON_PATH"),
+        "the error must name DAYFLY_FAVICON_PATH, got {error}"
+    );
+
+    env::set_var("DAYFLY_FAVICON_PATH", path.with_extension("missing"));
+    let error = Config::from_env()
+        .err()
+        .expect("a missing favicon must fail config load");
+    assert!(
+        matches!(error, ConfigError::Invalid(ref field, _) if field == "DAYFLY_FAVICON_PATH"),
+        "the error must name DAYFLY_FAVICON_PATH, got {error}"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn file_cap_accepts_32_gib_and_rejects_a_part_overflow() {
     let _guard = lock_env();
     clear_env();
@@ -508,6 +543,7 @@ fn safe_summary_omits_credentials_and_token_presence() {
     assert!(summary.contains("endpoint_scheme=https"));
     assert!(summary.contains("show_words=true"));
     assert!(summary.contains("show_internal_paths=false"));
+    assert!(summary.contains("favicon=unset"));
     assert!(summary.contains("inline_pdf=true"));
     for secret in ["test-access", "test-secret", "summary-secret"] {
         assert!(
