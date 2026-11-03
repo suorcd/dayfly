@@ -182,7 +182,7 @@ pub struct Config {
 }
 
 /// A favicon image loaded at startup.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Favicon {
     /// Raw image bytes.
     pub bytes: Arc<[u8]>,

@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::config::{bind_is_loopback, ensure_bind_is_safe, Config};
+use crate::config::{bind_is_loopback, ensure_bind_is_safe, environment_file_warnings, Config};
 use crate::http::AppState;
 use crate::store::Store;
 
@@ -41,7 +41,9 @@ pub async fn reload_from_file(
     bound_addr: &str,
 ) -> Result<ReloadReport, String> {
     let config = Config::from_env_file(Some(path)).map_err(|error| error.to_string())?;
-    reload_with_config(state, config, bound_addr).await
+    let mut report = reload_with_config(state, config, bound_addr).await?;
+    report.warnings.extend(environment_file_warnings(path));
+    Ok(report)
 }
 
 /// Apply one already-parsed configuration.
@@ -208,6 +210,24 @@ fn changed_fields(old: &Config, new: &Config) -> Vec<&'static str> {
     }
     if old.show_words != new.show_words {
         changed.push("DAYFLY_SHOW_WORDS");
+    }
+    if old.show_internal_paths != new.show_internal_paths {
+        changed.push("DAYFLY_SHOW_INTERNAL_PATHS");
+    }
+    if old.list_default_days != new.list_default_days {
+        changed.push("DAYFLY_LIST_DEFAULT_DAYS");
+    }
+    if old.list_requires_token != new.list_requires_token {
+        changed.push("DAYFLY_LIST_REQUIRES_TOKEN");
+    }
+    if old.rate_limit_per_minute != new.rate_limit_per_minute {
+        changed.push("DAYFLY_RATE_LIMIT_PER_MINUTE");
+    }
+    if old.trusted_proxies != new.trusted_proxies {
+        changed.push("DAYFLY_TRUSTED_PROXIES");
+    }
+    if old.favicon != new.favicon {
+        changed.push("DAYFLY_FAVICON_PATH");
     }
     if old.inline_pdf != new.inline_pdf {
         changed.push("DAYFLY_INLINE_PDF");

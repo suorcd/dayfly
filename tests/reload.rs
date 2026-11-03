@@ -10,7 +10,7 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::{Request, StatusCode};
 use chrono::Utc;
 use dayfly::http::{app_router, AppState};
-use dayfly::reload::reload_with_config;
+use dayfly::reload::{reload_from_file, reload_with_config};
 use dayfly::store::Store;
 use tower::ServiceExt;
 
@@ -48,6 +48,40 @@ fn request(uri: &str, token: &str) -> Request<Body> {
         .expect("request must build")
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn reload_from_file_warns_on_a_world_readable_env_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fake = FakeS3::start().await;
+    let state = state_with_token(&fake, Some(OLD_TOKEN)).await;
+    let path = common::temp_path("reload-env-mode");
+    std::fs::write(
+        &path,
+        "S3_ENDPOINT=http://127.0.0.1:1\n\
+         S3_BUCKET=reload-test\n\
+         S3_REGION=us-east-1\n\
+         S3_ACCESS_KEY_ID=test-access\n\
+         S3_SECRET_ACCESS_KEY=test-secret\n",
+    )
+    .expect("the env file must write");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+        .expect("the env file mode must set");
+
+    let report = reload_from_file(&path, &state, "127.0.0.1:8080")
+        .await
+        .expect("the env file must reload");
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("mode 0644") && warning.contains("Set mode 0600")),
+        "the reload must warn about the file mode: {:?}",
+        report.warnings
+    );
+}
+
 #[tokio::test]
 async fn reload_swaps_credentials_token_caps_ttl_and_show_words() {
     let fake = FakeS3::start().await;
@@ -65,6 +99,14 @@ async fn reload_swaps_credentials_token_caps_ttl_and_show_words() {
     new_config.retention_max_days = 90;
     new_config.paste_tokens = true;
     new_config.show_words = true;
+    new_config.list_requires_token = true;
+    new_config.rate_limit_per_minute = 7;
+    new_config.show_internal_paths = true;
+    new_config.list_default_days = 5;
+    new_config.favicon = Some(dayfly::config::Favicon {
+        bytes: std::sync::Arc::from(&b"icon"[..]),
+        content_type: "image/x-icon",
+    });
 
     let report = reload_with_config(&state, new_config, "127.0.0.1:8080")
         .await
@@ -79,6 +121,11 @@ async fn reload_swaps_credentials_token_caps_ttl_and_show_words() {
         "DAYFLY_RETENTION_MAX_DAYS",
         "DAYFLY_PASTE_TOKENS",
         "DAYFLY_SHOW_WORDS",
+        "DAYFLY_LIST_REQUIRES_TOKEN",
+        "DAYFLY_RATE_LIMIT_PER_MINUTE",
+        "DAYFLY_SHOW_INTERNAL_PATHS",
+        "DAYFLY_LIST_DEFAULT_DAYS",
+        "DAYFLY_FAVICON_PATH",
     ] {
         assert!(
             report.changed.contains(&field),
