@@ -185,8 +185,8 @@ fn check_config_file(path: Option<PathBuf>, explicit: bool, strict: bool) -> any
                     )),
                 }
             }
-            "DAYFLY_SHOW_WORDS" if parse_bool_flag(&value).is_none() => {
-                faults.push("DAYFLY_SHOW_WORDS: expected true or false".to_string());
+            "DAYFLY_SHOW_WORDS" | "DAYFLY_INLINE_PDF" if parse_bool_flag(&value).is_none() => {
+                faults.push(format!("{}: expected true or false", field.name));
             }
             "DAYFLY_HTTP_BEARER_TOKEN"
                 if value.contains(|character: char| character.is_ascii_whitespace()) =>

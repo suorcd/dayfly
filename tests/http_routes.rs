@@ -592,6 +592,94 @@ async fn bearer_auth_is_required_and_accepted_on_api_and_ui() {
     assert_eq!(status, StatusCode::OK);
 }
 
+async fn upload_named(app: &Router, content_type: &str, filename: &str, body: Vec<u8>) -> String {
+    let request = common::request(
+        "POST",
+        "/upload?format=json",
+        &[
+            ("content-type", content_type.to_string()),
+            ("x-filename", filename.to_string()),
+            content_length(body.len()),
+        ],
+        body,
+    );
+    let (status, _, response) = common::send(app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+    common::json_body(&response)["id"]
+        .as_str()
+        .expect("the upload response must carry an id")
+        .to_string()
+}
+
+#[tokio::test]
+async fn pdf_inline_control_and_inline_sandbox_policy() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let app = common::app(store);
+    let pdf_id = upload_named(
+        &app,
+        "application/pdf",
+        "report.pdf",
+        b"%PDF-1.7 fake".to_vec(),
+    )
+    .await;
+
+    let request = common::request("GET", &format!("/v1/pastes/{pdf_id}"), &[], Vec::new());
+    let (status, headers, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers[header::CONTENT_DISPOSITION]
+        .to_str()
+        .unwrap()
+        .starts_with("inline"));
+    assert_eq!(headers["content-security-policy"], "sandbox");
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+
+    let mut store = fake.store().await;
+    store.config.inline_pdf = false;
+    let app = common::app(store);
+    let request = common::request("GET", &format!("/v1/pastes/{pdf_id}"), &[], Vec::new());
+    let (status, headers, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let disposition = headers[header::CONTENT_DISPOSITION].to_str().unwrap();
+    assert!(disposition.starts_with("attachment"));
+    assert!(disposition.contains("filename=\"report.pdf\""));
+    assert!(headers.get("content-security-policy").is_none());
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+
+    for (content_type, filename, body) in [
+        ("text/html", "x.html", b"<html>hello</html>".to_vec()),
+        ("image/svg+xml", "x.svg", b"<svg></svg>".to_vec()),
+    ] {
+        let id = upload_named(&app, content_type, filename, body).await;
+        let request = common::request("GET", &format!("/v1/pastes/{id}"), &[], Vec::new());
+        let (status, headers, _) = common::send(&app, request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            headers[header::CONTENT_DISPOSITION]
+                .to_str()
+                .unwrap()
+                .starts_with("attachment"),
+            "{content_type} must stay an attachment"
+        );
+        assert!(headers.get("content-security-policy").is_none());
+    }
+}
+
+#[tokio::test]
+async fn inline_text_has_a_sandbox_policy() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"hello", None, None, None)
+        .await
+        .expect("text must store");
+    let app = common::app(store);
+    let request = common::request("GET", &format!("/v1/pastes/{}", stored.id), &[], Vec::new());
+    let (status, headers, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-security-policy"], "sandbox");
+}
+
 #[tokio::test]
 async fn download_head_and_range_responses_carry_the_right_headers() {
     let fake = FakeS3::start().await;

@@ -41,6 +41,7 @@ fn test_config() -> Config {
         default_ttl_days: 1,
         http_bind: "127.0.0.1:0".to_string(),
         show_words: true,
+        inline_pdf: true,
         allow_unauthenticated: false,
         http_bearer_token: None,
         mcp_local_root: None,

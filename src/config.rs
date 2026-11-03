@@ -82,6 +82,11 @@ pub struct Config {
     /// generated and stored, and the JSON/MCP responses still include the
     /// `words` field. It is not a secrecy control.
     pub show_words: bool,
+    /// Whether a PDF download is served inline.
+    ///
+    /// Default: `true`. Set this to `false` on a public instance so a PDF
+    /// is served as an attachment. HTML and SVG are always attachments.
+    pub inline_pdf: bool,
     /// Optional bearer token for the binary's own HTTP endpoint.
     /// This is NOT the S3/Garage credential and is not a replacement for
     /// it: the Garage key/secret stay in S3_ACCESS_KEY_ID /
@@ -193,6 +198,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("true"),
         required: false,
         help: "Show generated aliases in the human UI",
+    },
+    ConfigField {
+        name: "DAYFLY_INLINE_PDF",
+        value: Some("true"),
+        required: false,
+        help: "Serve PDF downloads inline",
     },
     ConfigField {
         name: "DAYFLY_HTTP_BEARER_TOKEN",
@@ -886,6 +897,11 @@ impl Config {
                 "DAYFLY_SHOW_WORDS",
                 field_default("DAYFLY_SHOW_WORDS") == Some("true"),
             )?,
+            inline_pdf: optional_bool(
+                &lookup,
+                "DAYFLY_INLINE_PDF",
+                field_default("DAYFLY_INLINE_PDF") == Some("true"),
+            )?,
             allow_unauthenticated: optional_bool(
                 &lookup,
                 "DAYFLY_ALLOW_UNAUTHENTICATED",
@@ -936,7 +952,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} show_words={} mcp_local_root={}",
+            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} show_words={} inline_pdf={} mcp_local_root={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -950,6 +966,7 @@ impl Config {
             self.alias_words,
             self.default_ttl_days,
             self.show_words,
+            self.inline_pdf,
             if self.mcp_local_root.is_some() {
                 "set"
             } else {
@@ -1277,6 +1294,7 @@ mod tests {
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
             show_words: true,
+            inline_pdf: true,
             allow_unauthenticated: false,
             http_bearer_token: None,
             mcp_local_root: None,

@@ -200,6 +200,9 @@ fn changed_fields(old: &Config, new: &Config) -> Vec<&'static str> {
     if old.show_words != new.show_words {
         changed.push("DAYFLY_SHOW_WORDS");
     }
+    if old.inline_pdf != new.inline_pdf {
+        changed.push("DAYFLY_INLINE_PDF");
+    }
     if old.http_bearer_token != new.http_bearer_token {
         changed.push("DAYFLY_HTTP_BEARER_TOKEN");
     }
