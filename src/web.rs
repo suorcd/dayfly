@@ -75,6 +75,8 @@ hr{border:none;border-top:1px dashed #0abdc6;margin:1.5rem 0;opacity:.6}
 a{color:#ea00d9;text-decoration:none}
 a:hover{text-decoration:underline;text-shadow:0 0 8px rgba(234,0,217,.8)}
 table{border-collapse:collapse;width:100%} th,td{text-align:left;padding:.4rem .5rem;border:1px dashed #0abdc6;vertical-align:top}
+.table-wrap{overflow-x:auto}
+th:first-child,td:first-child{white-space:nowrap}
 th{color:#ea00d9}
 .card,form{background:rgba(19,62,124,.35);border:1px dashed #0abdc6;border-radius:8px;padding:1rem;backdrop-filter:blur(4px)}
 details{background:rgba(19,62,124,.35);border:1px dashed #0abdc6;border-radius:8px;padding:.5rem 1rem;margin-bottom:1rem}
@@ -1055,7 +1057,7 @@ async fn list_handler(
         &format!(
             r#"<form method="get" action="/pastes"><p><label>Start <input type="date" name="start" value="{}"></label> <label>End <input type="date" name="end" value="{}"></label> <button type="submit">Show range</button></p></form>
 <p class="muted">Dates are UTC. With no dates, the page shows the last {default_days} days, ending today in UTC. Set DAYFLY_LIST_DEFAULT_DAYS to change that. Built from a direct bucket scan (ListObjectsV2 for each date prefix, plus HeadObject per paste). No database. Listing is O(n) in objects scanned and gets slower as the bucket grows — that slowdown is the trigger for adding a database later.</p>
-<table><thead><tr><th>{link_header}</th><th>Filename</th><th>Content-Type</th><th>{size_header}</th><th>{created_header}</th><th>{expires_header}</th><th>Remaining</th><th></th></tr></thead><tbody>{}</tbody></table>"#,
+<div class="table-wrap"><table><thead><tr><th>{link_header}</th><th>Filename</th><th>Content-Type</th><th>{size_header}</th><th>{created_header}</th><th>{expires_header}</th><th>Remaining</th><th></th></tr></thead><tbody>{}</tbody></table></div>"#,
             html_escape(&start_value),
             html_escape(&end_value),
             rows,
