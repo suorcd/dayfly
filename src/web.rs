@@ -88,7 +88,7 @@ table{border-collapse:collapse;width:auto;table-layout:fixed} th,td{text-align:l
 .size-unit{display:inline-block;min-width:3ch;text-align:left;margin-left:.4ch}
 th:nth-child(4){text-align:center}
 .ttl-header{cursor:help;text-decoration:underline dotted;text-underline-offset:.25rem}
-.hint{display:inline-flex;align-items:center;justify-content:center;width:1.4em;height:1.4em;border:1px dashed #0abdc6;border-radius:50%;color:#0abdc6;cursor:help;font-size:.85rem;vertical-align:middle}
+.hint{color:#0abdc6;cursor:help;text-decoration:underline dotted;text-underline-offset:.25rem;font-size:.95rem}
 .table-wrap{overflow-x:auto}
 .filename-cell{white-space:nowrap}
 th:first-child,td:first-child{white-space:nowrap}
