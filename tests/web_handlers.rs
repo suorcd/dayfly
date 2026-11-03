@@ -91,6 +91,18 @@ async fn index_page_renders_the_combined_form_and_the_default_ttl() {
     assert!(page.contains("enctype=\"multipart/form-data\""));
     assert!(page.contains("id=\"dropzone\""));
     assert!(page.contains("id=\"file-status\""));
+    assert!(
+        page.contains("id=\"file-status\" aria-live=\"polite\" aria-atomic=\"true\""),
+        "the file status must announce changes: {page}"
+    );
+    assert!(
+        page.contains("aria-label=\"Choose a file\""),
+        "the file input needs a short accessible name: {page}"
+    );
+    assert!(
+        page.contains(".dropzone:focus-within"),
+        "the drop zone needs a keyboard focus state: {page}"
+    );
     assert!(page.contains("id=\"clear-file\""));
     assert!(page.contains("data-max-file-bytes=\"1073741824\""));
     assert!(page.contains("Max file size: 1 GiB"));

@@ -121,7 +121,7 @@ summary{cursor:pointer;color:#0abdc6}
 td form{display:inline;background:none;border:0;padding:0;border-radius:0;backdrop-filter:none}
 details form{background:none;border:0;padding:0;border-radius:0;backdrop-filter:none;margin:0}
 .dropzone{display:block;border:2px dashed #0abdc6;border-radius:8px;padding:1.5rem;margin-bottom:.5rem;text-align:center;cursor:pointer;background:rgba(19,62,124,.2)}
-.dropzone:hover,.dropzone.dragover{border-color:#ea00d9;box-shadow:0 0 12px rgba(234,0,217,.35)}
+.dropzone:hover,.dropzone.dragover,.dropzone:focus-within{border-color:#ea00d9;box-shadow:0 0 12px rgba(234,0,217,.35)}
 .dropzone input[type=file]{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 .dropzone-title{display:block;font-weight:bold;color:#ea00d9}
 .dropzone .muted{display:block}
@@ -574,9 +574,9 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
 <p class="muted">Max file size: {max_file_human}. A selected file takes precedence and disables the text fields.</p>
 <div class="form-actions">
 <label class="dropzone compact" id="dropzone">
-<input type="file" name="file" id="file">
+<input type="file" name="file" id="file" aria-label="Choose a file">
 <span class="dropzone-line"><span class="dropzone-title">Drop a file</span><span class="muted">or click to choose one</span></span>
-<span class="badge" id="file-status">No file selected</span>
+<span class="badge" id="file-status" aria-live="polite" aria-atomic="true">No file selected</span>
 </label>
 <button type="button" id="clear-file" hidden>Remove file</button>
 <button type="submit">Create paste</button>
