@@ -213,6 +213,7 @@ impl FakeS3 {
             inline_pdf: true,
             allow_unauthenticated: false,
             list_requires_token: false,
+            rate_limit_per_minute: 0,
             http_bearer_token: None,
             mcp_local_root: None,
         }
