@@ -22,7 +22,7 @@ use axum::extract::{
 };
 use axum::http::header::{
     ACCEPT, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST,
-    IF_NONE_MATCH, RANGE,
+    IF_NONE_MATCH, RANGE, RETRY_AFTER,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
@@ -39,6 +39,7 @@ use subtle::ConstantTimeEq;
 use crate::client_addr::{self, ClientAddr};
 use crate::config::MAX_TTL_SECONDS;
 use crate::content_type::content_disposition;
+use crate::rate_limit::RateLimiter;
 use crate::store::{
     parse_list_window_request, parse_range_header, ListWindowRequest, PasteMetadata, Store,
     StoreError, StoreHandle, Ttl, TtlParseError, MULTIPART_CHUNK_BYTES,
@@ -85,13 +86,23 @@ pub(crate) async fn read_metadata_field(
 #[derive(Clone)]
 pub struct AppState {
     store: StoreHandle,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl AppState {
     pub fn new(store: Store) -> Self {
         Self {
             store: StoreHandle::new(store),
+            rate_limiter: Arc::new(RateLimiter::new()),
         }
+    }
+
+    /// The process-wide request limiter.
+    ///
+    /// It survives a store reload: the configured rate changes, and the
+    /// buckets keep counting.
+    pub(crate) fn rate_limiter(&self) -> &RateLimiter {
+        &self.rate_limiter
     }
 
     /// The store snapshot for one operation.
@@ -981,14 +992,49 @@ async fn client_context(
     response
 }
 
+/// Refuse a client over its request budget.
+///
+/// This runs inside [`client_context`], so the key is the same resolved
+/// address the auth log uses. The refusal happens before any extractor or
+/// handler reads the body, so an upload that is turned away costs no
+/// bytes. Every route counts, including `/` and `/mcp`.
+async fn rate_limit(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let limit = state.store().config.rate_limit_per_minute;
+    if limit > 0 {
+        if let Some(ClientAddr(client)) = request.extensions().get::<ClientAddr>().copied() {
+            if let Err(error) = state.rate_limiter().check(client, limit) {
+                // `Retry-After` is whole seconds, and truncation would tell
+                // a client to retry just before a token exists.
+                let retry_after = error.retry_after.as_secs_f64().ceil().max(1.0) as u64;
+                let header = HeaderValue::from_str(&retry_after.to_string())
+                    .expect("a whole number is a valid header value");
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(RETRY_AFTER, header)],
+                    Json(serde_json::json!({
+                        "error": "rate_limited",
+                        "retry_after_seconds": retry_after,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    next.run(request).await
+}
+
 /// Compose the complete HTTP app from one [`AppState`].
 ///
 /// The API routes, the human UI routes, and the MCP transport share the
 /// same store and configuration. Do not build a second store here.
+///
+/// `client_context` is added last, so it runs first and attaches the
+/// address that `rate_limit` reads.
 pub fn app_router(state: AppState) -> Router {
     api_router()
         .merge(mcp_router(state.clone()))
         .merge(crate::web::ui_router(state.clone()))
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             client_context,
@@ -1311,6 +1357,7 @@ mod tests {
             show_words: false,
             inline_pdf: true,
             allow_unauthenticated: false,
+            rate_limit_per_minute: 0,
             http_bearer_token: None,
             mcp_local_root: None,
         }
@@ -1468,6 +1515,168 @@ mod tests {
         )
         .await;
         assert_eq!(client, "10.0.0.5");
+    }
+
+    async fn state_with_rate_limit(limit: u32) -> AppState {
+        let mut config = test_config(10 * 1024 * 1024, 1024 * 1024 * 1024);
+        config.rate_limit_per_minute = limit;
+        AppState::new(
+            Store::from_config(config)
+                .await
+                .expect("test S3 config must build without network access"),
+        )
+    }
+
+    fn request_from(peer: SocketAddr, method: &str, uri: &str) -> Request<Body> {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request must build");
+        request.extensions_mut().insert(ConnectInfo(peer));
+        request
+    }
+
+    async fn status_from(app: &Router, peer: SocketAddr, method: &str, uri: &str) -> StatusCode {
+        app.clone()
+            .oneshot(request_from(peer, method, uri))
+            .await
+            .expect("router call must complete")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn the_rate_limit_is_off_by_default() {
+        let state = state_with_rate_limit(0).await;
+        let app = app_router(state);
+        let peer = SocketAddr::from(([198, 51, 100, 7], 40000));
+        for _ in 0..100 {
+            assert_eq!(
+                status_from(&app, peer, "GET", "/").await,
+                StatusCode::OK,
+                "a zero limit must never refuse"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_over_the_limit_gets_429_with_retry_after() {
+        let state = state_with_rate_limit(1).await;
+        let app = app_router(state);
+        let peer = SocketAddr::from(([198, 51, 100, 7], 40000));
+        assert_eq!(
+            status_from(&app, peer, "GET", "/v1/pastes").await,
+            StatusCode::BAD_GATEWAY,
+            "the first request must reach the S3 sink"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(request_from(peer, "GET", "/v1/pastes"))
+            .await
+            .expect("router call must complete");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("a 429 must carry a numeric Retry-After");
+        assert!(
+            (1..=60).contains(&retry_after),
+            "retry_after: {retry_after}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("error body must be readable");
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("the error body must be JSON");
+        assert_eq!(value["error"], "rate_limited");
+        assert_eq!(value["retry_after_seconds"].as_u64(), Some(retry_after));
+    }
+
+    #[tokio::test]
+    async fn a_refused_upload_body_is_not_polled() {
+        let state = state_with_rate_limit(1).await;
+        let app = app_router(state);
+        let peer = SocketAddr::from(([198, 51, 100, 7], 40000));
+        assert_eq!(
+            status_from(&app, peer, "GET", "/").await,
+            StatusCode::OK,
+            "the first request consumes the only token"
+        );
+
+        let polled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&polled);
+        let body = Body::from_stream(futures::stream::poll_fn(move |_| {
+            flag.store(true, Ordering::SeqCst);
+            Poll::<Option<Result<Bytes, std::io::Error>>>::Ready(None)
+        }));
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .body(body)
+            .expect("request must build");
+        request.extensions_mut().insert(ConnectInfo(peer));
+
+        let response = app
+            .oneshot(request)
+            .await
+            .expect("router call must complete");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            !polled.load(Ordering::SeqCst),
+            "a refused upload must not read its body"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_client_gets_its_own_bucket() {
+        let mut config = test_config(10 * 1024 * 1024, 1024 * 1024 * 1024);
+        config.rate_limit_per_minute = 1;
+        config.trusted_proxies = vec!["10.0.0.0/8".parse().expect("proxy CIDR must parse")];
+        let state = AppState::new(
+            Store::from_config(config)
+                .await
+                .expect("test S3 config must build without network access"),
+        );
+        let app = app_router(state);
+        let peer = SocketAddr::from(([10, 0, 0, 5], 40000));
+
+        let forwarded_request = |forwarded: &str| {
+            let mut request = Request::builder()
+                .method("GET")
+                .uri("/v1/pastes")
+                .header("x-forwarded-for", forwarded)
+                .body(Body::empty())
+                .expect("request must build");
+            request.extensions_mut().insert(ConnectInfo(peer));
+            request
+        };
+
+        for forwarded in ["203.0.113.9", "203.0.113.10"] {
+            let status = app
+                .clone()
+                .oneshot(forwarded_request(forwarded))
+                .await
+                .expect("router call must complete")
+                .status();
+            assert_eq!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "{forwarded} must get its own bucket"
+            );
+        }
+        let status = app
+            .oneshot(forwarded_request("203.0.113.9"))
+            .await
+            .expect("router call must complete")
+            .status();
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the first forwarded client is over its budget"
+        );
     }
 
     const TEST_TOKEN: &str = "correct-horse-battery-staple";
