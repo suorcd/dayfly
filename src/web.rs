@@ -49,9 +49,8 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::http::{
-    check_auth, check_list_access, check_paste_control, public_base, raw_inner,
-    read_metadata_field, status_for, AppState, ListAccessError, MultipartFieldError,
-    MULTIPART_METADATA_MAX_BYTES,
+    check_auth, check_list_access, check_paste_control, public_base, read_metadata_field,
+    status_for, AppState, ListAccessError, MultipartFieldError, MULTIPART_METADATA_MAX_BYTES,
 };
 use crate::store::{
     default_list_window, parse_list_window_request, ListWindowRequest, PasteSummary, Store,
@@ -1321,24 +1320,6 @@ async fn view_bare(
     view_inner(&state, &headers, &random).await
 }
 
-/// Raw bytes for the view page link. The shared download path keeps the
-/// stored content type and its disposition rules.
-async fn raw_dated(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((date, random)): Path<(String, String)>,
-) -> Response {
-    raw_inner(&state, &headers, &format!("{date}/{random}")).await
-}
-
-async fn raw_bare(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(random): Path<String>,
-) -> Response {
-    raw_inner(&state, &headers, &random).await
-}
-
 /// Deny framing and block MIME sniffing for every UI response.
 ///
 /// The human pages carry an inline style and script, so a broad
@@ -1385,8 +1366,6 @@ pub fn ui_router(state: AppState) -> Router<AppState> {
         .route("/pastes", get(list_handler))
         .route("/view/{date}/{random}", get(view_dated))
         .route("/view/{random}", get(view_bare))
-        .route("/raw/{date}/{random}", get(raw_dated))
-        .route("/raw/{random}", get(raw_bare))
         .layer(map_response(deny_framing))
 }
 

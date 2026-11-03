@@ -999,6 +999,22 @@ async fn download_bare_head(
     download_inner(&state, &headers, &random, true).await
 }
 
+async fn raw_dated(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((date, random)): Path<(String, String)>,
+) -> Response {
+    raw_inner(&state, &headers, &format!("{date}/{random}")).await
+}
+
+async fn raw_bare(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(random): Path<String>,
+) -> Response {
+    raw_inner(&state, &headers, &random).await
+}
+
 async fn meta_dated(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1395,6 +1411,16 @@ pub const API_ROUTE_DOCS: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "GET",
+        path: "/raw/{date}/{random}",
+        purpose: "Read the raw bytes of a paste with the full ID.",
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/raw/{random}",
+        purpose: "Read the raw bytes of a bare ID or alias.",
+    },
+    ApiRoute {
+        method: "GET",
         path: "/.well-known/dayfly.json",
         purpose: "Read this machine-readable service description.",
     },
@@ -1429,6 +1455,7 @@ async fn service_description(State(state): State<AppState>) -> Response {
             "max_file_bytes": config.max_file_bytes,
             "max_paste_bytes": config.max_paste_bytes,
             "default_ttl_seconds": u64::from(config.default_ttl_days) * 86_400,
+            "list_default_days": config.list_default_days,
             "max_ttl_seconds": MAX_TTL_SECONDS,
             "retention_by_size": config.retention_by_size,
             "retention_min_seconds": u64::from(config.retention_min_days) * 86_400,
@@ -1471,6 +1498,8 @@ pub fn api_router() -> Router<AppState> {
         .route("/v1/pastes/{random}/meta", get(meta_bare))
         .route("/v1/pastes/{date}/{random}/append", post(append_dated))
         .route("/v1/pastes/{random}/append", post(append_bare))
+        .route("/raw/{date}/{random}", get(raw_dated))
+        .route("/raw/{random}", get(raw_bare))
 }
 
 #[cfg(test)]
