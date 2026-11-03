@@ -1340,7 +1340,8 @@ pub fn mcp_router(state: AppState) -> Router<AppState> {
 }
 
 async fn append_inner(state: &AppState, headers: &HeaderMap, id: &str, req: Request) -> Response {
-    if let Err(resp) = check_auth(state, headers) {
+    let paste_token = header_str(headers, "x-paste-token");
+    if let Err(resp) = check_paste_control(state, headers, id, paste_token.as_deref()).await {
         return resp;
     }
     if !api_write_allowed(headers) {

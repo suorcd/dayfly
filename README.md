@@ -159,9 +159,9 @@ client can store. See "Retention by size".
 
 `DAYFLY_PASTE_TOKENS` gives each new paste a management token. Creation
 returns the token once: `paste_token` in the JSON response and
-`X-Paste-Token` in the plain response. Send that header on `DELETE` and
-`PATCH` to act on the paste without the bearer token. The bearer token
-remains a universal key. An append does not accept the paste token. The
+`X-Paste-Token` in the plain response. Send that header on `DELETE`,
+`PATCH`, and `append` to act on the paste without the bearer token. The
+bearer token remains a universal key. The
 base object stores only the SHA-256 of the token. The meta route and the
 MCP metadata tool do not return it. Treat the token as a credential and
 do not put it in a URL. A lost token means lost control of that paste;
@@ -503,11 +503,11 @@ metadata — binary content is never sent over JSON-RPC),
 `fetch_metadata`, `delete_paste`, `list_recent`.
 
 When `DAYFLY_PASTE_TOKENS` is on, `store_text` and `store_file` return
-`paste_token`. `delete_paste` and `set_ttl` accept a `paste_token`
-argument. A configured bearer token is checked by the HTTP transport
-before the MCP call, so the paste token is optional in that case. With
-no bearer token, those two tools require the paste token. `append_text`
-does not accept it.
+`paste_token`. `delete_paste`, `set_ttl`, and `append_text` accept a
+`paste_token` argument. A configured bearer token is checked by the
+HTTP transport before the MCP call, so the paste token is optional in
+that case. With no bearer token, those three tools require the paste
+token.
 
 `fetch_text` returns at most 8 MiB per call. Use `offset` and `limit`
 to page through a larger paste. The response reports `total_bytes` and

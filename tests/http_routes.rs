@@ -1918,6 +1918,97 @@ async fn initialize_mcp_session(app: &Router) -> String {
 }
 
 #[tokio::test]
+async fn paste_tokens_gate_http_append() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.paste_tokens = true;
+    let store = Store::from_config(config)
+        .await
+        .expect("the token store must build");
+    let stored = store
+        .store_text(b"base", None, None, None)
+        .await
+        .expect("the paste must store");
+    let token = stored
+        .paste_token
+        .clone()
+        .expect("a token paste must return a token");
+    let id = stored.id.clone();
+    let app = common::app(store);
+
+    let body = b"more".to_vec();
+    let request = common::request(
+        "POST",
+        &format!("/v1/pastes/{id}/append"),
+        &[("content-length", body.len().to_string())],
+        body.clone(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let request = common::request(
+        "POST",
+        &format!("/v1/pastes/{id}/append"),
+        &[
+            ("content-length", body.len().to_string()),
+            ("x-paste-token", token),
+        ],
+        body,
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn paste_tokens_gate_mcp_append() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.paste_tokens = true;
+    let store = Store::from_config(config)
+        .await
+        .expect("the token store must build");
+    let stored = store
+        .store_text(b"base", None, None, None)
+        .await
+        .expect("the paste must store");
+    let token = stored
+        .paste_token
+        .clone()
+        .expect("a token paste must return a token");
+    let id = stored.id.clone();
+    let app = app_router(AppState::new(store));
+    let session = initialize_mcp_session(&app).await;
+
+    let denied = json!({
+        "jsonrpc": "2.0",
+        "id": 12,
+        "method": "tools/call",
+        "params": {"name": "append_text", "arguments": {"id": id, "text": " more"}}
+    });
+    let (status, _, body) = mcp_post(&app, &denied, Some(&session)).await;
+    assert_eq!(status, StatusCode::OK);
+    let payload = sse_json(&body);
+    assert_eq!(
+        payload["result"]["isError"], true,
+        "an append without a token must fail: {payload}"
+    );
+
+    let allowed = json!({
+        "jsonrpc": "2.0",
+        "id": 13,
+        "method": "tools/call",
+        "params": {"name": "append_text", "arguments": {"id": id, "text": " more", "paste_token": token}}
+    });
+    let (status, _, body) = mcp_post(&app, &allowed, Some(&session)).await;
+    assert_eq!(status, StatusCode::OK);
+    let payload = sse_json(&body);
+    assert_eq!(
+        payload["result"]["isError"], false,
+        "an append with the right token must succeed: {payload}"
+    );
+}
+
+#[tokio::test]
 async fn append_text_works_through_the_http_mcp_endpoint() {
     let (state, _fake) = fake_state(1024).await;
     let app = app_router(state.clone());
@@ -2793,7 +2884,7 @@ async fn a_paste_token_appears_once_in_json_and_plain_upload_responses() {
 }
 
 #[tokio::test]
-async fn a_bearer_token_stays_universal_and_append_stays_bearer_only() {
+async fn a_bearer_token_stays_universal_and_a_paste_token_authorizes_append() {
     let fake = FakeS3::start().await;
     let mut config = fake.config();
     config.paste_tokens = true;
@@ -2836,8 +2927,8 @@ async fn a_bearer_token_stays_universal_and_append_stays_bearer_only() {
     let (status, _, _) = common::send(&app, request).await;
     assert_eq!(
         status,
-        StatusCode::UNAUTHORIZED,
-        "an append must not accept the paste token"
+        StatusCode::OK,
+        "an append must accept the paste token"
     );
 
     let request = common::request(

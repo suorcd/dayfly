@@ -123,9 +123,8 @@ pub struct Config {
     ///
     /// Default: `false`. When this is `true`, creation returns a random
     /// token once. Only its SHA-256 is stored. The token authorizes
-    /// `DELETE` and `PATCH` for that paste, as an alternative to the
-    /// bearer token. The bearer token remains a universal key. An append
-    /// does not accept the paste token.
+    /// `DELETE`, `PATCH`, and `append` for that paste, as an alternative to
+    /// the bearer token. The bearer token remains a universal key.
     pub paste_tokens: bool,
     /// Maximum requests per client per minute. Zero disables the limiter.
     ///
