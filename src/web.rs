@@ -34,6 +34,7 @@
 //! use the token for API clients. See README. No public sharing,
 //! accounts, or comments are added.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
@@ -51,7 +52,9 @@ use crate::http::{
     check_auth, read_metadata_field, status_for, AppState, MultipartFieldError,
     MULTIPART_METADATA_MAX_BYTES,
 };
-use crate::store::{parse_list_window_request, ListWindowRequest, StoreError, StoredPaste, Ttl};
+use crate::store::{
+    parse_list_window_request, ListWindowRequest, PasteSummary, StoreError, StoredPaste, Ttl,
+};
 
 /// Adapted base look from suorcd.us/style.css, palette cyberpunkNeon
 /// (background #091833, text #e3e8fc, accent #ea00d9, code background
@@ -694,6 +697,151 @@ async fn create_submit_handler(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PasteSort {
+    Size,
+    Created,
+    Expires,
+}
+
+impl PasteSort {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "size" => Some(Self::Size),
+            "created" => Some(Self::Created),
+            "expires" => Some(Self::Expires),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Size => "size",
+            Self::Created => "created",
+            Self::Expires => "expires",
+        }
+    }
+
+    fn default_order(self) -> SortOrder {
+        match self {
+            Self::Expires => SortOrder::Asc,
+            Self::Size | Self::Created => SortOrder::Desc,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortOrder {
+    Asc,
+    Desc,
+}
+
+impl SortOrder {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "asc" => Some(Self::Asc),
+            "desc" => Some(Self::Desc),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+
+    fn toggle(self) -> Self {
+        match self {
+            Self::Asc => Self::Desc,
+            Self::Desc => Self::Asc,
+        }
+    }
+}
+
+fn parse_sort_order(query: &HashMap<String, String>) -> Result<(PasteSort, SortOrder), String> {
+    let sort = match query.get("sort").map(String::as_str) {
+        None => PasteSort::Created,
+        Some(value) => PasteSort::parse(value)
+            .ok_or_else(|| "invalid sort: expected size, created, or expires".to_string())?,
+    };
+    let order = match query.get("order").map(String::as_str) {
+        None => sort.default_order(),
+        Some(value) => SortOrder::parse(value)
+            .ok_or_else(|| "invalid order: expected asc or desc".to_string())?,
+    };
+    Ok((sort, order))
+}
+
+/// Compare two timestamps with a direction. A missing value sorts last in
+/// both directions.
+fn compare_optional<T: Ord>(a: Option<T>, b: Option<T>, order: SortOrder) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => match order {
+            SortOrder::Asc => a.cmp(&b),
+            SortOrder::Desc => b.cmp(&a),
+        },
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn sort_pastes(items: &mut [PasteSummary], sort: PasteSort, order: SortOrder) {
+    items.sort_by(|a, b| {
+        let primary = match sort {
+            PasteSort::Size => match order {
+                SortOrder::Asc => a.size.cmp(&b.size),
+                SortOrder::Desc => b.size.cmp(&a.size),
+            },
+            PasteSort::Created => compare_optional(a.created_at, b.created_at, order),
+            PasteSort::Expires => compare_optional(a.expires_at, b.expires_at, order),
+        };
+        primary.then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+/// Build one sortable table header. The active column shows its direction.
+/// A click toggles the active column and keeps the date filters.
+fn sort_header(
+    label: &str,
+    key: PasteSort,
+    sort: PasteSort,
+    order: SortOrder,
+    filters: &str,
+) -> String {
+    let active = sort == key;
+    let next_order = if active {
+        order.toggle()
+    } else {
+        key.default_order()
+    };
+    let arrow = if active {
+        match order {
+            SortOrder::Asc => " ▲",
+            SortOrder::Desc => " ▼",
+        }
+    } else {
+        ""
+    };
+    let mut href = format!(
+        "/pastes?sort={}&order={}",
+        key.as_str(),
+        next_order.as_str()
+    );
+    if !filters.is_empty() {
+        href.push('&');
+        href.push_str(filters);
+    }
+    format!(
+        "<a href=\"{}\">{}{}</a>",
+        html_escape(&href),
+        html_escape(label),
+        arrow
+    )
+}
+
 async fn list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -702,6 +850,10 @@ async fn list_handler(
     if let Err(resp) = check_auth(&state, &headers) {
         return resp;
     }
+    let (sort, order) = match parse_sort_order(&query) {
+        Ok(value) => value,
+        Err(message) => return bad_request_page(&message),
+    };
     let date = query.get("date").cloned().unwrap_or_default();
     let start = query.get("start").cloned().unwrap_or_default();
     let end = query.get("end").cloned().unwrap_or_default();
@@ -722,10 +874,27 @@ async fn list_handler(
         }
         ListWindowRequest::Default => state.store.list_window(None, None, 1000).await,
     };
-    let items = match items {
+    let mut items = match items {
         Ok(items) => items,
         Err(e) => return error_page(e),
     };
+    sort_pastes(&mut items, sort, order);
+
+    let mut filters = Vec::new();
+    if !date.is_empty() {
+        filters.push(format!("date={date}"));
+    }
+    if !start.is_empty() {
+        filters.push(format!("start={start}"));
+    }
+    if !end.is_empty() {
+        filters.push(format!("end={end}"));
+    }
+    let filters = filters.join("&");
+    let size_header = sort_header("Size", PasteSort::Size, sort, order, &filters);
+    let created_header = sort_header("Created", PasteSort::Created, sort, order, &filters);
+    let expires_header = sort_header("Expires", PasteSort::Expires, sort, order, &filters);
+
     let mut rows = String::new();
     let show_words = state.store.config.show_words;
     for item in &items {
@@ -762,7 +931,7 @@ async fn list_handler(
             r#"<form method="get" action="/pastes"><p><label>Date <input type="date" name="date" value="{}"></label> <button type="submit">Show date</button></p></form>
 <form method="get" action="/pastes"><p><label>Start <input type="date" name="start" value="{}"></label> <label>End <input type="date" name="end" value="{}"></label> <button type="submit">Show range</button></p></form>
 <p class="muted">Dates are UTC. With no dates, the page shows yesterday and today in UTC, so a Pacific evening is included. Built from a direct bucket scan (ListObjectsV2 for each date prefix, plus HeadObject per paste). No database. Listing is O(n) in objects scanned and gets slower as the bucket grows — that slowdown is the trigger for adding a database later.</p>
-<table><thead><tr><th>Link / ID</th><th>Filename</th><th>Content-Type</th><th>Size</th><th>Created</th><th>Expires</th><th>Remaining</th><th></th></tr></thead><tbody>{}</tbody></table>"#,
+<table><thead><tr><th>Link / ID</th><th>Filename</th><th>Content-Type</th><th>{size_header}</th><th>{created_header}</th><th>{expires_header}</th><th>Remaining</th><th></th></tr></thead><tbody>{}</tbody></table>"#,
             html_escape(&date),
             html_escape(&start),
             html_escape(&end),
@@ -1052,6 +1221,183 @@ mod tests {
                 Some("DENY"),
                 "{uri}"
             );
+        }
+    }
+
+    fn summary(
+        id: &str,
+        size: u64,
+        created_at: Option<DateTime<Utc>>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> PasteSummary {
+        PasteSummary {
+            id: id.to_string(),
+            key: format!("pastes/{id}"),
+            words: None,
+            size,
+            last_modified: created_at,
+            expires_at,
+            created_at,
+            content_type: Some("text/plain".to_string()),
+            filename: None,
+        }
+    }
+
+    fn dt(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .expect("test timestamp must parse")
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn sort_pastes_covers_size_created_and_expires() {
+        let early = dt("2026-10-01T00:00:00Z");
+        let late = dt("2026-10-02T00:00:00Z");
+        let soon = dt("2026-10-10T00:00:00Z");
+        let later = dt("2026-10-20T00:00:00Z");
+        let mut items = vec![
+            summary("2026-10-28/a", 20, Some(late), Some(later)),
+            summary("2026-10-28/b", 10, Some(early), None),
+            summary("2026-10-28/c", 30, None, Some(soon)),
+        ];
+
+        sort_pastes(&mut items, PasteSort::Size, SortOrder::Desc);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["2026-10-28/c", "2026-10-28/a", "2026-10-28/b"]
+        );
+        sort_pastes(&mut items, PasteSort::Size, SortOrder::Asc);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["2026-10-28/b", "2026-10-28/a", "2026-10-28/c"]
+        );
+
+        sort_pastes(&mut items, PasteSort::Created, SortOrder::Desc);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["2026-10-28/a", "2026-10-28/b", "2026-10-28/c"]
+        );
+        sort_pastes(&mut items, PasteSort::Created, SortOrder::Asc);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["2026-10-28/b", "2026-10-28/a", "2026-10-28/c"]
+        );
+
+        sort_pastes(&mut items, PasteSort::Expires, SortOrder::Asc);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["2026-10-28/c", "2026-10-28/a", "2026-10-28/b"]
+        );
+        sort_pastes(&mut items, PasteSort::Expires, SortOrder::Desc);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["2026-10-28/a", "2026-10-28/c", "2026-10-28/b"]
+        );
+    }
+
+    #[test]
+    fn sort_defaults_to_created_descending_and_rejects_bad_values() {
+        let empty = HashMap::new();
+        assert_eq!(
+            parse_sort_order(&empty).expect("defaults must parse"),
+            (PasteSort::Created, SortOrder::Desc)
+        );
+
+        let mut size = HashMap::new();
+        size.insert("sort".to_string(), "size".to_string());
+        assert_eq!(
+            parse_sort_order(&size).expect("size must parse"),
+            (PasteSort::Size, SortOrder::Desc)
+        );
+
+        let mut expires = HashMap::new();
+        expires.insert("sort".to_string(), "expires".to_string());
+        assert_eq!(
+            parse_sort_order(&expires).expect("expires must parse"),
+            (PasteSort::Expires, SortOrder::Asc)
+        );
+
+        let mut bad_sort = HashMap::new();
+        bad_sort.insert("sort".to_string(), "bogus".to_string());
+        assert!(parse_sort_order(&bad_sort).is_err());
+
+        let mut bad_order = HashMap::new();
+        bad_order.insert("order".to_string(), "sideways".to_string());
+        assert!(parse_sort_order(&bad_order).is_err());
+    }
+
+    #[test]
+    fn sort_headers_toggle_and_keep_filters() {
+        let filters = "date=2026-10-28&start=2026-10-01&end=2026-10-31";
+        let created = sort_header(
+            "Created",
+            PasteSort::Created,
+            PasteSort::Created,
+            SortOrder::Desc,
+            filters,
+        );
+        assert!(
+            created.contains(
+                "href=\"/pastes?sort=created&amp;order=asc&amp;date=2026-10-28&amp;start=2026-10-01&amp;end=2026-10-31\""
+            ),
+            "got: {created}"
+        );
+        assert!(created.contains("Created ▼"), "got: {created}");
+
+        let size = sort_header(
+            "Size",
+            PasteSort::Size,
+            PasteSort::Created,
+            SortOrder::Desc,
+            filters,
+        );
+        assert!(
+            size.contains(
+                "href=\"/pastes?sort=size&amp;order=desc&amp;date=2026-10-28&amp;start=2026-10-01&amp;end=2026-10-31\""
+            ),
+            "got: {size}"
+        );
+        assert!(
+            !size.contains('▼'),
+            "inactive header must have no arrow: {size}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_rejects_invalid_sort_and_order() {
+        let state = test_state(None).await;
+        let app = ui_router(state.store.config.max_text_bytes).with_state(state);
+        for uri in ["/pastes?sort=bogus", "/pastes?order=sideways"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request must build"),
+                )
+                .await
+                .expect("router call must complete");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
         }
     }
 
