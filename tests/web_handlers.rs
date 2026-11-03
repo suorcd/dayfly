@@ -795,7 +795,7 @@ async fn list_page_shows_current_pastes_and_hides_expired_ones() {
     let page = html_text(&body);
     assert!(page.contains(&format!("{today}/visible")));
     assert!(!page.contains(&format!("{today}/expired")));
-    assert!(page.contains("02 days"));
+    assert!(page.contains("<td>02</td>"));
     assert!(
         !page.contains("name=\"date\""),
         "the page must not offer the single-date selector: {page}"
@@ -842,8 +842,8 @@ async fn list_page_shows_current_pastes_and_hides_expired_ones() {
         "the delete column must have a header: {page}"
     );
     assert!(
-        page.contains("<th>TTL</th>"),
-        "the duration column must be labelled TTL: {page}"
+        page.contains("<th>TTL (days)</th>"),
+        "the duration column must be labelled TTL (days): {page}"
     );
     assert!(
         !page.contains("<th>Remaining</th>"),

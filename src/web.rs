@@ -370,9 +370,10 @@ fn fmt_dt(dt: Option<DateTime<Utc>>) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
-/// Days remaining until expiry, for the list page. Consistent with the
-/// API's read-time expiry check: an object past its `expires_at` is
-/// expired, even if it is still physically in the bucket.
+/// Whole days remaining until expiry, zero-padded for the table.
+///
+/// Consistent with the API's read-time expiry check: an object past its
+/// `expires_at` is expired, even if it is still physically in the bucket.
 fn days_remaining(expires_at: Option<DateTime<Utc>>) -> String {
     let Some(exp) = expires_at else {
         return "—".to_string();
@@ -384,10 +385,16 @@ fn days_remaining(expires_at: Option<DateTime<Utc>>) -> String {
     let secs = (exp - now).num_seconds();
     // Ceiling division, in stable Rust (div_ceil is still unstable).
     let days = (secs + 86_400 - 1) / 86_400;
-    if days == 1 {
-        "01 day".to_string()
-    } else {
-        format!("{days:02} days")
+    format!("{days:02}")
+}
+
+/// Days remaining with the unit, for the view page.
+fn days_remaining_label(expires_at: Option<DateTime<Utc>>) -> String {
+    let value = days_remaining(expires_at);
+    match value.as_str() {
+        "expired" | "—" => value,
+        "01" => format!("{value} day"),
+        _ => format!("{value} days"),
     }
 }
 
@@ -1122,7 +1129,7 @@ async fn list_handler(
         &format!(
             r#"<form method="get" action="/pastes"><p><label>Start <input type="date" name="start" value="{}"></label> <label>End <input type="date" name="end" value="{}"></label> <button type="submit">Show range</button></p></form>
 <p class="muted">Dates are UTC. With no dates, the page shows the last {default_days} days, ending today in UTC. Set DAYFLY_LIST_DEFAULT_DAYS to change that. Built from a direct bucket scan (ListObjectsV2 for each date prefix, plus HeadObject per paste). No database. Listing is O(n) in objects scanned and gets slower as the bucket grows — that slowdown is the trigger for adding a database later.</p>
-<div class="table-wrap"><table><colgroup><col class="col-link"><col class="col-filename"><col class="col-content-type"><col class="col-size"><col class="col-created"><col class="col-ttl"><col class="col-action"></colgroup><thead><tr><th>{link_header}</th><th>Filename</th><th>Content-Type</th><th>{size_header}</th><th>{created_header}</th><th>TTL</th><th>Action</th></tr></thead><tbody>{}</tbody></table></div>"#,
+<div class="table-wrap"><table><colgroup><col class="col-link"><col class="col-filename"><col class="col-content-type"><col class="col-size"><col class="col-created"><col class="col-ttl"><col class="col-action"></colgroup><thead><tr><th>{link_header}</th><th>Filename</th><th>Content-Type</th><th>{size_header}</th><th>{created_header}</th><th>TTL (days)</th><th>Action</th></tr></thead><tbody>{}</tbody></table></div>"#,
             html_escape(&start_value),
             html_escape(&end_value),
             rows,
@@ -1193,7 +1200,7 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
         human_size(meta.size),
         fmt_dt(meta.created_at),
         fmt_dt(meta.expires_at),
-        days_remaining(meta.expires_at),
+        days_remaining_label(meta.expires_at),
     );
     if main == "text/plain"
         || main == "text/markdown"
@@ -1737,10 +1744,13 @@ mod tests {
     fn days_remaining_expired_and_future() {
         let past = Utc::now() - chrono::Duration::days(1);
         assert_eq!(days_remaining(Some(past)), "expired");
-        let future = Utc::now() + chrono::Duration::days(3);
-        assert_eq!(days_remaining(Some(future)), "03 days");
-        let tomorrow = Utc::now() + chrono::Duration::hours(1);
-        assert_eq!(days_remaining(Some(tomorrow)), "01 day");
+        let today = Utc::now();
+        let future = today + chrono::Duration::days(3);
+        assert_eq!(days_remaining(Some(future)), "03");
+        assert_eq!(days_remaining_label(Some(future)), "03 days");
+        let tomorrow = today + chrono::Duration::hours(1);
+        assert_eq!(days_remaining(Some(tomorrow)), "01");
+        assert_eq!(days_remaining_label(Some(tomorrow)), "01 day");
         assert_eq!(days_remaining(None), "—");
     }
 

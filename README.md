@@ -1057,7 +1057,7 @@ comments.
 - `GET /pastes` — current pastes, built from the bucket scan (no
   database): alias when enabled (with the canonical ID as secondary
   text when `DAYFLY_SHOW_INTERNAL_PATHS` is true), filename if any,
-  content type, size, created date, and days
+  content type, size, created date, and TTL in days
   remaining, and a delete action per row. Expired items are
   filtered out, consistent with the API's read-time expiry check. The
   Start and End inputs start with the default window:
