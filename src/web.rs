@@ -49,8 +49,8 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::http::{
-    check_auth, read_metadata_field, status_for, AppState, MultipartFieldError,
-    MULTIPART_METADATA_MAX_BYTES,
+    check_auth, check_list_access, read_metadata_field, status_for, AppState, ListAccessError,
+    MultipartFieldError, MULTIPART_METADATA_MAX_BYTES,
 };
 use crate::store::{
     parse_list_window_request, ListWindowRequest, PasteSummary, Store, StoreError, StoredPaste, Ttl,
@@ -427,6 +427,21 @@ fn error_page(e: StoreError) -> Response {
         page(
             "Error",
             &format!("<p>{}</p><p><a href=\"/\">Back</a></p>", html_escape(&msg)),
+        ),
+    )
+        .into_response()
+}
+
+/// A clear 401 page instead of an empty table that looks like "no pastes".
+fn unauthorized_page(message: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        page(
+            "Unauthorized",
+            &format!(
+                "<p>{}</p><p><a href=\"/\">Back</a></p>",
+                html_escape(message)
+            ),
         ),
     )
         .into_response()
@@ -847,8 +862,17 @@ async fn list_handler(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(resp) = check_auth(&state, &headers) {
-        return resp;
+    if let Err(error) = check_list_access(&state, &headers) {
+        return match error {
+            // A configured token already gated this page, and the shared
+            // JSON auth error is what every other UI route returns.
+            ListAccessError::Unauthorized(response) => response,
+            // This case would otherwise have rendered an open, empty list.
+            ListAccessError::MissingToken => unauthorized_page(
+                "Listing is gated by DAYFLY_LIST_REQUIRES_TOKEN, but no bearer token \
+                 is configured. Set DAYFLY_HTTP_BEARER_TOKEN, or turn the setting off.",
+            ),
+        };
     }
     let (sort, order) = match parse_sort_order(&query) {
         Ok(value) => value,
@@ -1147,9 +1171,12 @@ mod tests {
             alias_words: 3,
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
+            trusted_proxies: Vec::new(),
             show_words: false,
             inline_pdf: true,
             allow_unauthenticated: false,
+            list_requires_token: false,
+            rate_limit_per_minute: 0,
             http_bearer_token: None,
             mcp_local_root: None,
         }
@@ -1165,20 +1192,29 @@ mod tests {
         )
     }
 
-    /// Call the UI list route. A passing token reaches the unreachable test
-    /// S3 endpoint, and the UI maps that S3 error to 400. A 401 means the
-    /// auth check rejected the request.
-    async fn ui_list_status(state: AppState, auth: Option<&str>) -> StatusCode {
+    async fn ui_list_body(state: AppState, auth: Option<&str>) -> (StatusCode, String) {
         let app = ui_router(state.clone()).with_state(state);
         let mut builder = Request::builder().method("GET").uri("/pastes");
         if let Some(auth) = auth {
             builder = builder.header(axum::http::header::AUTHORIZATION, auth);
         }
         let request = builder.body(Body::empty()).expect("request must build");
-        app.oneshot(request)
+        let response = app
+            .oneshot(request)
             .await
-            .expect("router call must complete")
-            .status()
+            .expect("router call must complete");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("response body must be readable");
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// Call the UI list route. A passing token reaches the unreachable test
+    /// S3 endpoint, and the UI maps that S3 error to a 5xx status. A 401
+    /// means the auth check rejected the request.
+    async fn ui_list_status(state: AppState, auth: Option<&str>) -> StatusCode {
+        ui_list_body(state, auth).await.0
     }
 
     #[tokio::test]
@@ -1208,6 +1244,53 @@ mod tests {
             ui_list_status(state, None).await,
             StatusCode::BAD_GATEWAY,
             "an unset token must leave the UI routes open"
+        );
+    }
+
+    async fn state_with_gated_listing(token: Option<&str>) -> AppState {
+        let mut config = test_config();
+        config.list_requires_token = true;
+        config.http_bearer_token = token.map(str::to_string);
+        AppState::new(
+            Store::from_config(config)
+                .await
+                .expect("test S3 config must build without network access"),
+        )
+    }
+
+    #[tokio::test]
+    async fn ui_gated_listing_without_a_configured_token_renders_401() {
+        let state = state_with_gated_listing(None).await;
+        let (status, body) = ui_list_body(state, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            body.contains("DAYFLY_LIST_REQUIRES_TOKEN"),
+            "the page must name the setting: {body}"
+        );
+        assert!(
+            body.contains("DAYFLY_HTTP_BEARER_TOKEN"),
+            "the page must name the missing token: {body}"
+        );
+        assert!(
+            !body.contains("No current pastes"),
+            "a refusal must not look like an empty list: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ui_gated_listing_requires_the_token() {
+        let state = state_with_gated_listing(Some(TEST_TOKEN)).await;
+        assert_eq!(ui_list_status(state, None).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn ui_gated_listing_accepts_the_token() {
+        let state = state_with_gated_listing(Some(TEST_TOKEN)).await;
+        let auth = format!("Bearer {TEST_TOKEN}");
+        assert_eq!(
+            ui_list_status(state, Some(&auth)).await,
+            StatusCode::BAD_GATEWAY,
+            "the right token must pass the list gate and reach the S3 sink"
         );
     }
 

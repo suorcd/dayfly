@@ -612,6 +612,31 @@ async fn upload_named(app: &Router, content_type: &str, filename: &str, body: Ve
 }
 
 #[tokio::test]
+async fn gated_listing_returns_200_with_a_configured_token() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.list_requires_token = true;
+    config.http_bearer_token = Some("list-secret".to_string());
+    let store = Store::from_config(config)
+        .await
+        .expect("gated listing store must build");
+    let app = common::app(store);
+
+    let request = common::request("GET", "/v1/pastes", &[], Vec::new());
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let request = common::request(
+        "GET",
+        "/v1/pastes",
+        &[("authorization", "Bearer list-secret".to_string())],
+        Vec::new(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn pdf_inline_control_and_inline_sandbox_policy() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
@@ -1328,7 +1353,7 @@ async fn cross_origin_api_upload_is_forbidden() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn failed_bearer_check_logs_method_path_and_peer() {
+async fn failed_bearer_check_logs_method_path_and_client() {
     let fake = FakeS3::start().await;
     let mut store = fake.store().await;
     store.config.http_bearer_token = Some("correct-horse-battery-staple".to_string());
@@ -1362,7 +1387,11 @@ async fn failed_bearer_check_logs_method_path_and_peer() {
     assert!(logs.contains("WARN"), "expected one warning, got: {logs}");
     assert!(logs.contains("method=GET"), "got: {logs}");
     assert!(logs.contains("path=/v1/pastes/example"), "got: {logs}");
-    assert!(logs.contains("peer=Some(127.0.0.1:4567)"), "got: {logs}");
+    assert!(logs.contains("client=Some(127.0.0.1)"), "got: {logs}");
+    assert!(
+        !logs.contains("127.0.0.1:4567"),
+        "the peer port must not be logged"
+    );
     assert!(!logs.contains("wrong-horse"), "the offered token leaked");
     assert!(!logs.contains("correct-horse"), "the expected token leaked");
 
@@ -1384,6 +1413,52 @@ async fn failed_bearer_check_logs_method_path_and_peer() {
     assert!(
         !logs.contains("WARN"),
         "a valid token must not warn, got: {logs}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_bearer_check_logs_the_forwarded_client() {
+    let fake = FakeS3::start().await;
+    let mut store = fake.store().await;
+    store.config.http_bearer_token = Some("correct-horse-battery-staple".to_string());
+    store.config.trusted_proxies = vec!["10.0.0.0/8".parse().expect("proxy CIDR must parse")];
+    let app = dayfly::http::app_router(AppState::new(store));
+
+    let captured = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let mut request = common::request(
+        "GET",
+        "/v1/pastes/example",
+        &[
+            (
+                "authorization",
+                "Bearer wrong-horse-battery-staple".to_string(),
+            ),
+            ("x-forwarded-for", "203.0.113.9".to_string()),
+        ],
+        Vec::new(),
+    );
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([10, 0, 0, 5], 4567))));
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).expect("logs must be UTF-8");
+    assert!(
+        logs.contains("client=Some(203.0.113.9)"),
+        "the forwarded client must be logged, got: {logs}"
+    );
+    assert!(
+        !logs.contains("client=Some(10.0.0.5)"),
+        "the proxy must not be logged as the client, got: {logs}"
     );
 }
 

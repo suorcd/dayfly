@@ -107,6 +107,48 @@ the message names the ways out. The rule has three states:
   starts and writes one warning at startup. Set it only on a network
   you trust, or behind a proxy that authenticates.
 
+`DAYFLY_TRUSTED_PROXIES` names the reverse proxies whose
+`X-Forwarded-For` header is believed. It is a comma-separated list of
+CIDR blocks, and a bare address is a single host. The default is empty:
+the socket peer is the client and every forwarding header is ignored, so
+a request from an unlisted peer that sets `X-Forwarded-For` is
+attributed to that peer. When the socket peer is listed, the chain is
+walked from the right, skipping listed proxies, and the first address
+that is not a listed proxy is the client. A forged hop prepended on the
+left cannot win. A malformed or over-long chain, or one that names only
+trusted proxies, falls back to the socket peer with one warning.
+
+Only the rightmost unlisted address is used, so a proxy must append to
+`X-Forwarded-For`, not replace it. List only the proxies that actually
+front this service, and do not leave a path around them: a direct
+connection from an unlisted address is attributed to that address. This
+setting is what makes a per-client limit meaningful behind an ingress.
+
+`DAYFLY_LIST_REQUIRES_TOKEN` separates "public downloads" from "private
+listing". With the default `false`, listing follows the global token
+rule: gated when `DAYFLY_HTTP_BEARER_TOKEN` is set, open when it is not.
+When `true`, `GET /v1/pastes` and the human `/pastes` page require the
+bearer token even if reads are otherwise anonymous. If the setting is on
+and no token is configured, both routes refuse with 401 and a message
+naming the missing variable: there is nothing to check against, and an
+open list is what the setting prevents. The human page renders a 401
+page rather than an empty table. A browser cannot send an
+`Authorization` header, so put an authenticating proxy in front of
+`/pastes`, or use the API with the token.
+
+`DAYFLY_RATE_LIMIT_PER_MINUTE` caps requests per client per minute. It
+is a token bucket keyed on the resolved client address: the burst is the
+configured number, and the bucket refills at that number per minute.
+Zero, the default, disables the limiter and allocates no counters. Above
+the limit the response is 429 with `Retry-After` and a JSON error naming
+`retry_after_seconds`; the upload body is not read. The bucket map is
+bounded and releases idle clients. Every route counts, including `/` and
+`/mcp`. The counter is per process and resets on restart. It is a flood
+guard, not an access control: clients behind one NAT share a bucket, and
+a client that can change its address gets a fresh one. Set
+`DAYFLY_TRUSTED_PROXIES` first, or every request is attributed to the
+ingress and shares one bucket.
+
 The MCP stdio transport does not use the bearer token: spawning the
 binary locally is the trust boundary there. The MCP transport over
 HTTP at `/mcp` is part of HTTP mode and uses the same bearer token as
@@ -254,7 +296,10 @@ permissions and the lower total cap.
 | `DAYFLY_ALIAS_WORDS` | no | 3 | Number of words in a new alias. Allowed range 3 to 6. Resolution accepts 3 words up to this value |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1 and at most 3650. The name and meaning are unchanged |
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
+| `DAYFLY_TRUSTED_PROXIES` | no | (empty) | Comma-separated CIDR blocks (bare addresses are single hosts) of reverse proxies whose `X-Forwarded-For` header is believed. Empty keeps the socket peer as the client and ignores forwarding headers. The chain is walked from the right; a malformed or over-long chain falls back to the peer with one warning. Set this before any per-client limit behind an ingress |
+| `DAYFLY_RATE_LIMIT_PER_MINUTE` | no | 0 | Maximum requests per client per minute. 0 disables the limiter and allocates no counters. The burst is this value, and the bucket refills at this rate. Over the limit → 429 with `Retry-After`. Keyed on the resolved client address, so set `DAYFLY_TRUSTED_PROXIES` behind an ingress. Per process; resets on restart |
 | `DAYFLY_ALLOW_UNAUTHENTICATED` | no | `false` | Accept a non-loopback bind with no bearer token. Startup refuses that bind without this value, and with it the service writes one warning. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
+| `DAYFLY_LIST_REQUIRES_TOKEN` | no | `false` | Require the bearer token for `GET /v1/pastes` and the human `/pastes` page even when reads are anonymous. With this on and no token configured, both routes refuse with 401: there is nothing to check. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_SHOW_WORDS` | no | `true` | Show the generated word alias in the human UI: create redirects, the view page, and the paste list. Display only; the JSON/MCP responses still include `words`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_INLINE_PDF` | no | `true` | Serve a PDF download inline. Set this to `false` on a public instance so a PDF is an attachment. HTML and SVG are always attachments. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_HTTP_BEARER_TOKEN` | one form | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model); set this variable or `DAYFLY_HTTP_BEARER_TOKEN_FILE`. An unset value disables auth; a set empty or whitespace-only value is a startup error |
@@ -309,6 +354,9 @@ first, then the file. These settings take effect on the next request:
 - `DAYFLY_DEFAULT_TTL_DAYS`
 - `DAYFLY_SHOW_WORDS`
 - `DAYFLY_INLINE_PDF`
+- `DAYFLY_TRUSTED_PROXIES`
+- `DAYFLY_LIST_REQUIRES_TOKEN`
+- `DAYFLY_RATE_LIMIT_PER_MINUTE`
 - `DAYFLY_HTTP_BEARER_TOKEN` or `DAYFLY_HTTP_BEARER_TOKEN_FILE`
 
 These settings need a restart:

@@ -172,7 +172,7 @@ fn check_config_file(path: Option<PathBuf>, explicit: bool, strict: bool) -> any
                 faults.push("S3_ENDPOINT is not an http:// or https:// URL".to_string());
             }
             "DAYFLY_MAX_TEXT_BYTES" | "DAYFLY_MAX_FILE_BYTES" | "DAYFLY_MAX_PASTE_BYTES"
-            | "DAYFLY_ALIAS_WORDS" => {
+            | "DAYFLY_ALIAS_WORDS" | "DAYFLY_RATE_LIMIT_PER_MINUTE" => {
                 if value.parse::<u64>().is_err() {
                     faults.push(format!("{}: expected a non-negative integer", field.name));
                 }

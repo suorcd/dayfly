@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::client_addr::Cidr;
 use crate::stream::STREAM_PART_BYTES;
 
 /// Maximum number of parts in one S3 multipart upload.
@@ -68,6 +69,15 @@ pub struct Config {
     pub default_ttl_days: u32,
     /// Default bind address for HTTP mode.
     pub http_bind: String,
+    /// CIDR blocks of reverse proxies whose `X-Forwarded-For` header is
+    /// believed.
+    ///
+    /// Default: empty. With the default, the socket peer is the client and
+    /// forwarding headers are ignored. When the peer is listed here, the
+    /// forwarding chain is walked from the right and the first address
+    /// that is not a listed proxy is the client. See "Access model" in the
+    /// README.
+    pub trusted_proxies: Vec<Cidr>,
     /// Whether a non-loopback bind may run without a bearer token.
     ///
     /// Default: `false`. With the default, `serve` refuses a bind address
@@ -76,6 +86,22 @@ pub struct Config {
     /// proxy that authenticates. The service then logs one warning at
     /// startup. See "Access model" in the README.
     pub allow_unauthenticated: bool,
+    /// Whether listing requires the bearer token.
+    ///
+    /// Default: `false`. With the default, listing follows the global
+    /// bearer setting: gated when a token is set, open when none is. When
+    /// this is `true`, `GET /v1/pastes` and the human `/pastes` page
+    /// require the bearer token even if reads are otherwise anonymous.
+    /// With no token configured, both routes refuse: there is nothing to
+    /// check against, and an open list is what this setting prevents.
+    pub list_requires_token: bool,
+    /// Maximum requests per client per minute. Zero disables the limiter.
+    ///
+    /// Default: `0`. The limit is a token bucket per resolved client
+    /// address, refilled at this rate, with a burst of the same size. The
+    /// limiter is per process and resets on restart. See "Access model" in
+    /// the README.
+    pub rate_limit_per_minute: u32,
     /// Whether the human web UI shows the generated aliases.
     ///
     /// Default: `true`. This is a display setting only: aliases are still
@@ -188,10 +214,28 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         help: "HTTP bind address",
     },
     ConfigField {
+        name: "DAYFLY_TRUSTED_PROXIES",
+        value: Some(""),
+        required: false,
+        help: "Comma-separated CIDRs of proxies whose X-Forwarded-For is trusted, for example 10.0.0.0/8",
+    },
+    ConfigField {
         name: "DAYFLY_ALLOW_UNAUTHENTICATED",
         value: Some("false"),
         required: false,
         help: "Start a non-loopback bind with no bearer token",
+    },
+    ConfigField {
+        name: "DAYFLY_LIST_REQUIRES_TOKEN",
+        value: Some("false"),
+        required: false,
+        help: "Require the bearer token to list pastes",
+    },
+    ConfigField {
+        name: "DAYFLY_RATE_LIMIT_PER_MINUTE",
+        value: Some("0"),
+        required: false,
+        help: "Maximum requests per client per minute; 0 disables the limiter",
     },
     ConfigField {
         name: "DAYFLY_SHOW_WORDS",
@@ -340,6 +384,42 @@ where
             .ok_or_else(|| ConfigError::Invalid(name.to_string(), "expected true or false".into())),
         _ => Ok(default),
     }
+}
+
+/// Parse the trusted-proxy list.
+///
+/// An unset or empty value means no proxy is trusted, which keeps the
+/// socket peer as the client. Each entry is one CIDR block or one bare
+/// address.
+fn trusted_proxies<F>(lookup: &F) -> Result<Vec<Cidr>, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(value) = lookup("DAYFLY_TRUSTED_PROXIES") else {
+        return Ok(Vec::new());
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut proxies = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(ConfigError::Invalid(
+                "DAYFLY_TRUSTED_PROXIES".to_string(),
+                "expected a comma-separated list of CIDR blocks".to_string(),
+            ));
+        }
+        let cidr = part.parse::<Cidr>().map_err(|error| {
+            ConfigError::Invalid(
+                "DAYFLY_TRUSTED_PROXIES".to_string(),
+                format!("`{part}`: {error}"),
+            )
+        })?;
+        proxies.push(cidr);
+    }
+    Ok(proxies)
 }
 
 /// Read an S3 credential from a direct variable or from a file.
@@ -892,6 +972,7 @@ impl Config {
                 "DAYFLY_HTTP_BIND",
                 field_default("DAYFLY_HTTP_BIND").unwrap_or("127.0.0.1:8080"),
             ),
+            trusted_proxies: trusted_proxies(&lookup)?,
             show_words: optional_bool(
                 &lookup,
                 "DAYFLY_SHOW_WORDS",
@@ -906,6 +987,16 @@ impl Config {
                 &lookup,
                 "DAYFLY_ALLOW_UNAUTHENTICATED",
                 field_default("DAYFLY_ALLOW_UNAUTHENTICATED") == Some("true"),
+            )?,
+            list_requires_token: optional_bool(
+                &lookup,
+                "DAYFLY_LIST_REQUIRES_TOKEN",
+                field_default("DAYFLY_LIST_REQUIRES_TOKEN") == Some("true"),
+            )?,
+            rate_limit_per_minute: optional_u32(
+                &lookup,
+                "DAYFLY_RATE_LIMIT_PER_MINUTE",
+                field_u32("DAYFLY_RATE_LIMIT_PER_MINUTE", 0),
             )?,
             http_bearer_token: bearer_token(optional_credential(
                 &lookup,
@@ -952,7 +1043,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} show_words={} inline_pdf={} mcp_local_root={}",
+            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} show_words={} inline_pdf={} trusted_proxies={} list_requires_token={} rate_limit_per_minute={} mcp_local_root={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -967,6 +1058,9 @@ impl Config {
             self.default_ttl_days,
             self.show_words,
             self.inline_pdf,
+            self.trusted_proxies.len(),
+            self.list_requires_token,
+            self.rate_limit_per_minute,
             if self.mcp_local_root.is_some() {
                 "set"
             } else {
@@ -1293,9 +1387,12 @@ mod tests {
             alias_words: 3,
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
+            trusted_proxies: Vec::new(),
             show_words: true,
             inline_pdf: true,
             allow_unauthenticated: false,
+            list_requires_token: false,
+            rate_limit_per_minute: 0,
             http_bearer_token: None,
             mcp_local_root: None,
         }
@@ -1390,6 +1487,87 @@ mod tests {
     fn allow_unauthenticated_defaults_to_false() {
         let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
         assert!(!config.allow_unauthenticated);
+    }
+
+    #[test]
+    fn rate_limit_defaults_to_zero() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert_eq!(config.rate_limit_per_minute, 0);
+    }
+
+    #[test]
+    fn rate_limit_accepts_a_value() {
+        let mut pairs = base_env();
+        pairs.push((
+            "DAYFLY_RATE_LIMIT_PER_MINUTE".to_string(),
+            "120".to_string(),
+        ));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("rate limit config");
+        assert_eq!(config.rate_limit_per_minute, 120);
+    }
+
+    #[test]
+    fn trusted_proxies_default_to_empty() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert!(config.trusted_proxies.is_empty());
+    }
+
+    #[test]
+    fn trusted_proxies_accept_a_comma_separated_list() {
+        let mut pairs = base_env();
+        pairs.push((
+            "DAYFLY_TRUSTED_PROXIES".to_string(),
+            "10.0.0.0/8, 2001:db8::1".to_string(),
+        ));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("proxy list config");
+        let expected: Vec<Cidr> = vec![
+            "10.0.0.0/8".parse().expect("IPv4 CIDR"),
+            "2001:db8::1".parse().expect("IPv6 host"),
+        ];
+        assert_eq!(config.trusted_proxies, expected);
+    }
+
+    #[test]
+    fn an_empty_trusted_proxy_list_means_no_proxies() {
+        let mut pairs = base_env();
+        pairs.push(("DAYFLY_TRUSTED_PROXIES".to_string(), "   ".to_string()));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("empty proxy list");
+        assert!(config.trusted_proxies.is_empty());
+    }
+
+    #[test]
+    fn an_invalid_trusted_proxy_names_the_setting() {
+        let mut pairs = base_env();
+        pairs.push((
+            "DAYFLY_TRUSTED_PROXIES".to_string(),
+            "10.0.0.0/33".to_string(),
+        ));
+        let error = Config::from_lookup(lookup_from(&pairs))
+            .err()
+            .expect("an invalid prefix must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("DAYFLY_TRUSTED_PROXIES"),
+            "the error must name the setting: {message}"
+        );
+        assert!(
+            message.contains("10.0.0.0/33"),
+            "the error must name the entry: {message}"
+        );
+    }
+
+    #[test]
+    fn list_requires_token_defaults_to_false() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert!(!config.list_requires_token);
+    }
+
+    #[test]
+    fn list_requires_token_accepts_true() {
+        let mut pairs = base_env();
+        pairs.push(("DAYFLY_LIST_REQUIRES_TOKEN".to_string(), "true".to_string()));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("gated listing config");
+        assert!(config.list_requires_token);
     }
 
     #[test]
