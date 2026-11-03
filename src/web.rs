@@ -62,6 +62,7 @@ use crate::store::{
 /// #133e7c, border #0abdc6). Dark-only, no light-mode switch in v1.
 const CSS: &str = r#"
 body{font-family:"JetBrainsMono Nerd Font","JetBrains Mono",Hack,"Fira Code",ui-monospace,Menlo,Consolas,monospace;line-height:1.6;color:#e3e8fc;background:#091833;max-width:1200px;margin:0 auto;padding:20px}
+body.wide{max-width:1600px}
 header{padding-bottom:1rem;background:linear-gradient(to bottom,transparent 96%,transparent 100%)}
 header::after{content:"";display:block;height:2px;margin-top:1rem;background:linear-gradient(to right,#ea00d9,transparent)}
 nav{display:flex;gap:1rem;flex-wrap:wrap;align-items:center}
@@ -74,8 +75,8 @@ h2{font-size:1.3rem;text-transform:lowercase;color:#ea00d9;border-bottom:1px dot
 hr{border:none;border-top:1px dashed #0abdc6;margin:1.5rem 0;opacity:.6}
 a{color:#ea00d9;text-decoration:none}
 a:hover{text-decoration:underline;text-shadow:0 0 8px rgba(234,0,217,.8)}
-table{border-collapse:collapse;width:100%} th,td{text-align:left;padding:.4rem .5rem;border:1px dashed #0abdc6;vertical-align:top}
-.content-type-cell{display:block;max-width:9rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+table{border-collapse:collapse;width:100%} th,td{text-align:left;padding:.35rem .4rem;border:1px dashed #0abdc6;vertical-align:top}
+.content-type-cell{display:block;max-width:8rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .table-wrap{overflow-x:auto}
 .filename-cell{white-space:nowrap}
 th:first-child,td:first-child{white-space:nowrap}
@@ -243,8 +244,13 @@ fn page(title: &str, active: Option<&str>, body: &str) -> Html<String> {
     } else {
         format!("<h1>{title}</h1>\n")
     };
+    let body_class = if active == Some("/pastes") {
+        " class=\"wide\""
+    } else {
+        ""
+    };
     Html(format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title} — dayfly</title>\n<style>{CSS}</style>\n</head>\n<body>\n<header><nav><span class=\"prompt\">~/dayfly $</span>{nav}</nav></header>\n{heading}{body}\n<footer>dayfly — internal use only · &copy; 2026 suorcd</footer>\n</body>\n</html>\n"
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title} — dayfly</title>\n<style>{CSS}</style>\n</head>\n<body{body_class}>\n<header><nav><span class=\"prompt\">~/dayfly $</span>{nav}</nav></header>\n{heading}{body}\n<footer>dayfly — internal use only · &copy; 2026 suorcd</footer>\n</body>\n</html>\n"
     ))
 }
 
