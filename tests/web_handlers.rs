@@ -128,6 +128,10 @@ async fn index_page_renders_the_combined_form_and_the_default_ttl() {
         !page.contains("<h1>New paste</h1>"),
         "the page title must not repeat the nav link: {page}"
     );
+    assert!(
+        !page.contains("<h2>Paste or upload</h2>"),
+        "the form must not repeat a section heading: {page}"
+    );
 }
 
 #[tokio::test]

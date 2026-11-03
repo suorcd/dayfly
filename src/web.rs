@@ -416,8 +416,7 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
     let max_file_bytes = store.config.max_file_paste_bytes();
     let max_file_human = human_size(max_file_bytes);
     let mut body = format!(
-        r#"<h2>Paste or upload</h2>
-<form method="post" action="/ui/create" enctype="multipart/form-data" data-max-file-bytes="{max_file_bytes}">
+        r#"<form method="post" action="/ui/create" enctype="multipart/form-data" data-max-file-bytes="{max_file_bytes}">
 <p><label>Text<br><textarea name="text" id="text"></textarea></label></p>
 <div class="form-row">
 <p><label>Keep for <select name="ttl_days">{}</select></label></p>
