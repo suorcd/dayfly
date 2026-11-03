@@ -82,7 +82,7 @@ table{border-collapse:collapse;width:auto;table-layout:fixed} th,td{text-align:l
 .col-size{width:11ch}
 .col-created{width:22ch}
 .col-ttl{width:5ch}
-.col-action{width:9ch}
+.col-action{width:12ch}
 .content-type-cell{display:block;max-width:calc(8rem - 1ch);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .size-cell{text-align:right;white-space:nowrap}
 .size-unit{display:inline-block;min-width:3ch;text-align:left;margin-left:.4ch}
@@ -97,7 +97,8 @@ th:first-child,td:first-child{white-space:nowrap}
 td:first-child{overflow:hidden;text-overflow:ellipsis}
 th:nth-child(4),td:nth-child(4){white-space:nowrap}
 th:nth-child(5),td:nth-child(5){white-space:nowrap}
-th:nth-child(6),td:nth-child(6){white-space:nowrap}
+th:nth-child(6),td:nth-child(6){text-align:center;white-space:nowrap}
+th:nth-child(7),td:nth-child(7){text-align:center}
 th{color:#ea00d9}
 .card,form{background:rgba(19,62,124,.35);border:1px dashed #0abdc6;border-radius:8px;padding:1rem;backdrop-filter:blur(4px)}
 details{background:rgba(19,62,124,.35);border:1px dashed #0abdc6;border-radius:8px;padding:.5rem 1rem;margin-bottom:1rem}
