@@ -89,7 +89,12 @@ table{border-collapse:collapse;width:auto;table-layout:fixed} th,td{text-align:l
 th:nth-child(4){text-align:center}
 .ttl-header{cursor:help;text-decoration:underline dotted;text-underline-offset:.25rem}
 .hint{color:#0abdc6;cursor:help;text-decoration:underline dotted;text-underline-offset:.25rem;font-size:.95rem}
-.view-actions{display:flex;flex-wrap:wrap;gap:.5rem;margin-bottom:1rem}
+.view-bar{display:grid;grid-template-columns:1fr auto;align-items:center;gap:.5rem;margin-bottom:1rem}
+.view-actions{display:flex;flex-wrap:wrap;gap:.5rem}
+.view-bar .metadata{border:0;background:none;padding:0;margin:0;border-radius:0;backdrop-filter:none}
+.metadata[open]{grid-column:1/-1}
+.metadata summary{text-align:right}
+.metadata-body{margin-top:.5rem;padding:1rem;border:1px dashed #0abdc6;border-radius:8px;background:rgba(19,62,124,.35)}
 .content-box{position:relative}
 .content-box pre{margin:0;padding-right:6rem}
 .copy-content{position:absolute;top:.5rem;right:.5rem}
@@ -1258,15 +1263,18 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
     let target_esc = html_escape(display_name);
     let download_name = html_escape(meta.filename.as_deref().unwrap_or(display_name));
     let mut body = format!(
-        "<div class=\"view-actions\">\
+        "<div class=\"view-bar\">\
+         <div class=\"view-actions\">\
          <a class=\"button\" href=\"/v1/pastes/{target_esc}\" download=\"{download_name}\">Download</a>\
          <a class=\"button\" href=\"/raw/{target_esc}\">Raw</a>\
          <button type=\"button\" class=\"copy-link\" data-copy=\"/view/{target_esc}\" hidden>Copy link</button>\
          </div>\
-         <details><summary>Metadata &amp; delete</summary>\
+         <details class=\"metadata\"><summary>Metadata &amp; delete</summary>\
+         <div class=\"metadata-body\">\
          <p>Filename: {}</p><p>Content-Type: {}</p><p>Size: {}</p><p>Created: {}</p><p>Expires: {} ({})</p>\
          <form method=\"post\" action=\"/ui/delete\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\"><button type=\"submit\">Delete this paste</button></form>\
-         </details>",
+         </div></details>\
+         </div>",
         html_escape(meta.filename.as_deref().unwrap_or("—")),
         html_escape(&meta.content_type),
         human_size(meta.size),

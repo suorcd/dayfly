@@ -1002,13 +1002,19 @@ async fn view_page_renders_text_escaped_and_images_inline() {
         !page.contains("Download / raw:"),
         "the old raw link line must be gone: {page}"
     );
-    assert!(page.contains("<details><summary>Metadata &amp; delete</summary>"));
+    assert!(
+        page.contains(
+            "<details class=\"metadata\"><summary>Metadata &amp; delete</summary>\
+             <div class=\"metadata-body\">"
+        ),
+        "the metadata block must be a borderless toggle with a body box: {page}"
+    );
     assert!(page.contains("Delete this paste"));
     let actions_at = page
         .find("class=\"view-actions\"")
         .expect("the action row must render");
     let details_at = page
-        .find("<details>")
+        .find("<details class=\"metadata\">")
         .expect("the metadata details must render");
     let pre_at = page.find("<pre>").expect("the paste text must render");
     assert!(

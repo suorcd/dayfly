@@ -1069,13 +1069,14 @@ comments.
   direction and keeps the date filters. A missing created or expiry
   value sorts last in both directions.
 - `GET /view/<id>` — one paste: the alias as the page heading, then
-  Download, Raw, and Copy link actions, then the metadata and delete
-  form in a collapsed `<details>` block, then the content: text in
-  `<pre>` (capped at 1 MiB for the page; the raw route and the API
-  return the full paste) with a Copy button inside the box, including
-  the escaped source of HTML and SVG, safe images inline, other types
-  via the raw link. The Copy and Copy link buttons appear only when
-  JavaScript runs.
+  Download, Raw, and Copy link actions, with a right-aligned Metadata &
+  delete toggle on the same row. The toggle opens a full-width box with
+  the metadata and the delete form. Then the content: text in `<pre>`
+  (capped at 1 MiB for the page; the raw route and the API return the
+  full paste) with a Copy button inside the box, including the escaped
+  source of HTML and SVG, safe images inline, other types via the raw
+  link. The Copy and Copy link buttons appear only when JavaScript
+  runs.
 - `GET /raw/<id>` — the unformatted bytes. Markup types (`text/html`,
   `application/xhtml+xml`, `image/svg+xml`, and XML) and unknown
   binary types are served as `text/plain` and open inline. Other types
