@@ -157,6 +157,32 @@ fn metadata_json(meta: PasteMetadata) -> serde_json::Value {
     })
 }
 
+/// Check the paste token for an MCP delete or set_ttl call.
+///
+/// When a bearer token is configured, the HTTP transport already checked
+/// it, and the stdio transport is trusted. When no bearer is configured
+/// and paste tokens are on, the call must carry the token for the paste.
+async fn check_paste_token(
+    store: &Store,
+    id: &str,
+    token: Option<&str>,
+) -> Result<(), CallToolResult> {
+    if !store.config.paste_tokens || store.config.http_bearer_token.is_some() {
+        return Ok(());
+    }
+    let ok = match token {
+        Some(token) => store.verify_paste_token(id, token).await,
+        None => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(CallToolResult::error(vec![ContentBlock::text(
+            "unauthorized: a valid paste token is required",
+        )]))
+    }
+}
+
 /// Map a store error to the value that a tool method returns.
 ///
 /// A routine domain result is a tool result with `isError` set, so a
@@ -268,6 +294,9 @@ pub struct SetTtlParams {
     /// New TTL in whole days, for example 7. Do not set both `ttl` and
     /// `ttl_days`.
     pub ttl_days: Option<u32>,
+    /// Paste management token, when DAYFLY_PASTE_TOKENS is on and no
+    /// bearer token is configured.
+    pub paste_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -292,6 +321,15 @@ pub struct FetchFileParams {
 pub struct IdParams {
     /// Full or bare paste ID, or a word alias.
     pub id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteParams {
+    /// Full or bare paste ID, or a word alias.
+    pub id: String,
+    /// Paste management token, when DAYFLY_PASTE_TOKENS is on and no
+    /// bearer token is configured.
+    pub paste_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -350,7 +388,7 @@ impl Pastebin {
     }
 
     #[tool(
-        description = "Store a text paste in Garage (S3). Returns id, url path, size, sha256, content_type, detection_source, detection_conflict, and expiry. Set ttl to seconds or a duration such as 1h or 1h30m. A bare integer is seconds; use 7d for seven days. Do not set ttl and ttl_days together."
+        description = "Store a text paste in Garage (S3). Returns id, url path, size, sha256, content_type, detection_source, detection_conflict, expiry, and the paste token when enabled. Set ttl to seconds or a duration such as 1h or 1h30m. A bare integer is seconds; use 7d for seven days. Do not set ttl and ttl_days together."
     )]
     async fn store_text(
         &self,
@@ -367,7 +405,7 @@ impl Pastebin {
                 )
                 .await
         );
-        result_json(serde_json::json!({
+        let mut value = serde_json::json!({
             "id": stored.id,
             "key": stored.key,
             "words": stored.words,
@@ -378,11 +416,15 @@ impl Pastebin {
             "detection_source": stored.detection_source,
             "detection_conflict": stored.detection_conflict,
             "expires_at": stored.expires_at.to_rfc3339(),
-        }))
+        });
+        if let Some(token) = stored.paste_token {
+            value["paste_token"] = serde_json::Value::String(token);
+        }
+        result_json(value)
     }
 
     #[tool(
-        description = "Store a local file in Garage (S3), using multipart upload for large files. Returns id, size, sha256, content_type, detection_source, and expiry. Set ttl to seconds or a duration such as 1h or 1h30m. A bare integer is seconds; use 7d for seven days. Do not set ttl and ttl_days together."
+        description = "Store a local file in Garage (S3), using multipart upload for large files. Returns id, size, sha256, content_type, detection_source, expiry, and the paste token when enabled. Set ttl to seconds or a duration such as 1h or 1h30m. A bare integer is seconds; use 7d for seven days. Do not set ttl and ttl_days together."
     )]
     async fn store_file(
         &self,
@@ -403,7 +445,7 @@ impl Pastebin {
                 )
                 .await
         );
-        result_json(serde_json::json!({
+        let mut value = serde_json::json!({
             "id": stored.id,
             "key": stored.key,
             "words": stored.words,
@@ -414,7 +456,11 @@ impl Pastebin {
             "detection_source": stored.detection_source,
             "detection_conflict": stored.detection_conflict,
             "expires_at": stored.expires_at.to_rfc3339(),
-        }))
+        });
+        if let Some(token) = stored.paste_token {
+            value["paste_token"] = serde_json::Value::String(token);
+        }
+        result_json(value)
     }
 
     #[tool(
@@ -446,7 +492,7 @@ impl Pastebin {
     }
 
     #[tool(
-        description = "Change the expiry of an existing paste, its segments, and its alias. Use ttl for seconds or a duration such as 1h or 1h30m, or ttl_days for whole days. Do not set both. An expired paste is rejected. Returns the same metadata as fetch_metadata."
+        description = "Change the expiry of an existing paste, its segments, and its alias. Use ttl for seconds or a duration such as 1h or 1h30m, or ttl_days for whole days. Do not set both. Set paste_token when DAYFLY_PASTE_TOKENS is on and no bearer token is configured. An expired paste is rejected. Returns the same metadata as fetch_metadata."
     )]
     async fn set_ttl(
         &self,
@@ -454,7 +500,13 @@ impl Pastebin {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let ttl = resolve_ttl(params.ttl.as_deref(), params.ttl_days)?
             .ok_or_else(|| invalid_ttl("set_ttl requires ttl or ttl_days"))?;
-        let meta = try_store!(self.current_store().set_ttl(&params.id, ttl).await);
+        let store = self.current_store();
+        if let Err(result) =
+            check_paste_token(&store, &params.id, params.paste_token.as_deref()).await
+        {
+            return Ok(result);
+        }
+        let meta = try_store!(store.set_ttl(&params.id, ttl).await);
         result_json(metadata_json(meta))
     }
 
@@ -534,12 +586,20 @@ impl Pastebin {
         result_json(metadata_json(meta))
     }
 
-    #[tool(description = "Delete a paste by id or word alias.")]
+    #[tool(
+        description = "Delete a paste by id or word alias. Set paste_token when DAYFLY_PASTE_TOKENS is on and no bearer token is configured."
+    )]
     async fn delete_paste(
         &self,
-        Parameters(params): Parameters<IdParams>,
+        Parameters(params): Parameters<DeleteParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        try_store!(self.current_store().delete(&params.id).await);
+        let store = self.current_store();
+        if let Err(result) =
+            check_paste_token(&store, &params.id, params.paste_token.as_deref()).await
+        {
+            return Ok(result);
+        }
+        try_store!(store.delete(&params.id).await);
         result_json(serde_json::json!({"deleted": params.id}))
     }
 

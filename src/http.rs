@@ -146,12 +146,51 @@ pub(crate) fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Re
     if ok {
         Ok(())
     } else {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "unauthorized"})),
-        )
-            .into_response())
+        Err(unauthorized_response())
     }
+}
+
+fn unauthorized_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({"error": "unauthorized"})),
+    )
+        .into_response()
+}
+
+/// Check whether a request may delete a paste or change its expiry.
+///
+/// With `DAYFLY_PASTE_TOKENS` off this is exactly [`check_auth`], so the
+/// current behavior is unchanged. With it on, a valid bearer token still
+/// allows the request. Without one, the request must carry the paste
+/// token for this paste. A paste without a stored token can only be
+/// changed with the bearer token.
+// The error carries the shared auth response unchanged.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn check_paste_control(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    paste_token: Option<&str>,
+) -> Result<(), Response> {
+    let store = state.store();
+    if store.config.http_bearer_token.is_some() && check_auth(state, headers).is_ok() {
+        return Ok(());
+    }
+    if store.config.paste_tokens {
+        let ok = match paste_token {
+            Some(token) => store.verify_paste_token(id, token).await,
+            None => false,
+        };
+        if ok {
+            return Ok(());
+        }
+        if paste_token.is_some() {
+            tracing::warn!(id = %id, "paste token check failed");
+        }
+        return Err(unauthorized_response());
+    }
+    check_auth(state, headers)
 }
 
 /// Why a listing request was refused.
@@ -304,6 +343,8 @@ struct UploadEnvelope {
     filename: Option<String>,
     detection_source: Option<String>,
     detection_conflict: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paste_token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -469,12 +510,21 @@ fn upload_response(
                 filename: stored.filename.clone(),
                 detection_source: stored.detection_source.clone(),
                 detection_conflict: stored.detection_conflict.clone(),
+                paste_token: stored.paste_token.clone(),
             }),
         )
             .into_response()
     } else {
-        // Plain-text URL only, so `url=$(curl ...)` works.
-        (StatusCode::CREATED, format!("{url}\n")).into_response()
+        // Plain-text URL only, so `url=$(curl ...)` works. The token is
+        // a header, so the body stays a single URL.
+        let mut response = (StatusCode::CREATED, format!("{url}\n")).into_response();
+        if let Some(token) = &stored.paste_token {
+            response.headers_mut().insert(
+                HeaderName::from_static("x-paste-token"),
+                HeaderValue::from_str(token).expect("a hex token is a valid header value"),
+            );
+        }
+        response
     }
 }
 
@@ -940,7 +990,8 @@ async fn set_ttl_inner(
     id: &str,
     query: &HashMap<String, String>,
 ) -> Response {
-    if let Err(resp) = check_auth(state, headers) {
+    let paste_token = header_str(headers, "x-paste-token");
+    if let Err(resp) = check_paste_control(state, headers, id, paste_token.as_deref()).await {
         return resp;
     }
     if !api_write_allowed(headers) {
@@ -966,13 +1017,15 @@ async fn delete_dated(
     headers: HeaderMap,
     Path((date, random)): Path<(String, String)>,
 ) -> Response {
-    if let Err(resp) = check_auth(&state, &headers) {
+    let id = format!("{date}/{random}");
+    let paste_token = header_str(&headers, "x-paste-token");
+    if let Err(resp) = check_paste_control(&state, &headers, &id, paste_token.as_deref()).await {
         return resp;
     }
     if !api_write_allowed(&headers) {
         return forbidden_write();
     }
-    match state.store().delete(&format!("{date}/{random}")).await {
+    match state.store().delete(&id).await {
         Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
         Err(e) => error_response(e),
     }
@@ -983,7 +1036,9 @@ async fn delete_bare(
     headers: HeaderMap,
     Path(random): Path<String>,
 ) -> Response {
-    if let Err(resp) = check_auth(&state, &headers) {
+    let paste_token = header_str(&headers, "x-paste-token");
+    if let Err(resp) = check_paste_control(&state, &headers, &random, paste_token.as_deref()).await
+    {
         return resp;
     }
     if !api_write_allowed(&headers) {
@@ -995,7 +1050,7 @@ async fn delete_bare(
     }
 }
 
-/// Resolve the client address once, then log a failed bearer check.
+/// Resolve the client address once, then log a failed auth check.
 ///
 /// The socket peer is the client unless it is a listed trusted proxy; in
 /// that case `X-Forwarded-For` is walked from the right. The resolved
@@ -1041,7 +1096,7 @@ async fn client_context(
     let path = request.uri().path().to_string();
     let response = next.run(request).await;
     if response.status() == StatusCode::UNAUTHORIZED {
-        tracing::warn!(%method, %path, client = ?client, "bearer check failed");
+        tracing::warn!(%method, %path, client = ?client, "auth check failed");
     }
     response
 }
@@ -1319,6 +1374,7 @@ async fn service_description(State(state): State<AppState>) -> Response {
         } else {
             "none"
         },
+        "paste_tokens": config.paste_tokens,
         "limits": {
             "max_text_bytes": config.max_text_bytes,
             "max_file_bytes": config.max_file_bytes,
@@ -1418,6 +1474,7 @@ mod tests {
             inline_pdf: true,
             allow_unauthenticated: false,
             list_requires_token: false,
+            paste_tokens: false,
             rate_limit_per_minute: 0,
             http_bearer_token: None,
             mcp_local_root: None,

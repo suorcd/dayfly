@@ -216,6 +216,7 @@ impl FakeS3 {
             inline_pdf: true,
             allow_unauthenticated: false,
             list_requires_token: false,
+            paste_tokens: false,
             rate_limit_per_minute: 0,
             http_bearer_token: None,
             mcp_local_root: None,
@@ -234,6 +235,18 @@ impl FakeS3 {
         Store::from_config(self.config())
             .await
             .expect("fake S3 config must build without network access")
+    }
+
+    pub fn config_with_paste_tokens(&self) -> Config {
+        let mut config = self.config();
+        config.paste_tokens = true;
+        config
+    }
+
+    pub async fn store_with_paste_tokens(&self) -> Store {
+        Store::from_config(self.config_with_paste_tokens())
+            .await
+            .expect("fake S3 config with paste tokens must build without network access")
     }
 
     pub async fn store_with_retention(

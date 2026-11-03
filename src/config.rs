@@ -112,6 +112,14 @@ pub struct Config {
     /// With no token configured, both routes refuse: there is nothing to
     /// check against, and an open list is what this setting prevents.
     pub list_requires_token: bool,
+    /// Whether a new paste gets a management token.
+    ///
+    /// Default: `false`. When this is `true`, creation returns a random
+    /// token once. Only its SHA-256 is stored. The token authorizes
+    /// `DELETE` and `PATCH` for that paste, as an alternative to the
+    /// bearer token. The bearer token remains a universal key. An append
+    /// does not accept the paste token.
+    pub paste_tokens: bool,
     /// Maximum requests per client per minute. Zero disables the limiter.
     ///
     /// Default: `0`. The limit is a token bucket per resolved client
@@ -265,6 +273,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("false"),
         required: false,
         help: "Require the bearer token to list pastes",
+    },
+    ConfigField {
+        name: "DAYFLY_PASTE_TOKENS",
+        value: Some("false"),
+        required: false,
+        help: "Return a per-paste management token at creation",
     },
     ConfigField {
         name: "DAYFLY_RATE_LIMIT_PER_MINUTE",
@@ -1063,6 +1077,11 @@ impl Config {
                 "DAYFLY_LIST_REQUIRES_TOKEN",
                 field_default("DAYFLY_LIST_REQUIRES_TOKEN") == Some("true"),
             )?,
+            paste_tokens: optional_bool(
+                &lookup,
+                "DAYFLY_PASTE_TOKENS",
+                field_default("DAYFLY_PASTE_TOKENS") == Some("true"),
+            )?,
             rate_limit_per_minute: optional_u32(
                 &lookup,
                 "DAYFLY_RATE_LIMIT_PER_MINUTE",
@@ -1134,7 +1153,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} inline_pdf={} trusted_proxies={} list_requires_token={} rate_limit_per_minute={} mcp_local_root={}",
+            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} inline_pdf={} trusted_proxies={} list_requires_token={} paste_tokens={} rate_limit_per_minute={} mcp_local_root={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -1154,6 +1173,7 @@ impl Config {
             self.inline_pdf,
             self.trusted_proxies.len(),
             self.list_requires_token,
+            self.paste_tokens,
             self.rate_limit_per_minute,
             if self.mcp_local_root.is_some() {
                 "set"
@@ -1489,6 +1509,7 @@ mod tests {
             inline_pdf: true,
             allow_unauthenticated: false,
             list_requires_token: false,
+            paste_tokens: false,
             rate_limit_per_minute: 0,
             http_bearer_token: None,
             mcp_local_root: None,
@@ -1742,6 +1763,20 @@ mod tests {
         pairs.push(("DAYFLY_LIST_REQUIRES_TOKEN".to_string(), "true".to_string()));
         let config = Config::from_lookup(lookup_from(&pairs)).expect("gated listing config");
         assert!(config.list_requires_token);
+    }
+
+    #[test]
+    fn paste_tokens_default_to_false() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert!(!config.paste_tokens);
+    }
+
+    #[test]
+    fn paste_tokens_accept_true() {
+        let mut pairs = base_env();
+        pairs.push(("DAYFLY_PASTE_TOKENS".to_string(), "true".to_string()));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("token config");
+        assert!(config.paste_tokens);
     }
 
     #[test]

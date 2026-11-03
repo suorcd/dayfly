@@ -672,3 +672,71 @@ fn set_ttl_updates_expiry_and_keeps_alias() {
     assert_eq!(meta["expires_at"], updated["expires_at"]);
     assert_eq!(meta["words"], updated["words"]);
 }
+
+#[test]
+fn paste_tokens_work_through_mcp_store_metadata_delete_and_set_ttl() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let mut client = McpClient::spawn(&fake, &[("DAYFLY_PASTE_TOKENS", "true")]);
+
+    let stored = client
+        .call_tool("store_text", json!({"text": "mcp token"}))
+        .expect("store_text must succeed");
+    let token = stored["paste_token"]
+        .as_str()
+        .expect("store_text must return the token")
+        .to_string();
+    assert_eq!(token.len(), 32);
+    let id = stored["id"]
+        .as_str()
+        .expect("id must be a string")
+        .to_string();
+    let key = stored["key"]
+        .as_str()
+        .expect("key must be a string")
+        .to_string();
+
+    let meta = client
+        .call_tool("fetch_metadata", json!({"id": &id}))
+        .expect("fetch_metadata must succeed");
+    assert!(
+        meta.get("paste_token").is_none(),
+        "fetch_metadata must not return the token: {meta}"
+    );
+    assert!(
+        !meta.to_string().contains(&token),
+        "fetch_metadata must not leak the token"
+    );
+    assert!(
+        !meta.to_string().contains("paste-token-sha256"),
+        "fetch_metadata must not leak the hash"
+    );
+
+    let error = client
+        .call_tool("delete_paste", json!({"id": &id}))
+        .expect_err("delete_paste must require the token");
+    assert_tool_error(error, "unauthorized");
+    assert!(
+        fake.object(&key).is_some(),
+        "a refused delete must keep the object"
+    );
+
+    let error = client
+        .call_tool("set_ttl", json!({"id": &id, "ttl": "1h"}))
+        .expect_err("set_ttl must require the token");
+    assert_tool_error(error, "unauthorized");
+
+    let extended = client
+        .call_tool(
+            "set_ttl",
+            json!({"id": &id, "ttl": "1h", "paste_token": &token}),
+        )
+        .expect("set_ttl with the token must succeed");
+    assert_eq!(extended["id"], id);
+
+    let deleted = client
+        .call_tool("delete_paste", json!({"id": &id, "paste_token": &token}))
+        .expect("delete_paste with the token must succeed");
+    assert_eq!(deleted["deleted"], id);
+    assert!(fake.object(&key).is_none());
+}

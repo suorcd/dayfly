@@ -2528,6 +2528,7 @@ async fn well_known_service_description_reports_live_limits_without_auth() {
     assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(json["mcp_endpoint"], "/mcp");
     assert_eq!(json["auth"], "bearer");
+    assert_eq!(json["paste_tokens"], false);
     assert_eq!(json["limits"]["max_text_bytes"], 1_234);
     assert_eq!(json["limits"]["max_file_bytes"], 5_678);
     assert_eq!(json["limits"]["max_paste_bytes"], 1024 * 1024 * 1024);
@@ -2543,4 +2544,308 @@ async fn well_known_service_description_reports_live_limits_without_auth() {
     assert!(routes
         .iter()
         .any(|route| { route["method"] == "GET" && route["path"] == "/.well-known/dayfly.json" }));
+}
+
+#[tokio::test]
+async fn paste_tokens_authorize_delete_and_patch_without_a_bearer() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.paste_tokens = true;
+    let store = Store::from_config(config)
+        .await
+        .expect("the token store must build");
+    let first = store
+        .store_text(b"first", None, None, None)
+        .await
+        .expect("the first paste must store");
+    let second = store
+        .store_text(b"second", None, None, None)
+        .await
+        .expect("the second paste must store");
+    let third = store
+        .store_text(b"third", None, None, None)
+        .await
+        .expect("the third paste must store");
+    let first_token = first.paste_token.clone().expect("the first token");
+    let second_token = second.paste_token.clone().expect("the second token");
+    let third_token = third.paste_token.clone().expect("the third token");
+    let second_key = second.key.clone();
+    let app = common::app(store);
+
+    let request = common::request(
+        "DELETE",
+        &format!("/v1/pastes/{}", second.id),
+        &[("x-paste-token", "0".repeat(32))],
+        Vec::new(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(
+        fake.object(&second_key).is_some(),
+        "a wrong token must keep the paste"
+    );
+
+    let request = common::request(
+        "DELETE",
+        &format!("/v1/pastes/{}", second.id),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(
+        fake.object(&second_key).is_some(),
+        "a missing token must keep the paste"
+    );
+
+    let request = common::request(
+        "PATCH",
+        &format!("/v1/pastes/{}", second.id),
+        &[
+            ("x-ttl", "1h".to_string()),
+            ("x-paste-token", third_token.clone()),
+        ],
+        Vec::new(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a token for another paste must not change the expiry"
+    );
+
+    let request = common::request(
+        "PATCH",
+        &format!("/v1/pastes/{}", second.id),
+        &[("x-ttl", "1h".to_string()), ("x-paste-token", second_token)],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let json = common::json_body(&body);
+    let seconds = expires_in_seconds(json["expires_at"].as_str().unwrap());
+    assert!(
+        (3_500..=3_700).contains(&seconds),
+        "the token must allow a one-hour expiry, got {seconds}"
+    );
+
+    let request = common::request(
+        "DELETE",
+        &format!("/v1/pastes/{}", first.id),
+        &[("x-paste-token", first_token)],
+        Vec::new(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        fake.object(&first.key).is_none(),
+        "the correct token must delete the paste"
+    );
+}
+
+#[tokio::test]
+async fn a_paste_token_is_absent_from_upload_and_meta_responses_when_off() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let app = common::app(store);
+
+    let body = b"off json".to_vec();
+    let request = common::request(
+        "POST",
+        "/upload?format=json",
+        &[content_length(body.len())],
+        body,
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let json = common::json_body(&body);
+    assert!(
+        json.get("paste_token").is_none(),
+        "the default response must omit the token: {json}"
+    );
+
+    let body = b"off plain".to_vec();
+    let request = common::request("POST", "/upload", &[content_length(body.len())], body);
+    let (status, headers, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(
+        !headers.contains_key("x-paste-token"),
+        "the default plain response must omit the token header"
+    );
+}
+
+#[tokio::test]
+async fn a_paste_token_appears_once_in_json_and_plain_upload_responses() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_paste_tokens().await;
+    let app = common::app(store);
+
+    let body = b"token json".to_vec();
+    let request = common::request(
+        "POST",
+        "/upload?format=json",
+        &[content_length(body.len())],
+        body,
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let json = common::json_body(&body);
+    let token = json["paste_token"]
+        .as_str()
+        .expect("the JSON response must carry the token")
+        .to_string();
+    assert_eq!(token.len(), 32);
+    let id = json["id"].as_str().expect("the id must be a string");
+
+    let request = common::request("GET", &format!("/v1/pastes/{id}/meta"), &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let meta = common::json_body(&body);
+    assert!(
+        meta.get("paste_token").is_none(),
+        "the meta response must not return the token: {meta}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&body).contains(&token),
+        "the meta response must not leak the token"
+    );
+    assert!(
+        !String::from_utf8_lossy(&body).contains("paste-token-sha256"),
+        "the meta response must not leak the hash"
+    );
+
+    let body = b"token plain".to_vec();
+    let request = common::request("POST", "/upload", &[content_length(body.len())], body);
+    let (status, headers, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let plain_token = headers
+        .get("x-paste-token")
+        .and_then(|value| value.to_str().ok())
+        .expect("the plain response must carry the token header")
+        .to_string();
+    assert_eq!(plain_token.len(), 32);
+    let plain_id = id_from_plain_url(&body);
+
+    let request = common::request(
+        "DELETE",
+        &format!("/v1/pastes/{plain_id}"),
+        &[("x-paste-token", plain_token)],
+        Vec::new(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let request = common::request(
+        "DELETE",
+        &format!("/v1/pastes/{id}"),
+        &[("x-paste-token", token)],
+        Vec::new(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn a_bearer_token_stays_universal_and_append_stays_bearer_only() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.paste_tokens = true;
+    config.http_bearer_token = Some("secret".to_string());
+    let store = Store::from_config(config)
+        .await
+        .expect("the bearer and token store must build");
+    let bearer_paste = store
+        .store_text(b"bearer", None, None, None)
+        .await
+        .expect("the bearer paste must store");
+    let token_paste = store
+        .store_text(b"token", None, None, None)
+        .await
+        .expect("the token paste must store");
+    let token = token_paste.paste_token.clone().expect("the paste token");
+    let app = common::app(store);
+
+    let request = common::request(
+        "POST",
+        &format!("/v1/pastes/{}/append", token_paste.id),
+        &[
+            ("authorization", "Bearer secret".to_string()),
+            ("content-length", "1".to_string()),
+        ],
+        b"x".to_vec(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let request = common::request(
+        "POST",
+        &format!("/v1/pastes/{}/append", token_paste.id),
+        &[
+            ("x-paste-token", token.clone()),
+            ("content-length", "1".to_string()),
+        ],
+        b"y".to_vec(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "an append must not accept the paste token"
+    );
+
+    let request = common::request(
+        "DELETE",
+        &format!("/v1/pastes/{}", bearer_paste.id),
+        &[("authorization", "Bearer secret".to_string())],
+        Vec::new(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let request = common::request(
+        "DELETE",
+        &format!("/v1/pastes/{}", token_paste.id),
+        &[("x-paste-token", token)],
+        Vec::new(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn the_human_delete_form_does_not_bypass_paste_tokens() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.paste_tokens = true;
+    let store = Store::from_config(config)
+        .await
+        .expect("the token store must build");
+    let stored = store
+        .store_text(b"ui delete", None, None, None)
+        .await
+        .expect("the paste must store");
+    let key = stored.key.clone();
+    let app = common::app(store);
+
+    let body = format!("id={}", stored.id).into_bytes();
+    let request = common::request(
+        "POST",
+        "/ui/delete",
+        &[
+            (
+                "content-type",
+                "application/x-www-form-urlencoded".to_string(),
+            ),
+            ("host", "localhost".to_string()),
+            ("origin", "http://localhost".to_string()),
+            content_length(body.len()),
+        ],
+        body,
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(
+        fake.object(&key).is_some(),
+        "the UI must not delete without a token"
+    );
 }

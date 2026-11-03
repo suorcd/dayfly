@@ -49,8 +49,8 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::http::{
-    check_auth, check_list_access, read_metadata_field, status_for, AppState, ListAccessError,
-    MultipartFieldError, MULTIPART_METADATA_MAX_BYTES,
+    check_auth, check_list_access, check_paste_control, read_metadata_field, status_for, AppState,
+    ListAccessError, MultipartFieldError, MULTIPART_METADATA_MAX_BYTES,
 };
 use crate::store::{
     parse_list_window_request, ListWindowRequest, PasteSummary, Store, StoreError, StoredPaste, Ttl,
@@ -969,6 +969,7 @@ async fn list_handler(
 #[derive(Debug, Deserialize)]
 struct DeleteForm {
     id: String,
+    paste_token: Option<String>,
 }
 
 async fn delete_submit_handler(
@@ -976,7 +977,9 @@ async fn delete_submit_handler(
     headers: HeaderMap,
     Form(form): Form<DeleteForm>,
 ) -> Response {
-    if let Err(resp) = check_auth(&state, &headers) {
+    if let Err(resp) =
+        check_paste_control(&state, &headers, &form.id, form.paste_token.as_deref()).await
+    {
         return resp;
     }
     if !same_origin_allowed(&headers) {
@@ -1179,6 +1182,7 @@ mod tests {
             inline_pdf: true,
             allow_unauthenticated: false,
             list_requires_token: false,
+            paste_tokens: false,
             rate_limit_per_minute: 0,
             http_bearer_token: None,
             mcp_local_root: None,

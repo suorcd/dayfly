@@ -35,6 +35,7 @@ fn command() -> Command {
         "DAYFLY_HTTP_BIND",
         "DAYFLY_TRUSTED_PROXIES",
         "DAYFLY_LIST_REQUIRES_TOKEN",
+        "DAYFLY_PASTE_TOKENS",
         "DAYFLY_RATE_LIMIT_PER_MINUTE",
         "DAYFLY_SHOW_WORDS",
         "DAYFLY_INLINE_PDF",
