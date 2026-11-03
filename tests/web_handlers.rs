@@ -1001,7 +1001,10 @@ async fn view_page_renders_text_escaped_and_images_inline() {
     assert_eq!(status, StatusCode::OK);
     let page = html_text(&body);
     assert!(!page.contains("<img"));
-    assert!(!page.contains("<pre>"));
+    assert!(
+        page.contains("<pre>&lt;html&gt;body&lt;/html&gt;</pre>"),
+        "html source must render escaped in the view: {page}"
+    );
     assert!(page.contains(&format!("/raw/{}", html.id)));
 
     let request = common::request(
@@ -1059,8 +1062,18 @@ async fn raw_route_returns_the_unformatted_bytes() {
         .store_text(body, None, None, None)
         .await
         .expect("text must store");
+    let html = store
+        .store_text(
+            b"<html>raw</html>",
+            Some("page.html"),
+            Some("text/html"),
+            None,
+        )
+        .await
+        .expect("html must store");
     let id = stored.id.clone();
     let words = stored.words.clone().expect("a new paste must have words");
+    let html_id = html.id.clone();
     let app = common::app(store);
 
     let request = common::request("GET", &format!("/raw/{id}"), &[], Vec::new());
@@ -1079,6 +1092,25 @@ async fn raw_route_returns_the_unformatted_bytes() {
     let (status, _, bytes) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(bytes, body, "the alias must resolve on the raw route");
+
+    let request = common::request("GET", &format!("/raw/{html_id}"), &[], Vec::new());
+    let (status, headers, bytes) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain"),
+        "html raw must downgrade to plain text"
+    );
+    assert!(
+        headers[header::CONTENT_DISPOSITION]
+            .to_str()
+            .unwrap()
+            .starts_with("inline"),
+        "html raw must open in the browser, not download"
+    );
+    assert_eq!(bytes, b"<html>raw</html>");
 
     let today = Utc::now().format("%Y-%m-%d").to_string();
     fake.seed(

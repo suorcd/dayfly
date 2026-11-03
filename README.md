@@ -1017,10 +1017,11 @@ always served as attachments, never rendered inline**. Every download
 carries `X-Content-Type-Options: nosniff`. An inline response also
 carries `Content-Security-Policy: sandbox`, so a served document cannot
 run script in the service's origin even if a type slips through
-detection. The human view page follows the same rule: text in `<pre>`,
-safe images inline, HTML/SVG as a download link only. Every UI HTML
-response carries `X-Content-Type-Options: nosniff` and the framing
-headers.
+detection. The human view page shows text in `<pre>`, including the
+escaped source of HTML, SVG, and XML, and safe images inline. It never
+renders HTML/SVG as markup. The raw link drops markup types to
+`text/plain` so the source opens as text. Every UI HTML response
+carries `X-Content-Type-Options: nosniff` and the framing headers.
 
 Why: for internal use this is fine, but serving a sniffed
 `text/html` or `image/svg+xml` upload as inline HTML on a trusted
@@ -1069,13 +1070,14 @@ comments.
   value sorts last in both directions.
 - `GET /view/<id>` — one paste: a `Download / raw` link that names the
   alias, or the canonical ID when words are off, then the metadata and
-  delete form in a collapsed `<details>` block, then the content: text
-  in `<pre>` (capped at 1 MiB for the page; the raw route and the API
-  return the full paste), safe images inline, other types via the raw
-  link.
-- `GET /raw/<id>` — the unformatted bytes with the stored
-  Content-Type. An unknown binary type falls back to `text/plain`.
-  HTML and SVG keep the download disposition rules from the API.
+  delete form in a collapsed `<details>` block, then the content:
+  text in `<pre>` (capped at 1 MiB for the page; the raw route and the
+  API return the full paste), including the escaped source of HTML and
+  SVG, safe images inline, other types via the raw link.
+- `GET /raw/<id>` — the unformatted bytes. Markup types (`text/html`,
+  `application/xhtml+xml`, `image/svg+xml`, and XML) and unknown
+  binary types are served as `text/plain` and open inline. Other types
+  keep the stored Content-Type and the API disposition rules.
 
 Theme: the pages adapt the base look of the user's own site
 stylesheet, https://suorcd.us/style.css (verified live as the site's

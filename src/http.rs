@@ -743,6 +743,24 @@ pub(crate) async fn raw_inner(state: &AppState, headers: &HeaderMap, id: &str) -
     download_response(state, headers, id, false, true).await
 }
 
+/// Whether the raw view must downgrade this type to plain text.
+///
+/// A browser renders markup types when it loads them inline, and their
+/// scripts run on the dayfly origin. The raw route keeps the bytes and
+/// shows them as text instead.
+fn raw_view_type(content_type: &str) -> bool {
+    let main = content_type.split(';').next().unwrap_or("").trim();
+    matches!(
+        main,
+        "application/octet-stream"
+            | "text/html"
+            | "application/xhtml+xml"
+            | "image/svg+xml"
+            | "text/xml"
+            | "application/xml"
+    )
+}
+
 async fn download_response(
     state: &AppState,
     headers: &HeaderMap,
@@ -796,7 +814,7 @@ async fn download_response(
         ETAG,
         HeaderValue::from_str(&etag).unwrap_or_else(|_| HeaderValue::from_static("\"\"")),
     );
-    let content_type = if raw_fallback && meta.content_type == "application/octet-stream" {
+    let content_type = if raw_fallback && raw_view_type(&meta.content_type) {
         "text/plain; charset=utf-8".to_string()
     } else {
         meta.content_type.clone()

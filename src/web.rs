@@ -1172,6 +1172,18 @@ async fn delete_submit_handler(
     }
 }
 
+/// Whether the view page can show this type as escaped text.
+///
+/// Markup source (HTML, SVG, XML) is text. The view escapes it, so the
+/// browser never renders it as markup.
+fn text_preview_type(main: &str) -> bool {
+    main.starts_with("text/")
+        || matches!(
+            main,
+            "application/json" | "application/xml" | "application/javascript" | "image/svg+xml"
+        )
+}
+
 async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response {
     if let Err(resp) = check_auth(state, headers) {
         return resp;
@@ -1205,11 +1217,7 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
         fmt_dt(meta.expires_at),
         days_remaining_label(meta.expires_at),
     );
-    if main == "text/plain"
-        || main == "text/markdown"
-        || main == "text/csv"
-        || main == "application/json"
-    {
+    if text_preview_type(main) {
         // Text view, capped at 1 MiB so the page stays usable; the API
         // remains the route for full / sliced reads of large pastes.
         let slice = store.fetch_text(&meta.id, 0, Some(1_000_000)).await;
