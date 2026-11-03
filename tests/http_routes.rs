@@ -1253,6 +1253,60 @@ async fn same_origin_api_upload_is_allowed() {
 }
 
 #[tokio::test]
+async fn delete_routes_check_the_origin() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let foreign = store
+        .store_text(b"foreign delete", None, None, None)
+        .await
+        .expect("foreign paste must store");
+    let bare = store
+        .store_text(b"bare delete", None, None, None)
+        .await
+        .expect("bare paste must store");
+    let same = store
+        .store_text(b"same delete", None, None, None)
+        .await
+        .expect("same-origin paste must store");
+    let app = common::app(store);
+
+    let request = common::request(
+        "DELETE",
+        &format!("/v1/pastes/{}", foreign.id),
+        &[
+            ("host", "localhost".to_string()),
+            ("origin", "http://evil.example".to_string()),
+        ],
+        Vec::new(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        fake.object(&foreign.key).is_some(),
+        "a refused delete must keep the object"
+    );
+
+    let bare_id = bare.id.split_once('/').unwrap().1;
+    let request = common::request("DELETE", &format!("/v1/pastes/{bare_id}"), &[], Vec::new());
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(fake.object(&bare.key).is_none());
+
+    let request = common::request(
+        "DELETE",
+        &format!("/v1/pastes/{}", same.id),
+        &[
+            ("host", "localhost".to_string()),
+            ("origin", "http://localhost".to_string()),
+        ],
+        Vec::new(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(fake.object(&same.key).is_none());
+}
+
+#[tokio::test]
 async fn cross_origin_api_append_is_forbidden() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
