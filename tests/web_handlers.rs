@@ -93,7 +93,7 @@ async fn index_page_renders_the_combined_form_and_the_default_ttl() {
     assert!(page.contains("id=\"file-status\""));
     assert!(page.contains("id=\"clear-file\""));
     assert!(page.contains("data-max-file-bytes=\"1073741824\""));
-    assert!(page.contains("Max file size: 1.0 GiB"));
+    assert!(page.contains("Max file size: 1 GiB"));
     assert!(page.contains("File is too large"));
     assert!(page.contains("name=\"file\""));
     assert!(page.contains("name=\"text\""));
@@ -105,11 +105,161 @@ async fn index_page_renders_the_combined_form_and_the_default_ttl() {
         ttl_at < file_at,
         "the TTL field must precede the file field"
     );
+    let text_at = page.find("name=\"text\"").expect("text field");
+    assert!(
+        text_at < file_at,
+        "the text field must precede the file field"
+    );
+    let filename_at = page.find("name=\"filename\"").expect("filename field");
+    assert!(
+        ttl_at < filename_at,
+        "the TTL field must precede the filename field"
+    );
     assert!(page.contains("<option value=\"7\" selected>7 days</option>"));
     assert!(page.contains("The selector uses whole days"));
+    assert!(
+        page.contains("class=\"hint\" title=\"The selector uses whole days."),
+        "the TTL note must move into a tooltip by the selector: {page}"
+    );
+    assert!(
+        !page.contains("<p class=\"muted\">The selector uses whole days."),
+        "the TTL note must not stay in a paragraph: {page}"
+    );
     assert!(page.contains("~/dayfly $"));
     assert!(page.contains("href=\"/.well-known/dayfly.json\""));
     assert!(page.contains("&copy; 2026 suorcd"));
+    assert!(
+        page.contains("<a href=\"/\" class=\"active\" aria-current=\"page\">new paste</a>"),
+        "the current page must be marked in the nav: {page}"
+    );
+    assert!(
+        !page.contains("<h1>New paste</h1>"),
+        "the page title must not repeat the nav link: {page}"
+    );
+    assert!(
+        !page.contains("<h2>Paste or upload</h2>"),
+        "the form must not repeat a section heading: {page}"
+    );
+    assert!(
+        page.contains("<title>New paste — dayfly</title>"),
+        "the page title must use the product name: {page}"
+    );
+    assert!(
+        page.contains("<footer>dayfly — internal use only"),
+        "the footer must use the product name: {page}"
+    );
+}
+
+#[tokio::test]
+async fn index_page_shows_curl_examples_for_the_request_base() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let request = common::request(
+        "GET",
+        "/",
+        &[
+            ("host", "dayfly.test".to_string()),
+            ("x-forwarded-proto", "https".to_string()),
+        ],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        page.contains("BASE=https://dayfly.test"),
+        "the hint must use the request base URL: {page}"
+    );
+    assert!(
+        page.contains("<details class=\"cli-hint\"><summary>cli</summary>"),
+        "the hint must collapse under a cli summary: {page}"
+    );
+    assert!(
+        page.contains("curl -sS --data-binary @note.txt &quot;$BASE/upload&quot;"),
+        "the text example is missing: {page}"
+    );
+    assert!(
+        page.contains("cat error.log | curl -sS --data-binary @- &quot;$BASE/upload&quot;"),
+        "the stdin example is missing: {page}"
+    );
+    assert!(
+        page.contains(
+            "curl -sS --data-binary @report.pdf -H &quot;X-Filename: report.pdf&quot; \
+             &quot;$BASE/upload&quot;"
+        ),
+        "the file example is missing: {page}"
+    );
+    assert!(
+        page.contains(
+            "curl -sS -H &quot;Accept: application/json&quot; -H &quot;X-TTL: 1h&quot; \
+             --data-binary @note.txt &quot;$BASE/upload&quot;"
+        ),
+        "the JSON and TTL example is missing: {page}"
+    );
+    assert!(
+        !page.contains("Authorization:"),
+        "a page without a configured token must not show the header: {page}"
+    );
+}
+
+#[tokio::test]
+async fn index_page_curl_examples_carry_the_bearer_placeholder() {
+    const TOKEN: &str = "index-page-secret-token";
+    let fake = FakeS3::start().await;
+    let config = common::config_with_token(fake.config(), TOKEN);
+    let store = Store::from_config(config)
+        .await
+        .expect("the store must build without network access");
+    let app = common::app(store);
+    let request = common::request(
+        "GET",
+        "/",
+        &[
+            ("host", "dayfly.test".to_string()),
+            ("authorization", format!("Bearer {TOKEN}")),
+        ],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        page.contains(
+            "curl -sS -H &quot;Authorization: Bearer $DAYFLY_HTTP_BEARER_TOKEN&quot; \
+             --data-binary @note.txt &quot;$BASE/upload&quot;"
+        ),
+        "the example must carry the bearer placeholder: {page}"
+    );
+    assert!(
+        !page.contains(TOKEN),
+        "the configured token must not reach the page: {page}"
+    );
+}
+
+#[tokio::test]
+async fn index_page_escapes_the_base_url_in_the_curl_examples() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let request = common::request(
+        "GET",
+        "/",
+        &[(
+            "host",
+            "evil.example\"><script>alert(1)</script>".to_string(),
+        )],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        page.contains("BASE=http://evil.example&quot;&gt;&lt;script&gt;"),
+        "the base URL must be escaped: {page}"
+    );
+    assert!(
+        !page.contains("<script>alert(1)</script>"),
+        "the base URL must not inject markup: {page}"
+    );
 }
 
 #[tokio::test]
@@ -382,7 +532,10 @@ async fn create_submit_redirects_to_the_words_when_enabled() {
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::OK);
     let page = html_text(&body);
-    assert!(page.contains(&format!("Words: <a href=\"/view/{alias}\">")));
+    assert!(page.contains(&format!("<h1>{alias}</h1>")));
+    assert!(page.contains(&format!(
+        "<a class=\"button\" href=\"/raw/{alias}\">Raw</a>"
+    )));
 }
 
 #[tokio::test]
@@ -437,7 +590,7 @@ async fn multipart_over_the_declared_cap_is_rejected_before_reading() {
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{route}");
         let page = html_text(&response_body);
         assert!(page.contains("payload too large"), "{route}: {page}");
-        assert!(page.contains("1.0 GiB"), "{route}: {page}");
+        assert!(page.contains("1 GiB"), "{route}: {page}");
     }
     assert!(fake.keys().is_empty());
 }
@@ -653,23 +806,134 @@ async fn list_page_shows_current_pastes_and_hides_expired_ones() {
     let page = html_text(&body);
     assert!(page.contains(&format!("{today}/visible")));
     assert!(!page.contains(&format!("{today}/expired")));
-    assert!(page.contains("2 days"));
-    assert!(page.contains("name=\"date\""));
+    assert!(page.contains("<td>02</td>"));
+    assert!(
+        !page.contains("name=\"date\""),
+        "the page must not offer the single-date selector: {page}"
+    );
+    assert!(
+        !page.contains("Show date"),
+        "the page must not offer the single-date button: {page}"
+    );
     assert!(page.contains("name=\"start\""));
     assert!(page.contains("name=\"end\""));
-    assert!(page.contains("yesterday and today in UTC"));
+    let yesterday = (Utc::now() - Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    assert!(
+        page.contains(&format!("name=\"start\" value=\"{yesterday}\"")),
+        "the start input must show yesterday: {page}"
+    );
+    assert!(
+        page.contains(&format!("name=\"end\" value=\"{today}\"")),
+        "the end input must show today: {page}"
+    );
+    assert!(page.contains("last 2 days, ending today in UTC"));
+    assert!(
+        page.contains(
+            "class=\"hint\" title=\"Dates are UTC. With no dates, the page shows the last 2 days"
+        ),
+        "the range box must carry the explanation in a tooltip: {page}"
+    );
+    assert!(
+        !page.contains("<p class=\"muted\">Dates are UTC."),
+        "the explanation must not stay in a paragraph: {page}"
+    );
+    assert!(
+        !page.contains("sort=expires"),
+        "the redundant expires column must be gone: {page}"
+    );
+    assert!(
+        page.contains("class=\"content-type-cell\" title=\"text/plain"),
+        "the content type cell must keep the full type in a title attribute: {page}"
+    );
+    assert!(
+        page.contains(">text/plain"),
+        "the content type text must stay unedited: {page}"
+    );
+    assert!(
+        page.contains(
+            "<td class=\"size-cell\"><span class=\"size-number\">5</span>\
+             <span class=\"size-unit\">B</span></td>"
+        ),
+        "the size must split into a right-aligned value and a unit: {page}"
+    );
+    assert!(
+        page.contains("<th>Action</th>"),
+        "the delete column must have a header: {page}"
+    );
+    assert!(
+        page.contains("<th class=\"ttl-header\" title=\"days\">TTL</th>"),
+        "the duration column must be labelled TTL with a days title: {page}"
+    );
+    assert!(
+        !page.contains("<th>Remaining</th>"),
+        "the old duration header must be gone: {page}"
+    );
 
     let request = common::request("GET", "/pastes?date=2020-01-01", &[], Vec::new());
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::OK);
     let page = html_text(&body);
-    assert!(page.contains("value=\"2020-01-01\""));
     assert!(page.contains("No current pastes in this window."));
 
     let request = common::request("GET", "/pastes?date=bad-date", &[], Vec::new());
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(html_text(&body).contains("invalid date"));
+}
+
+#[tokio::test]
+async fn list_page_middle_truncates_long_filenames_with_a_title() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let name = "very-long-report-name-that-keeps-going.xlsx";
+    store
+        .store_text(b"data", Some(name), None, None)
+        .await
+        .expect("text with a filename must store");
+    let app = common::app(store);
+
+    let request = common::request("GET", "/pastes", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        page.contains(&format!("title=\"{name}\"")),
+        "the cell must keep the full filename in a title attribute: {page}"
+    );
+    assert!(
+        page.contains("very-long-repor…going.xlsx"),
+        "the visible name must be truncated in the middle: {page}"
+    );
+}
+
+#[tokio::test]
+async fn list_page_prepopulates_the_configured_default_window() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.list_default_days = 3;
+    let store = Store::from_config(config)
+        .await
+        .expect("the store must build without network access");
+    let app = common::app(store);
+
+    let request = common::request("GET", "/pastes", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    let start = (Utc::now() - Duration::days(2))
+        .format("%Y-%m-%d")
+        .to_string();
+    let end = Utc::now().format("%Y-%m-%d").to_string();
+    assert!(
+        page.contains(&format!("name=\"start\" value=\"{start}\"")),
+        "the start input must follow DAYFLY_LIST_DEFAULT_DAYS: {page}"
+    );
+    assert!(
+        page.contains(&format!("name=\"end\" value=\"{end}\"")),
+        "the end input must follow DAYFLY_LIST_DEFAULT_DAYS: {page}"
+    );
 }
 
 #[tokio::test]
@@ -705,19 +969,65 @@ async fn view_page_renders_text_escaped_and_images_inline() {
     assert_eq!(status, StatusCode::OK);
     let page = html_text(&body);
     assert!(page.contains("<pre>a &lt; b &amp; c &gt; d &quot;quoted&quot;</pre>"));
-    assert!(page.contains(&format!("/v1/pastes/{}", text.id)));
-    assert!(page.contains("<details><summary>Metadata &amp; delete</summary>"));
+    assert!(
+        page.contains(
+            "<div class=\"content-box\"><button type=\"button\" class=\"copy-content\" \
+             aria-label=\"Copy paste content\" hidden>Copy</button><pre>"
+        ),
+        "the content box must carry a hidden copy button: {page}"
+    );
+    assert!(
+        page.contains(&format!("<h1>{}</h1>", text.id)),
+        "the words must be the page header: {page}"
+    );
+    assert!(
+        page.contains(&format!(
+            "<a class=\"button\" href=\"/v1/pastes/{}\" download=",
+            text.id
+        )),
+        "the download button must target the API route: {page}"
+    );
+    assert!(
+        page.contains(&format!(
+            "<a class=\"button\" href=\"/raw/{}\">Raw</a>",
+            text.id
+        )),
+        "the raw button must target the raw route: {page}"
+    );
+    assert!(
+        page.contains("data-copy=\"/view/") && page.contains("hidden>Copy link</button>"),
+        "the copy link button must start hidden and wait for JS: {page}"
+    );
+    assert!(
+        !page.contains("Download / raw:"),
+        "the old raw link line must be gone: {page}"
+    );
+    assert!(
+        page.contains(
+            "<input type=\"checkbox\" id=\"metadata-toggle\" class=\"metadata-toggle\">\
+             <label for=\"metadata-toggle\" class=\"metadata-label\">Metadata &amp; delete</label>\
+             <div class=\"metadata-panel\">"
+        ),
+        "the metadata toggle must be a checkbox and label with a panel: {page}"
+    );
     assert!(page.contains("Delete this paste"));
+    let actions_at = page
+        .find("class=\"view-actions\"")
+        .expect("the action row must render");
     let details_at = page
-        .find("</details>")
-        .expect("the metadata details must close");
-    let download_at = page
-        .find("Download / raw")
-        .expect("the raw link must render");
+        .find("class=\"metadata-panel\"")
+        .expect("the metadata panel must render");
     let pre_at = page.find("<pre>").expect("the paste text must render");
     assert!(
-        details_at < download_at && download_at < pre_at,
-        "metadata must be collapsed above the raw link, and the paste content must come last"
+        actions_at < details_at && details_at < pre_at,
+        "the action row must sit above the metadata and the content last"
+    );
+    let hr_at = page
+        .find("<hr>")
+        .expect("the separator above the text must render");
+    assert!(
+        hr_at < pre_at,
+        "the separator must sit directly above the text box"
     );
 
     let request = common::request("GET", &format!("/view/{}", png.id), &[], Vec::new());
@@ -732,8 +1042,11 @@ async fn view_page_renders_text_escaped_and_images_inline() {
     assert_eq!(status, StatusCode::OK);
     let page = html_text(&body);
     assert!(!page.contains("<img"));
-    assert!(!page.contains("<pre>"));
-    assert!(page.contains(&format!("/v1/pastes/{}", html.id)));
+    assert!(
+        page.contains("<pre>&lt;html&gt;body&lt;/html&gt;</pre>"),
+        "html source must render escaped in the view: {page}"
+    );
+    assert!(page.contains(&format!("/raw/{}", html.id)));
 
     let request = common::request(
         "GET",
@@ -760,7 +1073,10 @@ async fn view_page_shows_words_when_enabled_and_hides_them_when_disabled() {
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::OK);
     let page = html_text(&body);
-    assert!(page.contains(&format!("Words: <a href=\"/view/{words}\">")));
+    assert!(page.contains(&format!("<h1>{words}</h1>")));
+    assert!(page.contains(&format!(
+        "<a class=\"button\" href=\"/raw/{words}\">Raw</a>"
+    )));
 
     let fake = FakeS3::start().await;
     let store = fake.store_with_show_words(false).await;
@@ -768,12 +1084,94 @@ async fn view_page_shows_words_when_enabled_and_hides_them_when_disabled() {
         .store_text(b"word view", None, None, None)
         .await
         .expect("text must store");
+    let id = stored.id.clone();
     let app = common::app(store);
 
     let request = common::request("GET", &format!("/view/{}", stored.id), &[], Vec::new());
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(!html_text(&body).contains("Words:"));
+    let page = html_text(&body);
+    assert!(!page.contains("Words:"));
+    assert!(page.contains(&format!("<h1>{id}</h1>")));
+    assert!(page.contains(&format!("<a class=\"button\" href=\"/raw/{id}\">Raw</a>")));
+}
+
+#[tokio::test]
+async fn raw_route_returns_the_unformatted_bytes() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let body = b"a < b & c\n";
+    let stored = store
+        .store_text(body, None, None, None)
+        .await
+        .expect("text must store");
+    let html = store
+        .store_text(
+            b"<html>raw</html>",
+            Some("page.html"),
+            Some("text/html"),
+            None,
+        )
+        .await
+        .expect("html must store");
+    let id = stored.id.clone();
+    let words = stored.words.clone().expect("a new paste must have words");
+    let html_id = html.id.clone();
+    let app = common::app(store);
+
+    let request = common::request("GET", &format!("/raw/{id}"), &[], Vec::new());
+    let (status, headers, bytes) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain"),
+        "raw must keep the text content type"
+    );
+    assert_eq!(bytes, body, "raw must return the unformatted bytes");
+
+    let request = common::request("GET", &format!("/raw/{words}"), &[], Vec::new());
+    let (status, _, bytes) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, body, "the alias must resolve on the raw route");
+
+    let request = common::request("GET", &format!("/raw/{html_id}"), &[], Vec::new());
+    let (status, headers, bytes) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain"),
+        "html raw must downgrade to plain text"
+    );
+    assert!(
+        headers[header::CONTENT_DISPOSITION]
+            .to_str()
+            .unwrap()
+            .starts_with("inline"),
+        "html raw must open in the browser, not download"
+    );
+    assert_eq!(bytes, b"<html>raw</html>");
+
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    fake.seed(
+        &format!("pastes/{today}/binaryish"),
+        b"abcde",
+        "application/octet-stream",
+        &common::metadata_refs(&future_metadata(5)),
+    );
+    let request = common::request("GET", &format!("/raw/{today}/binaryish"), &[], Vec::new());
+    let (status, headers, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain"),
+        "an unknown binary type must fall back to text/plain"
+    );
 }
 
 #[tokio::test]
@@ -797,8 +1195,12 @@ async fn list_page_shows_words_when_enabled_and_hides_them_when_disabled() {
         "the alias must be the primary link: {page}"
     );
     assert!(
-        page.contains(&format!("<span class=\"muted\">{id}</span>")),
-        "the canonical ID must be shown as secondary text: {page}"
+        !page.contains(&format!("<span class=\"muted\">{id}</span>")),
+        "the canonical ID must be hidden by default: {page}"
+    );
+    assert!(
+        page.contains("<th>Link</th>"),
+        "the header must say Link by default: {page}"
     );
 
     let fake = FakeS3::start().await;
@@ -817,6 +1219,36 @@ async fn list_page_shows_words_when_enabled_and_hides_them_when_disabled() {
     let page = html_text(&body);
     assert!(!page.contains(&format!("href=\"/view/{words}\"")));
     assert!(page.contains(&format!("href=\"/view/{id}\"")));
+}
+
+#[tokio::test]
+async fn list_page_shows_the_internal_path_when_configured() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.show_words = true;
+    config.show_internal_paths = true;
+    let store = Store::from_config(config)
+        .await
+        .expect("the store must build without network access");
+    let stored = store
+        .store_text(b"path list", None, None, None)
+        .await
+        .expect("text must store");
+    let id = stored.id.clone();
+    let app = common::app(store);
+
+    let request = common::request("GET", "/pastes", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        page.contains(&format!("<span class=\"muted\">{id}</span>")),
+        "the configured page must show the canonical ID: {page}"
+    );
+    assert!(
+        page.contains("<th>Link / ID</th>"),
+        "the configured header must say Link / ID: {page}"
+    );
 }
 
 #[tokio::test]

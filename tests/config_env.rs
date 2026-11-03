@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use dayfly::config::{Config, ConfigError};
 
-const VARS: [&str; 23] = [
+const VARS: [&str; 25] = [
     "S3_ENDPOINT",
     "S3_BUCKET",
     "S3_REGION",
@@ -22,6 +22,7 @@ const VARS: [&str; 23] = [
     "DAYFLY_MAX_PASTE_BYTES",
     "DAYFLY_ALIAS_WORDS",
     "DAYFLY_DEFAULT_TTL_DAYS",
+    "DAYFLY_LIST_DEFAULT_DAYS",
     "DAYFLY_RETENTION_BY_SIZE",
     "DAYFLY_RETENTION_MIN_DAYS",
     "DAYFLY_RETENTION_MAX_DAYS",
@@ -31,6 +32,7 @@ const VARS: [&str; 23] = [
     "DAYFLY_PASTE_TOKENS",
     "DAYFLY_RATE_LIMIT_PER_MINUTE",
     "DAYFLY_SHOW_WORDS",
+    "DAYFLY_SHOW_INTERNAL_PATHS",
     "DAYFLY_INLINE_PDF",
     "DAYFLY_MCP_LOCAL_ROOT",
 ];
@@ -100,6 +102,7 @@ fn minimal_environment_applies_documented_defaults() {
     assert!(!config.paste_tokens);
     assert_eq!(config.http_bind, "127.0.0.1:8080");
     assert!(config.show_words);
+    assert!(!config.show_internal_paths);
     assert!(config.inline_pdf);
     assert_eq!(config.http_bearer_token, None);
     assert_eq!(config.mcp_local_root, None);
@@ -237,6 +240,7 @@ fn optional_values_override_the_defaults() {
     env::set_var("DAYFLY_DEFAULT_TTL_DAYS", "30");
     env::set_var("DAYFLY_HTTP_BIND", "0.0.0.0:9999");
     env::set_var("DAYFLY_SHOW_WORDS", "false");
+    env::set_var("DAYFLY_SHOW_INTERNAL_PATHS", "true");
     env::set_var("DAYFLY_INLINE_PDF", "false");
     env::set_var("DAYFLY_HTTP_BEARER_TOKEN", "token-value");
 
@@ -249,6 +253,7 @@ fn optional_values_override_the_defaults() {
     assert_eq!(config.default_ttl_days, 30);
     assert_eq!(config.http_bind, "0.0.0.0:9999");
     assert!(!config.show_words);
+    assert!(config.show_internal_paths);
     assert!(!config.inline_pdf);
     assert_eq!(config.http_bearer_token.as_deref(), Some("token-value"));
     assert_eq!(config.max_bytes_for_upload(None), 1234);
@@ -409,6 +414,26 @@ fn default_ttl_days_zero_is_rejected() {
 }
 
 #[test]
+fn list_default_days_defaults_to_two_and_rejects_zero() {
+    let _guard = lock_env();
+    clear_env();
+    set_required();
+    let config = Config::from_env().expect("the default config must load");
+    assert_eq!(config.list_default_days, 2, "the default window is 2 days");
+    env::set_var("DAYFLY_LIST_DEFAULT_DAYS", "5");
+    let config = Config::from_env().expect("a custom window must load");
+    assert_eq!(config.list_default_days, 5);
+    env::set_var("DAYFLY_LIST_DEFAULT_DAYS", "0");
+    let error = Config::from_env()
+        .err()
+        .expect("a zero list window must fail config load");
+    assert!(
+        matches!(error, ConfigError::Invalid(ref field, _) if field == "DAYFLY_LIST_DEFAULT_DAYS"),
+        "the error must name DAYFLY_LIST_DEFAULT_DAYS, got {error}"
+    );
+}
+
+#[test]
 fn file_cap_accepts_32_gib_and_rejects_a_part_overflow() {
     let _guard = lock_env();
     clear_env();
@@ -482,6 +507,7 @@ fn safe_summary_omits_credentials_and_token_presence() {
     assert!(summary.contains("bucket=dayfly-test"));
     assert!(summary.contains("endpoint_scheme=https"));
     assert!(summary.contains("show_words=true"));
+    assert!(summary.contains("show_internal_paths=false"));
     assert!(summary.contains("inline_pdf=true"));
     for secret in ["test-access", "test-secret", "summary-secret"] {
         assert!(

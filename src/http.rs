@@ -477,17 +477,27 @@ fn wants_json(headers: &HeaderMap, query: &HashMap<String, String>) -> bool {
         .unwrap_or(false)
 }
 
-fn paste_url(headers: &HeaderMap, id: &str) -> String {
-    let path = format!("/v1/pastes/{id}");
-    let Some(host) = header_str(headers, HOST.as_str()) else {
-        return path;
-    };
+/// Public base URL for the current request, without a trailing slash.
+///
+/// The scheme comes from `x-forwarded-proto` when the value is `http`
+/// or `https`; otherwise it is `http`. The host comes from the `Host`
+/// header. A request without a host has no base URL.
+pub(crate) fn public_base(headers: &HeaderMap) -> Option<String> {
+    let host = header_str(headers, HOST.as_str())?;
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
         .filter(|s| *s == "https" || *s == "http")
         .unwrap_or("http");
-    format!("{scheme}://{host}{path}")
+    Some(format!("{scheme}://{host}"))
+}
+
+fn paste_url(headers: &HeaderMap, id: &str) -> String {
+    let path = format!("/v1/pastes/{id}");
+    match public_base(headers) {
+        Some(base) => format!("{base}{path}"),
+        None => path,
+    }
 }
 
 fn upload_response(
@@ -718,11 +728,45 @@ async fn meta_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
     }
 }
 
-async fn download_inner(
+pub(crate) async fn download_inner(
     state: &AppState,
     headers: &HeaderMap,
     id: &str,
     is_head: bool,
+) -> Response {
+    download_response(state, headers, id, is_head, false).await
+}
+
+/// Raw view link: keep the stored type, but read an unknown binary type
+/// as plain text so the browser shows it instead of downloading it.
+pub(crate) async fn raw_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response {
+    download_response(state, headers, id, false, true).await
+}
+
+/// Whether the raw view must downgrade this type to plain text.
+///
+/// A browser renders markup types when it loads them inline, and their
+/// scripts run on the dayfly origin. The raw route keeps the bytes and
+/// shows them as text instead.
+fn raw_view_type(content_type: &str) -> bool {
+    let main = content_type.split(';').next().unwrap_or("").trim();
+    matches!(
+        main,
+        "application/octet-stream"
+            | "text/html"
+            | "application/xhtml+xml"
+            | "image/svg+xml"
+            | "text/xml"
+            | "application/xml"
+    )
+}
+
+async fn download_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    is_head: bool,
+    raw_fallback: bool,
 ) -> Response {
     if let Err(resp) = check_auth(state, headers) {
         return resp;
@@ -770,13 +814,18 @@ async fn download_inner(
         ETAG,
         HeaderValue::from_str(&etag).unwrap_or_else(|_| HeaderValue::from_static("\"\"")),
     );
+    let content_type = if raw_fallback && raw_view_type(&meta.content_type) {
+        "text/plain; charset=utf-8".to_string()
+    } else {
+        meta.content_type.clone()
+    };
     resp_headers.insert(
         CONTENT_TYPE,
-        HeaderValue::from_str(&meta.content_type)
+        HeaderValue::from_str(&content_type)
             .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
     );
     let disposition = content_disposition(
-        &meta.content_type,
+        &content_type,
         meta.filename.as_deref(),
         store.config.inline_pdf,
     );
@@ -948,6 +997,22 @@ async fn download_bare_head(
     Path(random): Path<String>,
 ) -> Response {
     download_inner(&state, &headers, &random, true).await
+}
+
+async fn raw_dated(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((date, random)): Path<(String, String)>,
+) -> Response {
+    raw_inner(&state, &headers, &format!("{date}/{random}")).await
+}
+
+async fn raw_bare(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(random): Path<String>,
+) -> Response {
+    raw_inner(&state, &headers, &random).await
 }
 
 async fn meta_dated(
@@ -1346,6 +1411,16 @@ pub const API_ROUTE_DOCS: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "GET",
+        path: "/raw/{date}/{random}",
+        purpose: "Read the raw bytes of a paste with the full ID.",
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/raw/{random}",
+        purpose: "Read the raw bytes of a bare ID or alias.",
+    },
+    ApiRoute {
+        method: "GET",
         path: "/.well-known/dayfly.json",
         purpose: "Read this machine-readable service description.",
     },
@@ -1380,6 +1455,7 @@ async fn service_description(State(state): State<AppState>) -> Response {
             "max_file_bytes": config.max_file_bytes,
             "max_paste_bytes": config.max_paste_bytes,
             "default_ttl_seconds": u64::from(config.default_ttl_days) * 86_400,
+            "list_default_days": config.list_default_days,
             "max_ttl_seconds": MAX_TTL_SECONDS,
             "retention_by_size": config.retention_by_size,
             "retention_min_seconds": u64::from(config.retention_min_days) * 86_400,
@@ -1422,6 +1498,8 @@ pub fn api_router() -> Router<AppState> {
         .route("/v1/pastes/{random}/meta", get(meta_bare))
         .route("/v1/pastes/{date}/{random}/append", post(append_dated))
         .route("/v1/pastes/{random}/append", post(append_bare))
+        .route("/raw/{date}/{random}", get(raw_dated))
+        .route("/raw/{random}", get(raw_bare))
 }
 
 #[cfg(test)]
@@ -1465,12 +1543,14 @@ mod tests {
             max_paste_bytes: 1024 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,
+            list_default_days: 2,
             retention_by_size: false,
             retention_min_days: 30,
             retention_max_days: 365,
             http_bind: "127.0.0.1:0".to_string(),
             trusted_proxies: Vec::new(),
             show_words: false,
+            show_internal_paths: false,
             inline_pdf: true,
             allow_unauthenticated: false,
             list_requires_token: false,

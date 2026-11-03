@@ -2533,6 +2533,7 @@ async fn well_known_service_description_reports_live_limits_without_auth() {
     assert_eq!(json["limits"]["max_file_bytes"], 5_678);
     assert_eq!(json["limits"]["max_paste_bytes"], 1024 * 1024 * 1024);
     assert_eq!(json["limits"]["default_ttl_seconds"], 7 * 86_400);
+    assert_eq!(json["limits"]["list_default_days"], 2);
     assert_eq!(json["limits"]["max_ttl_seconds"], 3_650 * 86_400);
     assert_eq!(json["limits"]["retention_by_size"], false);
     assert_eq!(json["limits"]["retention_min_seconds"], 30 * 86_400);
@@ -2544,6 +2545,12 @@ async fn well_known_service_description_reports_live_limits_without_auth() {
     assert!(routes
         .iter()
         .any(|route| { route["method"] == "GET" && route["path"] == "/.well-known/dayfly.json" }));
+    assert!(routes
+        .iter()
+        .any(|route| { route["method"] == "GET" && route["path"] == "/raw/{random}" }));
+    assert!(routes
+        .iter()
+        .any(|route| { route["method"] == "GET" && route["path"] == "/raw/{date}/{random}" }));
 }
 
 #[tokio::test]

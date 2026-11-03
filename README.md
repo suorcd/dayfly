@@ -317,6 +317,7 @@ permissions and the lower total cap.
 | `DAYFLY_MAX_PASTE_BYTES` | no | 1073741824 (1 GiB) | Max total size for one paste, including the base object and every appended segment. A new paste or an append that would exceed the cap fails and writes no object |
 | `DAYFLY_ALIAS_WORDS` | no | 3 | Number of words in a new alias. Allowed range 3 to 6. Resolution accepts 3 words up to this value |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1 and at most 3650. The name and meaning are unchanged |
+| `DAYFLY_LIST_DEFAULT_DAYS` | no | 2 | Number of days in the default paste list window, ending today in UTC. Must be 1 to 366. The default of 2 covers yesterday and today |
 | `DAYFLY_RETENTION_BY_SIZE` | no | `false` | Clamp the expiry of a paste to a curve based on its total size. The clamp only shortens. Off keeps the exact requested TTL. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_RETENTION_MIN_DAYS` | no | 30 | Minimum retention in whole days at `DAYFLY_MAX_PASTE_BYTES`. Must be at least 1 and at most 3650, and must not exceed `DAYFLY_RETENTION_MAX_DAYS` |
 | `DAYFLY_RETENTION_MAX_DAYS` | no | 365 | Maximum retention in whole days at zero bytes. Must be at least 1 and at most 3650, and must be at least `DAYFLY_RETENTION_MIN_DAYS` |
@@ -327,6 +328,7 @@ permissions and the lower total cap.
 | `DAYFLY_LIST_REQUIRES_TOKEN` | no | `false` | Require the bearer token for `GET /v1/pastes` and the human `/pastes` page even when reads are anonymous. With this on and no token configured, both routes refuse with 401: there is nothing to check. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_PASTE_TOKENS` | no | `false` | Return a 128-bit management token at creation. The JSON store response carries `paste_token`; the plain response carries `X-Paste-Token`. The token authorizes `DELETE` and `PATCH` for that paste. Only its SHA-256 is stored. The bearer token remains universal. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_SHOW_WORDS` | no | `true` | Show the generated word alias in the human UI: create redirects, the view page, and the paste list. Display only; the JSON/MCP responses still include `words`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
+| `DAYFLY_SHOW_INTERNAL_PATHS` | no | `false` | Show the canonical date and ID under the alias in the human paste list. Off labels the column "Link" and shows only the alias. Display only; view URLs and API responses still accept the canonical ID. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_INLINE_PDF` | no | `true` | Serve a PDF download inline. Set this to `false` on a public instance so a PDF is an attachment. HTML and SVG are always attachments. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_HTTP_BEARER_TOKEN` | one form | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model); set this variable or `DAYFLY_HTTP_BEARER_TOKEN_FILE`. An unset value disables auth; a set empty or whitespace-only value is a startup error |
 | `DAYFLY_HTTP_BEARER_TOKEN_FILE` | one form | (unset) | Path to a file that contains the bearer token; set this variable or `DAYFLY_HTTP_BEARER_TOKEN` |
@@ -745,7 +747,8 @@ curl -X DELETE http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123...
 curl -X DELETE -H 'X-Paste-Token: <token>' \
   http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123...
 
-# List recent (expired filtered out). No dates means yesterday and today UTC:
+# List recent (expired filtered out). No dates means the default window:
+# the last DAYFLY_LIST_DEFAULT_DAYS days, ending today in UTC (2 by default).
 curl 'http://127.0.0.1:8080/v1/pastes?limit=100'
 
 # List one UTC date:
@@ -1014,10 +1017,11 @@ always served as attachments, never rendered inline**. Every download
 carries `X-Content-Type-Options: nosniff`. An inline response also
 carries `Content-Security-Policy: sandbox`, so a served document cannot
 run script in the service's origin even if a type slips through
-detection. The human view page follows the same rule: text in `<pre>`,
-safe images inline, HTML/SVG as a download link only. Every UI HTML
-response carries `X-Content-Type-Options: nosniff` and the framing
-headers.
+detection. The human view page shows text in `<pre>`, including the
+escaped source of HTML, SVG, and XML, and safe images inline. It never
+renders HTML/SVG as markup. The raw link drops markup types to
+`text/plain` so the source opens as text. Every UI HTML response
+carries `X-Content-Type-Options: nosniff` and the framing headers.
 
 Why: for internal use this is fine, but serving a sniffed
 `text/html` or `image/svg+xml` upload as inline HTML on a trusted
@@ -1031,37 +1035,52 @@ flip HTML/SVG to inline.
 ## Human frontend
 
 Server-rendered HTML with a small vanilla-JS drag-and-drop
-enhancement; no JavaScript framework, no build step. Plain forms and
-links otherwise. Internal use only — same private-network /
+enhancement and copy buttons for the body and the view link; no
+JavaScript framework, no build step. Plain forms and links otherwise. Internal use only — same private-network /
 binary-auth model as the API, no public sharing, accounts, or
 comments.
 
-- `GET /` — combined new-paste form: drop or choose a file, or paste
-  text, with a TTL selector in whole days (1, 3, 7, 14, 30, 90 days;
+- `GET /` — combined new-paste form: paste text or drop and choose a
+  file, with a TTL selector in whole days (1, 3, 7, 14, 30, 90 days;
   the API also accepts sub-day TTLs). One "Create paste" button posts
   multipart data to `POST /ui/create`; a selected file takes
   precedence over the text fields. Without JavaScript, the native file
   picker and textarea still work. The page shows the configured file
   size limit; with JavaScript, an oversized file is rejected before the
   upload starts, and the multipart handlers reject an obviously
-  oversized `Content-Length` before reading the body. On success the
-  browser is redirected to the new paste: the word alias when
-  `DAYFLY_SHOW_WORDS` is true (the default), otherwise the canonical ID.
+  oversized `Content-Length` before reading the body. Under the form,
+  the page shows curl examples for a text paste, a file paste, and a
+  JSON response. The examples use the request scheme and host. When a
+  token is configured, the examples add a bearer header placeholder. On
+  success the browser is redirected to the new paste: the word alias
+  when `DAYFLY_SHOW_WORDS` is true (the default), otherwise the
+  canonical ID.
 - `GET /pastes` — current pastes, built from the bucket scan (no
   database): alias when enabled (with the canonical ID as secondary
-  text), filename if any, content type, size, created date, expiry date
-  plus days remaining, and a delete action per row. Expired items are
-  filtered out, consistent with the API's read-time expiry check. Add
-  `?date=YYYY-MM-DD` for another day. Add `?sort=size|created|expires`
+  text when `DAYFLY_SHOW_INTERNAL_PATHS` is true), filename if any,
+  content type, size, created date, and TTL in days
+  remaining, and a delete action per row. Expired items are
+  filtered out, consistent with the API's read-time expiry check. The
+  Start and End inputs start with the default window:
+  `DAYFLY_LIST_DEFAULT_DAYS` days, ending today in UTC (2 by default).
+  Add `?date=YYYY-MM-DD` for another day. Add `?sort=size|created|expires`
   and `?order=asc|desc` to sort. The default is `created` descending.
-  The Size, Created, and Expires headers are links. A click toggles the
+  The Size and Created headers are links. A click toggles the
   direction and keeps the date filters. A missing created or expiry
   value sorts last in both directions.
-- `GET /view/<id>` — one paste: the word alias when enabled,
-  metadata and the delete form in a collapsed `<details>` block, then
-  the raw/download link, then the content: text in `<pre>` (capped at
-  1 MiB for the page; the API remains the route for full/sliced reads),
-  safe images inline, other types via the download link.
+- `GET /view/<id>` — one paste: the alias as the page heading, then
+  Download, Raw, and Copy link actions, with a right-aligned Metadata &
+  delete toggle on the same row. The toggle opens a full-width box with
+  the metadata and the delete form. Then the content: text in `<pre>`
+  (capped at 1 MiB for the page; the raw route and the API return the
+  full paste) with a Copy button inside the box, including the escaped
+  source of HTML and SVG, safe images inline, other types via the raw
+  link. The Copy and Copy link buttons appear only when JavaScript
+  runs.
+- `GET /raw/<id>` — the unformatted bytes. Markup types (`text/html`,
+  `application/xhtml+xml`, `image/svg+xml`, and XML) and unknown
+  binary types are served as `text/plain` and open inline. Other types
+  keep the stored Content-Type and the API disposition rules.
 
 Theme: the pages adapt the base look of the user's own site
 stylesheet, https://suorcd.us/style.css (verified live as the site's
@@ -1072,7 +1091,8 @@ background `#091833` (very dark blue), text `#e3e8fc`, accent
 border `#0abdc6` (bright cyan). The file's other two palettes
 (`green-dark`, `neon-dark01`) are **not** used. Layout mirrors the
 site: monospace-first typography, line-height 1.6, 20px body padding,
-1200px centred container, a header with a gradient
+1200px centred container (1600px on the paste list), a header with a
+gradient
 accent-to-transparent bottom border, nav links with a dimmed terminal
 prompt prefix and a dashed cyan border + glow on hover, pink links
 with underline + glow on hover and no visited styling, lowercase

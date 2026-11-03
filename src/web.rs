@@ -49,11 +49,12 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::http::{
-    check_auth, check_list_access, check_paste_control, read_metadata_field, status_for, AppState,
-    ListAccessError, MultipartFieldError, MULTIPART_METADATA_MAX_BYTES,
+    check_auth, check_list_access, check_paste_control, public_base, read_metadata_field,
+    status_for, AppState, ListAccessError, MultipartFieldError, MULTIPART_METADATA_MAX_BYTES,
 };
 use crate::store::{
-    parse_list_window_request, ListWindowRequest, PasteSummary, Store, StoreError, StoredPaste, Ttl,
+    default_list_window, parse_list_window_request, ListWindowRequest, PasteSummary, Store,
+    StoreError, StoredPaste, Ttl,
 };
 
 /// Adapted base look from suorcd.us/style.css, palette cyberpunkNeon
@@ -61,18 +62,58 @@ use crate::store::{
 /// #133e7c, border #0abdc6). Dark-only, no light-mode switch in v1.
 const CSS: &str = r#"
 body{font-family:"JetBrainsMono Nerd Font","JetBrains Mono",Hack,"Fira Code",ui-monospace,Menlo,Consolas,monospace;line-height:1.6;color:#e3e8fc;background:#091833;max-width:1200px;margin:0 auto;padding:20px}
+body.wide{max-width:1600px}
 header{padding-bottom:1rem;background:linear-gradient(to bottom,transparent 96%,transparent 100%)}
 header::after{content:"";display:block;height:2px;margin-top:1rem;background:linear-gradient(to right,#ea00d9,transparent)}
 nav{display:flex;gap:1rem;flex-wrap:wrap;align-items:center}
 nav .prompt{color:#0abdc6;opacity:.6}
 nav a{padding:.25rem .5rem;border:1px dashed transparent;border-radius:4px}
 nav a:hover{border-color:#0abdc6;box-shadow:0 0 10px rgba(10,189,198,.35)}
+nav a.active{color:#0abdc6;text-decoration:underline;text-underline-offset:.3rem;border-color:#0abdc6;box-shadow:0 0 10px rgba(10,189,198,.35)}
 h1{font-size:1.8rem;text-transform:lowercase;color:#ea00d9;text-shadow:0 0 12px rgba(234,0,217,.55)}
 h2{font-size:1.3rem;text-transform:lowercase;color:#ea00d9;border-bottom:1px dotted #0abdc6;padding-bottom:.25rem}
 hr{border:none;border-top:1px dashed #0abdc6;margin:1.5rem 0;opacity:.6}
 a{color:#ea00d9;text-decoration:none}
 a:hover{text-decoration:underline;text-shadow:0 0 8px rgba(234,0,217,.8)}
-table{border-collapse:collapse;width:100%} th,td{text-align:left;padding:.4rem .5rem;border:1px dashed #0abdc6;vertical-align:top}
+table{border-collapse:collapse;width:auto;table-layout:fixed} th,td{text-align:left;padding:.35rem .4rem;border:1px dashed #0abdc6;vertical-align:top}
+.col-link{width:31ch}
+.col-filename{width:28ch}
+.col-content-type{width:9rem}
+.col-size{width:11ch}
+.col-created{width:22ch}
+.col-ttl{width:5ch}
+.col-action{width:12ch}
+.content-type-cell{display:block;max-width:calc(8rem - 1ch);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.size-cell{text-align:right;white-space:nowrap}
+.size-unit{display:inline-block;min-width:3ch;text-align:left;margin-left:.4ch}
+th:nth-child(4){text-align:center}
+.ttl-header{cursor:help;text-decoration:underline dotted;text-underline-offset:.25rem}
+.hint{color:#0abdc6;cursor:help;text-decoration:underline dotted;text-underline-offset:.25rem;font-size:.95rem}
+.view-bar{display:grid;grid-template-columns:1fr auto;align-items:center;gap:.5rem;margin-bottom:1rem}
+.view-actions{display:flex;flex-wrap:wrap;gap:.5rem}
+.metadata-toggle{position:absolute;opacity:0;width:1px;height:1px}
+.metadata-label{grid-column:2;text-align:right;cursor:pointer;color:#0abdc6}
+.metadata-label::before{content:"▶ "}
+.metadata-toggle:checked ~ .metadata-label::before{content:"▼ "}
+.metadata-toggle:focus-visible ~ .metadata-label{outline:1px dashed #0abdc6;outline-offset:.2rem}
+.metadata-panel{grid-column:1/-1;display:none;margin-top:.5rem;padding:1rem;border:1px dashed #0abdc6;border-radius:8px;background:rgba(19,62,124,.35)}
+.metadata-panel form{background:none;border:0;padding:0;margin:0;border-radius:0;backdrop-filter:none}
+.metadata-toggle:checked ~ .metadata-panel{display:block}
+.content-box{position:relative}
+.content-box pre{margin:0;padding-right:6rem}
+.copy-content{position:absolute;top:.5rem;right:.5rem}
+a.button{display:inline-block;font-size:1rem;padding:.35rem .8rem;cursor:pointer;background:rgba(19,62,124,.5);color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px;text-decoration:none}
+a.button:hover{text-decoration:none;box-shadow:0 0 10px rgba(10,189,198,.4)}
+.table-wrap{overflow-x:auto}
+.list-panel{width:max-content;max-width:100%}
+.list-panel form{margin-bottom:1rem}
+.filename-cell{white-space:nowrap}
+th:first-child,td:first-child{white-space:nowrap}
+td:first-child{overflow:hidden;text-overflow:ellipsis}
+th:nth-child(4),td:nth-child(4){white-space:nowrap}
+th:nth-child(5),td:nth-child(5){white-space:nowrap}
+th:nth-child(6),td:nth-child(6){text-align:center;white-space:nowrap}
+th:nth-child(7),td:nth-child(7){text-align:center}
 th{color:#ea00d9}
 .card,form{background:rgba(19,62,124,.35);border:1px dashed #0abdc6;border-radius:8px;padding:1rem;backdrop-filter:blur(4px)}
 details{background:rgba(19,62,124,.35);border:1px dashed #0abdc6;border-radius:8px;padding:.5rem 1rem;margin-bottom:1rem}
@@ -84,13 +125,28 @@ details form{background:none;border:0;padding:0;border-radius:0;backdrop-filter:
 .dropzone input[type=file]{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 .dropzone-title{display:block;font-weight:bold;color:#ea00d9}
 .dropzone .muted{display:block}
-.dropzone .error{color:#ff6b6b}
+.dropzone .error{color:#ff6b6b;border-color:#ff6b6b}
+.dropzone.compact{display:inline-flex;flex-direction:column;align-items:flex-start;gap:.35rem;width:auto;max-width:100%;margin:0;padding:.45rem .8rem;border-width:1px;text-align:left;font-size:.95rem}
+.dropzone-line{display:inline-flex;flex-wrap:wrap;align-items:baseline;gap:.4rem}
+.badge{display:inline-block;max-width:100%;font-size:.8rem;line-height:1.4;padding:.05rem .5rem;border:1px solid #0abdc6;border-radius:999px;color:#0abdc6;background:rgba(10,189,198,.12);overflow-wrap:anywhere}
+.form-actions{display:flex;flex-wrap:wrap;gap:.75rem;align-items:stretch;margin-top:1rem}
+details.cli-hint{margin-top:1.5rem}
+form > p:first-child{margin-top:0}
+form > p:last-child{margin-bottom:0}
+.form-row{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem 1.25rem}
+.form-row p{margin:0}
+.form-row input{min-width:16rem;max-width:100%}
+.form-actions .dropzone.compact{justify-content:center}
+.form-actions button[type=button]{align-self:center}
+.form-actions button[type=submit]{margin-left:auto}
 textarea{width:100%;min-height:12rem;box-sizing:border-box;font-family:"Source Code Pro",Hack,ui-monospace,Menlo,Consolas,monospace;background:#133e7c;color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px;padding:.5rem}
 input,select{font-size:1rem;padding:.3rem .5rem;background:#133e7c;color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px}
+textarea:disabled,input:disabled{opacity:.45;background:#0d2447;color:#9aa6c4;border-color:#4a5568;cursor:not-allowed}
 button{font-size:1rem;padding:.35rem .8rem;cursor:pointer;background:rgba(19,62,124,.5);color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px}
 button:hover{box-shadow:0 0 10px rgba(10,189,198,.4)}
 pre,code{font-family:"Source Code Pro",Hack,ui-monospace,Menlo,Consolas,monospace;background:#133e7c;border:1px dashed #0abdc6;border-radius:4px}
 pre{white-space:pre-wrap;word-wrap:break-word;padding:1rem;overflow-x:auto}
+pre.curl-hint{white-space:pre;word-wrap:normal;background:#091833}
 img{max-width:100%;height:auto;border:1px dashed #0abdc6;border-radius:8px}
 footer{text-align:center;font-size:.85rem;margin-top:2rem;padding-top:1rem;border-top:1px dashed #0abdc6;color:#e3e8fc;opacity:.8}
 .muted{opacity:.7} .expired{color:#ff6b6b}
@@ -198,10 +254,92 @@ const DROPZONE_SCRIPT: &str = r#"<script>
 })();
 </script>"#;
 
-fn page(title: &str, body: &str) -> Html<String> {
+/// Nav items in display order: `(href, label)`.
+const NAV_ITEMS: [(&str, &str); 3] = [
+    ("/", "new paste"),
+    ("/pastes", "current pastes"),
+    ("/.well-known/dayfly.json", "api description"),
+];
+
+/// Build one page. `active` names the nav href for the current page, and
+/// `show_heading` controls the `<h1>`. Pages that repeat a nav label keep
+/// the heading off.
+/// Copy the current view URL or the paste body to the clipboard.
+///
+/// The copy buttons start hidden and the script unhides them, so a
+/// browser without JavaScript never shows an inert control.
+const COPY_LINK_SCRIPT: &str = r#"<script>
+(() => {
+  const copyText = async (text) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      const area = document.createElement('textarea');
+      area.value = text;
+      area.style.position = 'fixed';
+      area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.select();
+      let ok = false;
+      try { ok = document.execCommand('copy'); } catch { ok = false; }
+      area.remove();
+      return ok;
+    }
+  };
+
+  const flash = (button, label) => {
+    const old = button.textContent;
+    button.textContent = label;
+    setTimeout(() => { button.textContent = old; }, 1500);
+  };
+
+  const link = document.querySelector('.copy-link');
+  if (link) {
+    link.hidden = false;
+    link.addEventListener('click', async () => {
+      const url = new URL(link.dataset.copy, location.origin).href;
+      flash(link, (await copyText(url)) ? 'Copied' : 'Copy failed');
+    });
+  }
+
+  document.querySelectorAll('.copy-content').forEach((button) => {
+    button.hidden = false;
+    button.addEventListener('click', async () => {
+      const pre = button.parentElement.querySelector('pre');
+      if (!pre) return;
+      flash(button, (await copyText(pre.textContent)) ? 'Copied' : 'Copy failed');
+    });
+  });
+})();
+</script>"#;
+
+fn page(title: &str, active: Option<&str>, show_heading: bool, body: &str) -> Html<String> {
+    let nav: String = NAV_ITEMS
+        .iter()
+        .map(|(href, label)| nav_link(href, label, active))
+        .collect();
+    let heading = if show_heading {
+        format!("<h1>{title}</h1>\n")
+    } else {
+        String::new()
+    };
+    let body_class = if active == Some("/pastes") {
+        " class=\"wide\""
+    } else {
+        ""
+    };
     Html(format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title} — pastebin</title>\n<style>{CSS}</style>\n</head>\n<body>\n<header><nav><span class=\"prompt\">~/dayfly $</span><a href=\"/\">new paste</a><a href=\"/pastes\">current pastes</a><a href=\"/.well-known/dayfly.json\">api description</a></nav></header>\n<h1>{title}</h1>\n{body}\n<footer>pastebin — internal use only · &copy; 2026 suorcd</footer>\n</body>\n</html>\n"
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title} — dayfly</title>\n<style>{CSS}</style>\n</head>\n<body{body_class}>\n<header><nav><span class=\"prompt\">~/dayfly $</span>{nav}</nav></header>\n{heading}{body}\n<footer>dayfly — internal use only · &copy; 2026 suorcd</footer>\n</body>\n</html>\n"
     ))
+}
+
+fn nav_link(href: &str, label: &str, active: Option<&str>) -> String {
+    if active == Some(href) {
+        format!("<a href=\"{href}\" class=\"active\" aria-current=\"page\">{label}</a>")
+    } else {
+        format!("<a href=\"{href}\">{label}</a>")
+    }
 }
 
 fn html_escape(s: &str) -> String {
@@ -212,7 +350,67 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-fn human_size(size: u64) -> String {
+/// Truncate a filename in the middle and keep the extension.
+///
+/// A name of 25 characters or fewer stays unchanged. A longer name
+/// keeps the first 15 characters, an ellipsis, and the last 10
+/// characters.
+fn middle_truncate_filename(name: &str) -> String {
+    const MAX_CHARS: usize = 25;
+    const HEAD_CHARS: usize = 15;
+    const TAIL_CHARS: usize = 10;
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= MAX_CHARS {
+        return name.to_string();
+    }
+    let head: String = chars[..HEAD_CHARS].iter().collect();
+    let tail: String = chars[chars.len() - TAIL_CHARS..].iter().collect();
+    format!("{head}…{tail}")
+}
+
+/// Render the filename cell: full name in the tooltip, short name on screen.
+fn filename_cell(filename: Option<&str>) -> String {
+    match filename {
+        Some(name) => format!(
+            "<td class=\"filename-cell\" title=\"{}\">{}</td>",
+            html_escape(name),
+            html_escape(&middle_truncate_filename(name))
+        ),
+        None => "<td class=\"filename-cell\">—</td>".to_string(),
+    }
+}
+
+/// Shell examples for the new-paste page.
+///
+/// The base URL comes from the request, so the examples use the scheme
+/// and host that the reader used. The bearer value stays an environment
+/// placeholder: the configured token never appears in the page.
+fn curl_hint(base: &str, bearer: bool) -> String {
+    let auth = if bearer {
+        "-H \"Authorization: Bearer $DAYFLY_HTTP_BEARER_TOKEN\" "
+    } else {
+        ""
+    };
+    let commands = format!(
+        "BASE={base}\n\
+         curl -sS {auth}--data-binary @note.txt \"$BASE/upload\"\n\
+         cat error.log | curl -sS {auth}--data-binary @- \"$BASE/upload\"\n\
+         curl -sS {auth}--data-binary @report.pdf -H \"X-Filename: report.pdf\" \"$BASE/upload\"\n\
+         curl -sS {auth}-H \"Accept: application/json\" -H \"X-TTL: 1h\" --data-binary @note.txt \"$BASE/upload\""
+    );
+    format!(
+        "<details class=\"cli-hint\"><summary>cli</summary>\n\
+         <pre class=\"curl-hint\">{}</pre>\n\
+         </details>\n",
+        html_escape(&commands)
+    )
+}
+
+/// Split a byte count into a rounded whole value and its unit.
+///
+/// Byte counts below 1 KiB stay exact. Larger counts round to the
+/// nearest whole unit, and a rounded 1024 moves to the next unit.
+fn human_size_parts(size: u64) -> (u64, &'static str) {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = size as f64;
     let mut unit = 0;
@@ -221,10 +419,19 @@ fn human_size(size: u64) -> String {
         unit += 1;
     }
     if unit == 0 {
-        format!("{size} B")
-    } else {
-        format!("{v:.1} {}", UNITS[unit])
+        return (size, UNITS[0]);
     }
+    let mut value = (v + 0.5).floor() as u64;
+    if value == 1024 && unit < UNITS.len() - 1 {
+        value = 1;
+        unit += 1;
+    }
+    (value, UNITS[unit])
+}
+
+fn human_size(size: u64) -> String {
+    let (value, unit) = human_size_parts(size);
+    format!("{value} {unit}")
 }
 
 fn fmt_dt(dt: Option<DateTime<Utc>>) -> String {
@@ -232,9 +439,10 @@ fn fmt_dt(dt: Option<DateTime<Utc>>) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
-/// Days remaining until expiry, for the list page. Consistent with the
-/// API's read-time expiry check: an object past its `expires_at` is
-/// expired, even if it is still physically in the bucket.
+/// Whole days remaining until expiry, zero-padded for the table.
+///
+/// Consistent with the API's read-time expiry check: an object past its
+/// `expires_at` is expired, even if it is still physically in the bucket.
 fn days_remaining(expires_at: Option<DateTime<Utc>>) -> String {
     let Some(exp) = expires_at else {
         return "—".to_string();
@@ -246,10 +454,16 @@ fn days_remaining(expires_at: Option<DateTime<Utc>>) -> String {
     let secs = (exp - now).num_seconds();
     // Ceiling division, in stable Rust (div_ceil is still unstable).
     let days = (secs + 86_400 - 1) / 86_400;
-    if days == 1 {
-        "1 day".to_string()
-    } else {
-        format!("{days} days")
+    format!("{days:02}")
+}
+
+/// Days remaining with the unit, for the view page.
+fn days_remaining_label(expires_at: Option<DateTime<Utc>>) -> String {
+    let value = days_remaining(expires_at);
+    match value.as_str() {
+        "expired" | "—" => value,
+        "01" => format!("{value} day"),
+        _ => format!("{value} days"),
     }
 }
 
@@ -351,29 +565,30 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
     let max_file_bytes = store.config.max_file_paste_bytes();
     let max_file_human = human_size(max_file_bytes);
     let mut body = format!(
-        r#"<h2>Paste or upload</h2>
-<form method="post" action="/ui/create" enctype="multipart/form-data" data-max-file-bytes="{max_file_bytes}">
-<p><label>Keep for <select name="ttl_days">{}</select></label></p>
-<label class="dropzone" id="dropzone">
+        r#"<form method="post" action="/ui/create" enctype="multipart/form-data" data-max-file-bytes="{max_file_bytes}">
+<p><label>Text<br><textarea name="text" id="text"></textarea></label></p>
+<div class="form-row">
+<p><label>Keep for <select name="ttl_days">{}</select></label> <span class="hint" title="The selector uses whole days. API clients can send a sub-day TTL with X-TTL. Expiry is checked on read; the bucket sweeper is day-rounded. The bucket itself is private; only this binary talks to Garage.">i</span></p>
+<p><label>Filename (optional, text only) <input type="text" name="filename" id="filename"></label></p>
+</div>
+<p class="muted">Max file size: {max_file_human}. A selected file takes precedence and disables the text fields.</p>
+<div class="form-actions">
+<label class="dropzone compact" id="dropzone">
 <input type="file" name="file" id="file">
-<span class="dropzone-title">Drop a file here</span>
-<span class="muted">or click to choose one</span>
-<span class="muted" id="file-status">No file selected</span>
+<span class="dropzone-line"><span class="dropzone-title">Drop a file</span><span class="muted">or click to choose one</span></span>
+<span class="badge" id="file-status">No file selected</span>
 </label>
 <button type="button" id="clear-file" hidden>Remove file</button>
-<p class="muted">Max file size: {max_file_human}</p>
-<p class="muted">Or paste text below. A selected file takes precedence and disables the text fields.</p>
-<p><label>Text<br><textarea name="text" id="text"></textarea></label></p>
-<p><label>Filename (optional, text only) <input type="text" name="filename" id="filename"></label></p>
-<p><button type="submit">Create paste</button></p>
+<button type="submit">Create paste</button>
+</div>
 </form>"#,
         ttl_options(default_ttl),
     );
     body.push_str(DROPZONE_SCRIPT);
-    body.push_str(
-        r#"<p class="muted">The selector uses whole days. API clients can send a sub-day TTL with X-TTL. Expiry is checked on read; the bucket sweeper is day-rounded. The bucket itself is private; only this binary talks to Garage.</p>"#,
-    );
-    page("New paste", &body).into_response()
+    if let Some(base) = public_base(&headers) {
+        body.push_str(&curl_hint(&base, store.config.http_bearer_token.is_some()));
+    }
+    page("New paste", Some("/"), false, &body).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -426,6 +641,8 @@ fn error_page(e: StoreError) -> Response {
         status,
         page(
             "Error",
+            None,
+            true,
             &format!("<p>{}</p><p><a href=\"/\">Back</a></p>", html_escape(&msg)),
         ),
     )
@@ -438,6 +655,8 @@ fn unauthorized_page(message: &str) -> Response {
         StatusCode::UNAUTHORIZED,
         page(
             "Unauthorized",
+            None,
+            true,
             &format!(
                 "<p>{}</p><p><a href=\"/\">Back</a></p>",
                 html_escape(message)
@@ -453,6 +672,8 @@ fn bad_request_page(message: &str) -> Response {
         StatusCode::BAD_REQUEST,
         page(
             "Error",
+            None,
+            true,
             &format!(
                 "<p>{}</p><p><a href=\"/\">Back</a></p>",
                 html_escape(message)
@@ -892,6 +1113,17 @@ async fn list_handler(
     // list_window already filters expired objects (HeadObject per key),
     // so this page is consistent with the API's read-time expiry check.
     let store = state.store();
+    let (start_value, end_value) = match &request {
+        ListWindowRequest::Default => {
+            let (start_date, end_date) =
+                default_list_window(Utc::now(), store.config.list_default_days);
+            (
+                start_date.format("%Y-%m-%d").to_string(),
+                end_date.format("%Y-%m-%d").to_string(),
+            )
+        }
+        _ => (start.clone(), end.clone()),
+    };
     let items = match &request {
         ListWindowRequest::Date(date) => store.list_recent(Some(date), 1000).await,
         ListWindowRequest::Range { start, end } => {
@@ -918,49 +1150,59 @@ async fn list_handler(
     let filters = filters.join("&");
     let size_header = sort_header("Size", PasteSort::Size, sort, order, &filters);
     let created_header = sort_header("Created", PasteSort::Created, sort, order, &filters);
-    let expires_header = sort_header("Expires", PasteSort::Expires, sort, order, &filters);
 
     let mut rows = String::new();
     let show_words = store.config.show_words;
+    let show_internal_paths = store.config.show_internal_paths;
+    let link_header = if show_internal_paths {
+        "Link / ID"
+    } else {
+        "Link"
+    };
     for item in &items {
         let id_esc = html_escape(&item.id);
         let link_cell = match (show_words, item.words.as_deref()) {
             (true, Some(words)) => {
                 let words_esc = html_escape(words);
-                format!(
-                    "<a href=\"/view/{words_esc}\">{words_esc}</a><br><span class=\"muted\">{id_esc}</span>"
-                )
+                if show_internal_paths {
+                    format!(
+                        "<a href=\"/view/{words_esc}\" title=\"{words_esc}\">{words_esc}</a><br><span class=\"muted\">{id_esc}</span>"
+                    )
+                } else {
+                    format!("<a href=\"/view/{words_esc}\" title=\"{words_esc}\">{words_esc}</a>")
+                }
             }
-            _ => format!("<a href=\"/view/{id_esc}\">{id_esc}</a>"),
+            _ => format!("<a href=\"/view/{id_esc}\" title=\"{id_esc}\">{id_esc}</a>"),
         };
+        let content_type = html_escape(item.content_type.as_deref().unwrap_or("—"));
+        let filename = filename_cell(item.filename.as_deref());
+        let (size_value, size_unit) = human_size_parts(item.size);
         rows.push_str(&format!(
             "<tr><td>{link_cell}</td>\
-             <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
+             {filename}<td><span class=\"content-type-cell\" title=\"{content_type}\">{content_type}</span></td>\
+             <td class=\"size-cell\"><span class=\"size-number\">{size_value}</span><span class=\"size-unit\">{size_unit}</span></td>\
+             <td>{}</td><td>{}</td>\
              <td><form method=\"post\" action=\"/ui/delete\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\"><button type=\"submit\">Delete</button></form></td></tr>\n",
-            html_escape(item.filename.as_deref().unwrap_or("—")),
-            html_escape(item.content_type.as_deref().unwrap_or("—")),
-            human_size(item.size),
             fmt_dt(item.created_at),
-            fmt_dt(item.expires_at),
             days_remaining(item.expires_at),
         ));
     }
     if rows.is_empty() {
         rows.push_str(
-            "<tr><td colspan=\"8\" class=\"muted\">No current pastes in this window.</td></tr>\n",
+            "<tr><td colspan=\"7\" class=\"muted\">No current pastes in this window.</td></tr>\n",
         );
     }
     page(
         "Current pastes",
+        Some("/pastes"),
+        false,
         &format!(
-            r#"<form method="get" action="/pastes"><p><label>Date <input type="date" name="date" value="{}"></label> <button type="submit">Show date</button></p></form>
-<form method="get" action="/pastes"><p><label>Start <input type="date" name="start" value="{}"></label> <label>End <input type="date" name="end" value="{}"></label> <button type="submit">Show range</button></p></form>
-<p class="muted">Dates are UTC. With no dates, the page shows yesterday and today in UTC, so a Pacific evening is included. Built from a direct bucket scan (ListObjectsV2 for each date prefix, plus HeadObject per paste). No database. Listing is O(n) in objects scanned and gets slower as the bucket grows — that slowdown is the trigger for adding a database later.</p>
-<table><thead><tr><th>Link / ID</th><th>Filename</th><th>Content-Type</th><th>{size_header}</th><th>{created_header}</th><th>{expires_header}</th><th>Remaining</th><th></th></tr></thead><tbody>{}</tbody></table>"#,
-            html_escape(&date),
-            html_escape(&start),
-            html_escape(&end),
+            r#"<div class="list-panel"><form method="get" action="/pastes"><p><label>Start <input type="date" name="start" value="{}"></label> <label>End <input type="date" name="end" value="{}"></label> <button type="submit">Show range</button> <span class="hint" title="Dates are UTC. With no dates, the page shows the last {default_days} days, ending today in UTC. Set DAYFLY_LIST_DEFAULT_DAYS to change that. Built from a direct bucket scan (ListObjectsV2 for each date prefix, plus HeadObject per paste). No database. Listing is O(n) in objects scanned and gets slower as the bucket grows — that slowdown is the trigger for adding a database later.">i</span></p></form>
+<div class="table-wrap"><table><colgroup><col class="col-link"><col class="col-filename"><col class="col-content-type"><col class="col-size"><col class="col-created"><col class="col-ttl"><col class="col-action"></colgroup><thead><tr><th>{link_header}</th><th>Filename</th><th>Content-Type</th><th>{size_header}</th><th>{created_header}</th><th class="ttl-header" title="days">TTL</th><th>Action</th></tr></thead><tbody>{}</tbody></table></div></div>"#,
+            html_escape(&start_value),
+            html_escape(&end_value),
             rows,
+            default_days = store.config.list_default_days,
         ),
     )
     .into_response()
@@ -991,6 +1233,18 @@ async fn delete_submit_handler(
     }
 }
 
+/// Whether the view page can show this type as escaped text.
+///
+/// Markup source (HTML, SVG, XML) is text. The view escapes it, so the
+/// browser never renders it as markup.
+fn text_preview_type(main: &str) -> bool {
+    main.starts_with("text/")
+        || matches!(
+            main,
+            "application/json" | "application/xml" | "application/javascript" | "image/svg+xml"
+        )
+}
+
 async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response {
     if let Err(resp) = check_auth(state, headers) {
         return resp;
@@ -1005,43 +1259,49 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
     }
     let id_esc = html_escape(&meta.id);
     let main = meta.content_type.split(';').next().unwrap_or("").trim();
-    let words_line = if store.config.show_words {
-        meta.words
-            .as_deref()
-            .map(|words| {
-                let words_esc = html_escape(words);
-                format!("<p>Words: <a href=\"/view/{words_esc}\">{words_esc}</a></p>")
-            })
-            .unwrap_or_default()
+    let display_name = if store.config.show_words {
+        meta.words.as_deref().unwrap_or(meta.id.as_str())
     } else {
-        String::new()
+        meta.id.as_str()
     };
+    let target_esc = html_escape(display_name);
+    let download_name = html_escape(meta.filename.as_deref().unwrap_or(display_name));
     let mut body = format!(
-        "{words_line}<details><summary>Metadata &amp; delete</summary>\
+        "<div class=\"view-bar\">\
+         <div class=\"view-actions\">\
+         <a class=\"button\" href=\"/v1/pastes/{target_esc}\" download=\"{download_name}\">Download</a>\
+         <a class=\"button\" href=\"/raw/{target_esc}\">Raw</a>\
+         <button type=\"button\" class=\"copy-link\" data-copy=\"/view/{target_esc}\" hidden>Copy link</button>\
+         </div>\
+         <input type=\"checkbox\" id=\"metadata-toggle\" class=\"metadata-toggle\">\
+         <label for=\"metadata-toggle\" class=\"metadata-label\">Metadata &amp; delete</label>\
+         <div class=\"metadata-panel\">\
          <p>Filename: {}</p><p>Content-Type: {}</p><p>Size: {}</p><p>Created: {}</p><p>Expires: {} ({})</p>\
          <form method=\"post\" action=\"/ui/delete\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\"><button type=\"submit\">Delete this paste</button></form>\
-         </details>\
-         <p><a href=\"/v1/pastes/{id_esc}\">Download / raw</a> · <a href=\"/pastes\">Current pastes</a></p>",
+         </div>\
+         </div>",
         html_escape(meta.filename.as_deref().unwrap_or("—")),
         html_escape(&meta.content_type),
         human_size(meta.size),
         fmt_dt(meta.created_at),
         fmt_dt(meta.expires_at),
-        days_remaining(meta.expires_at),
+        days_remaining_label(meta.expires_at),
     );
-    if main == "text/plain"
-        || main == "text/markdown"
-        || main == "text/csv"
-        || main == "application/json"
-    {
+    if text_preview_type(main) {
         // Text view, capped at 1 MiB so the page stays usable; the API
         // remains the route for full / sliced reads of large pastes.
         let slice = store.fetch_text(&meta.id, 0, Some(1_000_000)).await;
         match slice {
             Ok(s) => {
-                body.push_str(&format!("<pre>{}</pre>", html_escape(&s.text)));
+                body.push_str(&format!(
+                    "<hr>\
+                     <div class=\"content-box\"><button type=\"button\" class=\"copy-content\" \
+                     aria-label=\"Copy paste content\" hidden>Copy</button>\
+                     <pre>{}</pre></div>",
+                    html_escape(&s.text)
+                ));
                 if s.truncated {
-                    body.push_str("<p class=\"muted\">Text truncated at 1 MiB for this view. Use the raw API URL above for the full paste.</p>");
+                    body.push_str("<p class=\"muted\">Text truncated at 1 MiB for this view. The raw route returns the full paste.</p>");
                 }
             }
             Err(e) => return error_page(e),
@@ -1054,7 +1314,8 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
             html_escape(meta.filename.as_deref().unwrap_or("image"))
         ));
     }
-    page("View paste", &body).into_response()
+    body.push_str(COPY_LINK_SCRIPT);
+    page(display_name, None, true, &body).into_response()
 }
 
 async fn view_dated(
@@ -1173,12 +1434,14 @@ mod tests {
             max_paste_bytes: 1024 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,
+            list_default_days: 2,
             retention_by_size: false,
             retention_min_days: 30,
             retention_max_days: 365,
             http_bind: "127.0.0.1:0".to_string(),
             trusted_proxies: Vec::new(),
             show_words: false,
+            show_internal_paths: false,
             inline_pdf: true,
             allow_unauthenticated: false,
             list_requires_token: false,
@@ -1543,20 +1806,39 @@ mod tests {
     }
 
     #[test]
+    fn middle_truncate_filename_keeps_the_extension() {
+        assert_eq!(middle_truncate_filename("short.txt"), "short.txt");
+        assert_eq!(
+            middle_truncate_filename("a2345678901234567890123456"),
+            "a23456789012345…7890123456"
+        );
+        assert_eq!(
+            middle_truncate_filename("very-long-report-name-that-keeps-going.xlsx"),
+            "very-long-repor…going.xlsx"
+        );
+    }
+
+    #[test]
     fn human_size_units() {
         assert_eq!(human_size(0), "0 B");
         assert_eq!(human_size(512), "512 B");
-        assert_eq!(human_size(2048), "2.0 KiB");
-        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MiB");
+        assert_eq!(human_size(2048), "2 KiB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5 MiB");
+        assert_eq!(human_size(1024 * 1024 - 1), "1 MiB");
+        assert_eq!(human_size_parts(1536), (2, "KiB"));
     }
 
     #[test]
     fn days_remaining_expired_and_future() {
         let past = Utc::now() - chrono::Duration::days(1);
         assert_eq!(days_remaining(Some(past)), "expired");
-        let future = Utc::now() + chrono::Duration::days(3);
-        // Ceil of ~3 days; allow the exact string for 3 days.
-        assert_eq!(days_remaining(Some(future)), "3 days");
+        let today = Utc::now();
+        let future = today + chrono::Duration::days(3);
+        assert_eq!(days_remaining(Some(future)), "03");
+        assert_eq!(days_remaining_label(Some(future)), "03 days");
+        let tomorrow = today + chrono::Duration::hours(1);
+        assert_eq!(days_remaining(Some(tomorrow)), "01");
+        assert_eq!(days_remaining_label(Some(tomorrow)), "01 day");
         assert_eq!(days_remaining(None), "—");
     }
 

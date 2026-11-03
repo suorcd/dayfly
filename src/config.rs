@@ -67,6 +67,12 @@ pub struct Config {
     /// specify one. Zero is invalid because it would create a paste that
     /// is already expired.
     pub default_ttl_days: u32,
+    /// Number of days in the default paste list window, ending today in
+    /// UTC.
+    ///
+    /// Default: 2, so the window covers yesterday and today. The value
+    /// must be from 1 to [`crate::store::LIST_WINDOW_MAX_DAYS`].
+    pub list_default_days: u32,
     /// Whether to clamp the expiry of a paste by its size.
     ///
     /// Default: `false`. With the default, the requested TTL is used
@@ -133,6 +139,13 @@ pub struct Config {
     /// generated and stored, and the JSON/MCP responses still include the
     /// `words` field. It is not a secrecy control.
     pub show_words: bool,
+    /// Whether the paste list shows the internal date and ID path.
+    ///
+    /// Default: `false`. The list keeps the alias as the link and hides
+    /// the canonical `date/id` text. Set this to `true` to show the ID
+    /// under the alias. This is a display setting only: the view URLs
+    /// and API responses still accept the canonical ID.
+    pub show_internal_paths: bool,
     /// Whether a PDF download is served inline.
     ///
     /// Default: `true`. Set this to `false` on a public instance so a PDF
@@ -233,6 +246,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         help: "Default TTL in whole days",
     },
     ConfigField {
+        name: "DAYFLY_LIST_DEFAULT_DAYS",
+        value: Some("2"),
+        required: false,
+        help: "Default window for the paste list, in whole days",
+    },
+    ConfigField {
         name: "DAYFLY_RETENTION_BY_SIZE",
         value: Some("false"),
         required: false,
@@ -291,6 +310,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("true"),
         required: false,
         help: "Show generated aliases in the human UI",
+    },
+    ConfigField {
+        name: "DAYFLY_SHOW_INTERNAL_PATHS",
+        value: Some("false"),
+        required: false,
+        help: "Show the internal date and ID path in the paste list",
     },
     ConfigField {
         name: "DAYFLY_INLINE_PDF",
@@ -967,6 +992,21 @@ impl Config {
                 format!("expected at most {MAX_TTL_DAYS} days"),
             ));
         }
+        let list_default_days = optional_u32(
+            &lookup,
+            "DAYFLY_LIST_DEFAULT_DAYS",
+            field_u32("DAYFLY_LIST_DEFAULT_DAYS", 2),
+        )?;
+        if list_default_days == 0 || list_default_days as usize > crate::store::LIST_WINDOW_MAX_DAYS
+        {
+            return Err(ConfigError::Invalid(
+                "DAYFLY_LIST_DEFAULT_DAYS".to_string(),
+                format!(
+                    "expected an integer from 1 to {}",
+                    crate::store::LIST_WINDOW_MAX_DAYS
+                ),
+            ));
+        }
         let retention_min_days = optional_u32(
             &lookup,
             "DAYFLY_RETENTION_MIN_DAYS",
@@ -1044,6 +1084,7 @@ impl Config {
             )?,
             alias_words,
             default_ttl_days,
+            list_default_days,
             retention_by_size: optional_bool(
                 &lookup,
                 "DAYFLY_RETENTION_BY_SIZE",
@@ -1061,6 +1102,11 @@ impl Config {
                 &lookup,
                 "DAYFLY_SHOW_WORDS",
                 field_default("DAYFLY_SHOW_WORDS") == Some("true"),
+            )?,
+            show_internal_paths: optional_bool(
+                &lookup,
+                "DAYFLY_SHOW_INTERNAL_PATHS",
+                field_default("DAYFLY_SHOW_INTERNAL_PATHS") == Some("true"),
             )?,
             inline_pdf: optional_bool(
                 &lookup,
@@ -1153,7 +1199,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} inline_pdf={} trusted_proxies={} list_requires_token={} paste_tokens={} rate_limit_per_minute={} mcp_local_root={}",
+            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} trusted_proxies={} list_requires_token={} paste_tokens={} rate_limit_per_minute={} mcp_local_root={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -1166,10 +1212,12 @@ impl Config {
             self.max_paste_bytes,
             self.alias_words,
             self.default_ttl_days,
+            self.list_default_days,
             self.retention_by_size,
             self.retention_min_days,
             self.retention_max_days,
             self.show_words,
+            self.show_internal_paths,
             self.inline_pdf,
             self.trusted_proxies.len(),
             self.list_requires_token,
@@ -1500,12 +1548,14 @@ mod tests {
             max_paste_bytes: 1024 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,
+            list_default_days: 2,
             retention_by_size: false,
             retention_min_days: 30,
             retention_max_days: 365,
             http_bind: "127.0.0.1:0".to_string(),
             trusted_proxies: Vec::new(),
             show_words: true,
+            show_internal_paths: false,
             inline_pdf: true,
             allow_unauthenticated: false,
             list_requires_token: false,
