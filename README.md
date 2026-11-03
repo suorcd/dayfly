@@ -333,6 +333,7 @@ permissions and the lower total cap.
 | `DAYFLY_HTTP_BEARER_TOKEN` | one form | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model); set this variable or `DAYFLY_HTTP_BEARER_TOKEN_FILE`. An unset value disables auth; a set empty or whitespace-only value is a startup error |
 | `DAYFLY_HTTP_BEARER_TOKEN_FILE` | one form | (unset) | Path to a file that contains the bearer token; set this variable or `DAYFLY_HTTP_BEARER_TOKEN` |
 | `DAYFLY_MCP_LOCAL_ROOT` | no | (unset) | Directory for the MCP local-path tools. It must exist, or startup fails. When set, `store_file` and `fetch_file` refuse any path outside it, after resolving symlinks. When unset, the stdio transport accepts any readable path and the HTTP transport refuses both tools |
+| `DAYFLY_FAVICON_PATH` | no | (unset) | Path to a favicon served at `/favicon.ico`. The file is read at startup and must be 1 MiB or smaller. The content type follows the extension (`.ico`, `.png`, `.svg`, `.gif`, `.jpg`, `.webp`). Unset returns 404 |
 
 ### Retention by size
 
@@ -1081,6 +1082,8 @@ comments.
   `application/xhtml+xml`, `image/svg+xml`, and XML) and unknown
   binary types are served as `text/plain` and open inline. Other types
   keep the stored Content-Type and the API disposition rules.
+- `GET /favicon.ico` — the file named by `DAYFLY_FAVICON_PATH`, or 404
+  when unset. The file is read at startup and cached for one day.
 
 Theme: the pages adapt the base look of the user's own site
 stylesheet, https://suorcd.us/style.css (verified live as the site's

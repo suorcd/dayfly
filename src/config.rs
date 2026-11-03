@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -172,6 +173,21 @@ pub struct Config {
     /// The HTTP transport has no such boundary, so it refuses both tools
     /// until this is set.
     pub mcp_local_root: Option<PathBuf>,
+    /// Optional favicon served at `/favicon.ico`.
+    ///
+    /// The path comes from `DAYFLY_FAVICON_PATH`. The file is read once
+    /// at startup and must be 1 MiB or smaller. When unset, the route
+    /// returns 404.
+    pub favicon: Option<Favicon>,
+}
+
+/// A favicon image loaded at startup.
+#[derive(Clone)]
+pub struct Favicon {
+    /// Raw image bytes.
+    pub bytes: Arc<[u8]>,
+    /// Response content type for the bytes.
+    pub content_type: &'static str,
 }
 
 /// One setting that the environment file template and the parser share.
@@ -334,6 +350,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: None,
         required: false,
         help: "Optional directory for the MCP local-path tools",
+    },
+    ConfigField {
+        name: "DAYFLY_FAVICON_PATH",
+        value: None,
+        required: false,
+        help: "Optional path to a favicon served at /favicon.ico",
     },
 ];
 
@@ -781,6 +803,55 @@ fn local_root(value: Option<String>) -> Result<Option<PathBuf>, ConfigError> {
     Ok(Some(resolved))
 }
 
+/// Largest favicon accepted at startup.
+const MAX_FAVICON_BYTES: usize = 1024 * 1024;
+
+/// Load the optional favicon file and pick its response content type.
+fn favicon(value: Option<String>) -> Result<Option<Favicon>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let path = Path::new(value);
+    let bytes = std::fs::read(path).map_err(|e| {
+        ConfigError::Invalid(
+            "DAYFLY_FAVICON_PATH".to_string(),
+            format!("cannot read {value}: {e}"),
+        )
+    })?;
+    if bytes.is_empty() {
+        return Err(ConfigError::Invalid(
+            "DAYFLY_FAVICON_PATH".to_string(),
+            "the file is empty".to_string(),
+        ));
+    }
+    if bytes.len() > MAX_FAVICON_BYTES {
+        return Err(ConfigError::Invalid(
+            "DAYFLY_FAVICON_PATH".to_string(),
+            format!("the file is larger than {MAX_FAVICON_BYTES} bytes"),
+        ));
+    }
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    let content_type = match extension.as_deref() {
+        Some("png") => "image/png",
+        Some("svg") => "image/svg+xml",
+        Some("gif") => "image/gif",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        _ => "image/x-icon",
+    };
+    Ok(Some(Favicon {
+        bytes: Arc::from(bytes.into_boxed_slice()),
+        content_type,
+    }))
+}
+
 /// Build a warning for unsafe credential file metadata.
 ///
 /// The warning names the path, the mode, and the owner IDs. It never
@@ -1138,6 +1209,7 @@ impl Config {
                 "DAYFLY_HTTP_BEARER_TOKEN",
             )?)?,
             mcp_local_root: local_root(lookup("DAYFLY_MCP_LOCAL_ROOT"))?,
+            favicon: favicon(lookup("DAYFLY_FAVICON_PATH"))?,
         })
     }
 
@@ -1199,7 +1271,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} trusted_proxies={} list_requires_token={} paste_tokens={} rate_limit_per_minute={} mcp_local_root={}",
+            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} trusted_proxies={} list_requires_token={} paste_tokens={} rate_limit_per_minute={} mcp_local_root={} favicon={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -1224,6 +1296,11 @@ impl Config {
             self.paste_tokens,
             self.rate_limit_per_minute,
             if self.mcp_local_root.is_some() {
+                "set"
+            } else {
+                "unset"
+            },
+            if self.favicon.is_some() {
                 "set"
             } else {
                 "unset"
@@ -1563,6 +1640,7 @@ mod tests {
             rate_limit_per_minute: 0,
             http_bearer_token: None,
             mcp_local_root: None,
+            favicon: None,
         }
     }
 

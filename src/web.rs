@@ -38,7 +38,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
-use axum::http::header::{CONTENT_LENGTH, HOST, ORIGIN, REFERER};
+use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN, REFERER};
 use axum::http::uri::{Authority, Uri};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{map_response, Next};
@@ -1366,6 +1366,20 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
     page(display_name, None, true, &body).into_response()
 }
 
+async fn favicon_handler(State(state): State<AppState>) -> Response {
+    let store = state.store();
+    let Some(favicon) = &store.config.favicon else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(favicon.content_type));
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
+    );
+    (headers, favicon.bytes.to_vec()).into_response()
+}
+
 async fn view_dated(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1424,6 +1438,7 @@ pub fn ui_router(state: AppState) -> Router<AppState> {
         .merge(form_routes)
         .merge(text_routes)
         .route("/", get(index_handler))
+        .route("/favicon.ico", get(favicon_handler))
         .route("/ui/delete", post(delete_submit_handler))
         .route("/pastes", get(list_handler))
         .route("/view/{date}/{random}", get(view_dated))
@@ -1497,6 +1512,7 @@ mod tests {
             rate_limit_per_minute: 0,
             http_bearer_token: None,
             mcp_local_root: None,
+            favicon: None,
         }
     }
 

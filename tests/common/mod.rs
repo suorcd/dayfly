@@ -222,6 +222,7 @@ impl FakeS3 {
             rate_limit_per_minute: 0,
             http_bearer_token: None,
             mcp_local_root: None,
+            favicon: None,
         }
     }
 
