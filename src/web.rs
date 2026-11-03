@@ -325,6 +325,7 @@ const COPY_LINK_SCRIPT: &str = r#"<script>
 </script>"#;
 
 fn page(title: &str, active: Option<&str>, show_heading: bool, body: &str) -> Html<String> {
+    let title = html_escape(title);
     let nav: String = NAV_ITEMS
         .iter()
         .map(|(href, label)| nav_link(href, label, active))
@@ -1859,6 +1860,20 @@ mod tests {
             error_page(StoreError::S3("s3".to_string())).status(),
             StatusCode::BAD_GATEWAY
         );
+    }
+
+    #[test]
+    fn page_escapes_the_title() {
+        let rendered = page("<script>alert(1)</script>", None, true, "").0;
+        assert!(
+            rendered.contains("<title>&lt;script&gt;alert(1)&lt;/script&gt; — dayfly</title>"),
+            "the title tag must be escaped: {rendered}"
+        );
+        assert!(
+            rendered.contains("<h1>&lt;script&gt;alert(1)&lt;/script&gt;</h1>"),
+            "the heading must be escaped: {rendered}"
+        );
+        assert!(!rendered.contains("<script>alert(1)</script>"));
     }
 
     #[test]
