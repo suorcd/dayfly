@@ -84,8 +84,10 @@ details form{background:none;border:0;padding:0;border-radius:0;backdrop-filter:
 .dropzone input[type=file]{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 .dropzone-title{display:block;font-weight:bold;color:#ea00d9}
 .dropzone .muted{display:block}
-.dropzone .error{color:#ff6b6b}
-.dropzone.compact{display:inline-flex;flex-wrap:wrap;align-items:center;gap:.5rem;width:auto;max-width:100%;margin:0;padding:.45rem .8rem;border-width:1px;text-align:left;font-size:.95rem}
+.dropzone .error{color:#ff6b6b;border-color:#ff6b6b}
+.dropzone.compact{display:inline-flex;flex-direction:column;align-items:flex-start;gap:.35rem;width:auto;max-width:100%;margin:0;padding:.45rem .8rem;border-width:1px;text-align:left;font-size:.95rem}
+.dropzone-line{display:inline-flex;flex-wrap:wrap;align-items:baseline;gap:.4rem}
+.badge{display:inline-block;max-width:100%;font-size:.8rem;line-height:1.4;padding:.05rem .5rem;border:1px solid #0abdc6;border-radius:999px;color:#0abdc6;background:rgba(10,189,198,.12);overflow-wrap:anywhere}
 .form-actions{display:flex;flex-wrap:wrap;gap:.75rem;align-items:center;margin-top:1rem}
 .form-actions button[type=submit]{margin-left:auto}
 textarea{width:100%;min-height:12rem;box-sizing:border-box;font-family:"Source Code Pro",Hack,ui-monospace,Menlo,Consolas,monospace;background:#133e7c;color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px;padding:.5rem}
@@ -363,9 +365,8 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
 <div class="form-actions">
 <label class="dropzone compact" id="dropzone">
 <input type="file" name="file" id="file">
-<span class="dropzone-title">Drop a file</span>
-<span class="muted">or click to choose one</span>
-<span class="muted" id="file-status">No file selected</span>
+<span class="dropzone-line"><span class="dropzone-title">Drop a file</span><span class="muted">or click to choose one</span></span>
+<span class="badge" id="file-status">No file selected</span>
 </label>
 <button type="button" id="clear-file" hidden>Remove file</button>
 <button type="submit">Create paste</button>
