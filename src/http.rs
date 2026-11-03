@@ -477,17 +477,27 @@ fn wants_json(headers: &HeaderMap, query: &HashMap<String, String>) -> bool {
         .unwrap_or(false)
 }
 
-fn paste_url(headers: &HeaderMap, id: &str) -> String {
-    let path = format!("/v1/pastes/{id}");
-    let Some(host) = header_str(headers, HOST.as_str()) else {
-        return path;
-    };
+/// Public base URL for the current request, without a trailing slash.
+///
+/// The scheme comes from `x-forwarded-proto` when the value is `http`
+/// or `https`; otherwise it is `http`. The host comes from the `Host`
+/// header. A request without a host has no base URL.
+pub(crate) fn public_base(headers: &HeaderMap) -> Option<String> {
+    let host = header_str(headers, HOST.as_str())?;
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
         .filter(|s| *s == "https" || *s == "http")
         .unwrap_or("http");
-    format!("{scheme}://{host}{path}")
+    Some(format!("{scheme}://{host}"))
+}
+
+fn paste_url(headers: &HeaderMap, id: &str) -> String {
+    let path = format!("/v1/pastes/{id}");
+    match public_base(headers) {
+        Some(base) => format!("{base}{path}"),
+        None => path,
+    }
 }
 
 fn upload_response(

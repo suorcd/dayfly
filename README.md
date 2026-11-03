@@ -1044,9 +1044,13 @@ comments.
   picker and textarea still work. The page shows the configured file
   size limit; with JavaScript, an oversized file is rejected before the
   upload starts, and the multipart handlers reject an obviously
-  oversized `Content-Length` before reading the body. On success the
-  browser is redirected to the new paste: the word alias when
-  `DAYFLY_SHOW_WORDS` is true (the default), otherwise the canonical ID.
+  oversized `Content-Length` before reading the body. Under the form,
+  the page shows curl examples for a text paste, a file paste, and a
+  JSON response. The examples use the request scheme and host. When a
+  token is configured, the examples add a bearer header placeholder. On
+  success the browser is redirected to the new paste: the word alias
+  when `DAYFLY_SHOW_WORDS` is true (the default), otherwise the
+  canonical ID.
 - `GET /pastes` — current pastes, built from the bucket scan (no
   database): alias when enabled (with the canonical ID as secondary
   text), filename if any, content type, size, created date, expiry date

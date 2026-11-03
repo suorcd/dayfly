@@ -123,6 +123,110 @@ async fn index_page_renders_the_combined_form_and_the_default_ttl() {
 }
 
 #[tokio::test]
+async fn index_page_shows_curl_examples_for_the_request_base() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let request = common::request(
+        "GET",
+        "/",
+        &[
+            ("host", "dayfly.test".to_string()),
+            ("x-forwarded-proto", "https".to_string()),
+        ],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        page.contains("BASE=https://dayfly.test"),
+        "the hint must use the request base URL: {page}"
+    );
+    assert!(
+        page.contains("curl -sS --data-binary @note.txt &quot;$BASE/upload&quot;"),
+        "the text example is missing: {page}"
+    );
+    assert!(
+        page.contains(
+            "curl -sS --data-binary @report.pdf -H &quot;X-Filename: report.pdf&quot; \
+             &quot;$BASE/upload&quot;"
+        ),
+        "the file example is missing: {page}"
+    );
+    assert!(
+        page.contains(
+            "curl -sS -H &quot;Accept: application/json&quot; --data-binary @note.txt \
+             &quot;$BASE/upload&quot;"
+        ),
+        "the JSON example is missing: {page}"
+    );
+    assert!(
+        !page.contains("Authorization:"),
+        "a page without a configured token must not show the header: {page}"
+    );
+}
+
+#[tokio::test]
+async fn index_page_curl_examples_carry_the_bearer_placeholder() {
+    const TOKEN: &str = "index-page-secret-token";
+    let fake = FakeS3::start().await;
+    let config = common::config_with_token(fake.config(), TOKEN);
+    let store = Store::from_config(config)
+        .await
+        .expect("the store must build without network access");
+    let app = common::app(store);
+    let request = common::request(
+        "GET",
+        "/",
+        &[
+            ("host", "dayfly.test".to_string()),
+            ("authorization", format!("Bearer {TOKEN}")),
+        ],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        page.contains(
+            "curl -sS -H &quot;Authorization: Bearer $DAYFLY_HTTP_BEARER_TOKEN&quot; \
+             --data-binary @note.txt &quot;$BASE/upload&quot;"
+        ),
+        "the example must carry the bearer placeholder: {page}"
+    );
+    assert!(
+        !page.contains(TOKEN),
+        "the configured token must not reach the page: {page}"
+    );
+}
+
+#[tokio::test]
+async fn index_page_escapes_the_base_url_in_the_curl_examples() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let request = common::request(
+        "GET",
+        "/",
+        &[(
+            "host",
+            "evil.example\"><script>alert(1)</script>".to_string(),
+        )],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        page.contains("BASE=http://evil.example&quot;&gt;&lt;script&gt;"),
+        "the base URL must be escaped: {page}"
+    );
+    assert!(
+        !page.contains("<script>alert(1)</script>"),
+        "the base URL must not inject markup: {page}"
+    );
+}
+
+#[tokio::test]
 async fn index_page_selects_a_default_outside_the_fixed_list() {
     let fake = FakeS3::start().await;
     let mut config = fake.config();

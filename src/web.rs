@@ -49,8 +49,8 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::http::{
-    check_auth, check_list_access, check_paste_control, read_metadata_field, status_for, AppState,
-    ListAccessError, MultipartFieldError, MULTIPART_METADATA_MAX_BYTES,
+    check_auth, check_list_access, check_paste_control, public_base, read_metadata_field,
+    status_for, AppState, ListAccessError, MultipartFieldError, MULTIPART_METADATA_MAX_BYTES,
 };
 use crate::store::{
     parse_list_window_request, ListWindowRequest, PasteSummary, Store, StoreError, StoredPaste, Ttl,
@@ -223,6 +223,30 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Shell examples for the new-paste page.
+///
+/// The base URL comes from the request, so the examples use the scheme
+/// and host that the reader used. The bearer value stays an environment
+/// placeholder: the configured token never appears in the page.
+fn curl_hint(base: &str, bearer: bool) -> String {
+    let auth = if bearer {
+        "-H \"Authorization: Bearer $DAYFLY_HTTP_BEARER_TOKEN\" "
+    } else {
+        ""
+    };
+    let commands = format!(
+        "BASE={base}\n\
+         curl -sS {auth}--data-binary @note.txt \"$BASE/upload\"\n\
+         curl -sS {auth}--data-binary @report.pdf -H \"X-Filename: report.pdf\" \"$BASE/upload\"\n\
+         curl -sS {auth}-H \"Accept: application/json\" --data-binary @note.txt \"$BASE/upload\""
+    );
+    format!(
+        "<p class=\"muted\">Send a paste from a shell. Set the base URL once:</p>\n\
+         <pre><code>{}</code></pre>\n",
+        html_escape(&commands)
+    )
+}
+
 fn human_size(size: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = size as f64;
@@ -383,6 +407,9 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
         ttl_options(default_ttl),
     );
     body.push_str(DROPZONE_SCRIPT);
+    if let Some(base) = public_base(&headers) {
+        body.push_str(&curl_hint(&base, store.config.http_bearer_token.is_some()));
+    }
     body.push_str(
         r#"<p class="muted">The selector uses whole days. API clients can send a sub-day TTL with X-TTL. Expiry is checked on read; the bucket sweeper is day-rounded. The bucket itself is private; only this binary talks to Garage.</p>"#,
     );
