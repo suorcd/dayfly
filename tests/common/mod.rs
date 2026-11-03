@@ -1178,6 +1178,11 @@ pub fn metadata_refs(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
         .collect()
 }
 
+/// Build the full HTTP app, including the global fallback and method mapping.
+pub fn full_app(store: Store) -> Router {
+    dayfly::http::app_router(AppState::new(store))
+}
+
 /// Build the full HTTP app: API routes plus the human UI routes.
 pub fn app(store: Store) -> Router {
     let state = AppState::new(store);
