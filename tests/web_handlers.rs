@@ -93,7 +93,7 @@ async fn index_page_renders_the_combined_form_and_the_default_ttl() {
     assert!(page.contains("id=\"file-status\""));
     assert!(page.contains("id=\"clear-file\""));
     assert!(page.contains("data-max-file-bytes=\"1073741824\""));
-    assert!(page.contains("Max file size: 1.0 GiB"));
+    assert!(page.contains("Max file size: 1 GiB"));
     assert!(page.contains("File is too large"));
     assert!(page.contains("name=\"file\""));
     assert!(page.contains("name=\"text\""));
@@ -579,7 +579,7 @@ async fn multipart_over_the_declared_cap_is_rejected_before_reading() {
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{route}");
         let page = html_text(&response_body);
         assert!(page.contains("payload too large"), "{route}: {page}");
-        assert!(page.contains("1.0 GiB"), "{route}: {page}");
+        assert!(page.contains("1 GiB"), "{route}: {page}");
     }
     assert!(fake.keys().is_empty());
 }
@@ -829,6 +829,13 @@ async fn list_page_shows_current_pastes_and_hides_expired_ones() {
     assert!(
         page.contains(">text/plain"),
         "the content type text must stay unedited: {page}"
+    );
+    assert!(
+        page.contains(
+            "<td class=\"size-cell\"><span class=\"size-number\">5</span>\
+             <span class=\"size-unit\">B</span></td>"
+        ),
+        "the size must split into a right-aligned value and a unit: {page}"
     );
     assert!(
         page.contains("<th>Action</th>"),

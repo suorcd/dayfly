@@ -84,6 +84,9 @@ table{border-collapse:collapse;width:auto;table-layout:fixed} th,td{text-align:l
 .col-ttl{width:9ch}
 .col-action{width:9ch}
 .content-type-cell{display:block;max-width:calc(8rem - 1ch);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.size-cell{text-align:right;white-space:nowrap}
+.size-unit{display:inline-block;min-width:3ch;text-align:left;margin-left:.4ch}
+th:nth-child(4){text-align:right}
 .table-wrap{overflow-x:auto}
 .filename-cell{white-space:nowrap}
 th:first-child,td:first-child{white-space:nowrap}
@@ -334,7 +337,11 @@ fn curl_hint(base: &str, bearer: bool) -> String {
     )
 }
 
-fn human_size(size: u64) -> String {
+/// Split a byte count into a rounded whole value and its unit.
+///
+/// Byte counts below 1 KiB stay exact. Larger counts round to the
+/// nearest whole unit, and a rounded 1024 moves to the next unit.
+fn human_size_parts(size: u64) -> (u64, &'static str) {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = size as f64;
     let mut unit = 0;
@@ -343,10 +350,19 @@ fn human_size(size: u64) -> String {
         unit += 1;
     }
     if unit == 0 {
-        format!("{size} B")
-    } else {
-        format!("{v:.1} {}", UNITS[unit])
+        return (size, UNITS[0]);
     }
+    let mut value = (v + 0.5).floor() as u64;
+    if value == 1024 && unit < UNITS.len() - 1 {
+        value = 1;
+        unit += 1;
+    }
+    (value, UNITS[unit])
+}
+
+fn human_size(size: u64) -> String {
+    let (value, unit) = human_size_parts(size);
+    format!("{value} {unit}")
 }
 
 fn fmt_dt(dt: Option<DateTime<Utc>>) -> String {
@@ -1084,11 +1100,13 @@ async fn list_handler(
         };
         let content_type = html_escape(item.content_type.as_deref().unwrap_or("—"));
         let filename = filename_cell(item.filename.as_deref());
+        let (size_value, size_unit) = human_size_parts(item.size);
         rows.push_str(&format!(
             "<tr><td>{link_cell}</td>\
-             {filename}<td><span class=\"content-type-cell\" title=\"{content_type}\">{content_type}</span></td><td>{}</td><td>{}</td><td>{}</td>\
+             {filename}<td><span class=\"content-type-cell\" title=\"{content_type}\">{content_type}</span></td>\
+             <td class=\"size-cell\"><span class=\"size-number\">{size_value}</span><span class=\"size-unit\">{size_unit}</span></td>\
+             <td>{}</td><td>{}</td>\
              <td><form method=\"post\" action=\"/ui/delete\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\"><button type=\"submit\">Delete</button></form></td></tr>\n",
-            human_size(item.size),
             fmt_dt(item.created_at),
             days_remaining(item.expires_at),
         ));
@@ -1709,8 +1727,10 @@ mod tests {
     fn human_size_units() {
         assert_eq!(human_size(0), "0 B");
         assert_eq!(human_size(512), "512 B");
-        assert_eq!(human_size(2048), "2.0 KiB");
-        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MiB");
+        assert_eq!(human_size(2048), "2 KiB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5 MiB");
+        assert_eq!(human_size(1024 * 1024 - 1), "1 MiB");
+        assert_eq!(human_size_parts(1536), (2, "KiB"));
     }
 
     #[test]
