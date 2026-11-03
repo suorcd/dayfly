@@ -1201,6 +1201,17 @@ async fn rate_limit(State(state): State<AppState>, request: Request, next: Next)
                 )
                     .into_response();
             }
+        } else {
+            // The app router can be mounted without ConnectInfo, for example
+            // in a library or a test. Do not fail closed silently: log once.
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "rate limiting is set but no client address is available; \
+                     the limit is not enforced"
+                );
+            }
         }
     }
     next.run(request).await
