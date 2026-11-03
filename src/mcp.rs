@@ -30,7 +30,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::store::{
-    parse_list_window_request, ListWindowRequest, PasteMetadata, Store, StoreError, Ttl,
+    parse_list_window_request, ListWindowRequest, PasteMetadata, Store, StoreError, StoreHandle,
+    Ttl,
 };
 
 /// How a transport may use server-local paths.
@@ -128,7 +129,7 @@ async fn local_write_path(local: &LocalFiles, requested: &str) -> Result<PathBuf
 
 #[derive(Clone)]
 pub struct Pastebin {
-    store: Arc<Store>,
+    store: StoreHandle,
     local: LocalFiles,
 }
 
@@ -321,11 +322,9 @@ impl Pastebin {
     /// local-path tools keep any readable path unless
     /// `DAYFLY_MCP_LOCAL_ROOT` narrows them.
     pub fn stdio(store: Store) -> Self {
-        let local = LocalFiles::resolve(&store, true);
-        Self {
-            store: Arc::new(store),
-            local,
-        }
+        let store = StoreHandle::new(store);
+        let local = LocalFiles::resolve(&store.get(), true);
+        Self { store, local }
     }
 
     /// Build the handler for the HTTP transport.
@@ -333,11 +332,21 @@ impl Pastebin {
     /// The caller is remote, so the local-path tools are refused unless
     /// `DAYFLY_MCP_LOCAL_ROOT` names a directory they may use.
     pub fn http(store: Store) -> Self {
-        let local = LocalFiles::resolve(&store, false);
-        Self {
-            store: Arc::new(store),
-            local,
-        }
+        Self::http_shared(StoreHandle::new(store))
+    }
+
+    /// Build the HTTP handler on a shared store handle.
+    ///
+    /// Each tool call takes the current snapshot, so a reload affects the
+    /// next call in an existing session.
+    pub fn http_shared(store: StoreHandle) -> Self {
+        let local = LocalFiles::resolve(&store.get(), false);
+        Self { store, local }
+    }
+
+    /// The current store snapshot for one tool call.
+    fn current_store(&self) -> Arc<Store> {
+        self.store.get()
     }
 
     #[tool(
@@ -349,7 +358,7 @@ impl Pastebin {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let ttl = resolve_ttl(params.ttl.as_deref(), params.ttl_days)?;
         let stored = try_store!(
-            self.store
+            self.current_store()
                 .store_text(
                     params.text.as_bytes(),
                     params.filename.as_deref(),
@@ -385,7 +394,7 @@ impl Pastebin {
             Err(e) => return store_error_result(e),
         };
         let stored = try_store!(
-            self.store
+            self.current_store()
                 .store_file_path(
                     path.as_path(),
                     params.filename.as_deref(),
@@ -416,7 +425,7 @@ impl Pastebin {
         Parameters(params): Parameters<AppendTextParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let appended = try_store!(
-            self.store
+            self.current_store()
                 .append_text(&params.id, params.text.as_bytes())
                 .await
         );
@@ -445,7 +454,7 @@ impl Pastebin {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let ttl = resolve_ttl(params.ttl.as_deref(), params.ttl_days)?
             .ok_or_else(|| invalid_ttl("set_ttl requires ttl or ttl_days"))?;
-        let meta = try_store!(self.store.set_ttl(&params.id, ttl).await);
+        let meta = try_store!(self.current_store().set_ttl(&params.id, ttl).await);
         result_json(metadata_json(meta))
     }
 
@@ -457,7 +466,7 @@ impl Pastebin {
         Parameters(params): Parameters<FetchTextParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let slice = try_store!(
-            self.store
+            self.current_store()
                 .fetch_text(&params.id, params.offset.unwrap_or(0), params.limit)
                 .await
         );
@@ -496,7 +505,7 @@ impl Pastebin {
             Err(e) => return store_error_result(e),
         };
         let meta = try_store!(
-            self.store
+            self.current_store()
                 .download_file(&params.id, dest.as_path(), range)
                 .await
         );
@@ -521,7 +530,7 @@ impl Pastebin {
         &self,
         Parameters(params): Parameters<IdParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let meta = try_store!(self.store.head_metadata_live(&params.id).await);
+        let meta = try_store!(self.current_store().head_metadata_live(&params.id).await);
         result_json(metadata_json(meta))
     }
 
@@ -530,7 +539,7 @@ impl Pastebin {
         &self,
         Parameters(params): Parameters<IdParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        try_store!(self.store.delete(&params.id).await);
+        try_store!(self.current_store().delete(&params.id).await);
         result_json(serde_json::json!({"deleted": params.id}))
     }
 
@@ -545,13 +554,17 @@ impl Pastebin {
         let limit = params.limit.unwrap_or(100);
         let items = match &request {
             ListWindowRequest::Date(date) => {
-                try_store!(self.store.list_recent(Some(date), limit).await)
+                try_store!(self.current_store().list_recent(Some(date), limit).await)
             }
             ListWindowRequest::Range { start, end } => {
-                try_store!(self.store.list_window(Some(start), Some(end), limit).await)
+                try_store!(
+                    self.current_store()
+                        .list_window(Some(start), Some(end), limit)
+                        .await
+                )
             }
             ListWindowRequest::Default => {
-                try_store!(self.store.list_window(None, None, limit).await)
+                try_store!(self.current_store().list_window(None, None, limit).await)
             }
         };
         result_json(serde_json::json!({

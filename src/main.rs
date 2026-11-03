@@ -30,6 +30,7 @@ use dayfly::config::{
 use dayfly::http;
 use dayfly::http::AppState;
 use dayfly::mcp;
+use dayfly::reload;
 use dayfly::store::Store;
 
 #[derive(Parser)]
@@ -438,6 +439,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let store = Store::from_config(config.clone()).await?;
+    // The watcher follows the same file that startup used and the secret
+    // files that it names. A process with only process-environment
+    // settings has nothing to watch.
+    let reload_paths = config_path
+        .filter(|path| path.exists())
+        .map(|path| Config::watch_paths(&path))
+        .unwrap_or_default();
 
     match cli.command {
         None | Some(Command::Mcp) => {
@@ -446,10 +454,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Serve { bind }) => {
             let bind_addr = serve_bind.unwrap_or(bind.unwrap_or_else(|| config.http_bind.clone()));
-            let state = AppState { store };
-            let app = http::app_router(state);
+            let state = AppState::new(store);
+            let app = http::app_router(state.clone());
             let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
             tracing::info!("HTTP listening on {bind_addr}");
+            reload::spawn_file_watcher(reload_paths, state, bind_addr.clone());
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),

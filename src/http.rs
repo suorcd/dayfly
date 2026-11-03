@@ -40,7 +40,7 @@ use crate::config::MAX_TTL_SECONDS;
 use crate::content_type::content_disposition;
 use crate::store::{
     parse_list_window_request, parse_range_header, ListWindowRequest, PasteMetadata, Store,
-    StoreError, Ttl, TtlParseError, MULTIPART_CHUNK_BYTES,
+    StoreError, StoreHandle, Ttl, TtlParseError, MULTIPART_CHUNK_BYTES,
 };
 use crate::web::api_write_allowed;
 
@@ -83,7 +83,33 @@ pub(crate) async fn read_metadata_field(
 
 #[derive(Clone)]
 pub struct AppState {
-    pub store: Store,
+    store: StoreHandle,
+}
+
+impl AppState {
+    pub fn new(store: Store) -> Self {
+        Self {
+            store: StoreHandle::new(store),
+        }
+    }
+
+    /// The store snapshot for one operation.
+    ///
+    /// An operation must take one snapshot and use it for its full
+    /// duration. A reload affects the next request, not one in progress.
+    pub fn store(&self) -> Arc<Store> {
+        self.store.get()
+    }
+
+    /// A shared handle for the MCP service and the reload watcher.
+    pub fn store_handle(&self) -> StoreHandle {
+        self.store.clone()
+    }
+
+    /// Replace the store after a successful reload.
+    pub fn replace_store(&self, store: Store) {
+        self.store.replace(store);
+    }
 }
 
 /// Check the bearer token for a route. The API routes and the human UI
@@ -92,7 +118,8 @@ pub struct AppState {
 // indirection at every call site.
 #[allow(clippy::result_large_err)]
 pub(crate) fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
-    let Some(token) = state.store.config.http_bearer_token.as_deref() else {
+    let store = state.store();
+    let Some(token) = store.config.http_bearer_token.as_deref() else {
         return Ok(());
     };
     // Compare the credential in constant time. A byte-by-byte comparison
@@ -401,10 +428,11 @@ async fn upload_dispatch(
     if !api_write_allowed(&headers) {
         return forbidden_write();
     }
+    let store = state.store();
     let content_type = header_str(&headers, CONTENT_TYPE.as_str()).unwrap_or_default();
     if content_type.starts_with("multipart/form-data") {
         match Multipart::from_request(req, &()).await {
-            Ok(multipart) => multipart_inner(state, headers, query, multipart).await,
+            Ok(multipart) => multipart_inner(store, headers, query, multipart).await,
             Err(e) => bad_request(format!("invalid multipart body: {e}")),
         }
     } else {
@@ -421,7 +449,7 @@ async fn upload_dispatch(
         let text_paste = filename
             .as_deref()
             .is_none_or(|name| name.trim().is_empty());
-        let max_bytes = state.store.config.max_bytes_for_upload(filename.as_deref());
+        let max_bytes = store.config.max_bytes_for_upload(filename.as_deref());
         let body = req.into_body();
         let stream = body
             .into_data_stream()
@@ -433,8 +461,7 @@ async fn upload_dispatch(
         } else {
             Some(content_type.as_str())
         };
-        match state
-            .store
+        match store
             .store_stream(
                 Box::pin(stream),
                 filename.as_deref(),
@@ -452,23 +479,22 @@ async fn upload_dispatch(
 }
 
 async fn multipart_inner(
-    state: AppState,
+    store: Arc<Store>,
     headers: HeaderMap,
     query: HashMap<String, String>,
     mut multipart: Multipart,
 ) -> Response {
-    let max_request = state
-        .store
+    let max_request = store
         .config
         .max_file_paste_bytes()
-        .saturating_add(state.store.config.max_text_paste_bytes())
+        .saturating_add(store.config.max_text_paste_bytes())
         .saturating_add(1024 * 1024);
     if let Some(length) =
         header_str(&headers, CONTENT_LENGTH.as_str()).and_then(|s| s.trim().parse::<u64>().ok())
     {
         if length > max_request {
             return error_response(StoreError::TooLarge {
-                limit: state.store.config.max_file_paste_bytes(),
+                limit: store.config.max_file_paste_bytes(),
             });
         }
     }
@@ -503,7 +529,7 @@ async fn multipart_inner(
             if filename.is_none() {
                 filename = field.file_name().map(|s| s.to_string());
             }
-            let max_bytes = state.store.config.max_bytes_for_upload(filename.as_deref());
+            let max_bytes = store.config.max_bytes_for_upload(filename.as_deref());
             let stream = futures::stream::unfold(field, |mut f| async move {
                 match f.chunk().await {
                     Ok(Some(chunk)) => Some((Ok(chunk), f)),
@@ -511,8 +537,7 @@ async fn multipart_inner(
                     Err(e) => Some((Err(StoreError::Io(e.to_string())), f)),
                 }
             });
-            return match state
-                .store
+            return match store
                 .store_stream(
                     Box::pin(stream),
                     filename.as_deref(),
@@ -570,7 +595,8 @@ async fn meta_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
     if let Err(resp) = check_auth(state, headers) {
         return resp;
     }
-    match state.store.head_metadata_live(id).await {
+    let store = state.store();
+    match store.head_metadata_live(id).await {
         Ok(meta) => Json(MetaEnvelope::from(meta)).into_response(),
         Err(e) => error_response(e),
     }
@@ -585,7 +611,8 @@ async fn download_inner(
     if let Err(resp) = check_auth(state, headers) {
         return resp;
     }
-    let meta = match state.store.head_metadata(id).await {
+    let store = state.store();
+    let meta = match store.head_metadata(id).await {
         Ok(m) => m,
         Err(e) => return error_response(e),
     };
@@ -671,7 +698,6 @@ async fn download_inner(
     // Stream back in 8 MiB range chunks: the server holds one chunk at
     // a time, never the whole paste. The plan is built once, so each
     // chunk maps to the base object or to the segment that holds it.
-    let store = state.store.clone();
     let plan = meta.plan();
     let stream = futures::stream::unfold(
         (start, end, store, plan),
@@ -734,12 +760,13 @@ async fn list_handler(
         .get("limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(100);
+    let store = state.store();
     let result = match &window {
-        ListWindowRequest::Date(date) => state.store.list_recent(Some(date), limit).await,
+        ListWindowRequest::Date(date) => store.list_recent(Some(date), limit).await,
         ListWindowRequest::Range { start, end } => {
-            state.store.list_window(Some(start), Some(end), limit).await
+            store.list_window(Some(start), Some(end), limit).await
         }
-        ListWindowRequest::Default => state.store.list_window(None, None, limit).await,
+        ListWindowRequest::Default => store.list_window(None, None, limit).await,
     };
     match result {
         Ok(items) => Json(serde_json::json!({
@@ -853,7 +880,7 @@ async fn set_ttl_inner(
         Ok(None) => return bad_request("a TTL is required".to_string()),
         Err(e) => return ttl_error_response(e),
     };
-    match state.store.set_ttl(id, ttl).await {
+    match state.store().set_ttl(id, ttl).await {
         Ok(meta) => Json(MetaEnvelope::from(meta)).into_response(),
         Err(e) => error_response(e),
     }
@@ -870,7 +897,7 @@ async fn delete_dated(
     if !api_write_allowed(&headers) {
         return forbidden_write();
     }
-    match state.store.delete(&format!("{date}/{random}")).await {
+    match state.store().delete(&format!("{date}/{random}")).await {
         Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
         Err(e) => error_response(e),
     }
@@ -887,7 +914,7 @@ async fn delete_bare(
     if !api_write_allowed(&headers) {
         return forbidden_write();
     }
-    match state.store.delete(&random).await {
+    match state.store().delete(&random).await {
         Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
         Err(e) => error_response(e),
     }
@@ -918,9 +945,7 @@ async fn log_failed_auth(request: Request, next: Next) -> Response {
 pub fn app_router(state: AppState) -> Router {
     api_router()
         .merge(mcp_router(state.clone()))
-        .merge(crate::web::ui_router(
-            state.store.config.max_text_paste_bytes(),
-        ))
+        .merge(crate::web::ui_router(state.clone()))
         .layer(middleware::from_fn(log_failed_auth))
         .with_state(state)
 }
@@ -938,9 +963,10 @@ async fn require_bearer(State(state): State<AppState>, request: Request, next: N
 
 /// Streamable HTTP MCP endpoint at `/mcp`.
 ///
-/// The service factory clones the one [`Store`] in `state`, so every MCP
-/// session reads and writes the same bucket as the REST routes. Each
-/// `initialize` request creates an in-memory session with
+/// The service factory shares the reloadable [`StoreHandle`] in `state`, so
+/// every MCP session reads and writes the same bucket as the REST routes.
+/// Each tool call takes the current snapshot, so a reload affects the next
+/// call. Each `initialize` request creates an in-memory session with
 /// [`LocalSessionManager`]. A restart ends the sessions, and a client then
 /// initializes again.
 ///
@@ -949,9 +975,9 @@ async fn require_bearer(State(state): State<AppState>, request: Request, next: N
 /// name, so the endpoint disables that list. The bearer token and the
 /// private network guard the endpoint, as they guard the REST routes.
 pub fn mcp_router(state: AppState) -> Router<AppState> {
-    let store = state.store.clone();
+    let store = state.store_handle();
     let service = StreamableHttpService::new(
-        move || Ok(crate::mcp::Pastebin::http(store.clone())),
+        move || Ok(crate::mcp::Pastebin::http_shared(store.clone())),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default().disable_allowed_hosts(),
     );
@@ -967,7 +993,8 @@ async fn append_inner(state: &AppState, headers: &HeaderMap, id: &str, req: Requ
     if !api_write_allowed(headers) {
         return forbidden_write();
     }
-    let limit = state.store.config.max_text_paste_bytes();
+    let store = state.store();
+    let limit = store.config.max_text_paste_bytes();
     let known_length =
         header_str(headers, CONTENT_LENGTH.as_str()).and_then(|s| s.trim().parse::<u64>().ok());
     if let Some(len) = known_length {
@@ -993,7 +1020,7 @@ async fn append_inner(state: &AppState, headers: &HeaderMap, id: &str, req: Requ
             return error_response(StoreError::LengthMismatch { expected, actual });
         }
     }
-    match state.store.append_text(id, &bytes).await {
+    match store.append_text(id, &bytes).await {
         Ok(appended) => Json(serde_json::json!({
             "id": appended.meta.id,
             "words": appended.meta.words,
@@ -1125,7 +1152,8 @@ pub const API_ROUTE_DOCS: &[ApiRoute] = &[
 
 /// Serve the unauthenticated service document.
 async fn service_description(State(state): State<AppState>) -> Response {
-    let config = &state.store.config;
+    let store = state.store();
+    let config = &store.config;
     let routes: Vec<serde_json::Value> = API_ROUTE_DOCS
         .iter()
         .map(|route| {
@@ -1243,21 +1271,21 @@ mod tests {
     }
 
     async fn test_state(max_text_bytes: u64, max_file_bytes: u64) -> AppState {
-        AppState {
-            store: Store::from_config(test_config(max_text_bytes, max_file_bytes))
+        AppState::new(
+            Store::from_config(test_config(max_text_bytes, max_file_bytes))
                 .await
                 .expect("test S3 config must build without network access"),
-        }
+        )
     }
 
     async fn test_state_with_token(token: &str) -> AppState {
         let mut config = test_config(10 * 1024 * 1024, 1024 * 1024 * 1024);
         config.http_bearer_token = Some(token.to_string());
-        AppState {
-            store: Store::from_config(config)
+        AppState::new(
+            Store::from_config(config)
                 .await
                 .expect("test S3 config must build without network access"),
-        }
+        )
     }
 
     /// HTTP auth schemes are case-insensitive. A `bearer` scheme with the

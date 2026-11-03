@@ -105,6 +105,48 @@ fn total_paste_cap_lowers_the_creation_caps() {
 }
 
 #[test]
+fn watch_paths_follows_the_env_file_and_its_secret_files() {
+    let _guard = lock_env();
+    clear_env();
+    let env_file = temp_env_file("watch-paths");
+    let key_file = env_file.with_extension("key");
+    let token_file = env_file.with_extension("token");
+    std::fs::write(&key_file, "key\n").expect("the key file must be writable");
+    std::fs::write(&token_file, "token\n").expect("the token file must be writable");
+    let key_name = key_file
+        .file_name()
+        .expect("the key path must have a file name")
+        .to_string_lossy();
+    let token_name = token_file
+        .file_name()
+        .expect("the token path must have a file name")
+        .to_string_lossy();
+    std::fs::write(
+        &env_file,
+        format!(
+            "S3_ENDPOINT=https://s3.example.invalid\n\
+             S3_BUCKET=bucket\n\
+             S3_ACCESS_KEY_ID_FILE={key_name}\n\
+             S3_SECRET_ACCESS_KEY=secret\n\
+             DAYFLY_HTTP_BEARER_TOKEN_FILE={token_name}\n"
+        ),
+    )
+    .expect("the env file must be writable");
+
+    let paths = Config::watch_paths(&env_file);
+    assert_eq!(paths.first(), Some(&env_file));
+    assert!(paths.contains(&key_file), "missing the key file: {paths:?}");
+    assert!(
+        paths.contains(&token_file),
+        "missing the token file: {paths:?}"
+    );
+
+    let _ = std::fs::remove_file(env_file);
+    let _ = std::fs::remove_file(key_file);
+    let _ = std::fs::remove_file(token_file);
+}
+
+#[test]
 fn env_file_supplies_values_and_the_process_environment_wins() {
     let _guard = lock_env();
     clear_env();

@@ -274,6 +274,44 @@ the file contents.
 Dayfly runs in the foreground. Use systemd or the container runtime to
 supervise it. There is no daemon mode.
 
+### Reload
+
+`serve` watches the environment file and the credential files that it
+names. It reloads when one of them changes. The watch checks the
+modification time every 2 seconds. A container cannot send a signal to
+itself, so the files are the trigger.
+
+A reload reads the same sources as startup: the process environment
+first, then the file. These settings take effect on the next request:
+
+- `S3_ENDPOINT`, `S3_BUCKET`, `S3_REGION`, and both S3 credentials
+  (`S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY` or their `_FILE` forms)
+- `DAYFLY_MAX_TEXT_BYTES`, `DAYFLY_MAX_FILE_BYTES`, and
+  `DAYFLY_MAX_PASTE_BYTES`
+- `DAYFLY_DEFAULT_TTL_DAYS`
+- `DAYFLY_SHOW_WORDS`
+- `DAYFLY_HTTP_BEARER_TOKEN` or `DAYFLY_HTTP_BEARER_TOKEN_FILE`
+
+These settings need a restart:
+
+- `DAYFLY_HTTP_BIND`: the listener is already bound.
+- `DAYFLY_ALLOW_UNAUTHENTICATED`: startup guard only.
+- `DAYFLY_MCP_LOCAL_ROOT`: an MCP handler resolves it at startup.
+
+A reload that names a different bind or a startup-only setting writes
+one warning and keeps the old value. A malformed file writes one error
+and keeps the running configuration. A successful reload writes one
+line with the changed field names and the safe summary. It never writes
+a value.
+
+Each operation uses one store snapshot. A reload affects the next
+request, not one in progress. An existing HTTP MCP session takes the
+current snapshot for each tool call.
+
+`mcp` (stdio) reads the environment at startup and does not watch the
+file. If the process has no environment file, `serve` writes one line
+and starts no watch.
+
 ## Running the MCP server
 
 stdio is the default transport. For the HTTP transport, see
@@ -621,7 +659,8 @@ The endpoint uses the same auth rule as the REST routes:
 
 Each `initialize` request creates an in-memory MCP session. The
 process accepts several sessions at the same time. Sessions do not
-survive a restart; the client then initializes again.
+survive a restart; the client then initializes again. A reload does not
+end an existing session; each tool call uses the current configuration.
 
 Minimal client configuration. Field names depend on the client; this
 example uses the common `mcpServers` shape:
@@ -1011,8 +1050,8 @@ where `cargo --version`, `rustc --version`, and
 `rust-analyzer --version` all succeed.
 
 **Nix validation result:** `nix build` and the test suite were run on
-`x86_64-linux` against `nixos-unstable`: 406 passed and 2 ignored at
-commit `5d00dce`. On the stable `nixos-25.11` branch the build fails
+`x86_64-linux` against `nixos-unstable`: 416 passed and 2 ignored at
+commit `b5d1ff0`. On the stable `nixos-25.11` branch the build fails
 before compilation with a rustc-too-old error naming 23 AWS crates,
 which is why the flake tracks unstable.
 

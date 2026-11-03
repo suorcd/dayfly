@@ -9,6 +9,7 @@ pub mod config;
 pub mod content_type;
 pub mod http;
 pub mod mcp;
+pub mod reload;
 pub mod store;
 pub mod stream;
 pub mod web;

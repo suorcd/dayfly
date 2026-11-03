@@ -22,7 +22,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
@@ -1114,6 +1114,41 @@ pub struct Store {
     pub config: Config,
     alias_lock: Arc<AsyncMutex<()>>,
     alias_candidates: Option<Arc<Vec<String>>>,
+}
+
+/// A shared handle to the current [`Store`].
+///
+/// An operation takes one snapshot with [`Self::get`] and uses that
+/// snapshot for its full duration. A reload replaces the snapshot, so the
+/// next request sees the new configuration and an in-flight request does
+/// not.
+#[derive(Clone)]
+pub struct StoreHandle {
+    current: Arc<RwLock<Arc<Store>>>,
+}
+
+impl StoreHandle {
+    pub fn new(store: Store) -> Self {
+        Self {
+            current: Arc::new(RwLock::new(Arc::new(store))),
+        }
+    }
+
+    /// The current snapshot.
+    pub fn get(&self) -> Arc<Store> {
+        self.current
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Replace the snapshot after a successful reload.
+    pub fn replace(&self, store: Store) {
+        *self
+            .current
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(store);
+    }
 }
 
 /// The S3 side of a streaming upload (see [`crate::stream::UploadSink`]).
