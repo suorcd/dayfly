@@ -207,6 +207,9 @@ impl FakeS3 {
             max_paste_bytes: 1024 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,
+            retention_by_size: false,
+            retention_min_days: 30,
+            retention_max_days: 365,
             http_bind: "127.0.0.1:0".to_string(),
             trusted_proxies: Vec::new(),
             show_words: false,
@@ -231,6 +234,22 @@ impl FakeS3 {
         Store::from_config(self.config())
             .await
             .expect("fake S3 config must build without network access")
+    }
+
+    pub async fn store_with_retention(
+        &self,
+        max_paste_bytes: u64,
+        min_days: u32,
+        max_days: u32,
+    ) -> Store {
+        let mut config = self.config();
+        config.max_paste_bytes = max_paste_bytes;
+        config.retention_by_size = true;
+        config.retention_min_days = min_days;
+        config.retention_max_days = max_days;
+        Store::from_config(config)
+            .await
+            .expect("fake S3 config with retention must build without network access")
     }
 
     pub async fn store_with_caps(&self, max_text_bytes: u64, max_file_bytes: u64) -> Store {

@@ -197,6 +197,15 @@ fn changed_fields(old: &Config, new: &Config) -> Vec<&'static str> {
     if old.default_ttl_days != new.default_ttl_days {
         changed.push("DAYFLY_DEFAULT_TTL_DAYS");
     }
+    if old.retention_by_size != new.retention_by_size {
+        changed.push("DAYFLY_RETENTION_BY_SIZE");
+    }
+    if old.retention_min_days != new.retention_min_days {
+        changed.push("DAYFLY_RETENTION_MIN_DAYS");
+    }
+    if old.retention_max_days != new.retention_max_days {
+        changed.push("DAYFLY_RETENTION_MAX_DAYS");
+    }
     if old.show_words != new.show_words {
         changed.push("DAYFLY_SHOW_WORDS");
     }

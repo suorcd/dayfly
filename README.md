@@ -38,7 +38,8 @@ is needed. See "No database in v1" below.
   such as `90m` or `1h30m`. A bare integer is always seconds: `7` is
   seven seconds, and `7d` is seven days. `ttl_days` remains as a
   positive whole-day form. The default is 7 days, configurable via
-  `DAYFLY_DEFAULT_TTL_DAYS`. The API and MCP layer compare stored
+  `DAYFLY_DEFAULT_TTL_DAYS`. `DAYFLY_RETENTION_BY_SIZE` can shorten
+  that TTL for a large paste. The API and MCP layer compare stored
   `expires-at` metadata with now and enforce expiry on read. S3
   lifecycle deletion is a separate, asynchronous sweeper (see
   `docs/lifecycle-example.json`): it is day-rounded and may run after
@@ -148,6 +149,11 @@ guard, not an access control: clients behind one NAT share a bucket, and
 a client that can change its address gets a fresh one. Set
 `DAYFLY_TRUSTED_PROXIES` first, or every request is attributed to the
 ingress and shares one bucket.
+
+`DAYFLY_RETENTION_BY_SIZE` bounds storage cost over time without a
+database. It shortens the expiry of a large paste. A public instance
+should set it, because a request limit does not bound the bytes that one
+client can store. See "Retention by size".
 
 The MCP stdio transport does not use the bearer token: spawning the
 binary locally is the trust boundary there. The MCP transport over
@@ -295,6 +301,9 @@ permissions and the lower total cap.
 | `DAYFLY_MAX_PASTE_BYTES` | no | 1073741824 (1 GiB) | Max total size for one paste, including the base object and every appended segment. A new paste or an append that would exceed the cap fails and writes no object |
 | `DAYFLY_ALIAS_WORDS` | no | 3 | Number of words in a new alias. Allowed range 3 to 6. Resolution accepts 3 words up to this value |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1 and at most 3650. The name and meaning are unchanged |
+| `DAYFLY_RETENTION_BY_SIZE` | no | `false` | Clamp the expiry of a paste to a curve based on its total size. The clamp only shortens. Off keeps the exact requested TTL. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
+| `DAYFLY_RETENTION_MIN_DAYS` | no | 30 | Minimum retention in whole days at `DAYFLY_MAX_PASTE_BYTES`. Must be at least 1 and at most 3650, and must not exceed `DAYFLY_RETENTION_MAX_DAYS` |
+| `DAYFLY_RETENTION_MAX_DAYS` | no | 365 | Maximum retention in whole days at zero bytes. Must be at least 1 and at most 3650, and must be at least `DAYFLY_RETENTION_MIN_DAYS` |
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
 | `DAYFLY_TRUSTED_PROXIES` | no | (empty) | Comma-separated CIDR blocks (bare addresses are single hosts) of reverse proxies whose `X-Forwarded-For` header is believed. Empty keeps the socket peer as the client and ignores forwarding headers. The chain is walked from the right; a malformed or over-long chain falls back to the peer with one warning. Set this before any per-client limit behind an ingress |
 | `DAYFLY_RATE_LIMIT_PER_MINUTE` | no | 0 | Maximum requests per client per minute. 0 disables the limiter and allocates no counters. The burst is this value, and the bucket refills at this rate. Over the limit → 429 with `Retry-After`. Keyed on the resolved client address, so set `DAYFLY_TRUSTED_PROXIES` behind an ingress. Per process; resets on restart |
@@ -305,6 +314,33 @@ permissions and the lower total cap.
 | `DAYFLY_HTTP_BEARER_TOKEN` | one form | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model); set this variable or `DAYFLY_HTTP_BEARER_TOKEN_FILE`. An unset value disables auth; a set empty or whitespace-only value is a startup error |
 | `DAYFLY_HTTP_BEARER_TOKEN_FILE` | one form | (unset) | Path to a file that contains the bearer token; set this variable or `DAYFLY_HTTP_BEARER_TOKEN` |
 | `DAYFLY_MCP_LOCAL_ROOT` | no | (unset) | Directory for the MCP local-path tools. It must exist, or startup fails. When set, `store_file` and `fetch_file` refuse any path outside it, after resolving symlinks. When unset, the stdio transport accepts any readable path and the HTTP transport refuses both tools |
+
+### Retention by size
+
+`DAYFLY_RETENTION_BY_SIZE` bounds storage cost with time. It is off by
+default. When it is on, the expiry of a new paste is clamped to the
+size curve:
+
+```text
+retention_days = min + (max - min) * (1 - size / cap)^3
+```
+
+`min` is `DAYFLY_RETENTION_MIN_DAYS` (default 30). `max` is
+`DAYFLY_RETENTION_MAX_DAYS` (default 365). `size` is the total paste
+size: the base object plus every segment. `cap` is
+`DAYFLY_MAX_PASTE_BYTES`.
+
+The clamp only shortens. A client TTL below the curve is kept. A paste
+at or above the cap gets `min` days. An append that crosses a curve
+boundary shortens the expiry of the base and every segment. `PATCH`
+cannot extend a paste past the curve value.
+
+A streamed upload without `Content-Length` uses its request cap as
+`size`, so it gets the shortest retention for that cap. Send a length
+to get the curve value for the real size.
+
+The alias keeps its original expiry. It is never earlier than the
+paste.
 
 Alias strength by word count (7,776 words, 12.925 bits per word):
 
@@ -352,6 +388,8 @@ first, then the file. These settings take effect on the next request:
   `DAYFLY_MAX_PASTE_BYTES`
 - `DAYFLY_ALIAS_WORDS`
 - `DAYFLY_DEFAULT_TTL_DAYS`
+- `DAYFLY_RETENTION_BY_SIZE`, `DAYFLY_RETENTION_MIN_DAYS`, and
+  `DAYFLY_RETENTION_MAX_DAYS`
 - `DAYFLY_SHOW_WORDS`
 - `DAYFLY_INLINE_PDF`
 - `DAYFLY_TRUSTED_PROXIES`
@@ -554,8 +592,10 @@ cat notes.txt | curl --data-binary @- \
 ### Change expiry
 
 `PATCH` the paste with a new TTL. The new expiry is measured from now,
-so a shorter or longer window both work. The call rewrites the base,
-every segment, and the alias, then returns the metadata shape.
+so a shorter or longer window both work. With `DAYFLY_RETENTION_BY_SIZE`
+on, the new expiry stops at the curve value for the current total size.
+The call rewrites the base, every segment, and the alias, then returns
+the metadata shape.
 
 ```sh
 # Shorten to one hour.
@@ -581,7 +621,8 @@ printf 'another line\n' | curl --data-binary @- \
 ```
 
 An append writes only the new bytes. It does not rewrite the base
-object. The text cap applies to this append, not to the total size.
+object, except when `DAYFLY_RETENTION_BY_SIZE` shortens the expiry. The
+text cap applies to this append, not to the total size.
 An expired or missing ID returns 410 or 404 and writes nothing. An
 empty body writes nothing. Use the bare ID form
 `/v1/pastes/<random>/append` if you do not have the date. A word alias
@@ -763,7 +804,8 @@ object and leaves the base object unchanged.
 - An append lists the segment prefix and takes max + 1. It writes only
   the new bytes. The cost is the new bytes plus metadata calls that
   scale with the segment count, not with the total size. It does not
-  copy or rewrite the base object.
+  copy or rewrite the base object, except when
+  `DAYFLY_RETENTION_BY_SIZE` shortens the expiry.
 - Two appends can choose the same sequence. The random suffix keeps the
   object names distinct, so both appends survive.
 - An ID has at most two components after `pastes/`. A segment key has
@@ -778,7 +820,9 @@ object and leaves the base object unchanged.
 - `delete` removes the base object, every object under its segment
   prefix, and the alias object.
 - An append keeps the `expires-at` value of the base object. It does
-  not extend the TTL.
+  not extend the TTL. With `DAYFLY_RETENTION_BY_SIZE` on, an append
+  that crosses a curve boundary shortens the expiry and rewrites the
+  base and the earlier segments.
 - An append to an expired or missing ID returns an error and writes no
   object.
 - A stored `sha256` covers the base object only. When segments exist,

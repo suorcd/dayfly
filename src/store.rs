@@ -15,9 +15,9 @@
 //!   both appends survive. See the README for the read order.
 //! * Expiry is enforced on read by comparing stored `expires-at` metadata
 //!   with now. A TTL can be shorter than one day. An append inherits the
-//!   base expiry and does not extend it. S3 lifecycle deletion, if
-//!   configured, is only a day-rounded storage sweeper and may run after
-//!   expiry.
+//!   base expiry and does not extend it. With `retention_by_size` on, an
+//!   append can shorten the expiry. S3 lifecycle deletion, if configured,
+//!   is only a day-rounded storage sweeper and may run after expiry.
 
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
@@ -178,6 +178,17 @@ impl Ttl {
             // A u32 day count always fits a chrono Duration. Keep the
             // fallback so an invalid value can never panic.
             duration: chrono::Duration::try_days(i64::from(days)).unwrap_or(chrono::Duration::MAX),
+        }
+    }
+
+    /// A TTL in seconds for a value that the server computes.
+    ///
+    /// The retention curve uses this constructor. A negative value is
+    /// clamped to zero, so this function cannot panic.
+    pub(crate) fn seconds(seconds: i64) -> Self {
+        Self {
+            duration: chrono::Duration::try_seconds(seconds.max(0))
+                .unwrap_or(chrono::Duration::MAX),
         }
     }
 
@@ -1638,6 +1649,22 @@ impl Store {
         Err(StoreError::NotFound(id.to_string()))
     }
 
+    /// Clamp a TTL to the size curve when `retention_by_size` is on.
+    ///
+    /// With the setting off, the original TTL comes back unchanged, so
+    /// every existing TTL form keeps its exact expiry.
+    fn clamp_ttl_to_size(&self, ttl: Ttl, size: u64) -> Ttl {
+        if !self.config.retention_by_size {
+            return ttl;
+        }
+        let limit = self.config.retention_seconds(size);
+        if ttl.num_seconds() > limit {
+            Ttl::seconds(limit)
+        } else {
+            ttl
+        }
+    }
+
     pub async fn store_text(
         &self,
         text: &[u8],
@@ -1650,6 +1677,7 @@ impl Store {
             return Err(StoreError::TooLarge { limit: max_bytes });
         }
         let ttl = ttl.unwrap_or_else(|| Ttl::days(self.config.default_ttl_days));
+        let ttl = self.clamp_ttl_to_size(ttl, text.len() as u64);
         let created_at = Utc::now();
         let random_id = generate_random_id();
         let date = created_at.format("%Y-%m-%d").to_string();
@@ -1739,7 +1767,8 @@ impl Store {
                 limit: max_file_bytes,
             });
         }
-        let ttl = ttl.unwrap_or_else(|| Ttl::days(self.config.default_ttl_days));
+        let mut ttl = ttl.unwrap_or_else(|| Ttl::days(self.config.default_ttl_days));
+        ttl = self.clamp_ttl_to_size(ttl, len);
         let created_at = Utc::now();
         let random_id = generate_random_id();
         let date = created_at.format("%Y-%m-%d").to_string();
@@ -1749,7 +1778,7 @@ impl Store {
                 .and_then(|n| n.to_str())
                 .map(|s| s.to_string())
         });
-        let expires_at = expires_at_for(created_at, ttl);
+        let mut expires_at = expires_at_for(created_at, ttl);
         let mut words: Option<String> = None;
         if len as usize <= MULTIPART_CHUNK_BYTES {
             // One bounded read gives the body, the hash, and the size, so
@@ -1777,6 +1806,8 @@ impl Store {
                 });
             }
             if size <= MULTIPART_CHUNK_BYTES as u64 {
+                let ttl = self.clamp_ttl_to_size(ttl, size);
+                let expires_at = expires_at_for(created_at, ttl);
                 let detection = detection_for(display_name.as_deref(), content_type, &bytes);
                 let ct = detection.content_type.clone();
                 let sha = sha256_hex(&bytes);
@@ -1850,6 +1881,10 @@ impl Store {
                     limit: max_file_bytes,
                 });
             }
+            // The file grew. A larger paste gets a shorter retention.
+            // The alias still holds the earlier, longer expiry.
+            ttl = self.clamp_ttl_to_size(ttl, len);
+            expires_at = expires_at_for(created_at, ttl);
         }
 
         // Multipart path. S3 takes the object metadata at
@@ -2013,6 +2048,10 @@ impl Store {
             }
             return self.store_text(&body, None, content_type, Some(ttl)).await;
         }
+        // A known length gives the exact size. Without one, use the
+        // request cap: the final size cannot exceed it, so the shorter
+        // retention is safe.
+        let ttl = self.clamp_ttl_to_size(ttl, known_length.unwrap_or(max_bytes));
         let created_at = Utc::now();
         let random_id = generate_random_id();
         let date = created_at.format("%Y-%m-%d").to_string();
@@ -2130,10 +2169,12 @@ impl Store {
 
     /// Append text to an existing paste as one new segment object.
     ///
-    /// The base object is never rewritten or copied. The text cap applies
-    /// to this append only, not to the total size. The expiry check
-    /// happens before the write, so an expired or missing id creates no
-    /// object.
+    /// The text cap applies to this append only, not to the total size.
+    /// The expiry check happens before the write, so an expired or
+    /// missing id creates no object. With `retention_by_size` on, an
+    /// append that crosses a curve boundary shortens the expiry. The base
+    /// object and the earlier segments are then rewritten with the new
+    /// expiry.
     ///
     /// Sequence assignment lists the segment prefix and uses max + 1.
     /// Two concurrent appends to the same id can choose the same
@@ -2156,7 +2197,8 @@ impl Store {
             });
         }
         let appended_bytes = text.len() as u64;
-        if meta.size.saturating_add(appended_bytes) > self.config.max_paste_bytes {
+        let new_size = meta.size.saturating_add(appended_bytes);
+        if new_size > self.config.max_paste_bytes {
             return Err(StoreError::TooLarge {
                 limit: self.config.max_paste_bytes,
             });
@@ -2165,6 +2207,23 @@ impl Store {
             return Err(StoreError::TooManySegments {
                 limit: MAX_SEGMENTS_PER_PASTE,
             });
+        }
+        let previous_segments = meta.segments.len();
+        let now = Utc::now();
+        let mut expires_at = meta.expires_at;
+        let mut shortened_ttl = None;
+        if self.config.retention_by_size {
+            if let (Some(created_at), Some(current)) = (meta.created_at, meta.expires_at) {
+                let curve_ttl = Ttl::seconds(self.config.retention_seconds(new_size));
+                let curve_expires = expires_at_for(created_at, curve_ttl);
+                if curve_expires < current {
+                    if curve_expires <= now {
+                        return Err(StoreError::Expired(meta.id.clone()));
+                    }
+                    expires_at = Some(curve_expires);
+                    shortened_ttl = Some(curve_ttl);
+                }
+            }
         }
         let sequence = match meta.segments.iter().map(|s| s.sequence).max() {
             Some(max) => max
@@ -2177,9 +2236,10 @@ impl Store {
         let mut object_meta = HashMap::new();
         object_meta.insert("sequence".to_string(), sequence.to_string());
         object_meta.insert("size".to_string(), text.len().to_string());
-        object_meta.insert("created-at".to_string(), Utc::now().to_rfc3339());
-        if let Some(expires_at) = meta.expires_at {
-            // The append inherits the base expiry. It does not extend it.
+        object_meta.insert("created-at".to_string(), now.to_rfc3339());
+        if let Some(expires_at) = expires_at {
+            // The append writes the current effective expiry. It does not
+            // extend it.
             object_meta.insert("expires-at".to_string(), expires_at.to_rfc3339());
         }
         self.client
@@ -2198,8 +2258,16 @@ impl Store {
             key: key.clone(),
             size: appended_bytes,
         });
-        meta.size = meta.size.saturating_add(appended_bytes);
+        meta.size = new_size;
         meta.sha256 = None;
+        if let (Some(ttl), Some(expires_at)) = (shortened_ttl, expires_at) {
+            for segment in &meta.segments[..previous_segments] {
+                self.rewrite_expiry(&segment.key, expires_at, ttl).await?;
+            }
+            self.rewrite_expiry(&meta.key, expires_at, ttl).await?;
+        }
+        meta.expires_at = expires_at;
+        meta.expired = false;
         Ok(AppendResult {
             appended_bytes,
             segment_key: Some(key),
@@ -2324,12 +2392,30 @@ impl Store {
 
     /// Change the expiry of an existing paste, every segment, and the alias.
     ///
-    /// The new expiry is computed from now, so an extension is real. An
-    /// expired paste is rejected before any object is rewritten.
+    /// The new expiry is computed from now, so an extension is real. With
+    /// `retention_by_size` on, the new expiry cannot go past the curve
+    /// value for the current total size. An expired paste is rejected
+    /// before any object is rewritten.
     pub async fn set_ttl(&self, id: &str, ttl: Ttl) -> Result<PasteMetadata, StoreError> {
         let mut meta = self.head_metadata(id).await?;
         Self::check_not_expired(&meta)?;
-        let expires_at = expires_at_for(Utc::now(), ttl);
+        let now = Utc::now();
+        let mut expires_at = expires_at_for(now, ttl);
+        if self.config.retention_by_size {
+            if let Some(created_at) = meta.created_at {
+                let curve_expires = expires_at_for(
+                    created_at,
+                    Ttl::seconds(self.config.retention_seconds(meta.size)),
+                );
+                if curve_expires < expires_at {
+                    expires_at = curve_expires;
+                }
+            }
+        }
+        if expires_at <= now {
+            return Err(StoreError::Expired(meta.id.clone()));
+        }
+        let ttl = Ttl::seconds((expires_at - now).num_seconds());
         for segment in &meta.segments {
             self.rewrite_expiry(&segment.key, expires_at, ttl).await?;
         }
