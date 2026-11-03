@@ -842,8 +842,8 @@ async fn list_page_shows_current_pastes_and_hides_expired_ones() {
         "the delete column must have a header: {page}"
     );
     assert!(
-        page.contains("<th>TTL (days)</th>"),
-        "the duration column must be labelled TTL (days): {page}"
+        page.contains("<th title=\"days\">TTL</th>"),
+        "the duration column must be labelled TTL with a days title: {page}"
     );
     assert!(
         !page.contains("<th>Remaining</th>"),
