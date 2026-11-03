@@ -970,6 +970,13 @@ async fn view_page_renders_text_escaped_and_images_inline() {
     let page = html_text(&body);
     assert!(page.contains("<pre>a &lt; b &amp; c &gt; d &quot;quoted&quot;</pre>"));
     assert!(
+        page.contains(
+            "<div class=\"content-box\"><button type=\"button\" class=\"copy-content\" \
+             aria-label=\"Copy paste content\" hidden>Copy</button><pre>"
+        ),
+        "the content box must carry a hidden copy button: {page}"
+    );
+    assert!(
         page.contains(&format!("<h1>{}</h1>", text.id)),
         "the words must be the page header: {page}"
     );

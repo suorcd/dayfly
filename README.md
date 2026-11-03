@@ -1035,8 +1035,8 @@ flip HTML/SVG to inline.
 ## Human frontend
 
 Server-rendered HTML with a small vanilla-JS drag-and-drop
-enhancement and a copy-link button; no JavaScript framework, no build
-step. Plain forms and links otherwise. Internal use only — same private-network /
+enhancement and copy buttons for the body and the view link; no
+JavaScript framework, no build step. Plain forms and links otherwise. Internal use only — same private-network /
 binary-auth model as the API, no public sharing, accounts, or
 comments.
 
@@ -1072,9 +1072,10 @@ comments.
   Download, Raw, and Copy link actions, then the metadata and delete
   form in a collapsed `<details>` block, then the content: text in
   `<pre>` (capped at 1 MiB for the page; the raw route and the API
-  return the full paste), including the escaped source of HTML and
-  SVG, safe images inline, other types via the raw link. The Copy link
-  button appears only when JavaScript runs.
+  return the full paste) with a Copy button inside the box, including
+  the escaped source of HTML and SVG, safe images inline, other types
+  via the raw link. The Copy and Copy link buttons appear only when
+  JavaScript runs.
 - `GET /raw/<id>` — the unformatted bytes. Markup types (`text/html`,
   `application/xhtml+xml`, `image/svg+xml`, and XML) and unknown
   binary types are served as `text/plain` and open inline. Other types

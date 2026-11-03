@@ -91,6 +91,9 @@ th:nth-child(4){text-align:center}
 .ttl-header{cursor:help;text-decoration:underline dotted;text-underline-offset:.25rem}
 .hint{color:#0abdc6;cursor:help;text-decoration:underline dotted;text-underline-offset:.25rem;font-size:.95rem}
 .view-actions{display:flex;flex-wrap:wrap;gap:.5rem;margin-bottom:1rem}
+.content-box{position:relative}
+.content-box pre{margin:0;padding-right:6rem}
+.copy-content{position:absolute;top:.5rem;right:.5rem}
 a.button{display:inline-block;font-size:1rem;padding:.35rem .8rem;cursor:pointer;background:rgba(19,62,124,.5);color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px;text-decoration:none}
 a.button:hover{text-decoration:none;box-shadow:0 0 10px rgba(10,189,198,.4)}
 .table-wrap{overflow-x:auto}
@@ -253,22 +256,52 @@ const NAV_ITEMS: [(&str, &str); 3] = [
 /// Build one page. `active` names the nav href for the current page, and
 /// `show_heading` controls the `<h1>`. Pages that repeat a nav label keep
 /// the heading off.
-/// Copy the current view URL to the clipboard. Falls back to a prompt
-/// when the browser blocks the clipboard API.
+/// Copy the current view URL or the paste body to the clipboard.
+///
+/// The copy buttons start hidden and the script unhides them, so a
+/// browser without JavaScript never shows an inert control.
 const COPY_LINK_SCRIPT: &str = r#"<script>
 (() => {
-  const button = document.querySelector('.copy-link');
-  if (!button) return;
-  button.hidden = false;
-  button.addEventListener('click', async () => {
-    const url = new URL(button.dataset.copy, location.origin).href;
+  const copyText = async (text) => {
     try {
-      await navigator.clipboard.writeText(url);
-      button.textContent = 'Copied';
+      await navigator.clipboard.writeText(text);
+      return true;
     } catch {
-      window.prompt('Copy link', url);
+      const area = document.createElement('textarea');
+      area.value = text;
+      area.style.position = 'fixed';
+      area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.select();
+      let ok = false;
+      try { ok = document.execCommand('copy'); } catch { ok = false; }
+      area.remove();
+      return ok;
     }
-    setTimeout(() => { button.textContent = 'Copy link'; }, 1500);
+  };
+
+  const flash = (button, label) => {
+    const old = button.textContent;
+    button.textContent = label;
+    setTimeout(() => { button.textContent = old; }, 1500);
+  };
+
+  const link = document.querySelector('.copy-link');
+  if (link) {
+    link.hidden = false;
+    link.addEventListener('click', async () => {
+      const url = new URL(link.dataset.copy, location.origin).href;
+      flash(link, (await copyText(url)) ? 'Copied' : 'Copy failed');
+    });
+  }
+
+  document.querySelectorAll('.copy-content').forEach((button) => {
+    button.hidden = false;
+    button.addEventListener('click', async () => {
+      const pre = button.parentElement.querySelector('pre');
+      if (!pre) return;
+      flash(button, (await copyText(pre.textContent)) ? 'Copied' : 'Copy failed');
+    });
   });
 })();
 </script>"#;
@@ -1248,9 +1281,14 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
         let slice = store.fetch_text(&meta.id, 0, Some(1_000_000)).await;
         match slice {
             Ok(s) => {
-                body.push_str(&format!("<pre>{}</pre>", html_escape(&s.text)));
+                body.push_str(&format!(
+                    "<div class=\"content-box\"><button type=\"button\" class=\"copy-content\" \
+                     aria-label=\"Copy paste content\" hidden>Copy</button>\
+                     <pre>{}</pre></div>",
+                    html_escape(&s.text)
+                ));
                 if s.truncated {
-                    body.push_str("<p class=\"muted\">Text truncated at 1 MiB for this view. Use the raw API URL above for the full paste.</p>");
+                    body.push_str("<p class=\"muted\">Text truncated at 1 MiB for this view. The raw route returns the full paste.</p>");
                 }
             }
             Err(e) => return error_page(e),
