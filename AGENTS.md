@@ -101,10 +101,12 @@ What a pass looks like, on a machine with Nix:
 A pull request runs the fast Cargo job in `.github/workflows/ci.yml`.
 The Nix flake job and the container image job run on pushes to `main`
 and `v*` tags, on manual dispatch, and on a pull request with the
-`ci:full` label. A documentation-only pull request skips CI. A `v*` tag
-also publishes the image and attaches the release binary and the image
-tar to the GitHub release. The flake job restores and saves a Nix store
-cache.
+`ci:full` label. A documentation-only pull request skips CI. A push to
+`main` builds and smoke-tests the image but publishes nothing. A `v*`
+tag publishes the image as `sha-<short>`, the tag name, and `latest`
+for a stable tag, and attaches the release binary and the image tar to
+the GitHub release. The `edge` tag is gone. The flake job restores and
+saves a Nix store cache.
 
 ## Nix build status (read this before claiming anything)
 

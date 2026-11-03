@@ -1177,10 +1177,13 @@ pull request and on every push. The coverage job runs `cargo llvm-cov`
 on pushes to `main` and on manual dispatch. The flake job (`nix flake
 check` and `nix build -L`) and the container image job run on pushes
 to `main`, on `v*` tags, on manual dispatch, and on a pull request with
-the `ci:full` label. A documentation-only pull request skips CI. A `v*`
-tag also publishes the image and attaches the release binary and the
-image tar to the GitHub release. The flake job restores and saves a Nix
-store cache, so a main or tag build normally reuses it.
+the `ci:full` label. A documentation-only pull request skips CI. A push
+to `main` builds and smoke-tests the image but publishes nothing. A
+`v*` tag publishes the image, and attaches the release binary and the
+image tar to the GitHub release. The image tags are `sha-<short>`, the
+tag name, and `latest` for a stable tag. The `edge` tag is gone. The
+flake job restores and saves a Nix store cache, so a main or tag build
+normally reuses it.
 
 ### Nix build path (additional, not a replacement for Cargo)
 

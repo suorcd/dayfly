@@ -4,10 +4,11 @@ name: container
 # `git ls-remote --tags <repo> <tag>` and replace the SHA and version comment.
 # For an annotated tag, pin the peeled `^{}` commit SHA.
 # Builds the OCI image from the flake, proves it runs, then publishes it to
-# ghcr.io. Pull requests build and smoke test only when the `ci:full` label is
-# present, so a normal PR does not run the image job and a branch cannot
-# publish. Publication is x86_64-linux only. GitHub runners build that
-# platform. A multi-platform image needs an emulated or native aarch64-linux
+# ghcr.io on a v* tag. A push to main builds and smoke tests the image but
+# publishes nothing. Pull requests build and smoke test only when the
+# `ci:full` label is present, so a normal PR does not run the image job and a
+# branch cannot publish. Publication is x86_64-linux only. GitHub runners build
+# that platform. A multi-platform image needs an emulated or native aarch64-linux
 # builder; this workflow does not add one.
 on:
   push:
@@ -145,7 +146,7 @@ jobs:
   publish:
     name: Publish the image
     needs: image
-    if: github.event_name != 'pull_request'
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -178,25 +179,20 @@ jobs:
       - name: Publish
         env:
           IMAGE: ${{ steps.load.outputs.image }}
-          REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           repo="ghcr.io/${{ github.repository }}"
 
           tags=("sha-${GITHUB_SHA::7}")
-          if [ "$REF_TYPE" = "tag" ]; then
-            tags+=("$REF_NAME")
-            # Publish `latest` only for a stable release. A tag with a hyphen
-            # is a pre-release such as v1.2.3-rc.1, so it must not move
-            # `latest`.
-            case "$REF_NAME" in
-              *-*) ;;
-              *) tags+=("latest") ;;
-            esac
-          elif [ "$REF_NAME" = "main" ]; then
-            tags+=("edge")
-          fi
+          tags+=("$REF_NAME")
+          # Publish `latest` only for a stable release. A tag with a hyphen
+          # is a pre-release such as v1.2.3-rc.1, so it must not move
+          # `latest`.
+          case "$REF_NAME" in
+            *-*) ;;
+            *) tags+=("latest") ;;
+          esac
 
           for t in "${tags[@]}"; do
             docker tag "$IMAGE" "$repo:$t"
