@@ -511,6 +511,31 @@ fn list_recent_filters_expired_objects_through_mcp() {
 }
 
 #[test]
+fn fetch_metadata_rejects_an_expired_paste_through_mcp() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let expired = common::stored_metadata(
+        &(Utc::now() - chrono::Duration::days(1)).to_rfc3339(),
+        "text/plain",
+        3,
+        "abc",
+    );
+    fake.seed(
+        &format!("pastes/{today}/expired"),
+        b"abc",
+        "text/plain",
+        &common::metadata_refs(&expired),
+    );
+    let mut client = McpClient::spawn(&fake, &[]);
+
+    let error = client
+        .call_tool("fetch_metadata", json!({"id": format!("{today}/expired")}))
+        .expect_err("fetch_metadata must reject an expired paste");
+    assert_tool_error(error, "paste expired");
+}
+
+#[test]
 fn fetch_file_rejects_malformed_ranges_before_writing() {
     let runtime = runtime();
     let fake = runtime.block_on(FakeS3::start());

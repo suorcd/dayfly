@@ -521,7 +521,7 @@ impl Pastebin {
         &self,
         Parameters(params): Parameters<IdParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let meta = try_store!(self.store.head_metadata(&params.id).await);
+        let meta = try_store!(self.store.head_metadata_live(&params.id).await);
         result_json(metadata_json(meta))
     }
 
