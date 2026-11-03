@@ -3062,3 +3062,226 @@ async fn set_ttl_moves_base_segments_alias_and_rejects_an_expired_paste() {
         "an expired paste must write nothing"
     );
 }
+
+#[tokio::test]
+async fn store_text_clamps_a_long_ttl_to_the_size_curve() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_retention(100, 30, 365).await;
+
+    let before = Utc::now();
+    let stored = store
+        .store_text(b"x", None, None, Some(Ttl::days(3650)))
+        .await
+        .expect("store_text must succeed against the fake");
+    let after = Utc::now();
+
+    assert!(
+        stored.expires_at > before + Duration::days(354),
+        "a one-byte paste under a 100-byte cap must get about 355 days, not 3650: {}",
+        stored.expires_at
+    );
+    assert!(
+        stored.expires_at < after + Duration::days(356),
+        "the size curve must clamp the requested 3650 days: {}",
+        stored.expires_at
+    );
+}
+
+#[tokio::test]
+async fn default_retention_keeps_the_requested_day_and_subday_ttls() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+
+    let before = Utc::now();
+    let day = store
+        .store_text(b"x", None, None, Some(Ttl::days(3650)))
+        .await
+        .expect("day TTL must store");
+    let after = Utc::now();
+    assert!(
+        day.expires_at >= before + Duration::days(3650)
+            && day.expires_at <= after + Duration::days(3650),
+        "the default path must keep the requested day TTL: {}",
+        day.expires_at
+    );
+
+    let before = Utc::now();
+    let subday = store
+        .store_text(b"x", None, None, Some(Ttl::parse("1h").unwrap()))
+        .await
+        .expect("sub-day TTL must store");
+    let after = Utc::now();
+    assert!(
+        subday.expires_at >= before + Duration::hours(1)
+            && subday.expires_at <= after + Duration::hours(1),
+        "the default path must keep the requested sub-day TTL: {}",
+        subday.expires_at
+    );
+}
+
+#[tokio::test]
+async fn retention_keeps_a_client_ttl_shorter_than_the_curve() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_retention(100, 30, 365).await;
+
+    let before = Utc::now();
+    let stored = store
+        .store_text(b"x", None, None, Some(Ttl::parse("1h").unwrap()))
+        .await
+        .expect("a short TTL must store");
+    let after = Utc::now();
+
+    assert!(
+        stored.expires_at >= before + Duration::hours(1)
+            && stored.expires_at <= after + Duration::hours(1),
+        "a client TTL below the curve must be kept: {}",
+        stored.expires_at
+    );
+}
+
+#[tokio::test]
+async fn append_past_a_boundary_shortens_the_expiry() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_retention(100, 30, 365).await;
+
+    let first = store
+        .store_text(b"0123456789", None, None, Some(Ttl::days(3650)))
+        .await
+        .expect("the first paste must store");
+    let first_expiry = first.expires_at;
+    let created = store
+        .head_metadata(&first.id)
+        .await
+        .expect("metadata must exist")
+        .created_at
+        .expect("created-at must be stored");
+
+    let second = store
+        .append_text(&first.id, b"0123456789012345678901234567890123456789")
+        .await
+        .expect("the first append must succeed");
+    let third = store
+        .append_text(&first.id, &[b'x'; 50])
+        .await
+        .expect("the second append must succeed");
+
+    assert!(
+        second.meta.expires_at.unwrap() < first_expiry,
+        "the first append must shorten the expiry"
+    );
+    assert_eq!(
+        third.meta.expires_at,
+        Some(created + Duration::days(30)),
+        "a paste at the cap must get the minimum retention"
+    );
+    assert_eq!(
+        first.words.as_deref().and_then(|words| {
+            fake.object(&dayfly::store::alias_key(words))
+                .and_then(|object| object.metadata.get("expires-at").cloned())
+        }),
+        Some(first_expiry.to_rfc3339()),
+        "the alias must keep its later expiry"
+    );
+
+    let expected = third.meta.expires_at.unwrap().to_rfc3339();
+    let base = fake.object(&third.meta.key).expect("the base must exist");
+    assert_eq!(
+        base.metadata.get("expires-at").map(String::as_str),
+        Some(expected.as_str()),
+        "the base metadata must carry the new expiry"
+    );
+    for segment_key in [second.segment_key, third.segment_key]
+        .into_iter()
+        .flatten()
+    {
+        let segment = fake.object(&segment_key).expect("the segment must exist");
+        assert_eq!(
+            segment.metadata.get("expires-at").map(String::as_str),
+            Some(expected.as_str()),
+            "every segment must carry the new expiry"
+        );
+    }
+}
+
+#[tokio::test]
+async fn set_ttl_cannot_extend_past_the_size_curve() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_retention(100, 30, 365).await;
+
+    let stored = store
+        .store_text(b"0123456789", None, None, Some(Ttl::days(3650)))
+        .await
+        .expect("the paste must store");
+    let created = store
+        .head_metadata(&stored.id)
+        .await
+        .expect("metadata must exist")
+        .created_at
+        .expect("created-at must be stored");
+    store
+        .append_text(&stored.id, &[b'x'; 90])
+        .await
+        .expect("the append must reach the cap");
+
+    let extended = store
+        .set_ttl(&stored.id, Ttl::days(3650))
+        .await
+        .expect("set_ttl must succeed");
+    assert_eq!(
+        extended.expires_at,
+        Some(created + Duration::days(30)),
+        "set_ttl must stop at the curve value for the current size"
+    );
+}
+
+#[tokio::test]
+async fn a_paste_above_the_cap_gets_the_minimum_retention() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_retention(100, 30, 365).await;
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let key = format!("pastes/{today}/above-cap");
+    let metadata = common::stored_metadata(
+        &(Utc::now() + Duration::days(1)).to_rfc3339(),
+        "application/octet-stream",
+        200,
+        "abc",
+    );
+    fake.seed(
+        &key,
+        &[b'x'; 200],
+        "application/octet-stream",
+        &common::metadata_refs(&metadata),
+    );
+
+    let extended = store
+        .set_ttl(&format!("{today}/above-cap"), Ttl::days(3650))
+        .await
+        .expect("set_ttl must not panic above the cap");
+    let created = extended.created_at.expect("created-at must be stored");
+    assert_eq!(
+        extended.expires_at,
+        Some(created + Duration::days(30)),
+        "a paste above the cap must get the minimum retention"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_length_stream_uses_the_request_cap() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_retention(100, 30, 365).await;
+    let body = stream::iter(vec![Ok(Bytes::from_static(b"x"))]);
+
+    let before = Utc::now();
+    let stored = store
+        .store_stream(body, Some("x.bin"), None, Some(Ttl::days(3650)), None, 100)
+        .await
+        .expect("the stream must store");
+    let after = Utc::now();
+
+    assert!(
+        stored.expires_at >= before + Duration::days(30)
+            && stored.expires_at <= after + Duration::days(30),
+        "an unknown length must use the request cap, not the final size: {}",
+        stored.expires_at
+    );
+}

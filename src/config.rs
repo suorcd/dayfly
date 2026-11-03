@@ -67,6 +67,23 @@ pub struct Config {
     /// specify one. Zero is invalid because it would create a paste that
     /// is already expired.
     pub default_ttl_days: u32,
+    /// Whether to clamp the expiry of a paste by its size.
+    ///
+    /// Default: `false`. With the default, the requested TTL is used
+    /// exactly. When this is `true`, a larger paste gets a shorter
+    /// retention, down to [`Self::retention_min_days`] at
+    /// [`Self::max_paste_bytes`]. The clamp only shortens the expiry.
+    pub retention_by_size: bool,
+    /// Minimum retention in whole days at [`Self::max_paste_bytes`].
+    ///
+    /// Default: 30. The value must be from 1 to 3650 and must not
+    /// exceed [`Self::retention_max_days`].
+    pub retention_min_days: u32,
+    /// Maximum retention in whole days at zero bytes.
+    ///
+    /// Default: 365. The value must be from 1 to 3650 and must be at
+    /// least [`Self::retention_min_days`].
+    pub retention_max_days: u32,
     /// Default bind address for HTTP mode.
     pub http_bind: String,
     /// CIDR blocks of reverse proxies whose `X-Forwarded-For` header is
@@ -206,6 +223,24 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("7"),
         required: false,
         help: "Default TTL in whole days",
+    },
+    ConfigField {
+        name: "DAYFLY_RETENTION_BY_SIZE",
+        value: Some("false"),
+        required: false,
+        help: "Clamp retention by the paste size",
+    },
+    ConfigField {
+        name: "DAYFLY_RETENTION_MIN_DAYS",
+        value: Some("30"),
+        required: false,
+        help: "Minimum retention in days at the paste size cap",
+    },
+    ConfigField {
+        name: "DAYFLY_RETENTION_MAX_DAYS",
+        value: Some("365"),
+        required: false,
+        help: "Maximum retention in days for a small paste",
     },
     ConfigField {
         name: "DAYFLY_HTTP_BIND",
@@ -918,6 +953,34 @@ impl Config {
                 format!("expected at most {MAX_TTL_DAYS} days"),
             ));
         }
+        let retention_min_days = optional_u32(
+            &lookup,
+            "DAYFLY_RETENTION_MIN_DAYS",
+            field_u32("DAYFLY_RETENTION_MIN_DAYS", 30),
+        )?;
+        if retention_min_days == 0 || retention_min_days > MAX_TTL_DAYS {
+            return Err(ConfigError::Invalid(
+                "DAYFLY_RETENTION_MIN_DAYS".to_string(),
+                format!("expected an integer from 1 to {MAX_TTL_DAYS}"),
+            ));
+        }
+        let retention_max_days = optional_u32(
+            &lookup,
+            "DAYFLY_RETENTION_MAX_DAYS",
+            field_u32("DAYFLY_RETENTION_MAX_DAYS", 365),
+        )?;
+        if retention_max_days == 0 || retention_max_days > MAX_TTL_DAYS {
+            return Err(ConfigError::Invalid(
+                "DAYFLY_RETENTION_MAX_DAYS".to_string(),
+                format!("expected an integer from 1 to {MAX_TTL_DAYS}"),
+            ));
+        }
+        if retention_min_days > retention_max_days {
+            return Err(ConfigError::Invalid(
+                "DAYFLY_RETENTION_MIN_DAYS".to_string(),
+                "must not exceed DAYFLY_RETENTION_MAX_DAYS".to_string(),
+            ));
+        }
         let max_file_bytes = optional_u64(
             &lookup,
             "DAYFLY_MAX_FILE_BYTES",
@@ -967,6 +1030,13 @@ impl Config {
             )?,
             alias_words,
             default_ttl_days,
+            retention_by_size: optional_bool(
+                &lookup,
+                "DAYFLY_RETENTION_BY_SIZE",
+                field_default("DAYFLY_RETENTION_BY_SIZE") == Some("true"),
+            )?,
+            retention_min_days,
+            retention_max_days,
             http_bind: optional_string(
                 &lookup,
                 "DAYFLY_HTTP_BIND",
@@ -1040,10 +1110,31 @@ impl Config {
         }
     }
 
+    /// The longest retention, in seconds, that the size curve allows.
+    ///
+    /// The curve is `min + (max - min) * (1 - size / cap)^3`. The size
+    /// and the cap are in bytes. A size at or above the cap gives the
+    /// minimum. This function does not check `retention_by_size`; the
+    /// caller decides whether the clamp applies.
+    pub fn retention_seconds(&self, size: u64) -> i64 {
+        let min_days = i64::from(self.retention_min_days);
+        let min_seconds = min_days * 86_400;
+        if self.max_paste_bytes == 0 {
+            return min_seconds;
+        }
+        let span_days = i64::from(
+            self.retention_max_days
+                .saturating_sub(self.retention_min_days),
+        );
+        let fraction = (size.min(self.max_paste_bytes) as f64) / (self.max_paste_bytes as f64);
+        let days = min_days as f64 + span_days as f64 * (1.0 - fraction).powi(3);
+        (days * 86_400.0).floor() as i64
+    }
+
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} show_words={} inline_pdf={} trusted_proxies={} list_requires_token={} rate_limit_per_minute={} mcp_local_root={}",
+            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} inline_pdf={} trusted_proxies={} list_requires_token={} rate_limit_per_minute={} mcp_local_root={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -1056,6 +1147,9 @@ impl Config {
             self.max_paste_bytes,
             self.alias_words,
             self.default_ttl_days,
+            self.retention_by_size,
+            self.retention_min_days,
+            self.retention_max_days,
             self.show_words,
             self.inline_pdf,
             self.trusted_proxies.len(),
@@ -1386,6 +1480,9 @@ mod tests {
             max_paste_bytes: 1024 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,
+            retention_by_size: false,
+            retention_min_days: 30,
+            retention_max_days: 365,
             http_bind: "127.0.0.1:0".to_string(),
             trusted_proxies: Vec::new(),
             show_words: true,
@@ -1504,6 +1601,83 @@ mod tests {
         ));
         let config = Config::from_lookup(lookup_from(&pairs)).expect("rate limit config");
         assert_eq!(config.rate_limit_per_minute, 120);
+    }
+
+    #[test]
+    fn retention_defaults_to_off_with_documented_days() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert!(!config.retention_by_size);
+        assert_eq!(config.retention_min_days, 30);
+        assert_eq!(config.retention_max_days, 365);
+    }
+
+    #[test]
+    fn retention_accepts_enabled_values() {
+        let mut pairs = base_env();
+        pairs.push(("DAYFLY_RETENTION_BY_SIZE".to_string(), "true".to_string()));
+        pairs.push(("DAYFLY_RETENTION_MIN_DAYS".to_string(), "10".to_string()));
+        pairs.push(("DAYFLY_RETENTION_MAX_DAYS".to_string(), "90".to_string()));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("retention config");
+        assert!(config.retention_by_size);
+        assert_eq!(config.retention_min_days, 10);
+        assert_eq!(config.retention_max_days, 90);
+    }
+
+    #[test]
+    fn retention_rejects_zero_and_values_above_the_maximum() {
+        for setting in ["DAYFLY_RETENTION_MIN_DAYS", "DAYFLY_RETENTION_MAX_DAYS"] {
+            for value in ["0".to_string(), (MAX_TTL_DAYS + 1).to_string()] {
+                let mut pairs = base_env();
+                pairs.push((setting.to_string(), value));
+                let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+                match error {
+                    ConfigError::Invalid(name, message) => {
+                        assert_eq!(name, setting);
+                        assert!(
+                            message.contains(&MAX_TTL_DAYS.to_string()),
+                            "message must name the maximum: {message}"
+                        );
+                    }
+                    other => panic!("unexpected error: {other}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retention_rejects_a_minimum_above_the_maximum() {
+        let mut pairs = base_env();
+        pairs.push(("DAYFLY_RETENTION_MIN_DAYS".to_string(), "90".to_string()));
+        pairs.push(("DAYFLY_RETENTION_MAX_DAYS".to_string(), "30".to_string()));
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        match error {
+            ConfigError::Invalid(name, message) => {
+                assert_eq!(name, "DAYFLY_RETENTION_MIN_DAYS");
+                assert!(
+                    message.contains("DAYFLY_RETENTION_MAX_DAYS"),
+                    "message must name the other setting: {message}"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn retention_curve_clamps_at_zero_and_at_the_size_cap() {
+        let mut pairs = base_env();
+        pairs.push(("DAYFLY_RETENTION_MIN_DAYS".to_string(), "30".to_string()));
+        pairs.push(("DAYFLY_RETENTION_MAX_DAYS".to_string(), "365".to_string()));
+        pairs.push(("DAYFLY_MAX_PASTE_BYTES".to_string(), "1000".to_string()));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("curve config");
+
+        assert_eq!(config.retention_seconds(0), 365 * 86_400);
+        assert_eq!(config.retention_seconds(500), 71 * 86_400 + 75_600);
+        assert_eq!(config.retention_seconds(1000), 30 * 86_400);
+        assert_eq!(
+            config.retention_seconds(5000),
+            30 * 86_400,
+            "a paste above the cap must get the minimum"
+        );
     }
 
     #[test]

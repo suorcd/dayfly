@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use dayfly::config::{Config, ConfigError};
 
-const VARS: [&str; 16] = [
+const VARS: [&str; 19] = [
     "S3_ENDPOINT",
     "S3_BUCKET",
     "S3_REGION",
@@ -22,6 +22,9 @@ const VARS: [&str; 16] = [
     "DAYFLY_MAX_PASTE_BYTES",
     "DAYFLY_ALIAS_WORDS",
     "DAYFLY_DEFAULT_TTL_DAYS",
+    "DAYFLY_RETENTION_BY_SIZE",
+    "DAYFLY_RETENTION_MIN_DAYS",
+    "DAYFLY_RETENTION_MAX_DAYS",
     "DAYFLY_HTTP_BIND",
     "DAYFLY_SHOW_WORDS",
     "DAYFLY_INLINE_PDF",
@@ -87,6 +90,9 @@ fn minimal_environment_applies_documented_defaults() {
     assert_eq!(config.max_paste_bytes, 1024 * 1024 * 1024);
     assert_eq!(config.alias_words, 3);
     assert_eq!(config.default_ttl_days, 7);
+    assert!(!config.retention_by_size);
+    assert_eq!(config.retention_min_days, 30);
+    assert_eq!(config.retention_max_days, 365);
     assert_eq!(config.http_bind, "127.0.0.1:8080");
     assert!(config.show_words);
     assert!(config.inline_pdf);

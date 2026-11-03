@@ -60,6 +60,9 @@ async fn reload_swaps_credentials_token_caps_ttl_and_show_words() {
     new_config.http_bearer_token = Some(NEW_TOKEN.to_string());
     new_config.max_text_bytes = 8;
     new_config.default_ttl_days = 2;
+    new_config.retention_by_size = true;
+    new_config.retention_min_days = 10;
+    new_config.retention_max_days = 90;
     new_config.show_words = true;
 
     let report = reload_with_config(&state, new_config, "127.0.0.1:8080")
@@ -70,6 +73,9 @@ async fn reload_swaps_credentials_token_caps_ttl_and_show_words() {
         "DAYFLY_HTTP_BEARER_TOKEN",
         "DAYFLY_MAX_TEXT_BYTES",
         "DAYFLY_DEFAULT_TTL_DAYS",
+        "DAYFLY_RETENTION_BY_SIZE",
+        "DAYFLY_RETENTION_MIN_DAYS",
+        "DAYFLY_RETENTION_MAX_DAYS",
         "DAYFLY_SHOW_WORDS",
     ] {
         assert!(
