@@ -334,6 +334,10 @@ MCP tools: `store_text`, `store_file`, `append_text`, `set_ttl`,
 metadata — binary content is never sent over JSON-RPC),
 `fetch_metadata`, `delete_paste`, `list_recent`.
 
+`fetch_text` returns at most 8 MiB per call. Use `offset` and `limit`
+to page through a larger paste. The response reports `total_bytes` and
+`truncated`.
+
 `store_file` and `fetch_file` are subject to the transport rule in the
 Access model section: the HTTP transport refuses them until
 `DAYFLY_MCP_LOCAL_ROOT` sets a directory.

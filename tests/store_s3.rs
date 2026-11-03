@@ -10,8 +10,8 @@ use bytes::Bytes;
 use chrono::{Duration, Utc};
 use common::{FailOp, FakeS3, Gate};
 use dayfly::store::{
-    normalize_words, parse_segment_key, segment_key, StoreError, Ttl, MAX_SEGMENTS_PER_PASTE,
-    MULTIPART_CHUNK_BYTES, SEGMENT_SUFFIX_LEN,
+    normalize_words, parse_segment_key, segment_key, StoreError, Ttl, MAX_FETCH_TEXT_BYTES,
+    MAX_SEGMENTS_PER_PASTE, MULTIPART_CHUNK_BYTES, SEGMENT_SUFFIX_LEN,
 };
 use futures::stream;
 use sha2::{Digest, Sha256};
@@ -2007,6 +2007,40 @@ async fn store_and_fetch_roundtrip_against_fake_s3() {
         .expect("fetch must succeed against the fake");
     assert_eq!(slice.text, "hello");
     assert!(fake.object(&stored.key).is_some());
+}
+
+#[tokio::test]
+async fn fetch_text_caps_the_returned_bytes() {
+    let fake = FakeS3::start().await;
+    let payload = vec![b'a'; MAX_FETCH_TEXT_BYTES as usize + 10];
+    let store = fake
+        .store_with_caps(MAX_FETCH_TEXT_BYTES + 1024, 1024 * 1024)
+        .await;
+    let stored = store
+        .store_text(&payload, None, Some("text/plain"), None)
+        .await
+        .expect("the large text paste must store");
+
+    let no_limit = store
+        .fetch_text(&stored.id, 0, None)
+        .await
+        .expect("a fetch with no limit must succeed");
+    assert_eq!(no_limit.returned_bytes, MAX_FETCH_TEXT_BYTES);
+    assert!(no_limit.truncated, "bytes must remain after the cap");
+
+    let above_cap = store
+        .fetch_text(&stored.id, 0, Some(MAX_FETCH_TEXT_BYTES + 100))
+        .await
+        .expect("a limit above the cap must succeed");
+    assert_eq!(above_cap.returned_bytes, MAX_FETCH_TEXT_BYTES);
+    assert!(above_cap.truncated);
+
+    let last = store
+        .fetch_text(&stored.id, MAX_FETCH_TEXT_BYTES, None)
+        .await
+        .expect("the last slice must succeed");
+    assert_eq!(last.returned_bytes, 10);
+    assert!(!last.truncated, "the last slice must reach the end");
 }
 
 #[tokio::test]
