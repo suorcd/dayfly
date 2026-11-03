@@ -656,7 +656,11 @@ async fn pdf_inline_control_and_inline_sandbox_policy() {
         .to_str()
         .unwrap()
         .starts_with("inline"));
-    assert_eq!(headers["content-security-policy"], "sandbox");
+    assert_eq!(
+        headers["content-security-policy"],
+        "sandbox; frame-ancestors 'none'"
+    );
+    assert_eq!(headers[header::CACHE_CONTROL], "private, no-store");
     assert_eq!(headers["x-content-type-options"], "nosniff");
 
     let mut store = fake.store().await;
@@ -668,8 +672,9 @@ async fn pdf_inline_control_and_inline_sandbox_policy() {
     let disposition = headers[header::CONTENT_DISPOSITION].to_str().unwrap();
     assert!(disposition.starts_with("attachment"));
     assert!(disposition.contains("filename=\"report.pdf\""));
-    assert!(headers.get("content-security-policy").is_none());
+    assert_eq!(headers["content-security-policy"], "frame-ancestors 'none'");
     assert_eq!(headers["x-content-type-options"], "nosniff");
+    assert_eq!(headers[header::CACHE_CONTROL], "private, no-store");
 
     for (content_type, filename, body) in [
         ("text/html", "x.html", b"<html>hello</html>".to_vec()),
@@ -686,7 +691,10 @@ async fn pdf_inline_control_and_inline_sandbox_policy() {
                 .starts_with("attachment"),
             "{content_type} must stay an attachment"
         );
-        assert!(headers.get("content-security-policy").is_none());
+        assert_eq!(
+            headers["content-security-policy"], "frame-ancestors 'none'",
+            "{content_type}"
+        );
     }
 }
 
@@ -702,7 +710,20 @@ async fn inline_text_has_a_sandbox_policy() {
     let request = common::request("GET", &format!("/v1/pastes/{}", stored.id), &[], Vec::new());
     let (status, headers, _) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(headers["content-security-policy"], "sandbox");
+    assert_eq!(
+        headers["content-security-policy"],
+        "sandbox; frame-ancestors 'none'"
+    );
+    assert_eq!(headers[header::CACHE_CONTROL], "private, no-store");
+
+    let request = common::request("GET", &format!("/raw/{}", stored.id), &[], Vec::new());
+    let (status, headers, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers["content-security-policy"],
+        "sandbox; frame-ancestors 'none'"
+    );
+    assert_eq!(headers[header::CACHE_CONTROL], "private, no-store");
 }
 
 #[tokio::test]
@@ -1850,6 +1871,25 @@ fn stored_paste(payload: &Value) -> Value {
         .as_str()
         .unwrap_or_else(|| panic!("store_text must return JSON text, got: {payload}"));
     serde_json::from_str(text).expect("store_text result must be JSON")
+}
+
+#[tokio::test]
+async fn mcp_rejects_a_foreign_origin() {
+    let fake = FakeS3::start().await;
+    let app = app_router(AppState::new(fake.store().await));
+    let request = common::request(
+        "POST",
+        "/mcp",
+        &[
+            ("host", "localhost".to_string()),
+            ("origin", "http://evil.example".to_string()),
+            ("content-type", "application/json".to_string()),
+            ("accept", "application/json, text/event-stream".to_string()),
+        ],
+        initialize_body().to_string().into_bytes(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 async fn initialize_mcp_session(app: &Router) -> String {

@@ -838,9 +838,18 @@ async fn download_response(
     if inline {
         resp_headers.insert(
             HeaderName::from_static("content-security-policy"),
-            HeaderValue::from_static("sandbox"),
+            HeaderValue::from_static("sandbox; frame-ancestors 'none'"),
+        );
+    } else {
+        resp_headers.insert(
+            HeaderName::from_static("content-security-policy"),
+            HeaderValue::from_static("frame-ancestors 'none'"),
         );
     }
+    resp_headers.insert(
+        HeaderName::from_static("cache-control"),
+        HeaderValue::from_static("private, no-store"),
+    );
     resp_headers.insert(
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
@@ -1286,6 +1295,13 @@ async fn require_bearer(State(state): State<AppState>, request: Request, next: N
     }
 }
 
+async fn require_same_origin(request: Request, next: Next) -> Response {
+    if !api_write_allowed(request.headers()) {
+        return forbidden_write();
+    }
+    next.run(request).await
+}
+
 /// Streamable HTTP MCP endpoint at `/mcp`.
 ///
 /// The service factory shares the reloadable [`StoreHandle`] in `state`, so
@@ -1309,6 +1325,7 @@ pub fn mcp_router(state: AppState) -> Router<AppState> {
     Router::new()
         .nest_service("/mcp", service)
         .layer(middleware::from_fn_with_state(state, require_bearer))
+        .layer(middleware::from_fn(require_same_origin))
 }
 
 async fn append_inner(state: &AppState, headers: &HeaderMap, id: &str, req: Request) -> Response {
