@@ -1058,7 +1058,7 @@ async fn list_handler(
         &format!(
             r#"<form method="get" action="/pastes"><p><label>Start <input type="date" name="start" value="{}"></label> <label>End <input type="date" name="end" value="{}"></label> <button type="submit">Show range</button></p></form>
 <p class="muted">Dates are UTC. With no dates, the page shows the last {default_days} days, ending today in UTC. Set DAYFLY_LIST_DEFAULT_DAYS to change that. Built from a direct bucket scan (ListObjectsV2 for each date prefix, plus HeadObject per paste). No database. Listing is O(n) in objects scanned and gets slower as the bucket grows — that slowdown is the trigger for adding a database later.</p>
-<div class="table-wrap"><table><thead><tr><th>{link_header}</th><th>Filename</th><th>Content-Type</th><th>{size_header}</th><th>{created_header}</th><th>Remaining</th><th></th></tr></thead><tbody>{}</tbody></table></div>"#,
+<div class="table-wrap"><table><thead><tr><th>{link_header}</th><th>Filename</th><th>Content-Type</th><th>{size_header}</th><th>{created_header}</th><th>Remaining</th><th>Action</th></tr></thead><tbody>{}</tbody></table></div>"#,
             html_escape(&start_value),
             html_escape(&end_value),
             rows,

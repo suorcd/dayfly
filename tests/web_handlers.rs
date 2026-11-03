@@ -830,6 +830,10 @@ async fn list_page_shows_current_pastes_and_hides_expired_ones() {
         page.contains(">text/plain"),
         "the content type text must stay unedited: {page}"
     );
+    assert!(
+        page.contains("<th>Action</th>"),
+        "the delete column must have a header: {page}"
+    );
 
     let request = common::request("GET", "/pastes?date=2020-01-01", &[], Vec::new());
     let (status, _, body) = common::send(&app, request).await;
