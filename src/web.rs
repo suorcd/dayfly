@@ -447,7 +447,7 @@ fn bad_request_page(message: &str) -> Response {
         .into_response()
 }
 
-/// Pick the three-word alias when the human UI is configured to show words,
+/// Pick the word alias when the human UI is configured to show words,
 /// otherwise the canonical ID. Legacy objects without an alias fall back to
 /// the ID either way.
 fn stored_view_target(stored: &StoredPaste, show_words: bool) -> String {
@@ -1140,6 +1140,7 @@ mod tests {
             max_text_bytes: 10 * 1024 * 1024,
             max_file_bytes: 1024 * 1024 * 1024,
             max_paste_bytes: 1024 * 1024 * 1024,
+            alias_words: 3,
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
             show_words: false,

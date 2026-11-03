@@ -205,6 +205,7 @@ impl FakeS3 {
             max_text_bytes,
             max_file_bytes,
             max_paste_bytes: 1024 * 1024 * 1024,
+            alias_words: 3,
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
             show_words: false,

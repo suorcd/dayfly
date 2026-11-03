@@ -24,10 +24,10 @@ is needed. See "No database in v1" below.
   in the key. An append adds one segment object under
   `pastes/<yyyy-mm-dd>/<random-id>/<sequence>-<suffix>`; see "Append and
   segmented storage". An alias adds one small object at
-  `words/<phrase>`; see "Three-word alias".
-- Each new paste also gets a three-word alias, for example
-  `abacus-abdomen-zoology`. The alias is a second name for the same
-  paste, not a second paste.
+  `words/<phrase>`; see "Word aliases".
+- Each new paste also gets a word alias, three words by default, for
+  example `abacus-abdomen-zoology`. The alias is a second name for the
+  same paste, not a second paste.
 - Filename, content-type, created date, and TTL are stored in object
   metadata. The S3 `Content-Length` gives the size. A `sha256` value is
   stored when the hash is known before the object is created. A
@@ -152,10 +152,10 @@ An ID has one or two components after `pastes/`. A segment key has a
 third component and is never a paste ID. Listing and bare-ID
 resolution skip segment keys.
 
-Every operation that takes an ID also accepts a three-word alias, such
-as `abacus-abdomen-zoology`. The JSON and MCP store responses include
+Every operation that takes an ID also accepts a word alias, such as
+`abacus-abdomen-zoology`. The JSON and MCP store responses include
 both forms; the plain-text HTTP response returns only the URL. See
-"Three-word alias".
+"Word aliases".
 
 ### Service description
 
@@ -251,13 +251,29 @@ permissions and the lower total cap.
 | `DAYFLY_MAX_TEXT_BYTES` | no | 104857600 (100 MiB) | Max text paste size for MCP `store_text`, the human text form, and `POST /upload` without a filename; oversize → 413. A new paste must also fit `DAYFLY_MAX_PASTE_BYTES`, so the lower cap wins. A filename (including a multipart filename) uses `DAYFLY_MAX_FILE_BYTES` instead |
 | `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error. A new paste must also fit `DAYFLY_MAX_PASTE_BYTES`, so the lower cap wins. The maximum is 52428800000 bytes: 10,000 parts of 5 MiB |
 | `DAYFLY_MAX_PASTE_BYTES` | no | 1073741824 (1 GiB) | Max total size for one paste, including the base object and every appended segment. A new paste or an append that would exceed the cap fails and writes no object |
+| `DAYFLY_ALIAS_WORDS` | no | 3 | Number of words in a new alias. Allowed range 3 to 6. Resolution accepts 3 words up to this value |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1 and at most 3650. The name and meaning are unchanged |
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
 | `DAYFLY_ALLOW_UNAUTHENTICATED` | no | `false` | Accept a non-loopback bind with no bearer token. Startup refuses that bind without this value, and with it the service writes one warning. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
-| `DAYFLY_SHOW_WORDS` | no | `true` | Show the generated three-word alias in the human UI: create redirects, the view page, and the paste list. Display only; the JSON/MCP responses still include `words`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
+| `DAYFLY_SHOW_WORDS` | no | `true` | Show the generated word alias in the human UI: create redirects, the view page, and the paste list. Display only; the JSON/MCP responses still include `words`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_HTTP_BEARER_TOKEN` | one form | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model); set this variable or `DAYFLY_HTTP_BEARER_TOKEN_FILE`. An unset value disables auth; a set empty or whitespace-only value is a startup error |
 | `DAYFLY_HTTP_BEARER_TOKEN_FILE` | one form | (unset) | Path to a file that contains the bearer token; set this variable or `DAYFLY_HTTP_BEARER_TOKEN` |
 | `DAYFLY_MCP_LOCAL_ROOT` | no | (unset) | Directory for the MCP local-path tools. It must exist, or startup fails. When set, `store_file` and `fetch_file` refuse any path outside it, after resolving symlinks. When unset, the stdio transport accepts any readable path and the HTTP transport refuses both tools |
+
+Alias strength by word count (7,776 words, 12.925 bits per word):
+
+| Words | Bits | Combinations |
+| --- | --- | --- |
+| 3 | 38.8 | 4.7e11 |
+| 4 | 51.7 | 3.7e15 |
+| 5 | 64.6 | 2.9e19 |
+| 6 | 77.5 | 2.2e23 |
+
+The default three words are a name, not a secret. Use four or more
+when aliases become addresses that a stranger can try. Resolution
+accepts 3 words up to the configured count. If you lower the count,
+aliases longer than the new count stop resolving. Keep the count at or
+above the longest alias in use.
 
 For each S3 credential and for the bearer token, set the direct
 variable or its `_FILE` alternative, not both. If both are set, startup
@@ -288,6 +304,7 @@ first, then the file. These settings take effect on the next request:
   (`S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY` or their `_FILE` forms)
 - `DAYFLY_MAX_TEXT_BYTES`, `DAYFLY_MAX_FILE_BYTES`, and
   `DAYFLY_MAX_PASTE_BYTES`
+- `DAYFLY_ALIAS_WORDS`
 - `DAYFLY_DEFAULT_TTL_DAYS`
 - `DAYFLY_SHOW_WORDS`
 - `DAYFLY_HTTP_BEARER_TOKEN` or `DAYFLY_HTTP_BEARER_TOKEN_FILE`
@@ -517,8 +534,8 @@ An append writes only the new bytes. It does not rewrite the base
 object. The text cap applies to this append, not to the total size.
 An expired or missing ID returns 410 or 404 and writes nothing. An
 empty body writes nothing. Use the bare ID form
-`/v1/pastes/<random>/append` if you do not have the date. A three-word
-alias works in place of the ID.
+`/v1/pastes/<random>/append` if you do not have the date. A word alias
+works in place of the ID.
 
 ### Streaming upload (curl piping, 0x0.st style)
 
@@ -587,7 +604,7 @@ after the file field are not read. Use headers (`X-Filename`,
 # Fetch text (plain curl GET returns the paste):
 curl http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123...
 
-# Fetch by three-word alias (the same route):
+# Fetch by word alias (the same route):
 curl http://127.0.0.1:8080/v1/pastes/abacus-abdomen-zoology
 
 # Fetch a byte range (206, streaming, never the whole object):
@@ -751,22 +768,24 @@ Limits:
   consume that budget, so keep the full ID for a paste with many
   segments.
 
-## Three-word alias
+## Word aliases
 
-Every new paste gets a three-word alias, for example
-`abacus-abdomen-zoology`. The alias is a second name for the paste,
-not a second object. Use the canonical ID or the alias in every
-operation that takes an ID: fetch, metadata, append, and delete.
+Every new paste gets an alias of `DAYFLY_ALIAS_WORDS` words. The
+default is three, for example `abacus-abdomen-zoology`. The alias is a
+second name for the paste, not a second object. Use the canonical ID or
+the alias in every operation that takes an ID: fetch, metadata, append,
+and delete.
 
 - The words come from the bundled EFF large wordlist in
   `src/wordlist.txt` (7,776 words). The source and the CC BY 3.0
   attribution are in `src/wordlist.LICENSE`. No external service is
   called. Four wordlist entries contain a hyphen; the parser matches
   each one as a single word.
-- An alias is three words joined by hyphens. The store returns the
-  hyphen form. Input is case-insensitive; spaces and hyphens are
-  accepted as separators. A phrase with the wrong word count or an
-  unknown word is rejected.
+- An alias is 3 to 6 words joined by hyphens. `DAYFLY_ALIAS_WORDS`
+  sets the count for new aliases. The store returns the hyphen form.
+  Input is case-insensitive; spaces and hyphens are accepted as
+  separators. A phrase outside 3 words up to the configured maximum, or
+  with an unknown word, is rejected.
 - The alias object is `words/<phrase>`. Its body is the canonical key
   `pastes/<date>/<id>`. Its metadata holds `target`, `expires-at`, and
   `kind=alias`. Lookup is O(1): one GetObject, then a HeadObject of
@@ -791,10 +810,10 @@ operation that takes an ID: fetch, metadata, append, and delete.
   to use and show the canonical ID instead. The setting is display-only:
   the alias is still generated and the JSON/MCP responses still return
   it.
-- Entropy: three words give about 38.8 bits. The uniqueness check
-  prevents collisions, not guessing. Treat the alias as a name, not a
-  secret. The bearer token and the private bucket remain the access
-  control.
+- Entropy: see the table in "Configuration". The default three words
+  give about 38.8 bits. The uniqueness check prevents collisions, not
+  guessing. Treat the alias as a name, not a secret. The bearer token
+  and the private bucket remain the access control.
 - The alias object is small. It has the same expiry as the paste.
   A lifecycle rule for `pastes/` does not cover `words/`. Add a
   `words/` rule if you want the storage sweeper to remove expired
@@ -891,7 +910,7 @@ comments.
   size limit; with JavaScript, an oversized file is rejected before the
   upload starts, and the multipart handlers reject an obviously
   oversized `Content-Length` before reading the body. On success the
-  browser is redirected to the new paste: the three-word alias when
+  browser is redirected to the new paste: the word alias when
   `DAYFLY_SHOW_WORDS` is true (the default), otherwise the canonical ID.
 - `GET /pastes` — current pastes, built from the bucket scan (no
   database): alias when enabled (with the canonical ID as secondary
@@ -903,7 +922,7 @@ comments.
   The Size, Created, and Expires headers are links. A click toggles the
   direction and keeps the date filters. A missing created or expiry
   value sorts last in both directions.
-- `GET /view/<id>` — one paste: the three-word alias when enabled,
+- `GET /view/<id>` — one paste: the word alias when enabled,
   metadata and the delete form in a collapsed `<details>` block, then
   the raw/download link, then the content: text in `<pre>` (capped at
   1 MiB for the page; the API remains the route for full/sliced reads),
@@ -1187,9 +1206,11 @@ recorded here so readers can plan around them.
   appends can choose the same sequence. Both survive, because the
   segment names have random suffixes. A read orders one sequence by
   suffix. See "Append and segmented storage".
-- **A three-word alias is guessable.** Three words from the 7,776-word
-  list give about 38.8 bits. The alias is a second name, not a bearer
-  token. Use the bearer token and the private network.
+- **A word alias is guessable at the default count.** The default three
+  words from the 7,776-word list give about 38.8 bits. Use
+  `DAYFLY_ALIAS_WORDS=4` or more when aliases are public. The alias is a
+  second name, not a bearer token. Use the bearer token and the private
+  network.
 - **The HTTP endpoint is intended for a private network.** The
   bearer token comparison is constant time for equal-length tokens.
   A length difference still leaks through timing. The write-route origin
