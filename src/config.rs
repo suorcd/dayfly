@@ -44,6 +44,9 @@ pub struct Config {
     pub max_text_bytes: u64,
     /// Maximum size, in bytes, for a file paste. Default: 1 GiB.
     pub max_file_bytes: u64,
+    /// Maximum total size, in bytes, for one paste, including the base
+    /// object and every appended segment. Default: 1 GiB.
+    pub max_paste_bytes: u64,
     /// Default TTL in positive whole days when a store call does not
     /// specify one. Zero is invalid because it would create a paste that
     /// is already expired.
@@ -139,6 +142,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("1073741824"),
         required: false,
         help: "Maximum file paste size in bytes",
+    },
+    ConfigField {
+        name: "DAYFLY_MAX_PASTE_BYTES",
+        value: Some("1073741824"),
+        required: false,
+        help: "Maximum total paste size in bytes, including appends",
     },
     ConfigField {
         name: "DAYFLY_DEFAULT_TTL_DAYS",
@@ -793,6 +802,11 @@ impl Config {
                 field_u64("DAYFLY_MAX_TEXT_BYTES", 100 * 1024 * 1024),
             )?,
             max_file_bytes,
+            max_paste_bytes: optional_u64(
+                &lookup,
+                "DAYFLY_MAX_PASTE_BYTES",
+                field_u64("DAYFLY_MAX_PASTE_BYTES", 1024 * 1024 * 1024),
+            )?,
             default_ttl_days,
             http_bind: optional_string(
                 &lookup,
@@ -835,7 +849,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} default_ttl_days={} show_words={} mcp_local_root={}",
+            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} default_ttl_days={} show_words={} mcp_local_root={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -845,6 +859,7 @@ impl Config {
             self.region,
             self.max_text_bytes,
             self.max_file_bytes,
+            self.max_paste_bytes,
             self.default_ttl_days,
             self.show_words,
             if self.mcp_local_root.is_some() {
@@ -1169,6 +1184,7 @@ mod tests {
             secret_access_key: "test-secret-key".to_string(),
             max_text_bytes,
             max_file_bytes,
+            max_paste_bytes: 1024 * 1024 * 1024,
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
             show_words: true,

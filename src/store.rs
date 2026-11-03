@@ -2071,6 +2071,12 @@ impl Store {
                 meta,
             });
         }
+        let appended_bytes = text.len() as u64;
+        if meta.size.saturating_add(appended_bytes) > self.config.max_paste_bytes {
+            return Err(StoreError::TooLarge {
+                limit: self.config.max_paste_bytes,
+            });
+        }
         if meta.segments.len() >= MAX_SEGMENTS_PER_PASTE {
             return Err(StoreError::TooManySegments {
                 limit: MAX_SEGMENTS_PER_PASTE,
@@ -2102,7 +2108,6 @@ impl Store {
             .send()
             .await
             .map_err(|e| map_sdk_error(e, &key))?;
-        let appended_bytes = text.len() as u64;
         meta.segments.push(Segment {
             sequence,
             suffix,
