@@ -984,8 +984,12 @@ async fn list_page_shows_words_when_enabled_and_hides_them_when_disabled() {
         "the alias must be the primary link: {page}"
     );
     assert!(
-        page.contains(&format!("<span class=\"muted\">{id}</span>")),
-        "the canonical ID must be shown as secondary text: {page}"
+        !page.contains(&format!("<span class=\"muted\">{id}</span>")),
+        "the canonical ID must be hidden by default: {page}"
+    );
+    assert!(
+        page.contains("<th>Link</th>"),
+        "the header must say Link by default: {page}"
     );
 
     let fake = FakeS3::start().await;
@@ -1004,6 +1008,36 @@ async fn list_page_shows_words_when_enabled_and_hides_them_when_disabled() {
     let page = html_text(&body);
     assert!(!page.contains(&format!("href=\"/view/{words}\"")));
     assert!(page.contains(&format!("href=\"/view/{id}\"")));
+}
+
+#[tokio::test]
+async fn list_page_shows_the_internal_path_when_configured() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.show_words = true;
+    config.show_internal_paths = true;
+    let store = Store::from_config(config)
+        .await
+        .expect("the store must build without network access");
+    let stored = store
+        .store_text(b"path list", None, None, None)
+        .await
+        .expect("text must store");
+    let id = stored.id.clone();
+    let app = common::app(store);
+
+    let request = common::request("GET", "/pastes", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        page.contains(&format!("<span class=\"muted\">{id}</span>")),
+        "the configured page must show the canonical ID: {page}"
+    );
+    assert!(
+        page.contains("<th>Link / ID</th>"),
+        "the configured header must say Link / ID: {page}"
+    );
 }
 
 #[tokio::test]

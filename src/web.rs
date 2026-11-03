@@ -1011,14 +1011,24 @@ async fn list_handler(
 
     let mut rows = String::new();
     let show_words = store.config.show_words;
+    let show_internal_paths = store.config.show_internal_paths;
+    let link_header = if show_internal_paths {
+        "Link / ID"
+    } else {
+        "Link"
+    };
     for item in &items {
         let id_esc = html_escape(&item.id);
         let link_cell = match (show_words, item.words.as_deref()) {
             (true, Some(words)) => {
                 let words_esc = html_escape(words);
-                format!(
-                    "<a href=\"/view/{words_esc}\">{words_esc}</a><br><span class=\"muted\">{id_esc}</span>"
-                )
+                if show_internal_paths {
+                    format!(
+                        "<a href=\"/view/{words_esc}\">{words_esc}</a><br><span class=\"muted\">{id_esc}</span>"
+                    )
+                } else {
+                    format!("<a href=\"/view/{words_esc}\">{words_esc}</a>")
+                }
             }
             _ => format!("<a href=\"/view/{id_esc}\">{id_esc}</a>"),
         };
@@ -1045,7 +1055,7 @@ async fn list_handler(
         &format!(
             r#"<form method="get" action="/pastes"><p><label>Start <input type="date" name="start" value="{}"></label> <label>End <input type="date" name="end" value="{}"></label> <button type="submit">Show range</button></p></form>
 <p class="muted">Dates are UTC. With no dates, the page shows the last {default_days} days, ending today in UTC. Set DAYFLY_LIST_DEFAULT_DAYS to change that. Built from a direct bucket scan (ListObjectsV2 for each date prefix, plus HeadObject per paste). No database. Listing is O(n) in objects scanned and gets slower as the bucket grows — that slowdown is the trigger for adding a database later.</p>
-<table><thead><tr><th>Link / ID</th><th>Filename</th><th>Content-Type</th><th>{size_header}</th><th>{created_header}</th><th>{expires_header}</th><th>Remaining</th><th></th></tr></thead><tbody>{}</tbody></table>"#,
+<table><thead><tr><th>{link_header}</th><th>Filename</th><th>Content-Type</th><th>{size_header}</th><th>{created_header}</th><th>{expires_header}</th><th>Remaining</th><th></th></tr></thead><tbody>{}</tbody></table>"#,
             html_escape(&start_value),
             html_escape(&end_value),
             rows,
@@ -1269,6 +1279,7 @@ mod tests {
             http_bind: "127.0.0.1:0".to_string(),
             trusted_proxies: Vec::new(),
             show_words: false,
+            show_internal_paths: false,
             inline_pdf: true,
             allow_unauthenticated: false,
             list_requires_token: false,

@@ -39,6 +39,7 @@ fn command() -> Command {
         "DAYFLY_PASTE_TOKENS",
         "DAYFLY_RATE_LIMIT_PER_MINUTE",
         "DAYFLY_SHOW_WORDS",
+        "DAYFLY_SHOW_INTERNAL_PATHS",
         "DAYFLY_INLINE_PDF",
         "DAYFLY_HTTP_BEARER_TOKEN",
         "DAYFLY_HTTP_BEARER_TOKEN_FILE",

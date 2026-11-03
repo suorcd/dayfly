@@ -1482,6 +1482,7 @@ mod tests {
             http_bind: "127.0.0.1:0".to_string(),
             trusted_proxies: Vec::new(),
             show_words: false,
+            show_internal_paths: false,
             inline_pdf: true,
             allow_unauthenticated: false,
             list_requires_token: false,
