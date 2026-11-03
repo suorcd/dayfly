@@ -99,7 +99,7 @@ What a pass looks like, on a machine with Nix:
 ## Nix build status (read this before claiming anything)
 
 The flake builds and its test suite passes on `x86_64-linux` against
-`nixos-unstable`: 406 passed and 2 ignored at commit `5d00dce`. That is
+`nixos-unstable`: 416 passed and 2 ignored at commit `b5d1ff0`. That is
 a real result from a real run, not an assumption.
 
 It does **not** build on the `nixos-25.11` stable branch. The AWS SDK

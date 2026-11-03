@@ -743,6 +743,39 @@ impl Config {
         })
     }
 
+    /// Files that a reload watch must follow.
+    ///
+    /// The result starts with `env_file`. It adds each secret file that
+    /// the process environment or the file selects. A relative secret
+    /// path in the file resolves against the file directory, as at
+    /// startup.
+    pub fn watch_paths(env_file: &Path) -> Vec<PathBuf> {
+        let mut paths = vec![env_file.to_path_buf()];
+        let Ok(mut values) = read_env_file(env_file) else {
+            return paths;
+        };
+        resolve_secret_paths(&mut values, env_file.parent());
+        let lookup = |name: &str| {
+            env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| values.get(name).cloned())
+        };
+        for name in [
+            "S3_ACCESS_KEY_ID_FILE",
+            "S3_SECRET_ACCESS_KEY_FILE",
+            "DAYFLY_HTTP_BEARER_TOKEN_FILE",
+        ] {
+            if let Some(path) = lookup(name) {
+                let path = PathBuf::from(path.trim());
+                if !path.as_os_str().is_empty() && !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+        paths
+    }
+
     /// Build a configuration from a name-to-value lookup.
     ///
     /// `from_env` passes the process environment. Unit tests pass a plain

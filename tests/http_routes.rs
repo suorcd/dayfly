@@ -1244,7 +1244,7 @@ async fn failed_bearer_check_logs_method_path_and_peer() {
     let fake = FakeS3::start().await;
     let mut store = fake.store().await;
     store.config.http_bearer_token = Some("correct-horse-battery-staple".to_string());
-    let app = dayfly::http::app_router(AppState { store });
+    let app = dayfly::http::app_router(AppState::new(store));
 
     let captured = CapturedLog::default();
     let subscriber = tracing_subscriber::fmt()
@@ -1467,9 +1467,7 @@ async fn response_headers_do_not_leak_secrets() {
 
 async fn fake_state(max_text_bytes: u64) -> (AppState, FakeS3) {
     let fake = FakeS3::start().await;
-    let state = AppState {
-        store: fake.store_with_caps(max_text_bytes, 1024 * 1024).await,
-    };
+    let state = AppState::new(fake.store_with_caps(max_text_bytes, 1024 * 1024).await);
     (state, fake)
 }
 
@@ -1477,7 +1475,7 @@ async fn fake_state(max_text_bytes: u64) -> (AppState, FakeS3) {
 async fn append_endpoint_extends_the_paste_and_fetch_returns_the_concatenation() {
     let (state, _fake) = fake_state(1024).await;
     let stored = state
-        .store
+        .store()
         .store_text(b"hello", None, Some("text/plain"), Some(Ttl::days(7)))
         .await
         .expect("store must succeed against the fake");
@@ -1531,7 +1529,7 @@ async fn append_accepts_a_body_above_the_axum_default_limit() {
     let cap = 3 * 1024 * 1024;
     let (state, fake) = fake_state(cap).await;
     let stored = state
-        .store
+        .store()
         .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(1)))
         .await
         .expect("store must succeed against the fake");
@@ -1566,7 +1564,7 @@ async fn append_accepts_a_body_above_the_axum_default_limit() {
 async fn append_rejects_a_body_shorter_than_content_length() {
     let (state, fake) = fake_state(1024).await;
     let stored = state
-        .store
+        .store()
         .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(1)))
         .await
         .expect("store must succeed against the fake");
@@ -1742,7 +1740,7 @@ async fn append_text_works_through_the_http_mcp_endpoint() {
     assert_eq!(appended["size"], 11);
 
     let slice = state
-        .store
+        .store()
         .fetch_text(id, 0, None)
         .await
         .expect("fetch must succeed");
@@ -1845,9 +1843,7 @@ async fn x_ttl_days_still_stores_whole_day_expiry() {
 #[tokio::test]
 async fn two_mcp_clients_store_text_through_one_shared_store() {
     let fake = FakeS3::start().await;
-    let app = app_router(AppState {
-        store: fake.store().await,
-    });
+    let app = app_router(AppState::new(fake.store().await));
     let session_a = initialize_mcp_session(&app).await;
     let session_b = initialize_mcp_session(&app).await;
     assert_ne!(
@@ -1901,9 +1897,7 @@ async fn state_with_local_root(fake: &FakeS3, root: &std::path::Path) -> AppStat
         root.canonicalize()
             .expect("the allowed root must exist before the store is built"),
     );
-    AppState {
-        store: Store::from_config(config).await.expect("store builds"),
-    }
+    AppState::new(Store::from_config(config).await.expect("store builds"))
 }
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -1920,9 +1914,7 @@ fn rpc_error_code(payload: &Value) -> Option<i64> {
 #[tokio::test]
 async fn http_mcp_cannot_position_itself_to_read_a_local_file() {
     let fake = FakeS3::start().await;
-    let app = app_router(AppState {
-        store: fake.store().await,
-    });
+    let app = app_router(AppState::new(fake.store().await));
     let session = initialize_mcp_session(&app).await;
 
     let canary = b"dayfly-test-canary-credential-material";
@@ -1967,9 +1959,7 @@ async fn http_mcp_cannot_position_itself_to_read_a_local_file() {
 #[tokio::test]
 async fn http_mcp_cannot_position_itself_to_write_a_local_file() {
     let fake = FakeS3::start().await;
-    let app = app_router(AppState {
-        store: fake.store().await,
-    });
+    let app = app_router(AppState::new(fake.store().await));
     let session = initialize_mcp_session(&app).await;
 
     let (status, _, body) = mcp_post(&app, &store_text_body(30, "payload"), Some(&session)).await;

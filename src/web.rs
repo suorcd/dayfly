@@ -41,7 +41,7 @@ use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::header::{CONTENT_LENGTH, HOST, ORIGIN, REFERER};
 use axum::http::uri::{Authority, Uri};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
-use axum::middleware::map_response;
+use axum::middleware::{map_response, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
@@ -53,7 +53,7 @@ use crate::http::{
     MULTIPART_METADATA_MAX_BYTES,
 };
 use crate::store::{
-    parse_list_window_request, ListWindowRequest, PasteSummary, StoreError, StoredPaste, Ttl,
+    parse_list_window_request, ListWindowRequest, PasteSummary, Store, StoreError, StoredPaste, Ttl,
 };
 
 /// Adapted base look from suorcd.us/style.css, palette cyberpunkNeon
@@ -346,8 +346,9 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
     if let Err(resp) = check_auth(&state, &headers) {
         return resp;
     }
-    let default_ttl = state.store.config.default_ttl_days;
-    let max_file_bytes = state.store.config.max_file_paste_bytes();
+    let store = state.store();
+    let default_ttl = store.config.default_ttl_days;
+    let max_file_bytes = store.config.max_file_paste_bytes();
     let max_file_human = human_size(max_file_bytes);
     let mut body = format!(
         r#"<h2>Paste or upload</h2>
@@ -394,6 +395,7 @@ async fn text_submit_handler(
         return forbidden_page();
     }
     let filename = form.filename.filter(|f| !f.trim().is_empty());
+    let store = state.store();
     let ttl = match form.ttl_days {
         Some(days) => match Ttl::checked_days(days) {
             Ok(ttl) => Some(ttl),
@@ -401,13 +403,13 @@ async fn text_submit_handler(
         },
         None => None,
     };
-    match state
-        .store
+    match store
         .store_text(form.text.as_bytes(), filename.as_deref(), None, ttl)
         .await
     {
-        Ok(stored) => Redirect::to(&stored_view_target(&stored, state.store.config.show_words))
-            .into_response(),
+        Ok(stored) => {
+            Redirect::to(&stored_view_target(&stored, store.config.show_words)).into_response()
+        }
         Err(e) => error_page(e),
     }
 }
@@ -461,7 +463,7 @@ fn stored_view_target(stored: &StoredPaste, show_words: bool) -> String {
 /// before the handler reads the body. The multipart envelope and text field
 /// add overhead, so this is a coarse upper bound; the streaming cap remains
 /// authoritative.
-fn multipart_length_allows(state: &AppState, headers: &HeaderMap) -> bool {
+fn multipart_length_allows(store: &Store, headers: &HeaderMap) -> bool {
     let Some(length) = headers
         .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
@@ -469,11 +471,10 @@ fn multipart_length_allows(state: &AppState, headers: &HeaderMap) -> bool {
     else {
         return true;
     };
-    let max_request = state
-        .store
+    let max_request = store
         .config
         .max_file_paste_bytes()
-        .saturating_add(state.store.config.max_text_paste_bytes())
+        .saturating_add(store.config.max_text_paste_bytes())
         .saturating_add(1024 * 1024);
     length <= max_request
 }
@@ -482,13 +483,13 @@ fn multipart_length_allows(state: &AppState, headers: &HeaderMap) -> bool {
 /// error page; this keeps the upload and combined-create handlers on one
 /// streaming path.
 async fn store_file_field(
-    state: &AppState,
+    store: &Store,
     field: axum::extract::multipart::Field<'_>,
     ttl: Option<Ttl>,
 ) -> Result<StoredPaste, StoreError> {
     let field_content_type = field.content_type().map(|s| s.to_string());
     let filename = field.file_name().map(|s| s.to_string());
-    let max_bytes = state.store.config.max_bytes_for_upload(filename.as_deref());
+    let max_bytes = store.config.max_bytes_for_upload(filename.as_deref());
     let stream = futures::stream::unfold(field, |mut f| async move {
         match f.chunk().await {
             Ok(Some(chunk)) => Some((Ok(chunk), f)),
@@ -496,8 +497,7 @@ async fn store_file_field(
             Err(e) => Some((Err(StoreError::Io(e.to_string())), f)),
         }
     });
-    state
-        .store
+    store
         .store_stream(
             Box::pin(stream),
             filename.as_deref(),
@@ -540,9 +540,10 @@ async fn upload_submit_handler(
     if !same_origin_allowed(&headers) {
         return forbidden_page();
     }
-    if !multipart_length_allows(&state, &headers) {
+    let store = state.store();
+    if !multipart_length_allows(&store, &headers) {
         return error_page(StoreError::TooLarge {
-            limit: state.store.config.max_file_paste_bytes(),
+            limit: store.config.max_file_paste_bytes(),
         });
     }
     let mut ttl: Option<Ttl> = None;
@@ -557,11 +558,9 @@ async fn upload_submit_handler(
         };
         let name = field.name().unwrap_or("").to_string();
         if name == "file" {
-            return match store_file_field(&state, field, ttl).await {
-                Ok(stored) => {
-                    Redirect::to(&stored_view_target(&stored, state.store.config.show_words))
-                        .into_response()
-                }
+            return match store_file_field(&store, field, ttl).await {
+                Ok(stored) => Redirect::to(&stored_view_target(&stored, store.config.show_words))
+                    .into_response(),
                 Err(e) => error_page(e),
             };
         }
@@ -601,17 +600,17 @@ async fn create_submit_handler(
     if !same_origin_allowed(&headers) {
         return forbidden_page();
     }
-    if !multipart_length_allows(&state, &headers) {
+    let store = state.store();
+    if !multipart_length_allows(&store, &headers) {
         return error_page(StoreError::TooLarge {
-            limit: state.store.config.max_file_paste_bytes(),
+            limit: store.config.max_file_paste_bytes(),
         });
     }
 
     let mut ttl: Option<Ttl> = None;
     let mut text: Option<Vec<u8>> = None;
     let mut text_filename: Option<String> = None;
-    let text_limit =
-        usize::try_from(state.store.config.max_text_paste_bytes()).unwrap_or(usize::MAX);
+    let text_limit = usize::try_from(store.config.max_text_paste_bytes()).unwrap_or(usize::MAX);
 
     loop {
         let field = match multipart.next_field().await {
@@ -656,7 +655,7 @@ async fn create_submit_handler(
                 Ok(bytes) => text = Some(bytes),
                 Err(MultipartFieldError::TooLarge) => {
                     return error_page(StoreError::TooLarge {
-                        limit: state.store.config.max_text_paste_bytes(),
+                        limit: store.config.max_text_paste_bytes(),
                     });
                 }
                 Err(MultipartFieldError::Malformed(message)) => {
@@ -669,9 +668,9 @@ async fn create_submit_handler(
                 if !field.file_name().is_some_and(|name| !name.is_empty()) {
                     continue;
                 }
-                return match store_file_field(&state, field, ttl).await {
+                return match store_file_field(&store, field, ttl).await {
                     Ok(stored) => {
-                        Redirect::to(&stored_view_target(&stored, state.store.config.show_words))
+                        Redirect::to(&stored_view_target(&stored, store.config.show_words))
                             .into_response()
                     }
                     Err(e) => error_page(e),
@@ -687,13 +686,13 @@ async fn create_submit_handler(
     if bytes.is_empty() {
         return bad_request_page("provide text or a file");
     }
-    match state
-        .store
+    match store
         .store_text(&bytes, text_filename.as_deref(), None, ttl)
         .await
     {
-        Ok(stored) => Redirect::to(&stored_view_target(&stored, state.store.config.show_words))
-            .into_response(),
+        Ok(stored) => {
+            Redirect::to(&stored_view_target(&stored, store.config.show_words)).into_response()
+        }
         Err(e) => error_page(e),
     }
 }
@@ -868,12 +867,13 @@ async fn list_handler(
     };
     // list_window already filters expired objects (HeadObject per key),
     // so this page is consistent with the API's read-time expiry check.
+    let store = state.store();
     let items = match &request {
-        ListWindowRequest::Date(date) => state.store.list_recent(Some(date), 1000).await,
+        ListWindowRequest::Date(date) => store.list_recent(Some(date), 1000).await,
         ListWindowRequest::Range { start, end } => {
-            state.store.list_window(Some(start), Some(end), 1000).await
+            store.list_window(Some(start), Some(end), 1000).await
         }
-        ListWindowRequest::Default => state.store.list_window(None, None, 1000).await,
+        ListWindowRequest::Default => store.list_window(None, None, 1000).await,
     };
     let mut items = match items {
         Ok(items) => items,
@@ -897,7 +897,7 @@ async fn list_handler(
     let expires_header = sort_header("Expires", PasteSort::Expires, sort, order, &filters);
 
     let mut rows = String::new();
-    let show_words = state.store.config.show_words;
+    let show_words = store.config.show_words;
     for item in &items {
         let id_esc = html_escape(&item.id);
         let link_cell = match (show_words, item.words.as_deref()) {
@@ -958,7 +958,7 @@ async fn delete_submit_handler(
     if !same_origin_allowed(&headers) {
         return forbidden_page();
     }
-    match state.store.delete(&form.id).await {
+    match state.store().delete(&form.id).await {
         Ok(()) => Redirect::to("/pastes").into_response(),
         Err(e) => error_page(e),
     }
@@ -968,7 +968,8 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
     if let Err(resp) = check_auth(state, headers) {
         return resp;
     }
-    let meta = match state.store.head_metadata(id).await {
+    let store = state.store();
+    let meta = match store.head_metadata(id).await {
         Ok(m) => m,
         Err(e) => return error_page(e),
     };
@@ -977,7 +978,7 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
     }
     let id_esc = html_escape(&meta.id);
     let main = meta.content_type.split(';').next().unwrap_or("").trim();
-    let words_line = if state.store.config.show_words {
+    let words_line = if store.config.show_words {
         meta.words
             .as_deref()
             .map(|words| {
@@ -1008,7 +1009,7 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
     {
         // Text view, capped at 1 MiB so the page stays usable; the API
         // remains the route for full / sliced reads of large pastes.
-        let slice = state.store.fetch_text(&meta.id, 0, Some(1_000_000)).await;
+        let slice = store.fetch_text(&meta.id, 0, Some(1_000_000)).await;
         match slice {
             Ok(s) => {
                 body.push_str(&format!("<pre>{}</pre>", html_escape(&s.text)));
@@ -1061,27 +1062,26 @@ async fn deny_framing(mut response: Response) -> Response {
     response
 }
 
-/// UI routes, without state attached. `main` merges these with the
-/// API routes and attaches a single shared [`AppState`].
-pub fn ui_router(max_text_paste_bytes: u64) -> Router<AppState> {
+/// UI routes for the shared reloadable [`AppState`].
+///
+/// `main` merges these with the API routes and attaches the same state.
+pub fn ui_router(state: AppState) -> Router<AppState> {
     // See http.rs: the store caps streams while it reads them. The 2 MiB
-    // axum default would reject real file uploads early. Keep the limit on
-    // the form routes, which buffer their bodies in memory.
-    let upload_routes = Router::new()
+    // axum default would reject real file uploads early. The combined form
+    // buffers only small metadata fields, so it disables the coarse limit
+    // and relies on the field and stream caps.
+    let form_routes = Router::new()
         .route("/ui/upload", post(upload_submit_handler))
         .route("/ui/create", post(create_submit_handler))
         .layer(DefaultBodyLimit::disable());
-    // The text form is URL-encoded, so one decoded byte can take three
-    // percent-encoded bytes. Give the body enough room for the encoded
-    // text plus the small field names, filename, and TTL. The decoded
-    // text still goes through the exact max_text_paste_bytes check.
+    // The URL-encoded text form is buffered. Set its body limit from the
+    // current text cap for each request, so a reload applies without a
+    // router rebuild. The decoded text still goes through the exact cap.
     let text_routes = Router::new()
         .route("/ui/text", post(text_submit_handler))
-        .layer(DefaultBodyLimit::max(text_form_body_limit(
-            max_text_paste_bytes,
-        )));
+        .layer(axum::middleware::from_fn_with_state(state, text_body_limit));
     Router::new()
-        .merge(upload_routes)
+        .merge(form_routes)
         .merge(text_routes)
         .route("/", get(index_handler))
         .route("/ui/delete", post(delete_submit_handler))
@@ -1089,6 +1089,21 @@ pub fn ui_router(max_text_paste_bytes: u64) -> Router<AppState> {
         .route("/view/{date}/{random}", get(view_dated))
         .route("/view/{random}", get(view_bare))
         .layer(map_response(deny_framing))
+}
+
+/// Enforce the current text cap on the URL-encoded form body.
+///
+/// The body is buffered before the form is parsed. The limit follows the
+/// current configuration, so a reload affects the next request.
+async fn text_body_limit(
+    State(state): State<AppState>,
+    mut request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let store = state.store();
+    let limit = text_form_body_limit(store.config.max_text_paste_bytes());
+    DefaultBodyLimit::max(limit).apply(&mut request);
+    next.run(request).await
 }
 
 /// Raw-body limit for the URL-encoded text form.
@@ -1137,19 +1152,18 @@ mod tests {
     async fn test_state(token: Option<&str>) -> AppState {
         let mut config = test_config();
         config.http_bearer_token = token.map(str::to_string);
-        AppState {
-            store: Store::from_config(config)
+        AppState::new(
+            Store::from_config(config)
                 .await
                 .expect("test S3 config must build without network access"),
-        }
+        )
     }
 
     /// Call the UI list route. A passing token reaches the unreachable test
     /// S3 endpoint, and the UI maps that S3 error to 400. A 401 means the
     /// auth check rejected the request.
     async fn ui_list_status(state: AppState, auth: Option<&str>) -> StatusCode {
-        let max_text_paste_bytes = state.store.config.max_text_paste_bytes();
-        let app = ui_router(max_text_paste_bytes).with_state(state);
+        let app = ui_router(state.clone()).with_state(state);
         let mut builder = Request::builder().method("GET").uri("/pastes");
         if let Some(auth) = auth {
             builder = builder.header(axum::http::header::AUTHORIZATION, auth);
@@ -1194,8 +1208,7 @@ mod tests {
     #[tokio::test]
     async fn ui_html_responses_deny_framing() {
         let state = test_state(None).await;
-        let max_text_paste_bytes = state.store.config.max_text_paste_bytes();
-        let app = ui_router(max_text_paste_bytes).with_state(state);
+        let app = ui_router(state.clone()).with_state(state);
 
         for uri in ["/", "/pastes", "/view/example"] {
             let response = app
@@ -1388,7 +1401,7 @@ mod tests {
     #[tokio::test]
     async fn list_rejects_invalid_sort_and_order() {
         let state = test_state(None).await;
-        let app = ui_router(state.store.config.max_text_paste_bytes()).with_state(state);
+        let app = ui_router(state.clone()).with_state(state);
         for uri in ["/pastes?sort=bogus", "/pastes?order=sideways"] {
             let response = app
                 .clone()
@@ -1536,12 +1549,12 @@ mod tests {
 
     #[tokio::test]
     async fn cross_site_delete_post_is_forbidden() {
-        let state = AppState {
-            store: Store::from_config(test_config())
+        let state = AppState::new(
+            Store::from_config(test_config())
                 .await
                 .expect("test S3 config must build without network access"),
-        };
-        let app = ui_router(state.store.config.max_text_paste_bytes()).with_state(state);
+        );
+        let app = ui_router(state.clone()).with_state(state);
         let request = Request::builder()
             .method("POST")
             .uri("/ui/delete")

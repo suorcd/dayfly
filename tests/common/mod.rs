@@ -1141,10 +1141,10 @@ pub fn metadata_refs(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
 
 /// Build the full HTTP app: API routes plus the human UI routes.
 pub fn app(store: Store) -> Router {
-    let max_text_paste_bytes = store.config.max_text_paste_bytes();
+    let state = AppState::new(store);
     dayfly::http::api_router()
-        .merge(dayfly::web::ui_router(max_text_paste_bytes))
-        .with_state(AppState { store })
+        .merge(dayfly::web::ui_router(state.clone()))
+        .with_state(state)
 }
 
 /// Send one request to the router in process and collect the response.
