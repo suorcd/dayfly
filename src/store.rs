@@ -53,6 +53,11 @@ pub const LIST_WINDOW_MAX_DAYS: usize = 366;
 /// Maximum number of appended segments for one paste.
 pub const MAX_SEGMENTS_PER_PASTE: usize = 4096;
 
+/// Maximum bytes returned by one `fetch_text` call. A caller that sends
+/// no limit gets this bound. The caller can page with `offset` to read
+/// the rest.
+pub const MAX_FETCH_TEXT_BYTES: u64 = 8 * 1024 * 1024;
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("paste not found: {0}")]
@@ -2334,6 +2339,11 @@ impl Store {
     ) -> Result<TextSlice, StoreError> {
         let meta = self.head_metadata(id).await?;
         Self::check_not_expired(&meta)?;
+        let limit = Some(
+            limit
+                .unwrap_or(MAX_FETCH_TEXT_BYTES)
+                .min(MAX_FETCH_TEXT_BYTES),
+        );
         let Some((start, end_exclusive)) = offset_limit_window(offset, limit, meta.size) else {
             return Ok(TextSlice {
                 text: String::new(),

@@ -450,7 +450,7 @@ impl Pastebin {
     }
 
     #[tool(
-        description = "Fetch a text paste by id or three-word alias, with optional byte offset and limit. Large pastes should be read in slices, not whole."
+        description = "Fetch a text paste by id or three-word alias, with optional byte offset and limit. A call returns at most 8 MiB. Large pastes should be read in slices, not whole."
     )]
     async fn fetch_text(
         &self,
