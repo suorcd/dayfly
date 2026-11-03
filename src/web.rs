@@ -87,6 +87,7 @@ table{border-collapse:collapse;width:auto;table-layout:fixed} th,td{text-align:l
 .size-cell{text-align:right;white-space:nowrap}
 .size-unit{display:inline-block;min-width:3ch;text-align:left;margin-left:.4ch}
 th:nth-child(4){text-align:center}
+.ttl-header{cursor:help;text-decoration:underline dotted;text-underline-offset:.25rem}
 .table-wrap{overflow-x:auto}
 .filename-cell{white-space:nowrap}
 th:first-child,td:first-child{white-space:nowrap}
@@ -1129,7 +1130,7 @@ async fn list_handler(
         &format!(
             r#"<form method="get" action="/pastes"><p><label>Start <input type="date" name="start" value="{}"></label> <label>End <input type="date" name="end" value="{}"></label> <button type="submit">Show range</button></p></form>
 <p class="muted">Dates are UTC. With no dates, the page shows the last {default_days} days, ending today in UTC. Set DAYFLY_LIST_DEFAULT_DAYS to change that. Built from a direct bucket scan (ListObjectsV2 for each date prefix, plus HeadObject per paste). No database. Listing is O(n) in objects scanned and gets slower as the bucket grows — that slowdown is the trigger for adding a database later.</p>
-<div class="table-wrap"><table><colgroup><col class="col-link"><col class="col-filename"><col class="col-content-type"><col class="col-size"><col class="col-created"><col class="col-ttl"><col class="col-action"></colgroup><thead><tr><th>{link_header}</th><th>Filename</th><th>Content-Type</th><th>{size_header}</th><th>{created_header}</th><th title="days">TTL</th><th>Action</th></tr></thead><tbody>{}</tbody></table></div>"#,
+<div class="table-wrap"><table><colgroup><col class="col-link"><col class="col-filename"><col class="col-content-type"><col class="col-size"><col class="col-created"><col class="col-ttl"><col class="col-action"></colgroup><thead><tr><th>{link_header}</th><th>Filename</th><th>Content-Type</th><th>{size_header}</th><th>{created_header}</th><th class="ttl-header" title="days">TTL</th><th>Action</th></tr></thead><tbody>{}</tbody></table></div>"#,
             html_escape(&start_value),
             html_escape(&end_value),
             rows,
