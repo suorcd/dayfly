@@ -89,6 +89,9 @@ details form{background:none;border:0;padding:0;border-radius:0;backdrop-filter:
 .dropzone-line{display:inline-flex;flex-wrap:wrap;align-items:baseline;gap:.4rem}
 .badge{display:inline-block;max-width:100%;font-size:.8rem;line-height:1.4;padding:.05rem .5rem;border:1px solid #0abdc6;border-radius:999px;color:#0abdc6;background:rgba(10,189,198,.12);overflow-wrap:anywhere}
 .form-actions{display:flex;flex-wrap:wrap;gap:.75rem;align-items:stretch;margin-top:1rem}
+.form-row{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem 1.25rem}
+.form-row p{margin:0}
+.form-row input{min-width:16rem;max-width:100%}
 .form-actions .dropzone.compact{justify-content:center}
 .form-actions button[type=button]{align-self:center}
 .form-actions button[type=submit]{margin-left:auto}
@@ -362,8 +365,10 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
         r#"<h2>Paste or upload</h2>
 <form method="post" action="/ui/create" enctype="multipart/form-data" data-max-file-bytes="{max_file_bytes}">
 <p><label>Text<br><textarea name="text" id="text"></textarea></label></p>
+<div class="form-row">
 <p><label>Keep for <select name="ttl_days">{}</select></label></p>
 <p><label>Filename (optional, text only) <input type="text" name="filename" id="filename"></label></p>
+</div>
 <p class="muted">Max file size: {max_file_human}. A selected file takes precedence and disables the text fields.</p>
 <div class="form-actions">
 <label class="dropzone compact" id="dropzone">
