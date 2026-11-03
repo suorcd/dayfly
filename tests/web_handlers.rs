@@ -132,6 +132,14 @@ async fn index_page_renders_the_combined_form_and_the_default_ttl() {
         !page.contains("<h2>Paste or upload</h2>"),
         "the form must not repeat a section heading: {page}"
     );
+    assert!(
+        page.contains("<title>New paste — dayfly</title>"),
+        "the page title must use the product name: {page}"
+    );
+    assert!(
+        page.contains("<footer>dayfly — internal use only"),
+        "the footer must use the product name: {page}"
+    );
 }
 
 #[tokio::test]

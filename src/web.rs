@@ -90,6 +90,8 @@ details form{background:none;border:0;padding:0;border-radius:0;backdrop-filter:
 .dropzone-line{display:inline-flex;flex-wrap:wrap;align-items:baseline;gap:.4rem}
 .badge{display:inline-block;max-width:100%;font-size:.8rem;line-height:1.4;padding:.05rem .5rem;border:1px solid #0abdc6;border-radius:999px;color:#0abdc6;background:rgba(10,189,198,.12);overflow-wrap:anywhere}
 .form-actions{display:flex;flex-wrap:wrap;gap:.75rem;align-items:stretch;margin-top:1rem}
+details.cli-hint{margin-top:1.5rem}
+form > p:first-child{margin-top:0}
 .form-row{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem 1.25rem}
 .form-row p{margin:0}
 .form-row input{min-width:16rem;max-width:100%}
@@ -233,7 +235,7 @@ fn page(title: &str, active: Option<&str>, body: &str) -> Html<String> {
         format!("<h1>{title}</h1>\n")
     };
     Html(format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title} — pastebin</title>\n<style>{CSS}</style>\n</head>\n<body>\n<header><nav><span class=\"prompt\">~/dayfly $</span>{nav}</nav></header>\n{heading}{body}\n<footer>pastebin — internal use only · &copy; 2026 suorcd</footer>\n</body>\n</html>\n"
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title} — dayfly</title>\n<style>{CSS}</style>\n</head>\n<body>\n<header><nav><span class=\"prompt\">~/dayfly $</span>{nav}</nav></header>\n{heading}{body}\n<footer>dayfly — internal use only · &copy; 2026 suorcd</footer>\n</body>\n</html>\n"
     ))
 }
 
