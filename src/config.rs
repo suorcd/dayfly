@@ -86,6 +86,15 @@ pub struct Config {
     /// proxy that authenticates. The service then logs one warning at
     /// startup. See "Access model" in the README.
     pub allow_unauthenticated: bool,
+    /// Whether listing requires the bearer token.
+    ///
+    /// Default: `false`. With the default, listing follows the global
+    /// bearer setting: gated when a token is set, open when none is. When
+    /// this is `true`, `GET /v1/pastes` and the human `/pastes` page
+    /// require the bearer token even if reads are otherwise anonymous.
+    /// With no token configured, both routes refuse: there is nothing to
+    /// check against, and an open list is what this setting prevents.
+    pub list_requires_token: bool,
     /// Whether the human web UI shows the generated aliases.
     ///
     /// Default: `true`. This is a display setting only: aliases are still
@@ -208,6 +217,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("false"),
         required: false,
         help: "Start a non-loopback bind with no bearer token",
+    },
+    ConfigField {
+        name: "DAYFLY_LIST_REQUIRES_TOKEN",
+        value: Some("false"),
+        required: false,
+        help: "Require the bearer token to list pastes",
     },
     ConfigField {
         name: "DAYFLY_SHOW_WORDS",
@@ -960,6 +975,11 @@ impl Config {
                 "DAYFLY_ALLOW_UNAUTHENTICATED",
                 field_default("DAYFLY_ALLOW_UNAUTHENTICATED") == Some("true"),
             )?,
+            list_requires_token: optional_bool(
+                &lookup,
+                "DAYFLY_LIST_REQUIRES_TOKEN",
+                field_default("DAYFLY_LIST_REQUIRES_TOKEN") == Some("true"),
+            )?,
             http_bearer_token: bearer_token(optional_credential(
                 &lookup,
                 "DAYFLY_HTTP_BEARER_TOKEN",
@@ -1005,7 +1025,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} show_words={} inline_pdf={} trusted_proxies={} mcp_local_root={}",
+            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} show_words={} inline_pdf={} trusted_proxies={} list_requires_token={} mcp_local_root={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -1021,6 +1041,7 @@ impl Config {
             self.show_words,
             self.inline_pdf,
             self.trusted_proxies.len(),
+            self.list_requires_token,
             if self.mcp_local_root.is_some() {
                 "set"
             } else {
@@ -1351,6 +1372,7 @@ mod tests {
             show_words: true,
             inline_pdf: true,
             allow_unauthenticated: false,
+            list_requires_token: false,
             http_bearer_token: None,
             mcp_local_root: None,
         }
@@ -1495,6 +1517,18 @@ mod tests {
             message.contains("10.0.0.0/33"),
             "the error must name the entry: {message}"
         );
+    #[test]
+    fn list_requires_token_defaults_to_false() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert!(!config.list_requires_token);
+    }
+
+    #[test]
+    fn list_requires_token_accepts_true() {
+        let mut pairs = base_env();
+        pairs.push(("DAYFLY_LIST_REQUIRES_TOKEN".to_string(), "true".to_string()));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("gated listing config");
+        assert!(config.list_requires_token);
     }
 
     #[test]

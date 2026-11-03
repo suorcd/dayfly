@@ -143,6 +143,60 @@ pub(crate) fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Re
     }
 }
 
+/// Why a listing request was refused.
+pub(crate) enum ListAccessError {
+    /// The request did not carry the configured bearer token. The shared
+    /// auth response is carried through unchanged.
+    Unauthorized(Response),
+    /// The setting requires a token, but the server has none configured.
+    MissingToken,
+}
+
+impl ListAccessError {
+    /// A message safe to show a client. It names the setting and the
+    /// missing variable, never a credential value.
+    pub(crate) const MISSING_TOKEN_MESSAGE: &'static str =
+        "DAYFLY_LIST_REQUIRES_TOKEN is set, but DAYFLY_HTTP_BEARER_TOKEN is not";
+}
+
+/// Check whether a request may list pastes.
+///
+/// With `DAYFLY_LIST_REQUIRES_TOKEN` off this is exactly [`check_auth`], so
+/// listing keeps today's behaviour in both the token and no-token cases.
+/// With it on, the bearer token is required even when reads are anonymous.
+/// When no token is configured, the request is refused: there is nothing to
+/// check against.
+// The error carries the shared auth response unchanged. Boxing it here
+// would only add an allocation at every refused listing request.
+#[allow(clippy::result_large_err)]
+pub(crate) fn check_list_access(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), ListAccessError> {
+    let store = state.store();
+    if !store.config.list_requires_token {
+        return check_auth(state, headers).map_err(ListAccessError::Unauthorized);
+    }
+    if store.config.http_bearer_token.is_none() {
+        return Err(ListAccessError::MissingToken);
+    }
+    check_auth(state, headers).map_err(ListAccessError::Unauthorized)
+}
+
+fn list_access_response(error: ListAccessError) -> Response {
+    match error {
+        ListAccessError::Unauthorized(response) => response,
+        ListAccessError::MissingToken => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "unauthorized",
+                "detail": ListAccessError::MISSING_TOKEN_MESSAGE,
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// Return true when an `Authorization` header value carries the expected
 /// bearer token. The scheme is case-insensitive. The credential is compared
 /// with `subtle::ConstantTimeEq`, so the comparison time does not depend on
@@ -759,8 +813,8 @@ async fn list_handler(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(resp) = check_auth(&state, &headers) {
-        return resp;
+    if let Err(error) = check_list_access(&state, &headers) {
+        return list_access_response(error);
     }
     let window = match parse_list_query(&query) {
         Ok(window) => window,
@@ -1311,6 +1365,7 @@ mod tests {
             show_words: false,
             inline_pdf: true,
             allow_unauthenticated: false,
+            list_requires_token: false,
             http_bearer_token: None,
             mcp_local_root: None,
         }
@@ -1611,6 +1666,63 @@ mod tests {
         let state = test_state(10 * 1024 * 1024, 1024 * 1024 * 1024).await;
         assert_eq!(
             status_for_auth_request(state, None).await,
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    async fn state_with_gated_listing(token: Option<&str>) -> AppState {
+        let mut config = test_config(10 * 1024 * 1024, 1024 * 1024 * 1024);
+        config.list_requires_token = true;
+        config.http_bearer_token = token.map(str::to_string);
+        AppState::new(
+            Store::from_config(config)
+                .await
+                .expect("test S3 config must build without network access"),
+        )
+    }
+
+    #[tokio::test]
+    async fn gated_listing_without_a_configured_token_is_refused() {
+        let state = state_with_gated_listing(None).await;
+        let app = api_router().with_state(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/pastes")
+            .body(Body::empty())
+            .expect("request must build");
+        let resp = app.oneshot(req).await.expect("router call must complete");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(resp.into_body(), 1024)
+            .await
+            .expect("error body must be readable");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("DAYFLY_HTTP_BEARER_TOKEN"),
+            "the error must name the missing token: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gated_listing_requires_the_token() {
+        let state = state_with_gated_listing(Some(TEST_TOKEN)).await;
+        assert_eq!(
+            status_for_auth_request(state, None).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn gated_listing_accepts_the_token() {
+        let state = state_with_gated_listing(Some(TEST_TOKEN)).await;
+        assert_eq!(
+            status_for_auth_request(
+                state,
+                Some(
+                    HeaderValue::from_str(&format!("Bearer {TEST_TOKEN}"))
+                        .expect("header value must build")
+                )
+            )
+            .await,
             StatusCode::BAD_GATEWAY
         );
     }
