@@ -90,6 +90,9 @@ table{border-collapse:collapse;width:auto;table-layout:fixed} th,td{text-align:l
 th:nth-child(4){text-align:center}
 .ttl-header{cursor:help;text-decoration:underline dotted;text-underline-offset:.25rem}
 .hint{color:#0abdc6;cursor:help;text-decoration:underline dotted;text-underline-offset:.25rem;font-size:.95rem}
+.view-actions{display:flex;flex-wrap:wrap;gap:.5rem;margin-bottom:1rem}
+a.button{display:inline-block;font-size:1rem;padding:.35rem .8rem;cursor:pointer;background:rgba(19,62,124,.5);color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px;text-decoration:none}
+a.button:hover{text-decoration:none;box-shadow:0 0 10px rgba(10,189,198,.4)}
 .table-wrap{overflow-x:auto}
 .list-panel{width:max-content;max-width:100%}
 .list-panel form{margin-bottom:1rem}
@@ -250,6 +253,26 @@ const NAV_ITEMS: [(&str, &str); 3] = [
 /// Build one page. `active` names the nav href for the current page, and
 /// `show_heading` controls the `<h1>`. Pages that repeat a nav label keep
 /// the heading off.
+/// Copy the current view URL to the clipboard. Falls back to a prompt
+/// when the browser blocks the clipboard API.
+const COPY_LINK_SCRIPT: &str = r#"<script>
+(() => {
+  const button = document.querySelector('.copy-link');
+  if (!button) return;
+  button.hidden = false;
+  button.addEventListener('click', async () => {
+    const url = new URL(button.dataset.copy, location.origin).href;
+    try {
+      await navigator.clipboard.writeText(url);
+      button.textContent = 'Copied';
+    } catch {
+      window.prompt('Copy link', url);
+    }
+    setTimeout(() => { button.textContent = 'Copy link'; }, 1500);
+  });
+})();
+</script>"#;
+
 fn page(title: &str, active: Option<&str>, show_heading: bool, body: &str) -> Html<String> {
     let nav: String = NAV_ITEMS
         .iter()
@@ -1198,15 +1221,20 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
     }
     let id_esc = html_escape(&meta.id);
     let main = meta.content_type.split(';').next().unwrap_or("").trim();
-    let raw_target = if store.config.show_words {
+    let display_name = if store.config.show_words {
         meta.words.as_deref().unwrap_or(meta.id.as_str())
     } else {
         meta.id.as_str()
     };
-    let raw_esc = html_escape(raw_target);
-    let raw_line = format!("<p>Download / raw: <a href=\"/raw/{raw_esc}\">{raw_esc}</a></p>");
+    let target_esc = html_escape(display_name);
+    let download_name = html_escape(meta.filename.as_deref().unwrap_or(display_name));
     let mut body = format!(
-        "{raw_line}<details><summary>Metadata &amp; delete</summary>\
+        "<div class=\"view-actions\">\
+         <a class=\"button\" href=\"/v1/pastes/{target_esc}\" download=\"{download_name}\">Download</a>\
+         <a class=\"button\" href=\"/raw/{target_esc}\">Raw</a>\
+         <button type=\"button\" class=\"copy-link\" data-copy=\"/view/{target_esc}\" hidden>Copy link</button>\
+         </div>\
+         <details><summary>Metadata &amp; delete</summary>\
          <p>Filename: {}</p><p>Content-Type: {}</p><p>Size: {}</p><p>Created: {}</p><p>Expires: {} ({})</p>\
          <form method=\"post\" action=\"/ui/delete\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\"><button type=\"submit\">Delete this paste</button></form>\
          </details>",
@@ -1238,7 +1266,8 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
             html_escape(meta.filename.as_deref().unwrap_or("image"))
         ));
     }
-    page("View paste", None, false, &body).into_response()
+    body.push_str(COPY_LINK_SCRIPT);
+    page(display_name, None, true, &body).into_response()
 }
 
 async fn view_dated(

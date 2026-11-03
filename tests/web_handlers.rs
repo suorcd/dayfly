@@ -524,8 +524,9 @@ async fn create_submit_redirects_to_the_words_when_enabled() {
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::OK);
     let page = html_text(&body);
+    assert!(page.contains(&format!("<h1>{alias}</h1>")));
     assert!(page.contains(&format!(
-        "Download / raw: <a href=\"/raw/{alias}\">{alias}</a>"
+        "<a class=\"button\" href=\"/raw/{alias}\">Raw</a>"
     )));
 }
 
@@ -961,32 +962,43 @@ async fn view_page_renders_text_escaped_and_images_inline() {
     let page = html_text(&body);
     assert!(page.contains("<pre>a &lt; b &amp; c &gt; d &quot;quoted&quot;</pre>"));
     assert!(
+        page.contains(&format!("<h1>{}</h1>", text.id)),
+        "the words must be the page header: {page}"
+    );
+    assert!(
         page.contains(&format!(
-            "Download / raw: <a href=\"/raw/{}\">{}</a>",
-            text.id, text.id
+            "<a class=\"button\" href=\"/v1/pastes/{}\" download=",
+            text.id
         )),
-        "the raw link must use the resolved id: {page}"
+        "the download button must target the API route: {page}"
     );
     assert!(
-        !page.contains("<h1>"),
-        "the view page must not repeat a title heading: {page}"
+        page.contains(&format!(
+            "<a class=\"button\" href=\"/raw/{}\">Raw</a>",
+            text.id
+        )),
+        "the raw button must target the raw route: {page}"
     );
     assert!(
-        !page.contains(">Current pastes</a>"),
-        "the nav already links the list: {page}"
+        page.contains("data-copy=\"/view/") && page.contains("hidden>Copy link</button>"),
+        "the copy link button must start hidden and wait for JS: {page}"
+    );
+    assert!(
+        !page.contains("Download / raw:"),
+        "the old raw link line must be gone: {page}"
     );
     assert!(page.contains("<details><summary>Metadata &amp; delete</summary>"));
     assert!(page.contains("Delete this paste"));
-    let download_at = page
-        .find("Download / raw")
-        .expect("the raw link must render");
+    let actions_at = page
+        .find("class=\"view-actions\"")
+        .expect("the action row must render");
     let details_at = page
         .find("<details>")
         .expect("the metadata details must render");
     let pre_at = page.find("<pre>").expect("the paste text must render");
     assert!(
-        download_at < details_at && details_at < pre_at,
-        "the raw link must sit above the metadata and the content last"
+        actions_at < details_at && details_at < pre_at,
+        "the action row must sit above the metadata and the content last"
     );
 
     let request = common::request("GET", &format!("/view/{}", png.id), &[], Vec::new());
@@ -1032,8 +1044,9 @@ async fn view_page_shows_words_when_enabled_and_hides_them_when_disabled() {
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::OK);
     let page = html_text(&body);
+    assert!(page.contains(&format!("<h1>{words}</h1>")));
     assert!(page.contains(&format!(
-        "Download / raw: <a href=\"/raw/{words}\">{words}</a>"
+        "<a class=\"button\" href=\"/raw/{words}\">Raw</a>"
     )));
 
     let fake = FakeS3::start().await;
@@ -1050,7 +1063,8 @@ async fn view_page_shows_words_when_enabled_and_hides_them_when_disabled() {
     assert_eq!(status, StatusCode::OK);
     let page = html_text(&body);
     assert!(!page.contains("Words:"));
-    assert!(page.contains(&format!("Download / raw: <a href=\"/raw/{id}\">{id}</a>")));
+    assert!(page.contains(&format!("<h1>{id}</h1>")));
+    assert!(page.contains(&format!("<a class=\"button\" href=\"/raw/{id}\">Raw</a>")));
 }
 
 #[tokio::test]
