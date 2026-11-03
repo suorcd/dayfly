@@ -818,6 +818,10 @@ async fn list_page_shows_current_pastes_and_hides_expired_ones() {
         "the end input must show today: {page}"
     );
     assert!(page.contains("last 2 days, ending today in UTC"));
+    assert!(
+        !page.contains("sort=expires"),
+        "the redundant expires column must be gone: {page}"
+    );
 
     let request = common::request("GET", "/pastes?date=2020-01-01", &[], Vec::new());
     let (status, _, body) = common::send(&app, request).await;

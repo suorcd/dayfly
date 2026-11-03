@@ -1057,14 +1057,14 @@ comments.
 - `GET /pastes` — current pastes, built from the bucket scan (no
   database): alias when enabled (with the canonical ID as secondary
   text when `DAYFLY_SHOW_INTERNAL_PATHS` is true), filename if any,
-  content type, size, created date, expiry date
-  plus days remaining, and a delete action per row. Expired items are
+  content type, size, created date, and days
+  remaining, and a delete action per row. Expired items are
   filtered out, consistent with the API's read-time expiry check. The
   Start and End inputs start with the default window:
   `DAYFLY_LIST_DEFAULT_DAYS` days, ending today in UTC (2 by default).
   Add `?date=YYYY-MM-DD` for another day. Add `?sort=size|created|expires`
   and `?order=asc|desc` to sort. The default is `created` descending.
-  The Size, Created, and Expires headers are links. A click toggles the
+  The Size and Created headers are links. A click toggles the
   direction and keeps the date filters. A missing created or expiry
   value sorts last in both directions.
 - `GET /view/<id>` — one paste: the word alias when enabled,
