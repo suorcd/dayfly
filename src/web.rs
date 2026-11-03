@@ -85,6 +85,9 @@ details form{background:none;border:0;padding:0;border-radius:0;backdrop-filter:
 .dropzone-title{display:block;font-weight:bold;color:#ea00d9}
 .dropzone .muted{display:block}
 .dropzone .error{color:#ff6b6b}
+.dropzone.compact{display:inline-flex;flex-wrap:wrap;align-items:center;gap:.5rem;width:auto;max-width:100%;margin:0;padding:.45rem .8rem;border-width:1px;text-align:left;font-size:.95rem}
+.form-actions{display:flex;flex-wrap:wrap;gap:.75rem;align-items:center;margin-top:1rem}
+.form-actions button[type=submit]{margin-left:auto}
 textarea{width:100%;min-height:12rem;box-sizing:border-box;font-family:"Source Code Pro",Hack,ui-monospace,Menlo,Consolas,monospace;background:#133e7c;color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px;padding:.5rem}
 input,select{font-size:1rem;padding:.3rem .5rem;background:#133e7c;color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px}
 button{font-size:1rem;padding:.35rem .8rem;cursor:pointer;background:rgba(19,62,124,.5);color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px}
@@ -354,18 +357,19 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
         r#"<h2>Paste or upload</h2>
 <form method="post" action="/ui/create" enctype="multipart/form-data" data-max-file-bytes="{max_file_bytes}">
 <p><label>Text<br><textarea name="text" id="text"></textarea></label></p>
+<p><label>Filename (optional, text only) <input type="text" name="filename" id="filename"></label></p>
 <p><label>Keep for <select name="ttl_days">{}</select></label></p>
-<p class="muted">Or drop a file below. A selected file takes precedence and disables the text fields.</p>
-<label class="dropzone" id="dropzone">
+<p class="muted">Max file size: {max_file_human}. A selected file takes precedence and disables the text fields.</p>
+<div class="form-actions">
+<label class="dropzone compact" id="dropzone">
 <input type="file" name="file" id="file">
-<span class="dropzone-title">Drop a file here</span>
+<span class="dropzone-title">Drop a file</span>
 <span class="muted">or click to choose one</span>
 <span class="muted" id="file-status">No file selected</span>
 </label>
 <button type="button" id="clear-file" hidden>Remove file</button>
-<p class="muted">Max file size: {max_file_human}</p>
-<p><label>Filename (optional, text only) <input type="text" name="filename" id="filename"></label></p>
-<p><button type="submit">Create paste</button></p>
+<button type="submit">Create paste</button>
+</div>
 </form>"#,
         ttl_options(default_ttl),
     );
