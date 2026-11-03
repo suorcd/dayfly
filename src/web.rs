@@ -93,6 +93,7 @@ details form{background:none;border:0;padding:0;border-radius:0;backdrop-filter:
 .form-actions{display:flex;flex-wrap:wrap;gap:.75rem;align-items:stretch;margin-top:1rem}
 details.cli-hint{margin-top:1.5rem}
 form > p:first-child{margin-top:0}
+form > p:last-child{margin-bottom:0}
 .form-row{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem 1.25rem}
 .form-row p{margin:0}
 .form-row input{min-width:16rem;max-width:100%}
