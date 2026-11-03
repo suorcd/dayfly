@@ -91,6 +91,20 @@ fn minimal_environment_applies_documented_defaults() {
 }
 
 #[test]
+fn total_paste_cap_lowers_the_creation_caps() {
+    let _guard = lock_env();
+    clear_env();
+    set_required();
+    env::set_var("DAYFLY_MAX_TEXT_BYTES", "400");
+    env::set_var("DAYFLY_MAX_FILE_BYTES", "2000");
+    env::set_var("DAYFLY_MAX_PASTE_BYTES", "500");
+
+    let config = Config::from_env().expect("caps must parse");
+    assert_eq!(config.max_bytes_for_upload(None), 400);
+    assert_eq!(config.max_bytes_for_upload(Some("file.bin")), 500);
+}
+
+#[test]
 fn env_file_supplies_values_and_the_process_environment_wins() {
     let _guard = lock_env();
     clear_env();

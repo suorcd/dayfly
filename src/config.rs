@@ -39,13 +39,16 @@ pub struct Config {
     pub secret_access_key: String,
     /// Maximum size, in bytes, for a text paste. Enforced by the MCP
     /// `store_text` tool, the human text form, and HTTP uploads with no
-    /// filename. A filename selects [`Self::max_file_bytes`] instead.
-    /// Default: 10 MiB.
+    /// filename. For an HTTP upload, a filename selects
+    /// [`Self::max_file_bytes`] instead. [`Self::max_paste_bytes`] also
+    /// limits a new paste, so the lower value wins. Default: 10 MiB.
     pub max_text_bytes: u64,
-    /// Maximum size, in bytes, for a file paste. Default: 1 GiB.
+    /// Maximum size, in bytes, for a file paste. [`Self::max_paste_bytes`]
+    /// also limits a new paste, so the lower value wins. Default: 1 GiB.
     pub max_file_bytes: u64,
     /// Maximum total size, in bytes, for one paste, including the base
-    /// object and every appended segment. Default: 1 GiB.
+    /// object and every appended segment. A new paste above this cap
+    /// fails with `TooLarge` and writes no object. Default: 1 GiB.
     pub max_paste_bytes: u64,
     /// Default TTL in positive whole days when a store call does not
     /// specify one. Zero is invalid because it would create a paste that
@@ -831,18 +834,37 @@ impl Config {
         })
     }
 
-    /// Cap for an HTTP upload, decided before the body is streamed.
+    /// Effective text cap when this config creates a paste.
+    ///
+    /// The result is the lower of [`Self::max_text_bytes`] and
+    /// [`Self::max_paste_bytes`]. A total cap below the text cap also
+    /// applies at creation.
+    pub fn max_text_paste_bytes(&self) -> u64 {
+        self.max_text_bytes.min(self.max_paste_bytes)
+    }
+
+    /// Effective file cap when this config creates a paste.
+    ///
+    /// The result is the lower of [`Self::max_file_bytes`] and
+    /// [`Self::max_paste_bytes`]. A total cap below the file cap also
+    /// applies at creation.
+    pub fn max_file_paste_bytes(&self) -> u64 {
+        self.max_file_bytes.min(self.max_paste_bytes)
+    }
+
+    /// Cap for the first write of an HTTP upload, decided before the body
+    /// is streamed.
     ///
     /// A filename (`X-Filename`, `?filename=`, or a multipart filename)
-    /// means a file upload and gets [`Self::max_file_bytes`]. No filename
-    /// means a text paste and gets [`Self::max_text_bytes`]. Content-Type
-    /// is deliberately not used here: detection needs bytes, and a file
-    /// named `report.txt` is still a file upload even though its bytes
-    /// look like text.
+    /// means a file upload and gets [`Self::max_file_paste_bytes`]. No
+    /// filename means a text paste and gets [`Self::max_text_paste_bytes`].
+    /// Content-Type is deliberately not used here: detection needs bytes,
+    /// and a file named `report.txt` is still a file upload even though its
+    /// bytes look like text.
     pub fn max_bytes_for_upload(&self, filename: Option<&str>) -> u64 {
         match filename {
-            Some(name) if !name.trim().is_empty() => self.max_file_bytes,
-            _ => self.max_text_bytes,
+            Some(name) if !name.trim().is_empty() => self.max_file_paste_bytes(),
+            _ => self.max_text_paste_bytes(),
         }
     }
 

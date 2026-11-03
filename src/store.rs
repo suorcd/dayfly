@@ -1571,10 +1571,9 @@ impl Store {
         content_type: Option<&str>,
         ttl: Option<Ttl>,
     ) -> Result<StoredPaste, StoreError> {
-        if u64::try_from(text.len()).unwrap_or(u64::MAX) > self.config.max_text_bytes {
-            return Err(StoreError::TooLarge {
-                limit: self.config.max_text_bytes,
-            });
+        let max_bytes = self.config.max_text_paste_bytes();
+        if u64::try_from(text.len()).unwrap_or(u64::MAX) > max_bytes {
+            return Err(StoreError::TooLarge { limit: max_bytes });
         }
         let ttl = ttl.unwrap_or_else(|| Ttl::days(self.config.default_ttl_days));
         let created_at = Utc::now();
@@ -1658,9 +1657,12 @@ impl Store {
             )));
         }
         let mut len = file_meta.len();
-        if len > self.config.max_file_bytes {
+        // The total paste cap also bounds creation. Use the lower value
+        // for every size check and for the streaming upload.
+        let max_file_bytes = self.config.max_file_paste_bytes();
+        if len > max_file_bytes {
             return Err(StoreError::TooLarge {
-                limit: self.config.max_file_bytes,
+                limit: max_file_bytes,
             });
         }
         let ttl = ttl.unwrap_or_else(|| Ttl::days(self.config.default_ttl_days));
@@ -1681,9 +1683,7 @@ impl Store {
             // the smaller of the file cap and one chunk. A file that grew
             // past one chunk is re-read on the multipart path. A file that
             // grew past the cap is rejected before any object is written.
-            let read_cap = self
-                .config
-                .max_file_bytes
+            let read_cap = max_file_bytes
                 .min(MULTIPART_CHUNK_BYTES as u64)
                 .saturating_add(1);
             let mut bytes: Vec<u8> = Vec::with_capacity(len as usize);
@@ -1696,10 +1696,10 @@ impl Store {
                 }
             };
             let size = read as u64;
-            if size > self.config.max_file_bytes {
+            if size > max_file_bytes {
                 self.cleanup_failed_store(&key, &claimed).await;
                 return Err(StoreError::TooLarge {
-                    limit: self.config.max_file_bytes,
+                    limit: max_file_bytes,
                 });
             }
             if size <= MULTIPART_CHUNK_BYTES as u64 {
@@ -1768,12 +1768,12 @@ impl Store {
                     return Err(e.into());
                 }
             };
-            if len > self.config.max_file_bytes {
+            if len > max_file_bytes {
                 if let Some(words) = words.as_deref() {
                     self.cleanup_failed_store(&key, words).await;
                 }
                 return Err(StoreError::TooLarge {
-                    limit: self.config.max_file_bytes,
+                    limit: max_file_bytes,
                 });
             }
         }
@@ -1798,9 +1798,9 @@ impl Store {
                 // The hash read stops at len + 1. If the file is now past
                 // the cap, report the cap rather than a generic change.
                 if let Ok(meta) = file.metadata().await {
-                    if meta.len() > self.config.max_file_bytes {
+                    if meta.len() > max_file_bytes {
                         return Err(StoreError::TooLarge {
-                            limit: self.config.max_file_bytes,
+                            limit: max_file_bytes,
                         });
                     }
                 }
@@ -1844,7 +1844,7 @@ impl Store {
             Box::pin(file_stream(file)),
             &mut sink,
             Some(len),
-            self.config.max_file_bytes,
+            max_file_bytes,
         )
         .await
         {
@@ -1900,8 +1900,10 @@ impl Store {
     ///
     /// `max_bytes` is chosen by the caller before streaming: the text cap
     /// for a text paste (no filename), or the file cap for a file upload.
-    /// A known `Content-Length` over that cap is rejected before detection
-    /// peeks, so an oversized body is not read at all.
+    /// The total paste cap always applies, so the store clamps `max_bytes`
+    /// to [`Config::max_paste_bytes`]. A known `Content-Length` over that
+    /// cap is rejected before detection peeks, so an oversized body is not
+    /// read at all.
     pub async fn store_stream<S>(
         &self,
         stream: S,
@@ -1914,6 +1916,9 @@ impl Store {
     where
         S: futures::Stream<Item = Result<Bytes, StoreError>> + Send + Unpin,
     {
+        // The total paste cap also bounds creation. Clamp here so a direct
+        // caller cannot create a paste above it.
+        let max_bytes = max_bytes.min(self.config.max_paste_bytes);
         if let Some(len) = known_length {
             if len > max_bytes {
                 return Err(StoreError::TooLarge { limit: max_bytes });

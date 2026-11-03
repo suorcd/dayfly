@@ -632,6 +632,119 @@ async fn append_respects_the_total_paste_cap() {
 }
 
 #[tokio::test]
+async fn create_text_above_the_total_paste_cap_stores_nothing() {
+    let fake = FakeS3::start().await;
+    let mut store = fake.store_with_caps(1024, 1024).await;
+    store.config.max_paste_bytes = 10;
+
+    let error = store
+        .store_text(b"12345678901", None, None, None)
+        .await
+        .expect_err("an 11-byte text paste must fail under a 10-byte total cap");
+    assert!(
+        matches!(error, StoreError::TooLarge { limit: 10 }),
+        "the error must name the total cap, got {error:?}"
+    );
+    assert!(
+        fake.keys().is_empty(),
+        "a refused paste must store nothing: {:?}",
+        fake.keys()
+    );
+
+    let stored = store
+        .store_text(b"1234567890", None, None, None)
+        .await
+        .expect("a text paste at the total cap must store");
+    assert_eq!(stored.size, 10);
+}
+
+#[tokio::test]
+async fn create_file_above_the_total_paste_cap_stores_nothing() {
+    let fake = FakeS3::start().await;
+    let mut store = fake.store_with_caps(1024, 1024).await;
+    store.config.max_paste_bytes = 10;
+    let path = common::write_temp_file("total-cap.bin", &common::pattern_bytes(11));
+
+    let error = store
+        .store_file_path(&path, Some("total-cap.bin"), None, None)
+        .await
+        .expect_err("an 11-byte file paste must fail under a 10-byte total cap");
+    assert!(
+        matches!(error, StoreError::TooLarge { limit: 10 }),
+        "the error must name the total cap, got {error:?}"
+    );
+    assert!(
+        fake.keys().is_empty(),
+        "a refused paste must store nothing: {:?}",
+        fake.keys()
+    );
+    let _ = std::fs::remove_file(path);
+
+    let at_cap = common::write_temp_file("total-cap-exact.bin", &common::pattern_bytes(10));
+    let stored = store
+        .store_file_path(&at_cap, Some("total-cap-exact.bin"), None, None)
+        .await
+        .expect("a file paste at the total cap must store");
+    assert_eq!(stored.size, 10);
+    let _ = std::fs::remove_file(at_cap);
+}
+
+#[tokio::test]
+async fn create_stream_above_the_total_paste_cap_stores_nothing() {
+    let fake = FakeS3::start().await;
+    let mut store = fake.store_with_caps(1024, 1024).await;
+    store.config.max_paste_bytes = 10;
+
+    let items: Vec<Result<Bytes, StoreError>> = vec![Ok(Bytes::from_static(b"12345678901"))];
+    let error = store
+        .store_stream(
+            stream::iter(items),
+            Some("total-cap.bin"),
+            None,
+            None,
+            Some(11),
+            1024,
+        )
+        .await
+        .expect_err("a known length above the total cap must fail");
+    assert!(
+        matches!(error, StoreError::TooLarge { limit: 10 }),
+        "the store must clamp the caller cap, got {error:?}"
+    );
+    assert!(
+        fake.requests().is_empty(),
+        "a known length above the cap must fail before any request"
+    );
+
+    let items: Vec<Result<Bytes, StoreError>> = vec![Ok(Bytes::from_static(b"12345678901"))];
+    let error = store
+        .store_stream(
+            stream::iter(items),
+            Some("total-cap.bin"),
+            None,
+            None,
+            None,
+            1024,
+        )
+        .await
+        .expect_err("an unknown-length stream above the total cap must fail");
+    assert!(
+        matches!(error, StoreError::TooLarge { limit: 10 }),
+        "the stream must stop at the total cap, got {error:?}"
+    );
+    assert!(
+        fake.keys().is_empty(),
+        "a refused stream must store nothing: {:?}",
+        fake.keys()
+    );
+    assert_eq!(
+        fake.aborted_uploads().len(),
+        1,
+        "the multipart upload must be aborted"
+    );
+}
+
+#[tokio::test]
 async fn delete_by_id_keeps_an_alias_that_points_to_another_paste() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;

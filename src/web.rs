@@ -347,7 +347,7 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
         return resp;
     }
     let default_ttl = state.store.config.default_ttl_days;
-    let max_file_bytes = state.store.config.max_file_bytes;
+    let max_file_bytes = state.store.config.max_file_paste_bytes();
     let max_file_human = human_size(max_file_bytes);
     let mut body = format!(
         r#"<h2>Paste or upload</h2>
@@ -472,8 +472,8 @@ fn multipart_length_allows(state: &AppState, headers: &HeaderMap) -> bool {
     let max_request = state
         .store
         .config
-        .max_file_bytes
-        .saturating_add(state.store.config.max_text_bytes)
+        .max_file_paste_bytes()
+        .saturating_add(state.store.config.max_text_paste_bytes())
         .saturating_add(1024 * 1024);
     length <= max_request
 }
@@ -542,7 +542,7 @@ async fn upload_submit_handler(
     }
     if !multipart_length_allows(&state, &headers) {
         return error_page(StoreError::TooLarge {
-            limit: state.store.config.max_file_bytes,
+            limit: state.store.config.max_file_paste_bytes(),
         });
     }
     let mut ttl: Option<Ttl> = None;
@@ -603,14 +603,15 @@ async fn create_submit_handler(
     }
     if !multipart_length_allows(&state, &headers) {
         return error_page(StoreError::TooLarge {
-            limit: state.store.config.max_file_bytes,
+            limit: state.store.config.max_file_paste_bytes(),
         });
     }
 
     let mut ttl: Option<Ttl> = None;
     let mut text: Option<Vec<u8>> = None;
     let mut text_filename: Option<String> = None;
-    let text_limit = usize::try_from(state.store.config.max_text_bytes).unwrap_or(usize::MAX);
+    let text_limit =
+        usize::try_from(state.store.config.max_text_paste_bytes()).unwrap_or(usize::MAX);
 
     loop {
         let field = match multipart.next_field().await {
@@ -655,7 +656,7 @@ async fn create_submit_handler(
                 Ok(bytes) => text = Some(bytes),
                 Err(MultipartFieldError::TooLarge) => {
                     return error_page(StoreError::TooLarge {
-                        limit: state.store.config.max_text_bytes,
+                        limit: state.store.config.max_text_paste_bytes(),
                     });
                 }
                 Err(MultipartFieldError::Malformed(message)) => {
@@ -1062,7 +1063,7 @@ async fn deny_framing(mut response: Response) -> Response {
 
 /// UI routes, without state attached. `main` merges these with the
 /// API routes and attaches a single shared [`AppState`].
-pub fn ui_router(max_text_bytes: u64) -> Router<AppState> {
+pub fn ui_router(max_text_paste_bytes: u64) -> Router<AppState> {
     // See http.rs: the store caps streams while it reads them. The 2 MiB
     // axum default would reject real file uploads early. Keep the limit on
     // the form routes, which buffer their bodies in memory.
@@ -1073,10 +1074,12 @@ pub fn ui_router(max_text_bytes: u64) -> Router<AppState> {
     // The text form is URL-encoded, so one decoded byte can take three
     // percent-encoded bytes. Give the body enough room for the encoded
     // text plus the small field names, filename, and TTL. The decoded
-    // text still goes through the exact max_text_bytes check.
+    // text still goes through the exact max_text_paste_bytes check.
     let text_routes = Router::new()
         .route("/ui/text", post(text_submit_handler))
-        .layer(DefaultBodyLimit::max(text_form_body_limit(max_text_bytes)));
+        .layer(DefaultBodyLimit::max(text_form_body_limit(
+            max_text_paste_bytes,
+        )));
     Router::new()
         .merge(upload_routes)
         .merge(text_routes)
@@ -1092,9 +1095,10 @@ pub fn ui_router(max_text_bytes: u64) -> Router<AppState> {
 ///
 /// The worst case is three bytes on the wire for every decoded byte.
 /// The extra margin covers the form field names, the filename, and the
-/// TTL. The decoded text is still capped exactly by `max_text_bytes`.
-fn text_form_body_limit(max_text_bytes: u64) -> usize {
-    let encoded = max_text_bytes.saturating_mul(3);
+/// TTL. The decoded text is still capped exactly by
+/// `max_text_paste_bytes`.
+fn text_form_body_limit(max_text_paste_bytes: u64) -> usize {
+    let encoded = max_text_paste_bytes.saturating_mul(3);
     usize::try_from(encoded.saturating_add(8 * 1024)).unwrap_or(usize::MAX)
 }
 
@@ -1144,8 +1148,8 @@ mod tests {
     /// S3 endpoint, and the UI maps that S3 error to 400. A 401 means the
     /// auth check rejected the request.
     async fn ui_list_status(state: AppState, auth: Option<&str>) -> StatusCode {
-        let max_text_bytes = state.store.config.max_text_bytes;
-        let app = ui_router(max_text_bytes).with_state(state);
+        let max_text_paste_bytes = state.store.config.max_text_paste_bytes();
+        let app = ui_router(max_text_paste_bytes).with_state(state);
         let mut builder = Request::builder().method("GET").uri("/pastes");
         if let Some(auth) = auth {
             builder = builder.header(axum::http::header::AUTHORIZATION, auth);
@@ -1190,8 +1194,8 @@ mod tests {
     #[tokio::test]
     async fn ui_html_responses_deny_framing() {
         let state = test_state(None).await;
-        let max_text_bytes = state.store.config.max_text_bytes;
-        let app = ui_router(max_text_bytes).with_state(state);
+        let max_text_paste_bytes = state.store.config.max_text_paste_bytes();
+        let app = ui_router(max_text_paste_bytes).with_state(state);
 
         for uri in ["/", "/pastes", "/view/example"] {
             let response = app
@@ -1384,7 +1388,7 @@ mod tests {
     #[tokio::test]
     async fn list_rejects_invalid_sort_and_order() {
         let state = test_state(None).await;
-        let app = ui_router(state.store.config.max_text_bytes).with_state(state);
+        let app = ui_router(state.store.config.max_text_paste_bytes()).with_state(state);
         for uri in ["/pastes?sort=bogus", "/pastes?order=sideways"] {
             let response = app
                 .clone()
@@ -1537,7 +1541,7 @@ mod tests {
                 .await
                 .expect("test S3 config must build without network access"),
         };
-        let app = ui_router(state.store.config.max_text_bytes).with_state(state);
+        let app = ui_router(state.store.config.max_text_paste_bytes()).with_state(state);
         let request = Request::builder()
             .method("POST")
             .uri("/ui/delete")

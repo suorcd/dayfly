@@ -26,6 +26,7 @@ fn command() -> Command {
         "S3_SECRET_ACCESS_KEY_FILE",
         "DAYFLY_MAX_TEXT_BYTES",
         "DAYFLY_MAX_FILE_BYTES",
+        "DAYFLY_MAX_PASTE_BYTES",
         "DAYFLY_DEFAULT_TTL_DAYS",
         "DAYFLY_HTTP_BIND",
         "DAYFLY_SHOW_WORDS",
@@ -353,6 +354,75 @@ fn config_check_strict_turns_a_secret_file_warning_into_a_fault() {
         .output()
         .expect("config check must run");
     assert!(!strict.status.success(), "--strict must fail on a warning");
+    let stderr = String::from_utf8_lossy(&strict.stderr);
+    assert!(
+        stderr.contains("warnings are faults under --strict"),
+        "got: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn config_check_warns_when_the_total_cap_lowers_a_creation_cap() {
+    let dir = temp_config_dir("check-total-cap");
+    let path = dir.join("dayfly.env");
+    std::fs::create_dir_all(&dir).expect("the directory must be creatable");
+    std::fs::write(
+        &path,
+        "S3_ENDPOINT=https://s3.example.invalid\n\
+         S3_BUCKET=bucket\n\
+         S3_ACCESS_KEY_ID=key\n\
+         S3_SECRET_ACCESS_KEY=secret\n\
+         DAYFLY_MAX_TEXT_BYTES=1000\n\
+         DAYFLY_MAX_FILE_BYTES=2000\n\
+         DAYFLY_MAX_PASTE_BYTES=500\n",
+    )
+    .expect("the env file must be writable");
+
+    let output = command()
+        .arg("--config")
+        .arg(&path)
+        .arg("config")
+        .arg("check")
+        .output()
+        .expect("config check must run");
+    assert!(
+        output.status.success(),
+        "a lower total cap must warn, not fail: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("warning:"), "got: {stdout}");
+    assert!(
+        stdout.contains("DAYFLY_MAX_PASTE_BYTES (500)"),
+        "the warning must name the total cap: {stdout}"
+    );
+    assert!(
+        stdout.contains("DAYFLY_MAX_TEXT_BYTES (1000)"),
+        "the warning must name the text cap: {stdout}"
+    );
+    assert!(
+        stdout.contains("DAYFLY_MAX_FILE_BYTES (2000)"),
+        "the warning must name the file cap: {stdout}"
+    );
+    assert_eq!(
+        stdout.matches("The total paste cap wins").count(),
+        2,
+        "each incoherent pair must say which cap wins: {stdout}"
+    );
+
+    let strict = command()
+        .arg("--config")
+        .arg(&path)
+        .arg("config")
+        .arg("check")
+        .arg("--strict")
+        .output()
+        .expect("config check must run");
+    assert!(
+        !strict.status.success(),
+        "--strict must fail on the total-cap warning"
+    );
     let stderr = String::from_utf8_lossy(&strict.stderr);
     assert!(
         stderr.contains("warnings are faults under --strict"),
