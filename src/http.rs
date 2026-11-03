@@ -13,10 +13,13 @@
 //! for securing this endpoint.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State};
+use axum::extract::{
+    ConnectInfo, DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State,
+};
 use axum::http::header::{
     ACCEPT, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST,
     IF_NONE_MATCH, RANGE,
@@ -889,6 +892,24 @@ async fn delete_bare(
     }
 }
 
+/// Write one warning when a request fails the bearer check.
+///
+/// The method, path, and peer address are safe to log. Never log the
+/// offered credential or the expected credential.
+async fn log_failed_auth(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0);
+    let response = next.run(request).await;
+    if response.status() == StatusCode::UNAUTHORIZED {
+        tracing::warn!(%method, %path, peer = ?peer, "bearer check failed");
+    }
+    response
+}
+
 /// Compose the complete HTTP app from one [`AppState`].
 ///
 /// The API routes, the human UI routes, and the MCP transport share the
@@ -897,6 +918,7 @@ pub fn app_router(state: AppState) -> Router {
     api_router()
         .merge(mcp_router(state.clone()))
         .merge(crate::web::ui_router(state.store.config.max_text_bytes))
+        .layer(middleware::from_fn(log_failed_auth))
         .with_state(state)
 }
 

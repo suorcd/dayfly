@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::fmt::Write as _;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -353,7 +354,11 @@ async fn main() -> anyhow::Result<()> {
             let app = http::app_router(state);
             let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
             tracing::info!("HTTP listening on {bind_addr}");
-            axum::serve(listener, app).await?;
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await?;
         }
         Some(Command::Config { .. }) => {
             unreachable!("config commands return before the store starts")
