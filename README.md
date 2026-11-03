@@ -1020,11 +1020,16 @@ one, sniffed-signature conflict, extension fallback), peeked-byte forwarding
 multi-part-sized uploads, disconnect/part-failure/oversize abort (no URL
 material), empty uploads, HTML escaping, human sizes, and days-remaining math.
 
-`.github/workflows/ci.yml` runs `cargo fmt --check`, clippy with warnings
-denied, `cargo test`, and `cargo build` on every push to `main` and on every
-pull request. A coverage job runs `cargo llvm-cov` on pushes to `main` and on
-manual dispatch. A separate flake job runs `nix flake check` and
-`nix build -L`.
+`.github/workflows/ci.yml` runs the fast job (`cargo fmt --check`,
+clippy with warnings denied, `cargo test`, and `cargo build`) on every
+pull request and on every push. The coverage job runs `cargo llvm-cov`
+on pushes to `main` and on manual dispatch. The flake job (`nix flake
+check` and `nix build -L`) and the container image job run on pushes
+to `main`, on `v*` tags, on manual dispatch, and on a pull request with
+the `ci:full` label. A documentation-only pull request skips CI. A `v*`
+tag also publishes the image and attaches the release binary and the
+image tar to the GitHub release. The flake job restores and saves a Nix
+store cache, so a main or tag build normally reuses it.
 
 ### Nix build path (additional, not a replacement for Cargo)
 
