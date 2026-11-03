@@ -345,14 +345,19 @@ fn optional_numeric_values_accept_zero() {
 }
 
 #[test]
-fn blank_bearer_token_means_no_auth() {
+fn blank_bearer_token_is_rejected() {
     let _guard = lock_env();
     for value in ["", "   ", "\t\n"] {
         clear_env();
         set_required();
         env::set_var("DAYFLY_HTTP_BEARER_TOKEN", value);
-        let config = Config::from_env().expect("a blank token must parse");
-        assert_eq!(config.http_bearer_token, None, "value {value:?}");
+        let error = Config::from_env()
+            .err()
+            .expect("a set-but-blank token must fail");
+        assert!(
+            matches!(error, ConfigError::Invalid(ref name, _) if name == "DAYFLY_HTTP_BEARER_TOKEN"),
+            "value {value:?} gave {error}"
+        );
     }
 }
 

@@ -324,12 +324,15 @@ where
 }
 
 /// Read an optional credential from a direct value or a file.
+///
+/// A direct value is returned even when it is blank. The caller decides
+/// whether a set-but-blank value is an error; for the bearer token it is.
 fn optional_credential<F>(lookup: &F, name: &str) -> Result<Option<String>, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
     let file_variable = format!("{name}_FILE");
-    let direct = lookup(name).filter(|value| !value.trim().is_empty());
+    let direct = lookup(name);
     let file_path = lookup(&file_variable).filter(|value| !value.trim().is_empty());
     match (direct, file_path) {
         (Some(_), Some(_)) => Err(ConfigError::ConflictingCredentialSources {
@@ -520,17 +523,22 @@ pub fn ensure_bind_is_safe(
 
 /// Parse the optional HTTP bearer token.
 ///
-/// An unset value or a value with only ASCII whitespace means "no token".
-/// A non-empty value that contains ASCII whitespace is invalid: the
-/// `Authorization` parser rejects such a credential, so startup must fail
-/// instead of locking out every request at runtime. The value is not
-/// trimmed into a different token.
+/// An unset value means "no token". A set value with only ASCII
+/// whitespace is invalid: the variable is present, but it would leave
+/// the service unauthenticated while it looks protected. A non-empty
+/// value that contains ASCII whitespace is also invalid: the
+/// `Authorization` parser rejects such a credential, so startup must
+/// fail instead of locking out every request at runtime. The value is
+/// not trimmed into a different token.
 fn bearer_token(value: Option<String>) -> Result<Option<String>, ConfigError> {
     let Some(value) = value else {
         return Ok(None);
     };
     if value.trim().is_empty() {
-        return Ok(None);
+        return Err(ConfigError::Invalid(
+            "DAYFLY_HTTP_BEARER_TOKEN".to_string(),
+            "the variable is set but empty; unset it to disable authentication".to_string(),
+        ));
     }
     if value.contains(|c: char| c.is_ascii_whitespace()) {
         return Err(ConfigError::Invalid(
@@ -1405,16 +1413,44 @@ mod tests {
     }
 
     #[test]
-    fn absent_or_empty_token_disables_auth() {
-        for token in [None, Some(""), Some("   "), Some("\t")] {
-            let config = match load_with_token(token) {
-                Ok(config) => config,
-                Err(e) => panic!("token {token:?} must mean no auth: {e}"),
-            };
-            assert_eq!(
-                config.http_bearer_token, None,
-                "token {token:?} must mean no auth"
-            );
+    fn absent_token_disables_auth() {
+        let config = match load_with_token(None) {
+            Ok(config) => config,
+            Err(e) => panic!("an unset token must mean no auth: {e}"),
+        };
+        assert_eq!(config.http_bearer_token, None);
+    }
+
+    #[test]
+    fn set_but_blank_token_is_rejected() {
+        for token in ["", "   ", "\t"] {
+            let err = expect_error(load_with_token(Some(token)));
+            match err {
+                ConfigError::Invalid(name, message) => {
+                    assert_eq!(name, "DAYFLY_HTTP_BEARER_TOKEN");
+                    assert!(
+                        message.contains("set") && message.contains("empty"),
+                        "the error must say the variable is set but empty: {message}"
+                    );
+                }
+                other => panic!("expected ConfigError::Invalid, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn env_file_blank_token_is_rejected() {
+        let values = parse_env_file("DAYFLY_HTTP_BEARER_TOKEN=\"\"\n", Path::new("test.env"))
+            .expect("the env file line must parse");
+        let mut entries = base_env();
+        entries.extend(values);
+        let err = expect_error(Config::from_lookup(lookup_from(&entries)));
+        match err {
+            ConfigError::Invalid(name, message) => {
+                assert_eq!(name, "DAYFLY_HTTP_BEARER_TOKEN");
+                assert!(message.contains("empty"), "got: {message}");
+            }
+            other => panic!("expected ConfigError::Invalid, got {other:?}"),
         }
     }
 }
