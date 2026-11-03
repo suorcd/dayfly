@@ -2377,6 +2377,7 @@ async fn well_known_service_description_reports_live_limits_without_auth() {
     assert_eq!(json["auth"], "bearer");
     assert_eq!(json["limits"]["max_text_bytes"], 1_234);
     assert_eq!(json["limits"]["max_file_bytes"], 5_678);
+    assert_eq!(json["limits"]["max_paste_bytes"], 1024 * 1024 * 1024);
     assert_eq!(json["limits"]["default_ttl_seconds"], 7 * 86_400);
     assert_eq!(json["limits"]["max_ttl_seconds"], 3_650 * 86_400);
     let routes = json["routes"].as_array().expect("routes must be an array");

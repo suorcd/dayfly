@@ -1151,6 +1151,7 @@ async fn service_description(State(state): State<AppState>) -> Response {
         "limits": {
             "max_text_bytes": config.max_text_bytes,
             "max_file_bytes": config.max_file_bytes,
+            "max_paste_bytes": config.max_paste_bytes,
             "default_ttl_seconds": u64::from(config.default_ttl_days) * 86_400,
             "max_ttl_seconds": MAX_TTL_SECONDS,
         },
@@ -1230,6 +1231,7 @@ mod tests {
             secret_access_key: "test-secret-key".to_string(),
             max_text_bytes,
             max_file_bytes,
+            max_paste_bytes: 1024 * 1024 * 1024,
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
             show_words: false,

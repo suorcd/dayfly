@@ -574,6 +574,64 @@ async fn an_append_at_the_segment_limit_writes_no_segment() {
 }
 
 #[tokio::test]
+async fn append_respects_the_total_paste_cap() {
+    let fake = FakeS3::start().await;
+    let mut store = fake.store_with_caps(1024, 1024 * 1024).await;
+    store.config.max_paste_bytes = 10;
+    let stored = store
+        .store_text(b"12345678", None, None, None)
+        .await
+        .expect("base paste must store");
+
+    let under = store
+        .append_text(&stored.id, b"1")
+        .await
+        .expect("an append under the cap must succeed");
+    assert_eq!(under.meta.size, 9);
+
+    let at = store
+        .append_text(&stored.id, b"2")
+        .await
+        .expect("an append at the cap must succeed");
+    assert_eq!(at.meta.size, 10);
+
+    let puts_at_cap = fake.puts().len();
+    let error = store
+        .append_text(&stored.id, b"3")
+        .await
+        .expect_err("an append past the cap must fail");
+    assert!(
+        matches!(error, StoreError::TooLarge { limit } if limit == 10),
+        "got {error:?}"
+    );
+    assert_eq!(
+        fake.puts().len(),
+        puts_at_cap,
+        "a refused append must write no segment"
+    );
+
+    let zero = store
+        .append_text(&stored.id, b"")
+        .await
+        .expect("a zero-byte append at the cap must succeed");
+    assert_eq!(zero.appended_bytes, 0);
+    assert!(zero.segment_key.is_none());
+    assert_eq!(fake.puts().len(), puts_at_cap);
+
+    let read = store
+        .fetch_text(&stored.id, 0, None)
+        .await
+        .expect("a paste at the cap must read");
+    assert_eq!(read.text, "1234567812");
+
+    store
+        .delete(&stored.id)
+        .await
+        .expect("a paste at the cap must delete");
+    assert!(fake.object(&stored.key).is_none());
+}
+
+#[tokio::test]
 async fn delete_by_id_keeps_an_alias_that_points_to_another_paste() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;

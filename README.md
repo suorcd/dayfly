@@ -247,6 +247,7 @@ file permission warnings into faults.
 | `S3_REGION` | no | `us-east-1` | Signing region for Garage; supply your own, do not rely on the default being "yours" |
 | `DAYFLY_MAX_TEXT_BYTES` | no | 104857600 (100 MiB) | Max text paste size for MCP `store_text`, the human text form, and `POST /upload` without a filename; oversize → 413. A filename (including a multipart filename) uses `DAYFLY_MAX_FILE_BYTES` instead |
 | `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error. The maximum is 52428800000 bytes: 10,000 parts of 5 MiB |
+| `DAYFLY_MAX_PASTE_BYTES` | no | 1073741824 (1 GiB) | Max total size for one paste, including the base object and every appended segment. An append that would pass the cap fails and writes no segment |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1 and at most 3650. The name and meaning are unchanged |
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
 | `DAYFLY_ALLOW_UNAUTHENTICATED` | no | `false` | Accept a non-loopback bind with no bearer token. Startup refuses that bind without this value, and with it the service writes one warning. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
@@ -682,7 +683,11 @@ Limits:
 - **A segment key is not a paste ID.** The API rejects an ID with three
   components after `pastes/`.
 - **An empty append is a no-op.** It writes no object and keeps the
-  base `sha256`.
+  base `sha256`. It succeeds even when the paste is at the total cap.
+- **A paste holds at most `DAYFLY_MAX_PASTE_BYTES` total bytes.** The
+  default is 1 GiB. An append that would pass the cap fails with
+  `TooLarge` and writes no object. The base object and every segment
+  count toward the cap.
 - **A paste holds at most 4,096 appended segments.** An append at the
   limit fails and writes no object. A metadata read, download, list, or
   delete fails when the bucket holds more segments than the limit.

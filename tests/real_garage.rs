@@ -36,6 +36,7 @@ fn test_config() -> Config {
         secret_access_key,
         max_text_bytes: 10 * 1024 * 1024,
         max_file_bytes: 1024 * 1024 * 1024,
+        max_paste_bytes: 1024 * 1024 * 1024,
         default_ttl_days: 1,
         http_bind: "127.0.0.1:0".to_string(),
         show_words: true,
