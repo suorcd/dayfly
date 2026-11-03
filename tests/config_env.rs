@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use dayfly::config::{Config, ConfigError};
 
-const VARS: [&str; 23] = [
+const VARS: [&str; 24] = [
     "S3_ENDPOINT",
     "S3_BUCKET",
     "S3_REGION",
@@ -22,6 +22,7 @@ const VARS: [&str; 23] = [
     "DAYFLY_MAX_PASTE_BYTES",
     "DAYFLY_ALIAS_WORDS",
     "DAYFLY_DEFAULT_TTL_DAYS",
+    "DAYFLY_LIST_DEFAULT_DAYS",
     "DAYFLY_RETENTION_BY_SIZE",
     "DAYFLY_RETENTION_MIN_DAYS",
     "DAYFLY_RETENTION_MAX_DAYS",
@@ -405,6 +406,26 @@ fn default_ttl_days_zero_is_rejected() {
     assert!(
         matches!(error, ConfigError::Invalid(ref field, _) if field == "DAYFLY_DEFAULT_TTL_DAYS"),
         "the error must name DAYFLY_DEFAULT_TTL_DAYS, got {error}"
+    );
+}
+
+#[test]
+fn list_default_days_defaults_to_two_and_rejects_zero() {
+    let _guard = lock_env();
+    clear_env();
+    set_required();
+    let config = Config::from_env().expect("the default config must load");
+    assert_eq!(config.list_default_days, 2, "the default window is 2 days");
+    env::set_var("DAYFLY_LIST_DEFAULT_DAYS", "5");
+    let config = Config::from_env().expect("a custom window must load");
+    assert_eq!(config.list_default_days, 5);
+    env::set_var("DAYFLY_LIST_DEFAULT_DAYS", "0");
+    let error = Config::from_env()
+        .err()
+        .expect("a zero list window must fail config load");
+    assert!(
+        matches!(error, ConfigError::Invalid(ref field, _) if field == "DAYFLY_LIST_DEFAULT_DAYS"),
+        "the error must name DAYFLY_LIST_DEFAULT_DAYS, got {error}"
     );
 }
 

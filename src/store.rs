@@ -322,7 +322,8 @@ pub enum ListWindowRequest {
     Date(String),
     /// Inclusive start and end dates.
     Range { start: String, end: String },
-    /// The default window: yesterday and today in UTC.
+    /// The default window: the last `DAYFLY_LIST_DEFAULT_DAYS` days,
+    /// ending today in UTC.
     Default,
 }
 
@@ -372,6 +373,7 @@ fn parse_list_date(value: &str) -> Result<NaiveDate, StoreError> {
 fn resolve_list_window(
     request: &ListWindowRequest,
     now: DateTime<Utc>,
+    default_days: u32,
 ) -> Result<(NaiveDate, NaiveDate), StoreError> {
     let (start, end) = match request {
         ListWindowRequest::Date(date) => {
@@ -379,7 +381,7 @@ fn resolve_list_window(
             (day, day)
         }
         ListWindowRequest::Range { start, end } => (parse_list_date(start)?, parse_list_date(end)?),
-        ListWindowRequest::Default => default_list_window(now),
+        ListWindowRequest::Default => default_list_window(now, default_days),
     };
     let days = (end - start).num_days() + 1;
     if days > LIST_WINDOW_MAX_DAYS as i64 {
@@ -2684,7 +2686,8 @@ impl Store {
 
     /// List current pastes for an inclusive date window.
     ///
-    /// No dates select the default window: yesterday and today in UTC. A
+    /// No dates select the default window: the last
+    /// `DAYFLY_LIST_DEFAULT_DAYS` days, ending today in UTC. A
     /// date for [`list_recent`](Self::list_recent) means one day.
     /// [`parse_list_window_request`] documents the range rules.
     ///
@@ -2714,7 +2717,8 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<PasteSummary>, StoreError> {
         let request = parse_list_window_request(None, start, end)?;
-        let (start_date, end_date) = resolve_list_window(&request, Utc::now())?;
+        let (start_date, end_date) =
+            resolve_list_window(&request, Utc::now(), self.config.list_default_days)?;
         let limit = limit.clamp(1, 1000);
         let mut summaries = Vec::new();
         let dates: Vec<NaiveDate> = inclusive_dates(start_date, end_date).collect();
@@ -2805,14 +2809,16 @@ impl Store {
     }
 }
 
-/// Default listing window: yesterday and today in UTC.
+/// Default listing window: `days` UTC dates that end today.
 ///
 /// The key layout uses UTC dates. At 20:00 Pacific the UTC clock is already
 /// on the next day, so the pastes written during that Pacific evening use
-/// two UTC date prefixes. Yesterday and today cover the full Pacific day.
-fn default_list_window(now: DateTime<Utc>) -> (NaiveDate, NaiveDate) {
+/// two UTC date prefixes. The default of two days covers the full Pacific
+/// day.
+pub fn default_list_window(now: DateTime<Utc>, days: u32) -> (NaiveDate, NaiveDate) {
     let today = now.date_naive();
-    (today - chrono::Duration::days(1), today)
+    let days = i64::from(days.max(1));
+    (today - chrono::Duration::days(days - 1), today)
 }
 
 #[cfg(test)]
@@ -2962,16 +2968,25 @@ mod tests {
         // 2026-10-29T03:00Z. The default window must cover both UTC dates,
         // because the Pacific day spans the UTC midnight boundary.
         let now = Utc.with_ymd_and_hms(2026, 10, 29, 3, 0, 0).unwrap();
-        let (start, end) = default_list_window(now);
+        let (start, end) = default_list_window(now, 2);
         assert_eq!(start, NaiveDate::from_ymd_opt(2026, 10, 28).unwrap());
         assert_eq!(end, NaiveDate::from_ymd_opt(2026, 10, 29).unwrap());
+    }
+
+    #[test]
+    fn default_list_window_follows_the_configured_days() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 29, 3, 0, 0).unwrap();
+        let (start, end) = default_list_window(now, 3);
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 10, 27).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 10, 29).unwrap());
+        assert_eq!(inclusive_dates(start, end).count(), 3);
     }
 
     #[test]
     fn list_recent_date_stays_one_day() {
         let request = parse_list_window_request(Some("2026-10-28"), None, None).unwrap();
         assert_eq!(request, ListWindowRequest::Date("2026-10-28".to_string()));
-        let (start, end) = resolve_list_window(&request, Utc::now()).unwrap();
+        let (start, end) = resolve_list_window(&request, Utc::now(), 2).unwrap();
         let days: Vec<_> = inclusive_dates(start, end).collect();
         assert_eq!(days, vec![NaiveDate::from_ymd_opt(2026, 10, 28).unwrap()]);
     }
@@ -2980,7 +2995,7 @@ mod tests {
     fn inclusive_range_spans_two_dates_in_order() {
         let request =
             parse_list_window_request(None, Some("2026-10-28"), Some("2026-10-29")).unwrap();
-        let (start, end) = resolve_list_window(&request, Utc::now()).unwrap();
+        let (start, end) = resolve_list_window(&request, Utc::now(), 2).unwrap();
         let days: Vec<_> = inclusive_dates(start, end)
             .map(|date| date.format("%Y-%m-%d").to_string())
             .collect();
@@ -3006,7 +3021,7 @@ mod tests {
         let request =
             parse_list_window_request(None, Some("2025-01-01"), Some("2026-10-29")).unwrap();
         assert!(matches!(
-            resolve_list_window(&request, Utc::now()),
+            resolve_list_window(&request, Utc::now(), 2),
             Err(StoreError::InvalidDate(_))
         ));
     }

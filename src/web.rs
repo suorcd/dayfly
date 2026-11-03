@@ -53,7 +53,8 @@ use crate::http::{
     status_for, AppState, ListAccessError, MultipartFieldError, MULTIPART_METADATA_MAX_BYTES,
 };
 use crate::store::{
-    parse_list_window_request, ListWindowRequest, PasteSummary, Store, StoreError, StoredPaste, Ttl,
+    default_list_window, parse_list_window_request, ListWindowRequest, PasteSummary, Store,
+    StoreError, StoredPaste, Ttl,
 };
 
 /// Adapted base look from suorcd.us/style.css, palette cyberpunkNeon
@@ -968,6 +969,17 @@ async fn list_handler(
     // list_window already filters expired objects (HeadObject per key),
     // so this page is consistent with the API's read-time expiry check.
     let store = state.store();
+    let (start_value, end_value) = match &request {
+        ListWindowRequest::Default => {
+            let (start_date, end_date) =
+                default_list_window(Utc::now(), store.config.list_default_days);
+            (
+                start_date.format("%Y-%m-%d").to_string(),
+                end_date.format("%Y-%m-%d").to_string(),
+            )
+        }
+        _ => (start.clone(), end.clone()),
+    };
     let items = match &request {
         ListWindowRequest::Date(date) => store.list_recent(Some(date), 1000).await,
         ListWindowRequest::Range { start, end } => {
@@ -1031,11 +1043,12 @@ async fn list_handler(
         Some("/pastes"),
         &format!(
             r#"<form method="get" action="/pastes"><p><label>Start <input type="date" name="start" value="{}"></label> <label>End <input type="date" name="end" value="{}"></label> <button type="submit">Show range</button></p></form>
-<p class="muted">Dates are UTC. With no dates, the page shows yesterday and today in UTC, so a Pacific evening is included. Built from a direct bucket scan (ListObjectsV2 for each date prefix, plus HeadObject per paste). No database. Listing is O(n) in objects scanned and gets slower as the bucket grows — that slowdown is the trigger for adding a database later.</p>
+<p class="muted">Dates are UTC. With no dates, the page shows the last {default_days} days, ending today in UTC. Set DAYFLY_LIST_DEFAULT_DAYS to change that. Built from a direct bucket scan (ListObjectsV2 for each date prefix, plus HeadObject per paste). No database. Listing is O(n) in objects scanned and gets slower as the bucket grows — that slowdown is the trigger for adding a database later.</p>
 <table><thead><tr><th>Link / ID</th><th>Filename</th><th>Content-Type</th><th>{size_header}</th><th>{created_header}</th><th>{expires_header}</th><th>Remaining</th><th></th></tr></thead><tbody>{}</tbody></table>"#,
-            html_escape(&start),
-            html_escape(&end),
+            html_escape(&start_value),
+            html_escape(&end_value),
             rows,
+            default_days = store.config.list_default_days,
         ),
     )
     .into_response()
@@ -1248,6 +1261,7 @@ mod tests {
             max_paste_bytes: 1024 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,
+            list_default_days: 2,
             retention_by_size: false,
             retention_min_days: 30,
             retention_max_days: 365,

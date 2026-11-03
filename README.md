@@ -317,6 +317,7 @@ permissions and the lower total cap.
 | `DAYFLY_MAX_PASTE_BYTES` | no | 1073741824 (1 GiB) | Max total size for one paste, including the base object and every appended segment. A new paste or an append that would exceed the cap fails and writes no object |
 | `DAYFLY_ALIAS_WORDS` | no | 3 | Number of words in a new alias. Allowed range 3 to 6. Resolution accepts 3 words up to this value |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1 and at most 3650. The name and meaning are unchanged |
+| `DAYFLY_LIST_DEFAULT_DAYS` | no | 2 | Number of days in the default paste list window, ending today in UTC. Must be 1 to 366. The default of 2 covers yesterday and today |
 | `DAYFLY_RETENTION_BY_SIZE` | no | `false` | Clamp the expiry of a paste to a curve based on its total size. The clamp only shortens. Off keeps the exact requested TTL. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_RETENTION_MIN_DAYS` | no | 30 | Minimum retention in whole days at `DAYFLY_MAX_PASTE_BYTES`. Must be at least 1 and at most 3650, and must not exceed `DAYFLY_RETENTION_MAX_DAYS` |
 | `DAYFLY_RETENTION_MAX_DAYS` | no | 365 | Maximum retention in whole days at zero bytes. Must be at least 1 and at most 3650, and must be at least `DAYFLY_RETENTION_MIN_DAYS` |
@@ -745,7 +746,8 @@ curl -X DELETE http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123...
 curl -X DELETE -H 'X-Paste-Token: <token>' \
   http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123...
 
-# List recent (expired filtered out). No dates means yesterday and today UTC:
+# List recent (expired filtered out). No dates means the default window:
+# the last DAYFLY_LIST_DEFAULT_DAYS days, ending today in UTC (2 by default).
 curl 'http://127.0.0.1:8080/v1/pastes?limit=100'
 
 # List one UTC date:
@@ -1055,8 +1057,10 @@ comments.
   database): alias when enabled (with the canonical ID as secondary
   text), filename if any, content type, size, created date, expiry date
   plus days remaining, and a delete action per row. Expired items are
-  filtered out, consistent with the API's read-time expiry check. Add
-  `?date=YYYY-MM-DD` for another day. Add `?sort=size|created|expires`
+  filtered out, consistent with the API's read-time expiry check. The
+  Start and End inputs start with the default window:
+  `DAYFLY_LIST_DEFAULT_DAYS` days, ending today in UTC (2 by default).
+  Add `?date=YYYY-MM-DD` for another day. Add `?sort=size|created|expires`
   and `?order=asc|desc` to sort. The default is `created` descending.
   The Size, Created, and Expires headers are links. A click toggles the
   direction and keeps the date filters. A missing created or expiry

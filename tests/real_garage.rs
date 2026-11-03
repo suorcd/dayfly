@@ -39,6 +39,7 @@ fn test_config() -> Config {
         max_paste_bytes: 1024 * 1024 * 1024,
         alias_words: 3,
         default_ttl_days: 1,
+        list_default_days: 2,
         retention_by_size: false,
         retention_min_days: 30,
         retention_max_days: 365,

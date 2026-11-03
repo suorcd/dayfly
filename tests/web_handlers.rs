@@ -806,7 +806,18 @@ async fn list_page_shows_current_pastes_and_hides_expired_ones() {
     );
     assert!(page.contains("name=\"start\""));
     assert!(page.contains("name=\"end\""));
-    assert!(page.contains("yesterday and today in UTC"));
+    let yesterday = (Utc::now() - Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    assert!(
+        page.contains(&format!("name=\"start\" value=\"{yesterday}\"")),
+        "the start input must show yesterday: {page}"
+    );
+    assert!(
+        page.contains(&format!("name=\"end\" value=\"{today}\"")),
+        "the end input must show today: {page}"
+    );
+    assert!(page.contains("last 2 days, ending today in UTC"));
 
     let request = common::request("GET", "/pastes?date=2020-01-01", &[], Vec::new());
     let (status, _, body) = common::send(&app, request).await;
@@ -818,6 +829,34 @@ async fn list_page_shows_current_pastes_and_hides_expired_ones() {
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(html_text(&body).contains("invalid date"));
+}
+
+#[tokio::test]
+async fn list_page_prepopulates_the_configured_default_window() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.list_default_days = 3;
+    let store = Store::from_config(config)
+        .await
+        .expect("the store must build without network access");
+    let app = common::app(store);
+
+    let request = common::request("GET", "/pastes", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    let start = (Utc::now() - Duration::days(2))
+        .format("%Y-%m-%d")
+        .to_string();
+    let end = Utc::now().format("%Y-%m-%d").to_string();
+    assert!(
+        page.contains(&format!("name=\"start\" value=\"{start}\"")),
+        "the start input must follow DAYFLY_LIST_DEFAULT_DAYS: {page}"
+    );
+    assert!(
+        page.contains(&format!("name=\"end\" value=\"{end}\"")),
+        "the end input must follow DAYFLY_LIST_DEFAULT_DAYS: {page}"
+    );
 }
 
 #[tokio::test]
