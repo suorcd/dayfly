@@ -99,8 +99,8 @@ What a pass looks like, on a machine with Nix:
 ## Nix build status (read this before claiming anything)
 
 The flake builds and its test suite passes on `x86_64-linux` against
-`nixos-unstable`: 361 passed and 2 ignored. That is a real result from
-a real run, not an assumption.
+`nixos-unstable`: 406 passed and 2 ignored at commit `5d00dce`. That is
+a real result from a real run, not an assumption.
 
 It does **not** build on the `nixos-25.11` stable branch. The AWS SDK
 crates pinned in `Cargo.lock` require rustc 1.94.1 and 25.11 ships
