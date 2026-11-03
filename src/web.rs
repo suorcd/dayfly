@@ -67,6 +67,7 @@ nav{display:flex;gap:1rem;flex-wrap:wrap;align-items:center}
 nav .prompt{color:#0abdc6;opacity:.6}
 nav a{padding:.25rem .5rem;border:1px dashed transparent;border-radius:4px}
 nav a:hover{border-color:#0abdc6;box-shadow:0 0 10px rgba(10,189,198,.35)}
+nav a.active{color:#0abdc6;text-decoration:underline;text-underline-offset:.3rem;border-color:#0abdc6;box-shadow:0 0 10px rgba(10,189,198,.35)}
 h1{font-size:1.8rem;text-transform:lowercase;color:#ea00d9;text-shadow:0 0 12px rgba(234,0,217,.55)}
 h2{font-size:1.3rem;text-transform:lowercase;color:#ea00d9;border-bottom:1px dotted #0abdc6;padding-bottom:.25rem}
 hr{border:none;border-top:1px dashed #0abdc6;margin:1.5rem 0;opacity:.6}
@@ -210,10 +211,38 @@ const DROPZONE_SCRIPT: &str = r#"<script>
 })();
 </script>"#;
 
-fn page(title: &str, body: &str) -> Html<String> {
+/// Nav items in display order: `(href, label)`.
+const NAV_ITEMS: [(&str, &str); 3] = [
+    ("/", "new paste"),
+    ("/pastes", "current pastes"),
+    ("/.well-known/dayfly.json", "api description"),
+];
+
+/// Build one page. `active` names the nav href for the current page.
+///
+/// A page with an active nav item omits its `<h1>`, because the nav
+/// link already names the page.
+fn page(title: &str, active: Option<&str>, body: &str) -> Html<String> {
+    let nav: String = NAV_ITEMS
+        .iter()
+        .map(|(href, label)| nav_link(href, label, active))
+        .collect();
+    let heading = if active.is_some() {
+        String::new()
+    } else {
+        format!("<h1>{title}</h1>\n")
+    };
     Html(format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title} — pastebin</title>\n<style>{CSS}</style>\n</head>\n<body>\n<header><nav><span class=\"prompt\">~/dayfly $</span><a href=\"/\">new paste</a><a href=\"/pastes\">current pastes</a><a href=\"/.well-known/dayfly.json\">api description</a></nav></header>\n<h1>{title}</h1>\n{body}\n<footer>pastebin — internal use only · &copy; 2026 suorcd</footer>\n</body>\n</html>\n"
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title} — pastebin</title>\n<style>{CSS}</style>\n</head>\n<body>\n<header><nav><span class=\"prompt\">~/dayfly $</span>{nav}</nav></header>\n{heading}{body}\n<footer>pastebin — internal use only · &copy; 2026 suorcd</footer>\n</body>\n</html>\n"
     ))
+}
+
+fn nav_link(href: &str, label: &str, active: Option<&str>) -> String {
+    if active == Some(href) {
+        format!("<a href=\"{href}\" class=\"active\" aria-current=\"page\">{label}</a>")
+    } else {
+        format!("<a href=\"{href}\">{label}</a>")
+    }
 }
 
 fn html_escape(s: &str) -> String {
@@ -414,7 +443,7 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
     body.push_str(
         r#"<p class="muted">The selector uses whole days. API clients can send a sub-day TTL with X-TTL. Expiry is checked on read; the bucket sweeper is day-rounded. The bucket itself is private; only this binary talks to Garage.</p>"#,
     );
-    page("New paste", &body).into_response()
+    page("New paste", Some("/"), &body).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -467,6 +496,7 @@ fn error_page(e: StoreError) -> Response {
         status,
         page(
             "Error",
+            None,
             &format!("<p>{}</p><p><a href=\"/\">Back</a></p>", html_escape(&msg)),
         ),
     )
@@ -479,6 +509,7 @@ fn unauthorized_page(message: &str) -> Response {
         StatusCode::UNAUTHORIZED,
         page(
             "Unauthorized",
+            None,
             &format!(
                 "<p>{}</p><p><a href=\"/\">Back</a></p>",
                 html_escape(message)
@@ -494,6 +525,7 @@ fn bad_request_page(message: &str) -> Response {
         StatusCode::BAD_REQUEST,
         page(
             "Error",
+            None,
             &format!(
                 "<p>{}</p><p><a href=\"/\">Back</a></p>",
                 html_escape(message)
@@ -993,6 +1025,7 @@ async fn list_handler(
     }
     page(
         "Current pastes",
+        Some("/pastes"),
         &format!(
             r#"<form method="get" action="/pastes"><p><label>Date <input type="date" name="date" value="{}"></label> <button type="submit">Show date</button></p></form>
 <form method="get" action="/pastes"><p><label>Start <input type="date" name="start" value="{}"></label> <label>End <input type="date" name="end" value="{}"></label> <button type="submit">Show range</button></p></form>
@@ -1095,7 +1128,7 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
             html_escape(meta.filename.as_deref().unwrap_or("image"))
         ));
     }
-    page("View paste", &body).into_response()
+    page("View paste", None, &body).into_response()
 }
 
 async fn view_dated(

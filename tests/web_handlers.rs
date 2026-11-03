@@ -120,6 +120,14 @@ async fn index_page_renders_the_combined_form_and_the_default_ttl() {
     assert!(page.contains("~/dayfly $"));
     assert!(page.contains("href=\"/.well-known/dayfly.json\""));
     assert!(page.contains("&copy; 2026 suorcd"));
+    assert!(
+        page.contains("<a href=\"/\" class=\"active\" aria-current=\"page\">new paste</a>"),
+        "the current page must be marked in the nav: {page}"
+    );
+    assert!(
+        !page.contains("<h1>New paste</h1>"),
+        "the page title must not repeat the nav link: {page}"
+    );
 }
 
 #[tokio::test]
