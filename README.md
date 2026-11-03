@@ -841,7 +841,11 @@ comments.
   text), filename if any, content type, size, created date, expiry date
   plus days remaining, and a delete action per row. Expired items are
   filtered out, consistent with the API's read-time expiry check. Add
-  `?date=YYYY-MM-DD` for another day.
+  `?date=YYYY-MM-DD` for another day. Add `?sort=size|created|expires`
+  and `?order=asc|desc` to sort. The default is `created` descending.
+  The Size, Created, and Expires headers are links. A click toggles the
+  direction and keeps the date filters. A missing created or expiry
+  value sorts last in both directions.
 - `GET /view/<id>` — one paste: the three-word alias when enabled,
   metadata and the delete form in a collapsed `<details>` block, then
   the raw/download link, then the content: text in `<pre>` (capped at
