@@ -1022,6 +1022,13 @@ async fn view_page_renders_text_escaped_and_images_inline() {
         actions_at < details_at && details_at < pre_at,
         "the action row must sit above the metadata and the content last"
     );
+    let hr_at = page
+        .find("<hr>")
+        .expect("the separator above the text must render");
+    assert!(
+        hr_at < pre_at,
+        "the separator must sit directly above the text box"
+    );
 
     let request = common::request("GET", &format!("/view/{}", png.id), &[], Vec::new());
     let (status, _, body) = common::send(&app, request).await;

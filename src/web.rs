@@ -1294,7 +1294,8 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
         match slice {
             Ok(s) => {
                 body.push_str(&format!(
-                    "<div class=\"content-box\"><button type=\"button\" class=\"copy-content\" \
+                    "<hr>\
+                     <div class=\"content-box\"><button type=\"button\" class=\"copy-content\" \
                      aria-label=\"Copy paste content\" hidden>Copy</button>\
                      <pre>{}</pre></div>",
                     html_escape(&s.text)
