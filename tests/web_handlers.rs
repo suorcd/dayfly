@@ -795,7 +795,7 @@ async fn list_page_shows_current_pastes_and_hides_expired_ones() {
     let page = html_text(&body);
     assert!(page.contains(&format!("{today}/visible")));
     assert!(!page.contains(&format!("{today}/expired")));
-    assert!(page.contains("2 days"));
+    assert!(page.contains("02 days"));
     assert!(
         !page.contains("name=\"date\""),
         "the page must not offer the single-date selector: {page}"
@@ -833,6 +833,14 @@ async fn list_page_shows_current_pastes_and_hides_expired_ones() {
     assert!(
         page.contains("<th>Action</th>"),
         "the delete column must have a header: {page}"
+    );
+    assert!(
+        page.contains("<th>TTL</th>"),
+        "the duration column must be labelled TTL: {page}"
+    );
+    assert!(
+        !page.contains("<th>Remaining</th>"),
+        "the old duration header must be gone: {page}"
     );
 
     let request = common::request("GET", "/pastes?date=2020-01-01", &[], Vec::new());
