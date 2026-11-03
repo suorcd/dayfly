@@ -75,6 +75,7 @@ hr{border:none;border-top:1px dashed #0abdc6;margin:1.5rem 0;opacity:.6}
 a{color:#ea00d9;text-decoration:none}
 a:hover{text-decoration:underline;text-shadow:0 0 8px rgba(234,0,217,.8)}
 table{border-collapse:collapse;width:100%} th,td{text-align:left;padding:.4rem .5rem;border:1px dashed #0abdc6;vertical-align:top}
+.content-type-cell{display:block;max-width:12rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .table-wrap{overflow-x:auto}
 th:first-child,td:first-child{white-space:nowrap}
 th:nth-child(4),td:nth-child(4){white-space:nowrap}
@@ -1034,12 +1035,12 @@ async fn list_handler(
             }
             _ => format!("<a href=\"/view/{id_esc}\">{id_esc}</a>"),
         };
+        let content_type = html_escape(item.content_type.as_deref().unwrap_or("—"));
         rows.push_str(&format!(
             "<tr><td>{link_cell}</td>\
-             <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
+             <td>{}</td><td><span class=\"content-type-cell\" title=\"{content_type}\">{content_type}</span></td><td>{}</td><td>{}</td><td>{}</td>\
              <td><form method=\"post\" action=\"/ui/delete\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\"><button type=\"submit\">Delete</button></form></td></tr>\n",
             html_escape(item.filename.as_deref().unwrap_or("—")),
-            html_escape(item.content_type.as_deref().unwrap_or("—")),
             human_size(item.size),
             fmt_dt(item.created_at),
             days_remaining(item.expires_at),

@@ -822,6 +822,14 @@ async fn list_page_shows_current_pastes_and_hides_expired_ones() {
         !page.contains("sort=expires"),
         "the redundant expires column must be gone: {page}"
     );
+    assert!(
+        page.contains("class=\"content-type-cell\" title=\"text/plain"),
+        "the content type cell must keep the full type in a title attribute: {page}"
+    );
+    assert!(
+        page.contains(">text/plain"),
+        "the content type text must stay unedited: {page}"
+    );
 
     let request = common::request("GET", "/pastes?date=2020-01-01", &[], Vec::new());
     let (status, _, body) = common::send(&app, request).await;
