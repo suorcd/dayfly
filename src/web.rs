@@ -91,10 +91,14 @@ th:nth-child(4){text-align:center}
 .hint{color:#0abdc6;cursor:help;text-decoration:underline dotted;text-underline-offset:.25rem;font-size:.95rem}
 .view-bar{display:grid;grid-template-columns:1fr auto;align-items:center;gap:.5rem;margin-bottom:1rem}
 .view-actions{display:flex;flex-wrap:wrap;gap:.5rem}
-.view-bar .metadata{border:0;background:none;padding:0;margin:0;border-radius:0;backdrop-filter:none}
-.metadata[open]{grid-column:1/-1}
-.metadata summary{text-align:right}
-.metadata-body{margin-top:.5rem;padding:1rem;border:1px dashed #0abdc6;border-radius:8px;background:rgba(19,62,124,.35)}
+.metadata-toggle{position:absolute;opacity:0;width:1px;height:1px}
+.metadata-label{grid-column:2;text-align:right;cursor:pointer;color:#0abdc6}
+.metadata-label::before{content:"▶ "}
+.metadata-toggle:checked ~ .metadata-label::before{content:"▼ "}
+.metadata-toggle:focus-visible ~ .metadata-label{outline:1px dashed #0abdc6;outline-offset:.2rem}
+.metadata-panel{grid-column:1/-1;display:none;margin-top:.5rem;padding:1rem;border:1px dashed #0abdc6;border-radius:8px;background:rgba(19,62,124,.35)}
+.metadata-panel form{background:none;border:0;padding:0;margin:0;border-radius:0;backdrop-filter:none}
+.metadata-toggle:checked ~ .metadata-panel{display:block}
 .content-box{position:relative}
 .content-box pre{margin:0;padding-right:6rem}
 .copy-content{position:absolute;top:.5rem;right:.5rem}
@@ -1269,11 +1273,12 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
          <a class=\"button\" href=\"/raw/{target_esc}\">Raw</a>\
          <button type=\"button\" class=\"copy-link\" data-copy=\"/view/{target_esc}\" hidden>Copy link</button>\
          </div>\
-         <details class=\"metadata\"><summary>Metadata &amp; delete</summary>\
-         <div class=\"metadata-body\">\
+         <input type=\"checkbox\" id=\"metadata-toggle\" class=\"metadata-toggle\">\
+         <label for=\"metadata-toggle\" class=\"metadata-label\">Metadata &amp; delete</label>\
+         <div class=\"metadata-panel\">\
          <p>Filename: {}</p><p>Content-Type: {}</p><p>Size: {}</p><p>Created: {}</p><p>Expires: {} ({})</p>\
          <form method=\"post\" action=\"/ui/delete\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\"><button type=\"submit\">Delete this paste</button></form>\
-         </div></details>\
+         </div>\
          </div>",
         html_escape(meta.filename.as_deref().unwrap_or("—")),
         html_escape(&meta.content_type),

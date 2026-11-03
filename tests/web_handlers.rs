@@ -1004,18 +1004,19 @@ async fn view_page_renders_text_escaped_and_images_inline() {
     );
     assert!(
         page.contains(
-            "<details class=\"metadata\"><summary>Metadata &amp; delete</summary>\
-             <div class=\"metadata-body\">"
+            "<input type=\"checkbox\" id=\"metadata-toggle\" class=\"metadata-toggle\">\
+             <label for=\"metadata-toggle\" class=\"metadata-label\">Metadata &amp; delete</label>\
+             <div class=\"metadata-panel\">"
         ),
-        "the metadata block must be a borderless toggle with a body box: {page}"
+        "the metadata toggle must be a checkbox and label with a panel: {page}"
     );
     assert!(page.contains("Delete this paste"));
     let actions_at = page
         .find("class=\"view-actions\"")
         .expect("the action row must render");
     let details_at = page
-        .find("<details class=\"metadata\">")
-        .expect("the metadata details must render");
+        .find("class=\"metadata-panel\"")
+        .expect("the metadata panel must render");
     let pre_at = page.find("<pre>").expect("the paste text must render");
     assert!(
         actions_at < details_at && details_at < pre_at,
