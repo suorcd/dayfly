@@ -37,6 +37,7 @@ use futures::StreamExt;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use rand::Rng;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -448,6 +449,11 @@ pub struct StoredPaste {
     /// "explicit -> sniffed" when a sniffed signature overrode the client.
     pub detection_conflict: Option<String>,
     pub expires_at: DateTime<Utc>,
+    /// Management token for this paste, when `paste_tokens` is on.
+    ///
+    /// The store returns the token once, at creation. Only its SHA-256
+    /// is stored, in the base object's metadata.
+    pub paste_token: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -563,6 +569,11 @@ pub fn base62_encode(mut n: u128) -> String {
 pub fn generate_random_id() -> String {
     let n: u128 = rand::rng().random();
     base62_encode(n)
+}
+
+/// A 128-bit management token in lowercase hex.
+fn generate_paste_token() -> String {
+    format!("{:032x}", rand::rng().random::<u128>())
 }
 
 /// Validate a client-supplied paste ID.
@@ -1092,11 +1103,13 @@ fn expires_at_for(created_at: DateTime<Utc>, ttl: Ttl) -> DateTime<Utc> {
         .unwrap_or(DateTime::<Utc>::MAX_UTC)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn metadata_for(
     filename: Option<&str>,
     sha256: Option<&str>,
     size: Option<u64>,
     words: Option<&str>,
+    paste_token_hash: Option<&str>,
     ttl: Ttl,
     created_at: DateTime<Utc>,
     detection: &Detection,
@@ -1119,6 +1132,9 @@ fn metadata_for(
     }
     if let Some(words) = words {
         meta.insert("words".to_string(), words.to_string());
+    }
+    if let Some(hash) = paste_token_hash {
+        meta.insert("paste-token-sha256".to_string(), hash.to_string());
     }
     meta.insert("ttl-seconds".to_string(), ttl.num_seconds().to_string());
     if let Some(days) = ttl.whole_days() {
@@ -1690,12 +1706,17 @@ impl Store {
         let detection = detection_for(filename, content_type, text);
         let ct = detection.content_type.clone();
         let expires_at = expires_at_for(created_at, ttl);
+        let paste_token = self.config.paste_tokens.then(generate_paste_token);
+        let paste_token_hash = paste_token
+            .as_deref()
+            .map(|token| sha256_hex(token.as_bytes()));
         let words = self.claim_alias(&key, expires_at).await?;
         let (meta, _) = metadata_for(
             filename,
             Some(&sha),
             Some(text.len() as u64),
             Some(&words),
+            paste_token_hash.as_deref(),
             ttl,
             created_at,
             &detection,
@@ -1731,6 +1752,7 @@ impl Store {
             detection_source: Some(detection.source.to_string()),
             detection_conflict: detection.conflict,
             expires_at,
+            paste_token,
         })
     }
 
@@ -1778,6 +1800,10 @@ impl Store {
                 .and_then(|n| n.to_str())
                 .map(|s| s.to_string())
         });
+        let paste_token = self.config.paste_tokens.then(generate_paste_token);
+        let paste_token_hash = paste_token
+            .as_deref()
+            .map(|token| sha256_hex(token.as_bytes()));
         let mut expires_at = expires_at_for(created_at, ttl);
         let mut words: Option<String> = None;
         if len as usize <= MULTIPART_CHUNK_BYTES {
@@ -1816,6 +1842,7 @@ impl Store {
                     Some(&sha),
                     Some(size),
                     Some(&claimed),
+                    paste_token_hash.as_deref(),
                     ttl,
                     created_at,
                     &detection,
@@ -1851,6 +1878,7 @@ impl Store {
                     detection_source: Some(detection.source.to_string()),
                     detection_conflict: detection.conflict,
                     expires_at,
+                    paste_token,
                 });
             }
 
@@ -1938,6 +1966,7 @@ impl Store {
             Some(&sha),
             Some(len),
             Some(&words),
+            paste_token_hash.as_deref(),
             ttl,
             created_at,
             &detection,
@@ -1987,6 +2016,7 @@ impl Store {
             detection_source: Some(detection.source.to_string()),
             detection_conflict: detection.conflict,
             expires_at,
+            paste_token,
         })
     }
 
@@ -2062,6 +2092,10 @@ impl Store {
                 .await;
         let ct = detection.content_type.clone();
         let expires_at = expires_at_for(created_at, ttl);
+        let paste_token = self.config.paste_tokens.then(generate_paste_token);
+        let paste_token_hash = paste_token
+            .as_deref()
+            .map(|token| sha256_hex(token.as_bytes()));
         let words = self.claim_alias(&key, expires_at).await?;
         // Metadata for the initial upload: filename, TTL, expiry, final
         // type and detection record. The hash and the final size are not
@@ -2073,6 +2107,7 @@ impl Store {
             None,
             None,
             Some(&words),
+            paste_token_hash.as_deref(),
             ttl,
             created_at,
             &detection,
@@ -2111,6 +2146,7 @@ impl Store {
             detection_source: Some(detection.source.to_string()),
             detection_conflict: detection.conflict,
             expires_at,
+            paste_token,
         })
     }
 
@@ -2290,6 +2326,35 @@ impl Store {
         let meta = self.head_metadata(id).await?;
         Self::check_not_expired(&meta)?;
         Ok(meta)
+    }
+
+    /// True when `token` matches the stored SHA-256 for `id`.
+    ///
+    /// A missing paste, a paste without a token, or an S3 error returns
+    /// false. The caller decides the HTTP status. This method never
+    /// returns or logs the stored hash.
+    pub async fn verify_paste_token(&self, id: &str, token: &str) -> bool {
+        let Ok(key) = self.resolve_key(id).await else {
+            return false;
+        };
+        let Ok(out) = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+        else {
+            return false;
+        };
+        let Some(expected) = out
+            .metadata()
+            .and_then(|meta| meta.get("paste-token-sha256"))
+        else {
+            return false;
+        };
+        let actual = sha256_hex(token.as_bytes());
+        expected.as_bytes().ct_eq(actual.as_bytes()).into()
     }
 
     /// Read metadata for a canonical key without another alias lookup.
@@ -3163,6 +3228,7 @@ mod tests {
             Some("deadbeef"),
             Some(3),
             None,
+            None,
             Ttl::days(7),
             created,
             &detection,
@@ -3254,6 +3320,7 @@ mod tests {
             Some("deadbeef"),
             Some(3),
             None,
+            None,
             Ttl::parse("1h").unwrap(),
             created,
             &detection,
@@ -3280,6 +3347,7 @@ mod tests {
             None,
             Some("deadbeef"),
             Some(3),
+            None,
             None,
             Ttl::parse("1h").unwrap(),
             created,
@@ -3327,6 +3395,7 @@ mod tests {
             Some("abc123"),
             Some(42),
             None,
+            None,
             Ttl::days(3),
             created,
             &detection,
@@ -3359,6 +3428,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Ttl::days(7),
             created,
             &detection,
@@ -3369,5 +3439,52 @@ mod tests {
         );
         assert!(!meta.contains_key("size"), "unknown size must be absent");
         assert_eq!(meta.get("expires-at").unwrap(), "2026-11-04T00:00:00+00:00");
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn paste_token_has_128_bits_of_hex() {
+        let token = generate_paste_token();
+        assert_eq!(token.len(), 32);
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(token, generate_paste_token());
+    }
+
+    #[test]
+    fn metadata_map_stores_the_token_hash_only_when_present() {
+        let created = Utc.with_ymd_and_hms(2026, 10, 28, 0, 0, 0).unwrap();
+        let detection = Detection {
+            content_type: "text/plain; charset=utf-8".to_string(),
+            source: "text",
+            conflict: None,
+        };
+        let (meta, _) = metadata_for(
+            None,
+            None,
+            None,
+            None,
+            Some("abc123"),
+            Ttl::days(1),
+            created,
+            &detection,
+        );
+        assert_eq!(meta.get("paste-token-sha256").unwrap(), "abc123");
+
+        let (meta, _) = metadata_for(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Ttl::days(1),
+            created,
+            &detection,
+        );
+        assert!(!meta.contains_key("paste-token-sha256"));
     }
 }

@@ -212,6 +212,9 @@ fn changed_fields(old: &Config, new: &Config) -> Vec<&'static str> {
     if old.inline_pdf != new.inline_pdf {
         changed.push("DAYFLY_INLINE_PDF");
     }
+    if old.paste_tokens != new.paste_tokens {
+        changed.push("DAYFLY_PASTE_TOKENS");
+    }
     if old.http_bearer_token != new.http_bearer_token {
         changed.push("DAYFLY_HTTP_BEARER_TOKEN");
     }

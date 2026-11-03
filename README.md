@@ -84,7 +84,9 @@ As a simple, optional extra for the binary's own endpoint (not a
 replacement for the S3 credentials), set
 `DAYFLY_HTTP_BEARER_TOKEN`: HTTP mode then requires
 `Authorization: Bearer <token>` on every HTTP route, including `/mcp`
-and the human pages. The token must not contain ASCII whitespace;
+and the human pages. The exceptions are `DELETE` and `PATCH`, which
+also accept a valid paste token when `DAYFLY_PASTE_TOKENS` is on. The
+token must not contain ASCII whitespace;
 startup fails if it does. Unset the variable to disable the token. A
 variable that is set to an empty or whitespace-only value stops
 startup, because it would look protected and accept every request. An
@@ -155,6 +157,19 @@ database. It shortens the expiry of a large paste. A public instance
 should set it, because a request limit does not bound the bytes that one
 client can store. See "Retention by size".
 
+`DAYFLY_PASTE_TOKENS` gives each new paste a management token. Creation
+returns the token once: `paste_token` in the JSON response and
+`X-Paste-Token` in the plain response. Send that header on `DELETE` and
+`PATCH` to act on the paste without the bearer token. The bearer token
+remains a universal key. An append does not accept the paste token. The
+base object stores only the SHA-256 of the token. The meta route and the
+MCP metadata tool do not return it. Treat the token as a credential and
+do not put it in a URL. A lost token means lost control of that paste;
+there is no recovery. A paste created before the setting has
+no token; only a bearer token can change it. A token for one paste
+cannot change another paste. The human delete form cannot send the
+token, so it needs the bearer token or a proxy that authenticates.
+
 The MCP stdio transport does not use the bearer token: spawning the
 binary locally is the trust boundary there. The MCP transport over
 HTTP at `/mcp` is part of HTTP mode and uses the same bearer token as
@@ -220,7 +235,8 @@ Listing/search/sorting beyond a date window, view counters,
 burn-after-read, per-paste permissions/ownership, audit history, and
 deduplication. These are the future SQLite triggers: they are the
 reasons a database would be added later. No database schema is
-invented in v1.
+invented in v1. A paste token is a per-paste delete and expiry
+credential, not an ownership model.
 
 ### No database in v1 — the performance tradeoff
 
@@ -309,6 +325,7 @@ permissions and the lower total cap.
 | `DAYFLY_RATE_LIMIT_PER_MINUTE` | no | 0 | Maximum requests per client per minute. 0 disables the limiter and allocates no counters. The burst is this value, and the bucket refills at this rate. Over the limit → 429 with `Retry-After`. Keyed on the resolved client address, so set `DAYFLY_TRUSTED_PROXIES` behind an ingress. Per process; resets on restart |
 | `DAYFLY_ALLOW_UNAUTHENTICATED` | no | `false` | Accept a non-loopback bind with no bearer token. Startup refuses that bind without this value, and with it the service writes one warning. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_LIST_REQUIRES_TOKEN` | no | `false` | Require the bearer token for `GET /v1/pastes` and the human `/pastes` page even when reads are anonymous. With this on and no token configured, both routes refuse with 401: there is nothing to check. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
+| `DAYFLY_PASTE_TOKENS` | no | `false` | Return a 128-bit management token at creation. The JSON store response carries `paste_token`; the plain response carries `X-Paste-Token`. The token authorizes `DELETE` and `PATCH` for that paste. Only its SHA-256 is stored. The bearer token remains universal. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_SHOW_WORDS` | no | `true` | Show the generated word alias in the human UI: create redirects, the view page, and the paste list. Display only; the JSON/MCP responses still include `words`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_INLINE_PDF` | no | `true` | Serve a PDF download inline. Set this to `false` on a public instance so a PDF is an attachment. HTML and SVG are always attachments. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_HTTP_BEARER_TOKEN` | one form | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model); set this variable or `DAYFLY_HTTP_BEARER_TOKEN_FILE`. An unset value disables auth; a set empty or whitespace-only value is a startup error |
@@ -394,6 +411,7 @@ first, then the file. These settings take effect on the next request:
 - `DAYFLY_INLINE_PDF`
 - `DAYFLY_TRUSTED_PROXIES`
 - `DAYFLY_LIST_REQUIRES_TOKEN`
+- `DAYFLY_PASTE_TOKENS`
 - `DAYFLY_RATE_LIMIT_PER_MINUTE`
 - `DAYFLY_HTTP_BEARER_TOKEN` or `DAYFLY_HTTP_BEARER_TOKEN_FILE`
 
@@ -481,6 +499,13 @@ MCP tools: `store_text`, `store_file`, `append_text`, `set_ttl`,
 metadata — binary content is never sent over JSON-RPC),
 `fetch_metadata`, `delete_paste`, `list_recent`.
 
+When `DAYFLY_PASTE_TOKENS` is on, `store_text` and `store_file` return
+`paste_token`. `delete_paste` and `set_ttl` accept a `paste_token`
+argument. A configured bearer token is checked by the HTTP transport
+before the MCP call, so the paste token is optional in that case. With
+no bearer token, those two tools require the paste token. `append_text`
+does not accept it.
+
 `fetch_text` returns at most 8 MiB per call. Use `offset` and `limit`
 to page through a larger paste. The response reports `total_bytes` and
 `truncated`.
@@ -548,6 +573,9 @@ curl --data-binary @- -H 'Accept: application/json' \
 #    "detection_source": "...", "detection_conflict": null}
 ```
 
+When `DAYFLY_PASTE_TOKENS` is on, the JSON response adds `paste_token`
+and the plain response adds an `X-Paste-Token` header.
+
 `POST /v1/pastes` is an alias for `POST /upload`.
 
 ### TTL forms
@@ -604,6 +632,10 @@ curl -X PATCH -H 'X-TTL: 1h' \
 
 # Extend to thirty days.
 curl -X PATCH -H 'X-TTL-Days: 30' \
+  http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123...
+
+# Change the expiry with the paste token, when no bearer token is set.
+curl -X PATCH -H 'X-TTL: 1h' -H 'X-Paste-Token: <token>' \
   http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123...
 ```
 
@@ -708,6 +740,10 @@ curl -I http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123...
 
 # Delete (204 on success, and also 204 when the object does not exist):
 curl -X DELETE http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123...
+
+# Delete with the paste token, when no bearer token is set:
+curl -X DELETE -H 'X-Paste-Token: <token>' \
+  http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123...
 
 # List recent (expired filtered out). No dates means yesterday and today UTC:
 curl 'http://127.0.0.1:8080/v1/pastes?limit=100'

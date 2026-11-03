@@ -3285,3 +3285,102 @@ async fn an_unknown_length_stream_uses_the_request_cap() {
         stored.expires_at
     );
 }
+
+#[tokio::test]
+async fn store_text_returns_a_paste_token_only_when_enabled() {
+    let fake = FakeS3::start().await;
+
+    let off = fake.store().await;
+    let stored = off
+        .store_text(b"no token", None, None, None)
+        .await
+        .expect("the default store must succeed");
+    assert!(
+        stored.paste_token.is_none(),
+        "the default must not return a token"
+    );
+
+    let on = fake.store_with_paste_tokens().await;
+    let stored = on
+        .store_text(b"token body", None, None, None)
+        .await
+        .expect("the token store must succeed");
+    let token = stored
+        .paste_token
+        .expect("the token setting must return a token");
+    assert_eq!(token.len(), 32, "a 128-bit token is 32 hex characters");
+    assert!(
+        token.chars().all(|c| c.is_ascii_hexdigit()),
+        "the token must be hex: {token}"
+    );
+
+    let object = fake.object(&stored.key).expect("the base must exist");
+    assert_eq!(
+        object
+            .metadata
+            .get("paste-token-sha256")
+            .map(String::as_str),
+        Some(sha256_hex(token.as_bytes()).as_str()),
+        "the base must store the SHA-256 of the token"
+    );
+    assert!(
+        on.verify_paste_token(&stored.id, &token).await,
+        "the stored hash must accept the token"
+    );
+    assert!(
+        !on.verify_paste_token(&stored.id, &"0".repeat(32)).await,
+        "the stored hash must reject a wrong token"
+    );
+    assert!(
+        !on.verify_paste_token(&stored.id, "").await,
+        "the stored hash must reject an empty token"
+    );
+}
+
+#[tokio::test]
+async fn a_paste_token_stays_out_of_the_alias_and_segments() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_paste_tokens().await;
+    let stored = store
+        .store_text(b"base", None, None, None)
+        .await
+        .expect("the paste must store");
+    let token = stored.paste_token.expect("the token must be present");
+    let words = stored.words.as_deref().expect("the alias must exist");
+    assert!(
+        store.verify_paste_token(words, &token).await,
+        "the alias must resolve to the same token check"
+    );
+
+    let alias = fake
+        .object(&dayfly::store::alias_key(words))
+        .expect("the alias must exist");
+    assert!(
+        !alias.metadata.contains_key("paste-token-sha256"),
+        "the alias must not hold the token hash"
+    );
+
+    let appended = store
+        .append_text(&stored.id, b"segment")
+        .await
+        .expect("the append must succeed");
+    let segment = fake
+        .object(
+            appended
+                .segment_key
+                .as_deref()
+                .expect("the segment key must exist"),
+        )
+        .expect("the segment must exist");
+    assert!(
+        !segment.metadata.contains_key("paste-token-sha256"),
+        "a segment must not hold the token hash"
+    );
+
+    let base = fake.object(&stored.key).expect("the base must exist");
+    assert_eq!(
+        base.metadata.get("paste-token-sha256").map(String::as_str),
+        Some(sha256_hex(token.as_bytes()).as_str()),
+        "the base keeps the hash after an append"
+    );
+}
