@@ -24,8 +24,8 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
 use dayfly::config::{
-    bind_is_loopback, credential_warnings, ensure_bind_is_safe, load_env_file, parse_bool_flag,
-    Config, CONFIG_FIELDS, MAX_TTL_DAYS,
+    bind_is_loopback, credential_warnings, ensure_bind_is_safe, environment_file_warnings,
+    load_env_file, parse_bool_flag, Config, CONFIG_FIELDS, MAX_TTL_DAYS,
 };
 use dayfly::http;
 use dayfly::http::AppState;
@@ -127,6 +127,22 @@ fn check_config_file(path: Option<PathBuf>, explicit: bool, strict: bool) -> any
 
     let mut faults = Vec::new();
     let mut warnings = Vec::new();
+    if let Some(path) = path.as_deref().filter(|path| path.exists()) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(path) {
+                println!(
+                    "env file: {} (mode {:04o})",
+                    path.display(),
+                    metadata.permissions().mode() & 0o777
+                );
+            }
+        }
+        #[cfg(not(unix))]
+        println!("env file: {}", path.display());
+        warnings.extend(environment_file_warnings(path));
+    }
     for field in CONFIG_FIELDS {
         let file_value = match field.name {
             "S3_ACCESS_KEY_ID" => lookup("S3_ACCESS_KEY_ID_FILE"),
@@ -370,6 +386,11 @@ async fn main() -> anyhow::Result<()> {
                 check_config_file(config_path.clone(), explicit, *strict)
             }
         };
+    }
+    if let Some(path) = config_path.as_ref().filter(|path| path.exists()) {
+        for warning in environment_file_warnings(path) {
+            tracing::warn!("{warning}");
+        }
     }
     let config = if explicit || config_path.as_ref().is_some_and(|path| path.exists()) {
         Config::from_env_file(config_path.as_deref())?
