@@ -449,6 +449,15 @@ fn parse_env_file(contents: &str, path: &Path) -> Result<HashMap<String, String>
     Ok(values)
 }
 
+/// Build the mode and owner warnings for one environment file.
+///
+/// The environment file can hold the S3 credentials and the bearer token,
+/// so it gets the same mode and owner check as a credential file. The
+/// warnings never include the file contents.
+pub fn environment_file_warnings(path: &Path) -> Vec<String> {
+    credential_warnings(&path.display().to_string())
+}
+
 /// Build the mode and owner warnings for one credential file.
 ///
 /// The warnings never include the file contents. A missing file returns no
@@ -931,6 +940,49 @@ mod tests {
         }
     }
 
+    fn unique_temp_dir() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "dayfly-config-test-dir-{}-{count}",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(unix)]
+    struct TempEnvFile {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl TempEnvFile {
+        fn new(contents: &str, mode: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = unique_temp_dir();
+            std::fs::create_dir(&dir).expect("create temp config directory");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("set temp config directory mode");
+            let path = dir.join("dayfly.env");
+            std::fs::write(&path, contents).expect("write temp env file");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("set temp env file mode");
+            Self { dir, path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TempEnvFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     #[cfg(unix)]
     fn credential_metadata(file: &TempCredentialFile) -> std::fs::Metadata {
         std::fs::metadata(file.path()).expect("read temp credential file metadata")
@@ -945,6 +997,28 @@ mod tests {
             credential_file_warning(file.path(), &credential_metadata(&file)),
             None
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_file_with_mode_0600_produces_no_warning() {
+        let file = TempEnvFile::new("DAYFLY_HTTP_BEARER_TOKEN=secret\n", 0o600);
+        assert_eq!(environment_file_warnings(file.path()), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_file_with_mode_0644_produces_a_warning() {
+        let file = TempEnvFile::new("DAYFLY_HTTP_BEARER_TOKEN=secret\n", 0o644);
+        let warnings = environment_file_warnings(file.path());
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        let warning = &warnings[0];
+        assert!(
+            warning.contains(file.path().to_str().expect("temp path is UTF-8")),
+            "warning: {warning}"
+        );
+        assert!(warning.contains("0644"), "warning: {warning}");
+        assert!(!warning.contains("secret"), "warning: {warning}");
     }
 
     #[cfg(unix)]
