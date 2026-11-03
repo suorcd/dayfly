@@ -1346,6 +1346,52 @@ async fn list_page_shows_the_internal_path_when_configured() {
 }
 
 #[tokio::test]
+async fn view_page_offers_a_paste_token_field_when_enabled() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.paste_tokens = true;
+    let store = Store::from_config(config)
+        .await
+        .expect("the token store must build");
+    let stored = store
+        .store_text(b"token view", None, None, None)
+        .await
+        .expect("the paste must store");
+    let token = stored
+        .paste_token
+        .clone()
+        .expect("a token paste must return a token");
+    let app = common::app(store);
+
+    let request = common::request("GET", &format!("/view/{}", stored.id), &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        page.contains("name=\"paste_token\""),
+        "the delete form must accept a paste token: {page}"
+    );
+
+    let request = common::request("GET", "/pastes", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        page.contains("Paste tokens are on"),
+        "the list must explain how to delete with tokens: {page}"
+    );
+
+    let body = format!("id={}&paste_token={token}", stored.id).into_bytes();
+    let request = common::request("POST", "/ui/delete", &form_headers(body.len()), body);
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "the token field must let the UI delete the paste"
+    );
+}
+
+#[tokio::test]
 async fn view_page_marks_truncated_large_text() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;

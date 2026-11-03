@@ -282,6 +282,9 @@ pub struct AppendTextParams {
     pub id: String,
     /// Text to append. The text cap applies to this append only.
     pub text: String,
+    /// Paste management token, when DAYFLY_PASTE_TOKENS is on and no
+    /// bearer token is configured.
+    pub paste_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -470,11 +473,13 @@ impl Pastebin {
         &self,
         Parameters(params): Parameters<AppendTextParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let appended = try_store!(
-            self.current_store()
-                .append_text(&params.id, params.text.as_bytes())
-                .await
-        );
+        let store = self.current_store();
+        if let Err(result) =
+            check_paste_token(&store, &params.id, params.paste_token.as_deref()).await
+        {
+            return Ok(result);
+        }
+        let appended = try_store!(store.append_text(&params.id, params.text.as_bytes()).await);
         result_json(serde_json::json!({
             "id": appended.meta.id,
             "key": appended.meta.key,
