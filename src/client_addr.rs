@@ -97,7 +97,20 @@ impl FromStr for Cidr {
                 "prefix length {prefix} is too large for {network} (maximum {max})"
             ));
         }
+        let masked = network_address(network, prefix);
+        if masked != network {
+            return Err(format!(
+                "`{value}` has host bits set; use `{masked}/{prefix}`"
+            ));
+        }
         Ok(Self { network, prefix })
+    }
+}
+
+fn network_address(address: IpAddr, prefix: u8) -> IpAddr {
+    match address {
+        IpAddr::V4(address) => IpAddr::V4((u32::from(address) & ipv4_mask(prefix)).into()),
+        IpAddr::V6(address) => IpAddr::V6((u128::from(address) & ipv6_mask(prefix)).into()),
     }
 }
 
@@ -218,6 +231,17 @@ mod tests {
         assert!(range.contains("10.0.0.0".parse().unwrap()));
         assert!(range.contains("10.0.0.255".parse().unwrap()));
         assert!(!range.contains("10.0.1.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_rejects_host_bits_and_names_the_network() {
+        let error = "10.0.0.5/24".parse::<Cidr>().unwrap_err();
+        assert!(error.contains("host bits"), "error: {error}");
+        assert!(error.contains("10.0.0.0/24"), "error: {error}");
+
+        let error = "fd00::1/8".parse::<Cidr>().unwrap_err();
+        assert!(error.contains("host bits"), "error: {error}");
+        assert!(error.contains("fd00::/8"), "error: {error}");
     }
 
     #[test]
