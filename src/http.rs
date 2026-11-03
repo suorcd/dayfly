@@ -869,6 +869,9 @@ async fn delete_dated(
     if let Err(resp) = check_auth(&state, &headers) {
         return resp;
     }
+    if !api_write_allowed(&headers) {
+        return forbidden_write();
+    }
     match state.store.delete(&format!("{date}/{random}")).await {
         Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
         Err(e) => error_response(e),
@@ -882,6 +885,9 @@ async fn delete_bare(
 ) -> Response {
     if let Err(resp) = check_auth(&state, &headers) {
         return resp;
+    }
+    if !api_write_allowed(&headers) {
+        return forbidden_write();
     }
     match state.store.delete(&random).await {
         Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
