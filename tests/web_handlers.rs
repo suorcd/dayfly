@@ -517,6 +517,50 @@ async fn create_submit_creates_a_text_paste_with_filename_and_ttl() {
 }
 
 #[tokio::test]
+async fn unknown_routes_and_methods_render_error_pages() {
+    let fake = FakeS3::start().await;
+    let app = common::full_app(fake.store().await);
+
+    let request = common::request("GET", "/does-not-exist", &[], Vec::new());
+    let (status, headers, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"),
+        "an unknown page must return the HTML error page"
+    );
+    let page = html_text(&body);
+    assert!(
+        page.contains("/does-not-exist"),
+        "the page must name the path"
+    );
+    assert!(page.contains("href=\"/\""), "the page must link home");
+
+    let request = common::request("POST", "/", &[], Vec::new());
+    let (status, headers, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert!(
+        headers[header::ALLOW].to_str().unwrap().contains("GET"),
+        "the 405 must keep the Allow header"
+    );
+    assert!(html_text(&body).contains("Method not allowed"));
+
+    let request = common::request("GET", "/v1/does-not-exist", &[], Vec::new());
+    let (status, headers, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json"),
+        "an unknown API path must return JSON"
+    );
+    assert!(String::from_utf8_lossy(&body).contains("not found"));
+}
+
+#[tokio::test]
 async fn create_submit_redirects_to_the_words_when_enabled() {
     let fake = FakeS3::start().await;
     let app = common::app(fake.store_with_show_words(true).await);

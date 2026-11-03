@@ -342,6 +342,33 @@ fn nav_link(href: &str, label: &str, active: Option<&str>) -> String {
     }
 }
 
+/// A styled 404 page for a path that matches no route.
+pub(crate) fn not_found_page(path: &str) -> Html<String> {
+    page(
+        "Not found",
+        None,
+        true,
+        &format!(
+            "<p>No page matches <code>{}</code>.</p><p><a href=\"/\">Back</a></p>",
+            html_escape(path)
+        ),
+    )
+}
+
+/// A styled 405 page for a path that does not accept the method.
+pub(crate) fn method_not_allowed_page(path: &str) -> Html<String> {
+    page(
+        "Method not allowed",
+        None,
+        true,
+        &format!(
+            "<p>This method is not allowed for <code>{}</code>.</p>\
+             <p><a href=\"/\">Back</a></p>",
+            html_escape(path)
+        ),
+    )
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")

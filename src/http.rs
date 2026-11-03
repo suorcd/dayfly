@@ -21,10 +21,10 @@ use axum::extract::{
     ConnectInfo, DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State,
 };
 use axum::http::header::{
-    ACCEPT, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST,
+    ACCEPT, ALLOW, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST,
     IF_NONE_MATCH, RANGE, RETRY_AFTER,
 };
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -1208,12 +1208,71 @@ pub fn app_router(state: AppState) -> Router {
     api_router()
         .merge(mcp_router(state.clone()))
         .merge(crate::web::ui_router(state.clone()))
+        .fallback(fallback_handler)
+        .layer(middleware::from_fn(map_method_not_allowed))
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             client_context,
         ))
         .with_state(state)
+}
+
+/// Whether an unmatched or wrong-method route should answer with JSON.
+fn error_wants_json(path: &str, headers: &HeaderMap) -> bool {
+    let accepts_json = headers
+        .get(ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("application/json"));
+    accepts_json
+        || path == "/upload"
+        || path == "/mcp"
+        || path == "/v1"
+        || path.starts_with("/v1/")
+        || path == "/raw"
+        || path.starts_with("/raw/")
+}
+
+/// A styled 404 page for an unknown page, and JSON for API paths.
+async fn fallback_handler(uri: Uri, headers: HeaderMap) -> Response {
+    let path = uri.path();
+    if error_wants_json(path, &headers) {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("not found: {path}")})),
+        )
+            .into_response()
+    } else {
+        (StatusCode::NOT_FOUND, crate::web::not_found_page(path)).into_response()
+    }
+}
+
+/// Replace the empty 405 body with the styled page or a JSON error.
+async fn map_method_not_allowed(request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_string();
+    let wants_json = error_wants_json(&path, request.headers());
+    let response = next.run(request).await;
+    if response.status() != StatusCode::METHOD_NOT_ALLOWED {
+        return response;
+    }
+    let allow = response.headers().get(ALLOW).cloned();
+    let mut replacement = if wants_json {
+        (
+            StatusCode::METHOD_NOT_ALLOWED,
+            Json(serde_json::json!({"error": format!("method not allowed: {path}")})),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::METHOD_NOT_ALLOWED,
+            crate::web::method_not_allowed_page(&path),
+        )
+            .into_response()
+    };
+    if let Some(allow) = allow {
+        replacement.headers_mut().insert(ALLOW, allow);
+    }
+    replacement
 }
 
 /// Require the REST bearer token on the MCP endpoint.
