@@ -91,6 +91,18 @@ set, and use the token for API clients. Do not put the token in a URL
 query
 parameter — it would leak into logs and browser history.
 
+`serve` refuses a bind address that other hosts can reach when the
+bearer token is unset. Startup stops with a configuration error, and
+the message names the ways out. The rule has three states:
+
+- Loopback bind, no token: start. This is the default.
+- Non-loopback bind with a token: start. The browser front end stays
+  unusable, as the paragraph above says.
+- Non-loopback bind, no token: refuse, unless
+  `DAYFLY_ALLOW_UNAUTHENTICATED=1` is set. With that value the service
+  starts and writes one warning at startup. Set it only on a network
+  you trust, or behind a proxy that authenticates.
+
 The MCP stdio transport does not use the bearer token: spawning the
 binary locally is the trust boundary there. The MCP transport over
 HTTP at `/mcp` is part of HTTP mode and uses the same bearer token as
@@ -233,6 +245,7 @@ file permission warnings into faults.
 | `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error. The maximum is 52428800000 bytes: 10,000 parts of 5 MiB |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1 and at most 3650. The name and meaning are unchanged |
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
+| `DAYFLY_ALLOW_UNAUTHENTICATED` | no | `false` | Accept a non-loopback bind with no bearer token. Startup refuses that bind without this value, and with it the service writes one warning. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_SHOW_WORDS` | no | `true` | Show the generated three-word alias in the human UI: create redirects, the view page, and the paste list. Display only; the JSON/MCP responses still include `words`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_HTTP_BEARER_TOKEN` | one form | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model); set this variable or `DAYFLY_HTTP_BEARER_TOKEN_FILE` |
 | `DAYFLY_HTTP_BEARER_TOKEN_FILE` | one form | (unset) | Path to a file that contains the bearer token; set this variable or `DAYFLY_HTTP_BEARER_TOKEN` |

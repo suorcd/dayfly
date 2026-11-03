@@ -23,7 +23,8 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
 use dayfly::config::{
-    credential_warnings, load_env_file, parse_bool_flag, Config, CONFIG_FIELDS, MAX_TTL_DAYS,
+    bind_is_loopback, credential_warnings, ensure_bind_is_safe, load_env_file, parse_bool_flag,
+    Config, CONFIG_FIELDS, MAX_TTL_DAYS,
 };
 use dayfly::http;
 use dayfly::http::AppState;
@@ -82,6 +83,19 @@ enum ConfigAction {
         #[arg(long)]
         strict: bool,
     },
+}
+
+/// Name the bind state in one line for `config check`.
+fn exposure_state(bind: &str, has_token: bool, allow_unauthenticated: bool) -> &'static str {
+    if bind_is_loopback(bind) {
+        "loopback"
+    } else if has_token {
+        "non-loopback with a token"
+    } else if allow_unauthenticated {
+        "non-loopback without a token, opted in"
+    } else {
+        "non-loopback without a token, refused"
+    }
 }
 
 /// Validate the environment file and print one line per setting.
@@ -194,8 +208,30 @@ fn check_config_file(path: Option<PathBuf>, explicit: bool, strict: bool) -> any
         } else {
             Config::from_env()
         };
-        if let Err(error) = result {
-            faults.push(error.to_string());
+        match result {
+            Ok(config) => {
+                let exposure = exposure_state(
+                    &config.http_bind,
+                    config.http_bearer_token.is_some(),
+                    config.allow_unauthenticated,
+                );
+                println!("bind exposure: {exposure}");
+                if let Err(error) = ensure_bind_is_safe(
+                    &config.http_bind,
+                    config.http_bearer_token.is_some(),
+                    config.allow_unauthenticated,
+                ) {
+                    faults.push(error.to_string());
+                } else if !bind_is_loopback(&config.http_bind) && config.http_bearer_token.is_none()
+                {
+                    warnings.push(format!(
+                        "{}: unauthenticated service on a non-loopback bind, allowed by \
+                         DAYFLY_ALLOW_UNAUTHENTICATED",
+                        config.http_bind
+                    ));
+                }
+            }
+            Err(error) => faults.push(error.to_string()),
         }
     }
 
@@ -340,6 +376,27 @@ async fn main() -> anyhow::Result<()> {
         Config::from_env()?
     };
     tracing::info!("dayfly starting: {}", config.safe_summary());
+    // Resolve the serve bind before the store starts, so an unsafe bind is
+    // refused for its own reason instead of failing on an S3 error first.
+    let serve_bind = match &cli.command {
+        Some(Command::Serve { bind }) => {
+            Some(bind.clone().unwrap_or_else(|| config.http_bind.clone()))
+        }
+        _ => None,
+    };
+    if let Some(bind_addr) = &serve_bind {
+        ensure_bind_is_safe(
+            bind_addr,
+            config.http_bearer_token.is_some(),
+            config.allow_unauthenticated,
+        )?;
+        if !bind_is_loopback(bind_addr) && config.http_bearer_token.is_none() {
+            tracing::warn!(
+                "serving {bind_addr} without a bearer token: every host that reaches \
+                 this port can read, append to, and delete every paste"
+            );
+        }
+    }
     let store = Store::from_config(config.clone()).await?;
 
     match cli.command {
@@ -348,7 +405,7 @@ async fn main() -> anyhow::Result<()> {
             service.waiting().await?;
         }
         Some(Command::Serve { bind }) => {
-            let bind_addr = bind.unwrap_or(config.http_bind.clone());
+            let bind_addr = serve_bind.unwrap_or(bind.unwrap_or_else(|| config.http_bind.clone()));
             let state = AppState { store };
             let app = http::app_router(state);
             let listener = tokio::net::TcpListener::bind(&bind_addr).await?;

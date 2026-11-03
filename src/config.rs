@@ -50,6 +50,14 @@ pub struct Config {
     pub default_ttl_days: u32,
     /// Default bind address for HTTP mode.
     pub http_bind: String,
+    /// Whether a non-loopback bind may run without a bearer token.
+    ///
+    /// Default: `false`. With the default, `serve` refuses a bind address
+    /// that other hosts can reach when `DAYFLY_HTTP_BEARER_TOKEN` is unset.
+    /// Set this to `true` only on a network you already trust, or behind a
+    /// proxy that authenticates. The service then logs one warning at
+    /// startup. See "Access model" in the README.
+    pub allow_unauthenticated: bool,
     /// Whether the human web UI shows the generated three-word aliases.
     ///
     /// Default: `true`. This is a display setting only: aliases are still
@@ -143,6 +151,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("127.0.0.1:8080"),
         required: false,
         help: "HTTP bind address",
+    },
+    ConfigField {
+        name: "DAYFLY_ALLOW_UNAUTHENTICATED",
+        value: Some("false"),
+        required: false,
+        help: "Start a non-loopback bind with no bearer token",
     },
     ConfigField {
         name: "DAYFLY_SHOW_WORDS",
@@ -459,6 +473,51 @@ pub fn credential_warnings(_path: &str) -> Vec<String> {
     Vec::new()
 }
 
+/// Return true when the bind address accepts connections from this host only.
+///
+/// The check reads the host part of `host:port`. It does not resolve names,
+/// so only the literal `localhost` and a loopback IP address count as local.
+/// Any other value counts as exposed, which is the safe answer for a failed
+/// parse.
+pub fn bind_is_loopback(bind: &str) -> bool {
+    let Some((host, _port)) = bind.rsplit_once(':') else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
+
+/// Refuse an exposed bind that has no authentication in front of it.
+///
+/// Three states. A loopback bind needs no token. A non-loopback bind needs a
+/// token. `DAYFLY_ALLOW_UNAUTHENTICATED` accepts an exposed bind with no
+/// token on purpose, for a deployment behind an authenticating proxy.
+///
+/// Without the token check, one environment change turns every paste in the
+/// bucket into a read, append, and delete target for any host that can reach
+/// the port. The service would not warn.
+pub fn ensure_bind_is_safe(
+    bind: &str,
+    has_token: bool,
+    allow_unauthenticated: bool,
+) -> Result<(), ConfigError> {
+    if bind_is_loopback(bind) || has_token || allow_unauthenticated {
+        return Ok(());
+    }
+    Err(ConfigError::Invalid(
+        bind.to_string(),
+        "this bind address is reachable from other hosts and \
+         DAYFLY_HTTP_BEARER_TOKEN is unset. Set the token, bind to 127.0.0.1, \
+         or set DAYFLY_ALLOW_UNAUTHENTICATED=1 to accept an unauthenticated \
+         service on this network"
+            .to_string(),
+    ))
+}
+
 /// Parse the optional HTTP bearer token.
 ///
 /// An unset value or a value with only ASCII whitespace means "no token".
@@ -727,6 +786,11 @@ impl Config {
                 &lookup,
                 "DAYFLY_SHOW_WORDS",
                 field_default("DAYFLY_SHOW_WORDS") == Some("true"),
+            )?,
+            allow_unauthenticated: optional_bool(
+                &lookup,
+                "DAYFLY_ALLOW_UNAUTHENTICATED",
+                field_default("DAYFLY_ALLOW_UNAUTHENTICATED") == Some("true"),
             )?,
             http_bearer_token: bearer_token(optional_credential(
                 &lookup,
@@ -1026,6 +1090,7 @@ mod tests {
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
             show_words: true,
+            allow_unauthenticated: false,
             http_bearer_token: None,
             mcp_local_root: None,
         }
@@ -1069,6 +1134,57 @@ mod tests {
         let config = Config::from_lookup(lookup_from(&pairs)).expect("default config");
         assert_eq!(config.region, "us-east-1");
         assert_eq!(config.http_bind, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn bind_is_loopback_classifies_common_addresses() {
+        assert!(bind_is_loopback("127.0.0.1:8080"));
+        assert!(bind_is_loopback("[::1]:8080"));
+        assert!(bind_is_loopback("localhost:8080"));
+        assert!(!bind_is_loopback("0.0.0.0:8080"));
+        assert!(!bind_is_loopback("[::]:8080"));
+        assert!(!bind_is_loopback("10.11.111.7:8080"));
+        assert!(!bind_is_loopback("dayfly.k.ser.ink:8080"));
+        assert!(!bind_is_loopback("not an address"));
+    }
+
+    #[test]
+    fn non_loopback_bind_without_a_token_is_refused() {
+        let error = ensure_bind_is_safe("0.0.0.0:8080", false, false)
+            .expect_err("a non-loopback bind with no token must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("DAYFLY_ALLOW_UNAUTHENTICATED"),
+            "the error must name the opt-in: {message}"
+        );
+        assert!(
+            message.contains("0.0.0.0:8080"),
+            "the error must name the bind address: {message}"
+        );
+    }
+
+    #[test]
+    fn loopback_bind_without_a_token_is_allowed() {
+        ensure_bind_is_safe("127.0.0.1:8080", false, false)
+            .expect("a loopback bind needs no token and no opt-in");
+    }
+
+    #[test]
+    fn non_loopback_bind_with_a_token_is_allowed() {
+        ensure_bind_is_safe("0.0.0.0:8080", true, false)
+            .expect("a bearer token covers a non-loopback bind");
+    }
+
+    #[test]
+    fn non_loopback_bind_with_the_opt_in_is_allowed() {
+        ensure_bind_is_safe("[::]:8080", false, true)
+            .expect("the opt-in accepts an exposed bind on purpose");
+    }
+
+    #[test]
+    fn allow_unauthenticated_defaults_to_false() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert!(!config.allow_unauthenticated);
     }
 
     #[test]
