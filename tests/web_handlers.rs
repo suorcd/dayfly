@@ -155,8 +155,16 @@ async fn index_page_shows_curl_examples_for_the_request_base() {
         "the hint must use the request base URL: {page}"
     );
     assert!(
+        page.contains("<details class=\"cli-hint\"><summary>cli</summary>"),
+        "the hint must collapse under a cli summary: {page}"
+    );
+    assert!(
         page.contains("curl -sS --data-binary @note.txt &quot;$BASE/upload&quot;"),
         "the text example is missing: {page}"
+    );
+    assert!(
+        page.contains("cat error.log | curl -sS --data-binary @- &quot;$BASE/upload&quot;"),
+        "the stdin example is missing: {page}"
     );
     assert!(
         page.contains(
@@ -167,10 +175,10 @@ async fn index_page_shows_curl_examples_for_the_request_base() {
     );
     assert!(
         page.contains(
-            "curl -sS -H &quot;Accept: application/json&quot; --data-binary @note.txt \
-             &quot;$BASE/upload&quot;"
+            "curl -sS -H &quot;Accept: application/json&quot; -H &quot;X-TTL: 1h&quot; \
+             --data-binary @note.txt &quot;$BASE/upload&quot;"
         ),
-        "the JSON example is missing: {page}"
+        "the JSON and TTL example is missing: {page}"
     );
     assert!(
         !page.contains("Authorization:"),

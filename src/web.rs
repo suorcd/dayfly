@@ -103,7 +103,7 @@ button{font-size:1rem;padding:.35rem .8rem;cursor:pointer;background:rgba(19,62,
 button:hover{box-shadow:0 0 10px rgba(10,189,198,.4)}
 pre,code{font-family:"Source Code Pro",Hack,ui-monospace,Menlo,Consolas,monospace;background:#133e7c;border:1px dashed #0abdc6;border-radius:4px}
 pre{white-space:pre-wrap;word-wrap:break-word;padding:1rem;overflow-x:auto}
-pre.curl-hint{white-space:pre;word-wrap:normal}
+pre.curl-hint{white-space:pre;word-wrap:normal;background:#091833}
 img{max-width:100%;height:auto;border:1px dashed #0abdc6;border-radius:8px}
 footer{text-align:center;font-size:.85rem;margin-top:2rem;padding-top:1rem;border-top:1px dashed #0abdc6;color:#e3e8fc;opacity:.8}
 .muted{opacity:.7} .expired{color:#ff6b6b}
@@ -267,12 +267,14 @@ fn curl_hint(base: &str, bearer: bool) -> String {
     let commands = format!(
         "BASE={base}\n\
          curl -sS {auth}--data-binary @note.txt \"$BASE/upload\"\n\
+         cat error.log | curl -sS {auth}--data-binary @- \"$BASE/upload\"\n\
          curl -sS {auth}--data-binary @report.pdf -H \"X-Filename: report.pdf\" \"$BASE/upload\"\n\
-         curl -sS {auth}-H \"Accept: application/json\" --data-binary @note.txt \"$BASE/upload\""
+         curl -sS {auth}-H \"Accept: application/json\" -H \"X-TTL: 1h\" --data-binary @note.txt \"$BASE/upload\""
     );
     format!(
-        "<p class=\"muted\">Send a paste from a shell. Set the base URL once:</p>\n\
-         <pre class=\"curl-hint\">{}</pre>\n",
+        "<details class=\"cli-hint\"><summary>cli</summary>\n\
+         <pre class=\"curl-hint\">{}</pre>\n\
+         </details>\n",
         html_escape(&commands)
     )
 }
