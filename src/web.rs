@@ -98,6 +98,16 @@ th:nth-child(4){text-align:center}
 .metadata-toggle:focus-visible ~ .metadata-label{outline:1px dashed #0abdc6;outline-offset:.2rem}
 .metadata-panel{grid-column:1/-1;display:none;margin-top:.5rem;padding:1rem;border:1px dashed #0abdc6;border-radius:8px;background:rgba(19,62,124,.35)}
 .metadata-panel form{background:none;border:0;padding:0;margin:0;border-radius:0;backdrop-filter:none}
+.not-found{text-align:center;margin:2rem 0}
+.not-found-code{font-size:5rem;line-height:1.1;margin-bottom:.5rem;color:#0abdc6;text-shadow:0 0 15px rgba(10,189,198,.55)}
+.not-found h2{border-bottom:none;margin-top:0}
+.not-found-log{max-width:650px;margin:1.5rem auto 2rem;text-align:left;font-size:.95rem}
+.nf-user{color:#ea00d9}
+.nf-error{color:#ffb86c}
+.nf-muted{opacity:.7}
+.nf-warn{color:#e5c07b}
+.nf-cursor{animation:nf-blink 1s step-end infinite}
+@keyframes nf-blink{0%,100%{opacity:1}50%{opacity:0}}
 .metadata-toggle:checked ~ .metadata-panel{display:block}
 .content-box{position:relative}
 .content-box pre{margin:0;padding-right:6rem}
@@ -342,17 +352,28 @@ fn nav_link(href: &str, label: &str, active: Option<&str>) -> String {
     }
 }
 
-/// A styled 404 page for a path that matches no route.
+/// A themed 404 page for a path that matches no route.
 pub(crate) fn not_found_page(path: &str) -> Html<String> {
-    page(
-        "Not found",
-        None,
-        true,
-        &format!(
-            "<p>No page matches <code>{}</code>.</p><p><a href=\"/\">Back</a></p>",
-            html_escape(path)
-        ),
-    )
+    let path = html_escape(path);
+    let body = format!(
+        "<div class=\"not-found\">\
+         <h1 class=\"not-found-code\">404</h1>\
+         <h2>Sector not found</h2>\
+         <pre class=\"not-found-log\"><span class=\"nf-user\">~/dayfly</span> $ cd {path}\n\
+<span class=\"nf-error\">bash: cd: {path}: No such file or directory</span>\n\
+\n\
+<span class=\"nf-user\">~/dayfly</span> $ cat page.html\n\
+<span class=\"nf-error\">cat: page.html: No such file or directory</span>\n\
+\n\
+<span class=\"nf-muted\">Initiating deep bucket scan...</span>\n\
+<span class=\"nf-muted\">Scanning objects.......... [FAILED]</span>\n\
+<span class=\"nf-warn\">Error 404: The requested resource has been wiped, relocated, or never existed.</span>\n\
+\n\
+<span class=\"nf-user\">~/dayfly</span> $ <span class=\"nf-cursor\">_</span></pre>\
+         <a class=\"button\" href=\"/\">cd /</a>\
+         </div>"
+    );
+    page("Not found", None, false, &body)
 }
 
 /// A styled 405 page for a path that does not accept the method.

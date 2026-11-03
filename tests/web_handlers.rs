@@ -537,6 +537,14 @@ async fn unknown_routes_and_methods_render_error_pages() {
         "the page must name the path"
     );
     assert!(page.contains("href=\"/\""), "the page must link home");
+    assert!(
+        page.contains("class=\"not-found-code\">404"),
+        "the page must carry the 404 treatment: {page}"
+    );
+    assert!(
+        page.contains("Sector not found"),
+        "the page must carry the themed heading: {page}"
+    );
 
     let request = common::request("POST", "/", &[], Vec::new());
     let (status, headers, body) = common::send(&app, request).await;
