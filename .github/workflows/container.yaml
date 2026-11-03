@@ -4,15 +4,21 @@ name: container
 # `git ls-remote --tags <repo> <tag>` and replace the SHA and version comment.
 # For an annotated tag, pin the peeled `^{}` commit SHA.
 # Builds the OCI image from the flake, proves it runs, then publishes it to
-# ghcr.io. Pull requests build and smoke test only, so a branch cannot publish.
-# Publication is x86_64-linux only. GitHub runners build that platform. A
-# multi-platform image needs an emulated or native aarch64-linux builder;
-# this workflow does not add one.
+# ghcr.io. Pull requests build and smoke test only when the `ci:full` label is
+# present, so a normal PR does not run the image job and a branch cannot
+# publish. Publication is x86_64-linux only. GitHub runners build that
+# platform. A multi-platform image needs an emulated or native aarch64-linux
+# builder; this workflow does not add one.
 on:
   push:
     branches: [main]
     tags: ["v*"]
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE"
   workflow_dispatch:
 
 concurrency:
@@ -23,6 +29,11 @@ concurrency:
 
 jobs:
   image:
+    name: Build and smoke test the image
+    if: |
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -109,7 +120,30 @@ jobs:
           path: dayfly-image.tar
           if-no-files-found: error
 
+  binary:
+    name: Build the release binary
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Cache Cargo build output
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Build the binary
+        run: cargo build --release
+      - name: Upload the binary
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: dayfly-binary
+          path: target/release/dayfly
+          if-no-files-found: error
+
   publish:
+    name: Publish the image
     needs: image
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -169,3 +203,40 @@ jobs:
             docker push "$repo:$t"
           done
           echo "published ${tags[*]}"
+
+  release:
+    name: Attach release assets
+    needs: [image, binary]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the binary
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: dayfly-binary
+          path: assets
+
+      - name: Download the image tar
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: dayfly-image
+          path: assets
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          prerelease=()
+          case "$TAG" in
+            *-*) prerelease=(--prerelease) ;;
+          esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" assets/dayfly assets/dayfly-image.tar --clobber
+          else
+            gh release create "$TAG" assets/dayfly assets/dayfly-image.tar \
+              --title "$TAG" --generate-notes --verify-tag "${prerelease[@]}"
+          fi

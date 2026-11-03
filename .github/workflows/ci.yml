@@ -2,10 +2,21 @@ name: CI
 
 # Actions are pinned to commit SHAs. To update one, resolve the tag with
 # `git ls-remote --tags <repo> <tag>` and replace the SHA and version comment.
+#
+# Scope: every pull request runs the fast test job. The flake job runs on
+# pushes to main and v* tags, on workflow_dispatch, and on a pull request
+# with the `ci:full` label. A documentation-only pull request skips this
+# workflow. This keeps the slow Nix build off the normal PR path.
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE"
   workflow_dispatch:
 
 permissions:
@@ -39,6 +50,10 @@ jobs:
 
   flake:
     name: Nix flake check and build
+    if: |
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full'))
     runs-on: ubuntu-latest
     steps:
       - name: Check out the repository
@@ -48,6 +63,11 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+      - name: Restore and save the Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', '**/*.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
       - name: Run nix flake check
         run: nix flake check
       - name: Run nix build
