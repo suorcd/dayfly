@@ -92,6 +92,7 @@ details form{background:none;border:0;padding:0;border-radius:0;backdrop-filter:
 .form-actions button[type=submit]{margin-left:auto}
 textarea{width:100%;min-height:12rem;box-sizing:border-box;font-family:"Source Code Pro",Hack,ui-monospace,Menlo,Consolas,monospace;background:#133e7c;color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px;padding:.5rem}
 input,select{font-size:1rem;padding:.3rem .5rem;background:#133e7c;color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px}
+textarea:disabled,input:disabled{opacity:.45;background:#0d2447;color:#9aa6c4;border-color:#4a5568;cursor:not-allowed}
 button{font-size:1rem;padding:.35rem .8rem;cursor:pointer;background:rgba(19,62,124,.5);color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px}
 button:hover{box-shadow:0 0 10px rgba(10,189,198,.4)}
 pre,code{font-family:"Source Code Pro",Hack,ui-monospace,Menlo,Consolas,monospace;background:#133e7c;border:1px dashed #0abdc6;border-radius:4px}
