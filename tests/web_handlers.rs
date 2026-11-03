@@ -819,6 +819,16 @@ async fn list_page_shows_current_pastes_and_hides_expired_ones() {
     );
     assert!(page.contains("last 2 days, ending today in UTC"));
     assert!(
+        page.contains(
+            "class=\"hint\" title=\"Dates are UTC. With no dates, the page shows the last 2 days"
+        ),
+        "the range box must carry the explanation in a tooltip: {page}"
+    );
+    assert!(
+        !page.contains("<p class=\"muted\">Dates are UTC."),
+        "the explanation must not stay in a paragraph: {page}"
+    );
+    assert!(
         !page.contains("sort=expires"),
         "the redundant expires column must be gone: {page}"
     );
