@@ -1036,8 +1036,8 @@ links otherwise. Internal use only — same private-network /
 binary-auth model as the API, no public sharing, accounts, or
 comments.
 
-- `GET /` — combined new-paste form: drop or choose a file, or paste
-  text, with a TTL selector in whole days (1, 3, 7, 14, 30, 90 days;
+- `GET /` — combined new-paste form: paste text or drop and choose a
+  file, with a TTL selector in whole days (1, 3, 7, 14, 30, 90 days;
   the API also accepts sub-day TTLs). One "Create paste" button posts
   multipart data to `POST /ui/create`; a selected file takes
   precedence over the text fields. Without JavaScript, the native file

@@ -353,7 +353,9 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
     let mut body = format!(
         r#"<h2>Paste or upload</h2>
 <form method="post" action="/ui/create" enctype="multipart/form-data" data-max-file-bytes="{max_file_bytes}">
+<p><label>Text<br><textarea name="text" id="text"></textarea></label></p>
 <p><label>Keep for <select name="ttl_days">{}</select></label></p>
+<p class="muted">Or drop a file below. A selected file takes precedence and disables the text fields.</p>
 <label class="dropzone" id="dropzone">
 <input type="file" name="file" id="file">
 <span class="dropzone-title">Drop a file here</span>
@@ -362,8 +364,6 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
 </label>
 <button type="button" id="clear-file" hidden>Remove file</button>
 <p class="muted">Max file size: {max_file_human}</p>
-<p class="muted">Or paste text below. A selected file takes precedence and disables the text fields.</p>
-<p><label>Text<br><textarea name="text" id="text"></textarea></label></p>
 <p><label>Filename (optional, text only) <input type="text" name="filename" id="filename"></label></p>
 <p><button type="submit">Create paste</button></p>
 </form>"#,

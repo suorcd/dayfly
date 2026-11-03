@@ -105,6 +105,11 @@ async fn index_page_renders_the_combined_form_and_the_default_ttl() {
         ttl_at < file_at,
         "the TTL field must precede the file field"
     );
+    let text_at = page.find("name=\"text\"").expect("text field");
+    assert!(
+        text_at < file_at,
+        "the text field must precede the file field"
+    );
     assert!(page.contains("<option value=\"7\" selected>7 days</option>"));
     assert!(page.contains("The selector uses whole days"));
     assert!(page.contains("~/dayfly $"));
