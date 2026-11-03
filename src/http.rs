@@ -570,13 +570,8 @@ async fn meta_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
     if let Err(resp) = check_auth(state, headers) {
         return resp;
     }
-    match state.store.head_metadata(id).await {
-        Ok(meta) => {
-            if meta.expired {
-                return error_response(StoreError::Expired(meta.id));
-            }
-            Json(MetaEnvelope::from(meta)).into_response()
-        }
+    match state.store.head_metadata_live(id).await {
+        Ok(meta) => Json(MetaEnvelope::from(meta)).into_response(),
         Err(e) => error_response(e),
     }
 }

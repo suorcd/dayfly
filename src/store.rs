@@ -2123,6 +2123,18 @@ impl Store {
         self.head_metadata_by_key(&key, id).await
     }
 
+    /// Read metadata and reject an expired paste.
+    ///
+    /// The HTTP metadata route and the MCP `fetch_metadata` tool share
+    /// this method, so both report the same error class for an expired
+    /// paste. [`Self::head_metadata`] stays available for callers that
+    /// need to inspect an expired object, such as set-TTL.
+    pub async fn head_metadata_live(&self, id: &str) -> Result<PasteMetadata, StoreError> {
+        let meta = self.head_metadata(id).await?;
+        Self::check_not_expired(&meta)?;
+        Ok(meta)
+    }
+
     /// Read metadata for a canonical key without another alias lookup.
     async fn head_metadata_by_key(&self, key: &str, id: &str) -> Result<PasteMetadata, StoreError> {
         let out = self
