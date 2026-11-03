@@ -49,8 +49,9 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::http::{
-    check_auth, check_list_access, check_paste_control, public_base, read_metadata_field,
-    status_for, AppState, ListAccessError, MultipartFieldError, MULTIPART_METADATA_MAX_BYTES,
+    check_auth, check_list_access, check_paste_control, public_base, raw_inner,
+    read_metadata_field, status_for, AppState, ListAccessError, MultipartFieldError,
+    MULTIPART_METADATA_MAX_BYTES,
 };
 use crate::store::{
     default_list_window, parse_list_window_request, ListWindowRequest, PasteSummary, Store,
@@ -246,19 +247,18 @@ const NAV_ITEMS: [(&str, &str); 3] = [
     ("/.well-known/dayfly.json", "api description"),
 ];
 
-/// Build one page. `active` names the nav href for the current page.
-///
-/// A page with an active nav item omits its `<h1>`, because the nav
-/// link already names the page.
-fn page(title: &str, active: Option<&str>, body: &str) -> Html<String> {
+/// Build one page. `active` names the nav href for the current page, and
+/// `show_heading` controls the `<h1>`. Pages that repeat a nav label keep
+/// the heading off.
+fn page(title: &str, active: Option<&str>, show_heading: bool, body: &str) -> Html<String> {
     let nav: String = NAV_ITEMS
         .iter()
         .map(|(href, label)| nav_link(href, label, active))
         .collect();
-    let heading = if active.is_some() {
-        String::new()
-    } else {
+    let heading = if show_heading {
         format!("<h1>{title}</h1>\n")
+    } else {
+        String::new()
     };
     let body_class = if active == Some("/pastes") {
         " class=\"wide\""
@@ -527,7 +527,7 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
     body.push_str(
         r#"<p class="muted">The selector uses whole days. API clients can send a sub-day TTL with X-TTL. Expiry is checked on read; the bucket sweeper is day-rounded. The bucket itself is private; only this binary talks to Garage.</p>"#,
     );
-    page("New paste", Some("/"), &body).into_response()
+    page("New paste", Some("/"), false, &body).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -581,6 +581,7 @@ fn error_page(e: StoreError) -> Response {
         page(
             "Error",
             None,
+            true,
             &format!("<p>{}</p><p><a href=\"/\">Back</a></p>", html_escape(&msg)),
         ),
     )
@@ -594,6 +595,7 @@ fn unauthorized_page(message: &str) -> Response {
         page(
             "Unauthorized",
             None,
+            true,
             &format!(
                 "<p>{}</p><p><a href=\"/\">Back</a></p>",
                 html_escape(message)
@@ -610,6 +612,7 @@ fn bad_request_page(message: &str) -> Response {
         page(
             "Error",
             None,
+            true,
             &format!(
                 "<p>{}</p><p><a href=\"/\">Back</a></p>",
                 html_escape(message)
@@ -1131,6 +1134,7 @@ async fn list_handler(
     page(
         "Current pastes",
         Some("/pastes"),
+        false,
         &format!(
             r#"<div class="list-panel"><form method="get" action="/pastes"><p><label>Start <input type="date" name="start" value="{}"></label> <label>End <input type="date" name="end" value="{}"></label> <button type="submit">Show range</button> <span class="hint" title="Dates are UTC. With no dates, the page shows the last {default_days} days, ending today in UTC. Set DAYFLY_LIST_DEFAULT_DAYS to change that. Built from a direct bucket scan (ListObjectsV2 for each date prefix, plus HeadObject per paste). No database. Listing is O(n) in objects scanned and gets slower as the bucket grows — that slowdown is the trigger for adding a database later.">i</span></p></form>
 <div class="table-wrap"><table><colgroup><col class="col-link"><col class="col-filename"><col class="col-content-type"><col class="col-size"><col class="col-created"><col class="col-ttl"><col class="col-action"></colgroup><thead><tr><th>{link_header}</th><th>Filename</th><th>Content-Type</th><th>{size_header}</th><th>{created_header}</th><th class="ttl-header" title="days">TTL</th><th>Action</th></tr></thead><tbody>{}</tbody></table></div></div>"#,
@@ -1182,23 +1186,18 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
     }
     let id_esc = html_escape(&meta.id);
     let main = meta.content_type.split(';').next().unwrap_or("").trim();
-    let words_line = if store.config.show_words {
-        meta.words
-            .as_deref()
-            .map(|words| {
-                let words_esc = html_escape(words);
-                format!("<p>Words: <a href=\"/view/{words_esc}\">{words_esc}</a></p>")
-            })
-            .unwrap_or_default()
+    let raw_target = if store.config.show_words {
+        meta.words.as_deref().unwrap_or(meta.id.as_str())
     } else {
-        String::new()
+        meta.id.as_str()
     };
+    let raw_esc = html_escape(raw_target);
+    let raw_line = format!("<p>Download / raw: <a href=\"/raw/{raw_esc}\">{raw_esc}</a></p>");
     let mut body = format!(
-        "{words_line}<details><summary>Metadata &amp; delete</summary>\
+        "{raw_line}<details><summary>Metadata &amp; delete</summary>\
          <p>Filename: {}</p><p>Content-Type: {}</p><p>Size: {}</p><p>Created: {}</p><p>Expires: {} ({})</p>\
          <form method=\"post\" action=\"/ui/delete\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\"><button type=\"submit\">Delete this paste</button></form>\
-         </details>\
-         <p><a href=\"/v1/pastes/{id_esc}\">Download / raw</a> · <a href=\"/pastes\">Current pastes</a></p>",
+         </details>",
         html_escape(meta.filename.as_deref().unwrap_or("—")),
         html_escape(&meta.content_type),
         human_size(meta.size),
@@ -1231,7 +1230,7 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
             html_escape(meta.filename.as_deref().unwrap_or("image"))
         ));
     }
-    page("View paste", None, &body).into_response()
+    page("View paste", None, false, &body).into_response()
 }
 
 async fn view_dated(
@@ -1248,6 +1247,24 @@ async fn view_bare(
     Path(random): Path<String>,
 ) -> Response {
     view_inner(&state, &headers, &random).await
+}
+
+/// Raw bytes for the view page link. The shared download path keeps the
+/// stored content type and its disposition rules.
+async fn raw_dated(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((date, random)): Path<(String, String)>,
+) -> Response {
+    raw_inner(&state, &headers, &format!("{date}/{random}")).await
+}
+
+async fn raw_bare(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(random): Path<String>,
+) -> Response {
+    raw_inner(&state, &headers, &random).await
 }
 
 /// Deny framing and block MIME sniffing for every UI response.
@@ -1296,6 +1313,8 @@ pub fn ui_router(state: AppState) -> Router<AppState> {
         .route("/pastes", get(list_handler))
         .route("/view/{date}/{random}", get(view_dated))
         .route("/view/{random}", get(view_bare))
+        .route("/raw/{date}/{random}", get(raw_dated))
+        .route("/raw/{random}", get(raw_bare))
         .layer(map_response(deny_framing))
 }
 

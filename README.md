@@ -1067,11 +1067,15 @@ comments.
   The Size and Created headers are links. A click toggles the
   direction and keeps the date filters. A missing created or expiry
   value sorts last in both directions.
-- `GET /view/<id>` — one paste: the word alias when enabled,
-  metadata and the delete form in a collapsed `<details>` block, then
-  the raw/download link, then the content: text in `<pre>` (capped at
-  1 MiB for the page; the API remains the route for full/sliced reads),
-  safe images inline, other types via the download link.
+- `GET /view/<id>` — one paste: a `Download / raw` link that names the
+  alias, or the canonical ID when words are off, then the metadata and
+  delete form in a collapsed `<details>` block, then the content: text
+  in `<pre>` (capped at 1 MiB for the page; the raw route and the API
+  return the full paste), safe images inline, other types via the raw
+  link.
+- `GET /raw/<id>` — the unformatted bytes with the stored
+  Content-Type. An unknown binary type falls back to `text/plain`.
+  HTML and SVG keep the download disposition rules from the API.
 
 Theme: the pages adapt the base look of the user's own site
 stylesheet, https://suorcd.us/style.css (verified live as the site's
@@ -1082,7 +1086,8 @@ background `#091833` (very dark blue), text `#e3e8fc`, accent
 border `#0abdc6` (bright cyan). The file's other two palettes
 (`green-dark`, `neon-dark01`) are **not** used. Layout mirrors the
 site: monospace-first typography, line-height 1.6, 20px body padding,
-1200px centred container, a header with a gradient
+1200px centred container (1600px on the paste list), a header with a
+gradient
 accent-to-transparent bottom border, nav links with a dimmed terminal
 prompt prefix and a dashed cyan border + glow on hover, pink links
 with underline + glow on hover and no visited styling, lowercase

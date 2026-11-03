@@ -728,11 +728,27 @@ async fn meta_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
     }
 }
 
-async fn download_inner(
+pub(crate) async fn download_inner(
     state: &AppState,
     headers: &HeaderMap,
     id: &str,
     is_head: bool,
+) -> Response {
+    download_response(state, headers, id, is_head, false).await
+}
+
+/// Raw view link: keep the stored type, but read an unknown binary type
+/// as plain text so the browser shows it instead of downloading it.
+pub(crate) async fn raw_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response {
+    download_response(state, headers, id, false, true).await
+}
+
+async fn download_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    is_head: bool,
+    raw_fallback: bool,
 ) -> Response {
     if let Err(resp) = check_auth(state, headers) {
         return resp;
@@ -780,13 +796,18 @@ async fn download_inner(
         ETAG,
         HeaderValue::from_str(&etag).unwrap_or_else(|_| HeaderValue::from_static("\"\"")),
     );
+    let content_type = if raw_fallback && meta.content_type == "application/octet-stream" {
+        "text/plain; charset=utf-8".to_string()
+    } else {
+        meta.content_type.clone()
+    };
     resp_headers.insert(
         CONTENT_TYPE,
-        HeaderValue::from_str(&meta.content_type)
+        HeaderValue::from_str(&content_type)
             .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
     );
     let disposition = content_disposition(
-        &meta.content_type,
+        &content_type,
         meta.filename.as_deref(),
         store.config.inline_pdf,
     );

@@ -524,7 +524,9 @@ async fn create_submit_redirects_to_the_words_when_enabled() {
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::OK);
     let page = html_text(&body);
-    assert!(page.contains(&format!("Words: <a href=\"/view/{alias}\">")));
+    assert!(page.contains(&format!(
+        "Download / raw: <a href=\"/raw/{alias}\">{alias}</a>"
+    )));
 }
 
 #[tokio::test]
@@ -958,19 +960,33 @@ async fn view_page_renders_text_escaped_and_images_inline() {
     assert_eq!(status, StatusCode::OK);
     let page = html_text(&body);
     assert!(page.contains("<pre>a &lt; b &amp; c &gt; d &quot;quoted&quot;</pre>"));
-    assert!(page.contains(&format!("/v1/pastes/{}", text.id)));
+    assert!(
+        page.contains(&format!(
+            "Download / raw: <a href=\"/raw/{}\">{}</a>",
+            text.id, text.id
+        )),
+        "the raw link must use the resolved id: {page}"
+    );
+    assert!(
+        !page.contains("<h1>"),
+        "the view page must not repeat a title heading: {page}"
+    );
+    assert!(
+        !page.contains(">Current pastes</a>"),
+        "the nav already links the list: {page}"
+    );
     assert!(page.contains("<details><summary>Metadata &amp; delete</summary>"));
     assert!(page.contains("Delete this paste"));
-    let details_at = page
-        .find("</details>")
-        .expect("the metadata details must close");
     let download_at = page
         .find("Download / raw")
         .expect("the raw link must render");
+    let details_at = page
+        .find("<details>")
+        .expect("the metadata details must render");
     let pre_at = page.find("<pre>").expect("the paste text must render");
     assert!(
-        details_at < download_at && download_at < pre_at,
-        "metadata must be collapsed above the raw link, and the paste content must come last"
+        download_at < details_at && details_at < pre_at,
+        "the raw link must sit above the metadata and the content last"
     );
 
     let request = common::request("GET", &format!("/view/{}", png.id), &[], Vec::new());
@@ -986,7 +1002,7 @@ async fn view_page_renders_text_escaped_and_images_inline() {
     let page = html_text(&body);
     assert!(!page.contains("<img"));
     assert!(!page.contains("<pre>"));
-    assert!(page.contains(&format!("/v1/pastes/{}", html.id)));
+    assert!(page.contains(&format!("/raw/{}", html.id)));
 
     let request = common::request(
         "GET",
@@ -1013,7 +1029,9 @@ async fn view_page_shows_words_when_enabled_and_hides_them_when_disabled() {
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::OK);
     let page = html_text(&body);
-    assert!(page.contains(&format!("Words: <a href=\"/view/{words}\">")));
+    assert!(page.contains(&format!(
+        "Download / raw: <a href=\"/raw/{words}\">{words}</a>"
+    )));
 
     let fake = FakeS3::start().await;
     let store = fake.store_with_show_words(false).await;
@@ -1021,12 +1039,64 @@ async fn view_page_shows_words_when_enabled_and_hides_them_when_disabled() {
         .store_text(b"word view", None, None, None)
         .await
         .expect("text must store");
+    let id = stored.id.clone();
     let app = common::app(store);
 
     let request = common::request("GET", &format!("/view/{}", stored.id), &[], Vec::new());
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(!html_text(&body).contains("Words:"));
+    let page = html_text(&body);
+    assert!(!page.contains("Words:"));
+    assert!(page.contains(&format!("Download / raw: <a href=\"/raw/{id}\">{id}</a>")));
+}
+
+#[tokio::test]
+async fn raw_route_returns_the_unformatted_bytes() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let body = b"a < b & c\n";
+    let stored = store
+        .store_text(body, None, None, None)
+        .await
+        .expect("text must store");
+    let id = stored.id.clone();
+    let words = stored.words.clone().expect("a new paste must have words");
+    let app = common::app(store);
+
+    let request = common::request("GET", &format!("/raw/{id}"), &[], Vec::new());
+    let (status, headers, bytes) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain"),
+        "raw must keep the text content type"
+    );
+    assert_eq!(bytes, body, "raw must return the unformatted bytes");
+
+    let request = common::request("GET", &format!("/raw/{words}"), &[], Vec::new());
+    let (status, _, bytes) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, body, "the alias must resolve on the raw route");
+
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    fake.seed(
+        &format!("pastes/{today}/binaryish"),
+        b"abcde",
+        "application/octet-stream",
+        &common::metadata_refs(&future_metadata(5)),
+    );
+    let request = common::request("GET", &format!("/raw/{today}/binaryish"), &[], Vec::new());
+    let (status, headers, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain"),
+        "an unknown binary type must fall back to text/plain"
+    );
 }
 
 #[tokio::test]
