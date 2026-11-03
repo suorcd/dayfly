@@ -796,7 +796,14 @@ async fn list_page_shows_current_pastes_and_hides_expired_ones() {
     assert!(page.contains(&format!("{today}/visible")));
     assert!(!page.contains(&format!("{today}/expired")));
     assert!(page.contains("2 days"));
-    assert!(page.contains("name=\"date\""));
+    assert!(
+        !page.contains("name=\"date\""),
+        "the page must not offer the single-date selector: {page}"
+    );
+    assert!(
+        !page.contains("Show date"),
+        "the page must not offer the single-date button: {page}"
+    );
     assert!(page.contains("name=\"start\""));
     assert!(page.contains("name=\"end\""));
     assert!(page.contains("yesterday and today in UTC"));
@@ -805,7 +812,6 @@ async fn list_page_shows_current_pastes_and_hides_expired_ones() {
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::OK);
     let page = html_text(&body);
-    assert!(page.contains("value=\"2020-01-01\""));
     assert!(page.contains("No current pastes in this window."));
 
     let request = common::request("GET", "/pastes?date=bad-date", &[], Vec::new());
