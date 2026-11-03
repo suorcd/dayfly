@@ -117,6 +117,14 @@ async fn index_page_renders_the_combined_form_and_the_default_ttl() {
     );
     assert!(page.contains("<option value=\"7\" selected>7 days</option>"));
     assert!(page.contains("The selector uses whole days"));
+    assert!(
+        page.contains("class=\"hint\" title=\"The selector uses whole days."),
+        "the TTL note must move into a tooltip by the selector: {page}"
+    );
+    assert!(
+        !page.contains("<p class=\"muted\">The selector uses whole days."),
+        "the TTL note must not stay in a paragraph: {page}"
+    );
     assert!(page.contains("~/dayfly $"));
     assert!(page.contains("href=\"/.well-known/dayfly.json\""));
     assert!(page.contains("&copy; 2026 suorcd"));

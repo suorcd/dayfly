@@ -527,7 +527,7 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
         r#"<form method="post" action="/ui/create" enctype="multipart/form-data" data-max-file-bytes="{max_file_bytes}">
 <p><label>Text<br><textarea name="text" id="text"></textarea></label></p>
 <div class="form-row">
-<p><label>Keep for <select name="ttl_days">{}</select></label></p>
+<p><label>Keep for <select name="ttl_days">{}</select></label> <span class="hint" title="The selector uses whole days. API clients can send a sub-day TTL with X-TTL. Expiry is checked on read; the bucket sweeper is day-rounded. The bucket itself is private; only this binary talks to Garage.">i</span></p>
 <p><label>Filename (optional, text only) <input type="text" name="filename" id="filename"></label></p>
 </div>
 <p class="muted">Max file size: {max_file_human}. A selected file takes precedence and disables the text fields.</p>
@@ -547,9 +547,6 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
     if let Some(base) = public_base(&headers) {
         body.push_str(&curl_hint(&base, store.config.http_bearer_token.is_some()));
     }
-    body.push_str(
-        r#"<p class="muted">The selector uses whole days. API clients can send a sub-day TTL with X-TTL. Expiry is checked on read; the bucket sweeper is day-rounded. The bucket itself is private; only this binary talks to Garage.</p>"#,
-    );
     page("New paste", Some("/"), false, &body).into_response()
 }
 
