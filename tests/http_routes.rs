@@ -2,6 +2,11 @@
 
 mod common;
 
+use std::io::Write;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+
+use axum::extract::ConnectInfo;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::Router;
 use chrono::{DateTime, Duration, Utc};
@@ -9,6 +14,29 @@ use common::{FailOp, FakeS3};
 use dayfly::http::{api_router, app_router, AppState, MULTIPART_METADATA_MAX_BYTES};
 use dayfly::store::{normalize_words, Store, Ttl};
 use serde_json::{json, Value};
+use tracing_subscriber::fmt::MakeWriter;
+
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl Write for CapturedLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 fn id_from_plain_url(body: &[u8]) -> String {
     String::from_utf8_lossy(body)
@@ -1209,6 +1237,66 @@ async fn cross_origin_api_upload_is_forbidden() {
         String::from_utf8_lossy(&body)
     );
     assert!(fake.keys().is_empty(), "a refused write must store nothing");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_bearer_check_logs_method_path_and_peer() {
+    let fake = FakeS3::start().await;
+    let mut store = fake.store().await;
+    store.config.http_bearer_token = Some("correct-horse-battery-staple".to_string());
+    let app = dayfly::http::app_router(AppState { store });
+
+    let captured = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let mut request = common::request(
+        "GET",
+        "/v1/pastes/example",
+        &[(
+            "authorization",
+            "Bearer wrong-horse-battery-staple".to_string(),
+        )],
+        Vec::new(),
+    );
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 4567))));
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).expect("logs must be UTF-8");
+    assert!(logs.contains("WARN"), "expected one warning, got: {logs}");
+    assert!(logs.contains("method=GET"), "got: {logs}");
+    assert!(logs.contains("path=/v1/pastes/example"), "got: {logs}");
+    assert!(logs.contains("peer=Some(127.0.0.1:4567)"), "got: {logs}");
+    assert!(!logs.contains("wrong-horse"), "the offered token leaked");
+    assert!(!logs.contains("correct-horse"), "the expected token leaked");
+
+    captured.0.lock().unwrap().clear();
+    let mut request = common::request(
+        "GET",
+        "/v1/pastes/example",
+        &[(
+            "authorization",
+            "Bearer correct-horse-battery-staple".to_string(),
+        )],
+        Vec::new(),
+    );
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 4567))));
+    let (_, _, _) = common::send(&app, request).await;
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).expect("logs must be UTF-8");
+    assert!(
+        !logs.contains("WARN"),
+        "a valid token must not warn, got: {logs}"
+    );
 }
 
 #[tokio::test]
