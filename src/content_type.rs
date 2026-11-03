@@ -242,11 +242,11 @@ pub fn detect_content_type_sample(
 ///
 /// Safe inline types are served inline so a web frontend can render an
 /// image or show text. Everything else, and specifically `text/html` and
-/// `image/svg+xml`, is served as an attachment. This is a deliberate v1
-/// choice, not a sandbox: see README. Serving sniffed HTML/SVG inline on
-/// a trusted origin would let an uploaded file run script in that
-/// origin's context.
-pub fn content_disposition(content_type: &str, filename: Option<&str>) -> String {
+/// `image/svg+xml`, is served as an attachment. PDF is inline when
+/// `inline_pdf` is true. This is a deliberate v1 choice, not a sandbox:
+/// see README. Serving sniffed HTML/SVG inline on a trusted origin would
+/// let an uploaded file run script in that origin's context.
+pub fn content_disposition(content_type: &str, filename: Option<&str>, inline_pdf: bool) -> String {
     let main = content_type.split(';').next().unwrap_or("").trim();
     let safe_inline = matches!(
         main,
@@ -257,8 +257,7 @@ pub fn content_disposition(content_type: &str, filename: Option<&str>) -> String
             | "image/jpeg"
             | "image/gif"
             | "image/webp"
-            | "application/pdf"
-    );
+    ) || (inline_pdf && main == "application/pdf");
     let disposition = if safe_inline { "inline" } else { "attachment" };
     match filename {
         Some(f) if !f.is_empty() => {
@@ -612,11 +611,25 @@ mod tests {
 
     #[test]
     fn content_disposition_html_and_svg_are_attachments() {
-        assert!(content_disposition("text/html", Some("x.html")).starts_with("attachment"));
-        assert!(content_disposition("image/svg+xml", Some("x.svg")).starts_with("attachment"));
-        assert!(content_disposition("image/png", Some("x.png")).starts_with("inline"));
-        assert!(content_disposition("text/plain", None).starts_with("inline"));
-        assert!(content_disposition("application/octet-stream", None).starts_with("attachment"));
+        assert!(content_disposition("text/html", Some("x.html"), true).starts_with("attachment"));
+        assert!(content_disposition("image/svg+xml", Some("x.svg"), true).starts_with("attachment"));
+        assert!(content_disposition("image/png", Some("x.png"), true).starts_with("inline"));
+        assert!(content_disposition("text/plain", None, true).starts_with("inline"));
+        assert!(
+            content_disposition("application/octet-stream", None, true).starts_with("attachment")
+        );
+    }
+
+    #[test]
+    fn content_disposition_controls_pdf_inline_and_keeps_html_as_attachment() {
+        assert!(content_disposition("application/pdf", Some("x.pdf"), true).starts_with("inline"));
+        assert!(
+            content_disposition("application/pdf", Some("x.pdf"), false).starts_with("attachment")
+        );
+        assert!(content_disposition("text/html", Some("x.html"), false).starts_with("attachment"));
+        assert!(
+            content_disposition("image/svg+xml", Some("x.svg"), false).starts_with("attachment")
+        );
     }
 
     #[tokio::test]

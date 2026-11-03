@@ -1046,7 +1046,7 @@ async fn view_bare(
     view_inner(&state, &headers, &random).await
 }
 
-/// Deny framing for every UI response.
+/// Deny framing and block MIME sniffing for every UI response.
 ///
 /// The human pages carry an inline style and script, so a broad
 /// `default-src` policy would break them. Keep the policy to framing.
@@ -1058,6 +1058,10 @@ async fn deny_framing(mut response: Response) -> Response {
     response.headers_mut().insert(
         HeaderName::from_static("x-frame-options"),
         HeaderValue::from_static("DENY"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
     );
     response
 }
@@ -1144,6 +1148,7 @@ mod tests {
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
             show_words: false,
+            inline_pdf: true,
             allow_unauthenticated: false,
             http_bearer_token: None,
             mcp_local_root: None,
@@ -1237,6 +1242,14 @@ mod tests {
                     .get("x-frame-options")
                     .and_then(|value| value.to_str().ok()),
                 Some("DENY"),
+                "{uri}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-content-type-options")
+                    .and_then(|value| value.to_str().ok()),
+                Some("nosniff"),
                 "{uri}"
             );
         }

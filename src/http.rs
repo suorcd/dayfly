@@ -24,7 +24,7 @@ use axum::http::header::{
     ACCEPT, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST,
     IF_NONE_MATCH, RANGE,
 };
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -659,14 +659,23 @@ async fn download_inner(
         HeaderValue::from_str(&meta.content_type)
             .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
     );
+    let disposition = content_disposition(
+        &meta.content_type,
+        meta.filename.as_deref(),
+        store.config.inline_pdf,
+    );
+    let inline = disposition.starts_with("inline");
     resp_headers.insert(
         CONTENT_DISPOSITION,
-        HeaderValue::from_str(&content_disposition(
-            &meta.content_type,
-            meta.filename.as_deref(),
-        ))
-        .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+        HeaderValue::from_str(&disposition)
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
     );
+    if inline {
+        resp_headers.insert(
+            HeaderName::from_static("content-security-policy"),
+            HeaderValue::from_static("sandbox"),
+        );
+    }
     resp_headers.insert(
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
@@ -1261,6 +1270,7 @@ mod tests {
             default_ttl_days: 7,
             http_bind: "127.0.0.1:0".to_string(),
             show_words: false,
+            inline_pdf: true,
             allow_unauthenticated: false,
             http_bearer_token: None,
             mcp_local_root: None,

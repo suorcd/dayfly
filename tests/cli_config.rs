@@ -31,6 +31,7 @@ fn command() -> Command {
         "DAYFLY_DEFAULT_TTL_DAYS",
         "DAYFLY_HTTP_BIND",
         "DAYFLY_SHOW_WORDS",
+        "DAYFLY_INLINE_PDF",
         "DAYFLY_HTTP_BEARER_TOKEN",
         "DAYFLY_HTTP_BEARER_TOKEN_FILE",
         "DAYFLY_MCP_LOCAL_ROOT",
