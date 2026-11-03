@@ -77,6 +77,7 @@ a:hover{text-decoration:underline;text-shadow:0 0 8px rgba(234,0,217,.8)}
 table{border-collapse:collapse;width:100%} th,td{text-align:left;padding:.4rem .5rem;border:1px dashed #0abdc6;vertical-align:top}
 .table-wrap{overflow-x:auto}
 th:first-child,td:first-child{white-space:nowrap}
+th:nth-child(4),td:nth-child(4){white-space:nowrap}
 th{color:#ea00d9}
 .card,form{background:rgba(19,62,124,.35);border:1px dashed #0abdc6;border-radius:8px;padding:1rem;backdrop-filter:blur(4px)}
 details{background:rgba(19,62,124,.35);border:1px dashed #0abdc6;border-radius:8px;padding:.5rem 1rem;margin-bottom:1rem}
