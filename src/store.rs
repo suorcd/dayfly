@@ -56,6 +56,14 @@ pub const LIST_WINDOW_MAX_DAYS: usize = 366;
 /// Maximum number of appended segments for one paste.
 pub const MAX_SEGMENTS_PER_PASTE: usize = 4096;
 
+/// Extra segments the reader tolerates above the append cap.
+///
+/// Two concurrent appends can pass the pre-write check and overshoot by
+/// one. The reader must still serve and delete that paste.
+const SEGMENT_READ_HEADROOM: usize = 64;
+/// Hard bound for reading a segment listing.
+const MAX_SEGMENTS_READ: usize = MAX_SEGMENTS_PER_PASTE + SEGMENT_READ_HEADROOM;
+
 /// Maximum bytes returned by one `fetch_text` call. A caller that sends
 /// no limit gets this bound. The caller can page with `offset` to read
 /// the rest.
@@ -2162,7 +2170,7 @@ impl Store {
         let prefix = segment_prefix(base_key);
         let mut entries = Vec::new();
         let mut token: Option<String> = None;
-        let max_pages = MAX_SEGMENTS_PER_PASTE.div_ceil(1000) + 1;
+        let max_pages = MAX_SEGMENTS_READ.div_ceil(1000) + 1;
         for _ in 0..max_pages {
             let mut req = self
                 .client
@@ -2182,9 +2190,9 @@ impl Store {
                     ));
                 }
             }
-            if entries.len() > MAX_SEGMENTS_PER_PASTE {
+            if entries.len() > MAX_SEGMENTS_READ {
                 return Err(StoreError::TooManySegments {
-                    limit: MAX_SEGMENTS_PER_PASTE,
+                    limit: MAX_SEGMENTS_READ,
                 });
             }
             match out.next_continuation_token() {
@@ -2194,7 +2202,7 @@ impl Store {
         }
         // The page limit is reached while the listing is still truncated.
         Err(StoreError::TooManySegments {
-            limit: MAX_SEGMENTS_PER_PASTE,
+            limit: MAX_SEGMENTS_READ,
         })
     }
 

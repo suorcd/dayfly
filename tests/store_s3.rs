@@ -567,7 +567,7 @@ async fn a_transient_alias_read_failure_keeps_the_stored_paste() {
 }
 
 #[tokio::test]
-async fn a_paste_over_the_segment_limit_fails_a_metadata_read() {
+async fn a_paste_over_the_segment_limit_stays_readable_and_deletable() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
     let base_key = "pastes/2026-10-28/manysegments";
@@ -578,13 +578,20 @@ async fn a_paste_over_the_segment_limit_fails_a_metadata_read() {
         fake.seed(&key, b"a", "text/plain", &[]);
     }
 
-    let error = store
+    let meta = store
         .head_metadata("2026-10-28/manysegments")
         .await
-        .expect_err("a paste over the segment limit must not be read");
+        .expect("a paste one segment over the cap must stay readable");
+    assert_eq!(meta.segments.len(), MAX_SEGMENTS_PER_PASTE + 1);
+
+    store
+        .delete("2026-10-28/manysegments")
+        .await
+        .expect("a paste over the cap must still delete");
+    assert!(fake.object(base_key).is_none());
     assert!(
-        matches!(error, StoreError::TooManySegments { .. }),
-        "got {error:?}"
+        fake.keys().iter().all(|key| !key.starts_with(base_key)),
+        "the delete must remove the segments"
     );
 }
 
