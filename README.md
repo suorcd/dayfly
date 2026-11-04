@@ -627,7 +627,11 @@ cat notes.txt | curl --data-binary @- \
 so a shorter or longer window both work. With `DAYFLY_RETENTION_BY_SIZE`
 on, the new expiry stops at the curve value for the current total size.
 The call rewrites the base, every segment, and the alias, then returns
-the metadata shape.
+the metadata shape. The base object is the read-time authority. A
+shortening writes the base first; a later failure keeps the shorter
+expiry. An extension writes the base last; a failure before it keeps the
+old expiry. A failed step returns an error that names the step and the
+object key.
 
 ```sh
 # Shorten to one hour.
@@ -847,6 +851,10 @@ object and leaves the base object unchanged.
   scale with the segment count, not with the total size. It does not
   copy or rewrite the base object, except when
   `DAYFLY_RETENTION_BY_SIZE` shortens the expiry.
+- A shortening append writes the base first, then the earlier segments,
+  and the new segment last. A failure before the last write leaves no
+  new content, so a retry does not duplicate the text. A later `PATCH`
+  rewrites every segment if an earlier segment update failed.
 - Two appends can choose the same sequence. The random suffix keeps the
   object names distinct, so both appends survive.
 - An ID has at most two components after `pastes/`. A segment key has
@@ -859,7 +867,10 @@ object and leaves the base object unchanged.
   range.
 - `fetch_metadata` reports the total size: base plus segments.
 - `delete` removes the base object, every object under its segment
-  prefix, and the alias object.
+  prefix, and the alias object. It lists the segment prefix again after
+  the base delete and removes anything that arrived. An append checks
+  the base after it writes the segment; if the base is gone, it removes
+  the segment.
 - An append keeps the `expires-at` value of the base object. It does
   not extend the TTL. With `DAYFLY_RETENTION_BY_SIZE` on, an append
   that crosses a curve boundary shortens the expiry and rewrites the
@@ -880,8 +891,13 @@ Limits:
   The order of the chunks for one sequence follows the suffix, so the
   order is arbitrary but deterministic. The store does not use a
   conditional write, because Garage accepts `If-None-Match` and ignores
-  it. A delete that races an append can leave an orphan segment; a
-  later delete of the full ID removes it.
+  it.
+- **A delete that races an append does not leave an orphan segment.**
+  The delete removes the base, then lists the segment prefix again and
+  removes anything left. An append checks the base after it writes its
+  segment; if the base is gone, it removes the segment. A later delete
+  of the full ID retries the cleanup. A bare ID or a word alias may not
+  resolve after the base is gone, so keep the full ID.
 - **A segment key is not a paste ID.** The API rejects an ID with three
   components after `pastes/`.
 - **An empty append is a no-op.** It writes no object and keeps the

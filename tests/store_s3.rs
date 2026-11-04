@@ -45,6 +45,26 @@ fn future_metadata(size: usize) -> Vec<(String, String)> {
     )
 }
 
+fn object_expiry(fake: &FakeS3, key: &str) -> String {
+    fake.object(key)
+        .unwrap_or_else(|| panic!("object {key} must exist"))
+        .metadata
+        .get("expires-at")
+        .unwrap_or_else(|| panic!("object {key} must have an expiry"))
+        .clone()
+}
+
+fn segment_keys(fake: &FakeS3, base_key: &str) -> Vec<String> {
+    let prefix = format!("{base_key}/");
+    let mut keys: Vec<String> = fake
+        .keys()
+        .into_iter()
+        .filter(|key| key.starts_with(&prefix))
+        .collect();
+    keys.sort();
+    keys
+}
+
 #[tokio::test]
 async fn store_text_round_trip_through_the_s3_sdk() {
     let fake = FakeS3::start().await;
@@ -3390,4 +3410,551 @@ async fn a_paste_token_stays_out_of_the_alias_and_segments() {
         Some(sha256_hex(token.as_bytes()).as_str()),
         "the base keeps the hash after an append"
     );
+}
+
+#[tokio::test]
+async fn set_ttl_shortening_failure_at_the_base_keeps_the_old_expiry() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"base", None, None, Some(Ttl::days(7)))
+        .await
+        .expect("the base must store");
+    let appended = store
+        .append_text(&stored.id, b"segment")
+        .await
+        .expect("the segment must append");
+    let segment_key = appended.segment_key.expect("the segment key");
+    let alias_key = dayfly::store::alias_key(stored.words.as_deref().expect("the alias"));
+    let old_base = object_expiry(&fake, &stored.key);
+    let old_segment = object_expiry(&fake, &segment_key);
+    let old_alias = object_expiry(&fake, &alias_key);
+
+    fake.fail_copy_key(&stored.key);
+    let error = store
+        .set_ttl(&stored.id, Ttl::parse("1h").expect("one hour"))
+        .await
+        .expect_err("the base rewrite must fail");
+    match error {
+        StoreError::PartialUpdate { step, key } => {
+            assert_eq!(step, "base");
+            assert_eq!(key, stored.key);
+        }
+        other => panic!("expected a base step error, got {other:?}"),
+    }
+    assert_eq!(object_expiry(&fake, &stored.key), old_base);
+    assert_eq!(object_expiry(&fake, &segment_key), old_segment);
+    assert_eq!(object_expiry(&fake, &alias_key), old_alias);
+}
+
+#[tokio::test]
+async fn set_ttl_shortening_failure_at_a_segment_keeps_the_new_base_expiry() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"base", None, None, Some(Ttl::days(7)))
+        .await
+        .expect("the base must store");
+    let first = store
+        .append_text(&stored.id, b"first")
+        .await
+        .expect("the first segment must append");
+    let second = store
+        .append_text(&stored.id, b"second")
+        .await
+        .expect("the second segment must append");
+    let first_key = first.segment_key.expect("the first segment key");
+    let second_key = second.segment_key.expect("the second segment key");
+    let alias_key = dayfly::store::alias_key(stored.words.as_deref().expect("the alias"));
+    let old_base = object_expiry(&fake, &stored.key);
+    let old_first = object_expiry(&fake, &first_key);
+    let old_second = object_expiry(&fake, &second_key);
+    let old_alias = object_expiry(&fake, &alias_key);
+
+    fake.fail_copy_key(&first_key);
+    let error = store
+        .set_ttl(&stored.id, Ttl::parse("1h").expect("one hour"))
+        .await
+        .expect_err("the first segment rewrite must fail");
+    match error {
+        StoreError::PartialUpdate { step, key } => {
+            assert_eq!(step, "segment");
+            assert_eq!(key, first_key);
+        }
+        other => panic!("expected a segment step error, got {other:?}"),
+    }
+    assert_ne!(object_expiry(&fake, &stored.key), old_base);
+    assert_eq!(object_expiry(&fake, &first_key), old_first);
+    assert_ne!(object_expiry(&fake, &second_key), old_second);
+    assert_ne!(object_expiry(&fake, &alias_key), old_alias);
+    let meta = store
+        .head_metadata(&stored.id)
+        .await
+        .expect("the base metadata must be readable");
+    let seconds = (meta.expires_at.expect("the expiry") - Utc::now()).num_seconds();
+    assert!(
+        (3_500..=3_700).contains(&seconds),
+        "the read path must use the new one-hour expiry, got {seconds}"
+    );
+}
+
+#[tokio::test]
+async fn set_ttl_shortening_failure_at_the_alias_keeps_the_new_base_expiry() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"base", None, None, Some(Ttl::days(7)))
+        .await
+        .expect("the base must store");
+    let appended = store
+        .append_text(&stored.id, b"segment")
+        .await
+        .expect("the segment must append");
+    let segment_key = appended.segment_key.expect("the segment key");
+    let alias_key = dayfly::store::alias_key(stored.words.as_deref().expect("the alias"));
+    let old_base = object_expiry(&fake, &stored.key);
+    let old_segment = object_expiry(&fake, &segment_key);
+    let old_alias = object_expiry(&fake, &alias_key);
+
+    fake.fail_copy_key(&alias_key);
+    let error = store
+        .set_ttl(&stored.id, Ttl::parse("1h").expect("one hour"))
+        .await
+        .expect_err("the alias rewrite must fail");
+    match error {
+        StoreError::PartialUpdate { step, key } => {
+            assert_eq!(step, "alias");
+            assert_eq!(key, alias_key);
+        }
+        other => panic!("expected an alias step error, got {other:?}"),
+    }
+    assert_ne!(object_expiry(&fake, &stored.key), old_base);
+    assert_ne!(object_expiry(&fake, &segment_key), old_segment);
+    assert_eq!(object_expiry(&fake, &alias_key), old_alias);
+}
+
+#[tokio::test]
+async fn set_ttl_extension_failure_at_a_segment_keeps_the_old_base_expiry() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"base", None, None, Some(Ttl::days(1)))
+        .await
+        .expect("the base must store");
+    let first = store
+        .append_text(&stored.id, b"first")
+        .await
+        .expect("the first segment must append");
+    let first_key = first.segment_key.expect("the first segment key");
+    let old_base = object_expiry(&fake, &stored.key);
+
+    fake.fail_copy_key(&first_key);
+    let error = store
+        .set_ttl(&stored.id, Ttl::parse("30d").expect("thirty days"))
+        .await
+        .expect_err("the segment rewrite must fail");
+    match error {
+        StoreError::PartialUpdate { step, key } => {
+            assert_eq!(step, "segment");
+            assert_eq!(key, first_key);
+        }
+        other => panic!("expected a segment step error, got {other:?}"),
+    }
+    assert_eq!(
+        object_expiry(&fake, &stored.key),
+        old_base,
+        "an extension must keep the old base expiry when a step fails"
+    );
+    let meta = store
+        .head_metadata(&stored.id)
+        .await
+        .expect("the base metadata must be readable");
+    let seconds = (meta.expires_at.expect("the expiry") - Utc::now()).num_seconds();
+    assert!(
+        seconds < 2 * 86_400,
+        "the read path must keep the old one-day expiry, got {seconds}"
+    );
+}
+
+#[tokio::test]
+async fn set_ttl_extension_failure_at_the_base_keeps_the_old_base_expiry() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"base", None, None, Some(Ttl::days(1)))
+        .await
+        .expect("the base must store");
+    let appended = store
+        .append_text(&stored.id, b"segment")
+        .await
+        .expect("the segment must append");
+    let segment_key = appended.segment_key.expect("the segment key");
+    let old_base = object_expiry(&fake, &stored.key);
+    let old_segment = object_expiry(&fake, &segment_key);
+
+    fake.fail_copy_key(&stored.key);
+    let error = store
+        .set_ttl(&stored.id, Ttl::parse("30d").expect("thirty days"))
+        .await
+        .expect_err("the base rewrite must fail");
+    match error {
+        StoreError::PartialUpdate { step, key } => {
+            assert_eq!(step, "base");
+            assert_eq!(key, stored.key);
+        }
+        other => panic!("expected a base step error, got {other:?}"),
+    }
+    assert_eq!(object_expiry(&fake, &stored.key), old_base);
+    assert_ne!(
+        object_expiry(&fake, &segment_key),
+        old_segment,
+        "the earlier step must have reached the segment"
+    );
+}
+
+#[tokio::test]
+async fn set_ttl_retries_a_transient_segment_failure() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"base", None, None, Some(Ttl::days(1)))
+        .await
+        .expect("the base must store");
+    let appended = store
+        .append_text(&stored.id, b"segment")
+        .await
+        .expect("the segment must append");
+    let segment_key = appended.segment_key.expect("the segment key");
+    let alias_key = dayfly::store::alias_key(stored.words.as_deref().expect("the alias"));
+    let old_base = object_expiry(&fake, &stored.key);
+
+    fake.fail_copy_once(&segment_key);
+    let meta = store
+        .set_ttl(&stored.id, Ttl::parse("30d").expect("thirty days"))
+        .await
+        .expect("the retry must finish the update");
+    let new_base = object_expiry(&fake, &stored.key);
+    assert_ne!(new_base, old_base);
+    assert_eq!(object_expiry(&fake, &segment_key), new_base);
+    assert_eq!(object_expiry(&fake, &alias_key), new_base);
+    assert_eq!(meta.expires_at.expect("the expiry").to_rfc3339(), new_base);
+}
+
+#[tokio::test]
+async fn append_retention_failure_at_the_base_writes_no_segment() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_retention(100, 30, 365).await;
+    let stored = store
+        .store_text(b"0123456789", None, None, Some(Ttl::days(3650)))
+        .await
+        .expect("the base must store");
+    let old_base = object_expiry(&fake, &stored.key);
+
+    fake.fail_copy_key(&stored.key);
+    let error = store
+        .append_text(&stored.id, &[b'a'; 40])
+        .await
+        .expect_err("the base rewrite must fail");
+    match error {
+        StoreError::PartialUpdate { step, key } => {
+            assert_eq!(step, "base");
+            assert_eq!(key, stored.key);
+        }
+        other => panic!("expected a base step error, got {other:?}"),
+    }
+    assert!(
+        segment_keys(&fake, &stored.key).is_empty(),
+        "a failed base rewrite must write no new segment"
+    );
+    assert_eq!(object_expiry(&fake, &stored.key), old_base);
+
+    fake.clear_failures();
+    let appended = store
+        .append_text(&stored.id, &[b'a'; 40])
+        .await
+        .expect("the retry must append once");
+    assert!(appended.segment_key.is_some());
+    assert_eq!(segment_keys(&fake, &stored.key).len(), 1);
+    assert_ne!(object_expiry(&fake, &stored.key), old_base);
+}
+
+#[tokio::test]
+async fn append_retention_failure_at_an_earlier_segment_writes_no_segment() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_retention(100, 30, 365).await;
+    let stored = store
+        .store_text(b"x", None, None, Some(Ttl::days(3650)))
+        .await
+        .expect("the base must store");
+    let first = store
+        .append_text(&stored.id, &[b'a'; 40])
+        .await
+        .expect("the first segment must append");
+    let first_key = first.segment_key.expect("the first segment key");
+    let old_base = object_expiry(&fake, &stored.key);
+    let old_first = object_expiry(&fake, &first_key);
+
+    fake.fail_copy_key(&first_key);
+    let error = store
+        .append_text(&stored.id, &[b'b'; 50])
+        .await
+        .expect_err("the earlier segment rewrite must fail");
+    match error {
+        StoreError::PartialUpdate { step, key } => {
+            assert_eq!(step, "segment");
+            assert_eq!(key, first_key);
+        }
+        other => panic!("expected a segment step error, got {other:?}"),
+    }
+    assert_eq!(
+        segment_keys(&fake, &stored.key).len(),
+        1,
+        "a failed earlier-segment rewrite must write no new segment"
+    );
+    assert_ne!(object_expiry(&fake, &stored.key), old_base);
+    assert_eq!(object_expiry(&fake, &first_key), old_first);
+
+    fake.clear_failures();
+    let second = store
+        .append_text(&stored.id, &[b'b'; 50])
+        .await
+        .expect("the retry must append once");
+    assert!(second.segment_key.is_some());
+    assert_eq!(segment_keys(&fake, &stored.key).len(), 2);
+}
+
+#[tokio::test]
+async fn append_retention_failure_at_the_new_segment_writes_no_segment() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_retention(100, 30, 365).await;
+    let stored = store
+        .store_text(b"0123456789", None, None, Some(Ttl::days(3650)))
+        .await
+        .expect("the base must store");
+    let first = store
+        .append_text(&stored.id, &[b'a'; 40])
+        .await
+        .expect("the first segment must append");
+    let first_key = first.segment_key.expect("the first segment key");
+    let old_base = object_expiry(&fake, &stored.key);
+    let old_first = object_expiry(&fake, &first_key);
+
+    fake.fail_put_prefix(&format!("{}/", stored.key));
+    let error = store
+        .append_text(&stored.id, &[b'b'; 50])
+        .await
+        .expect_err("the new segment write must fail");
+    match error {
+        StoreError::PartialUpdate { step, key } => {
+            assert_eq!(step, "new segment");
+            assert!(key.starts_with(&format!("{}/", stored.key)));
+        }
+        other => panic!("expected a new-segment step error, got {other:?}"),
+    }
+    assert_eq!(
+        segment_keys(&fake, &stored.key).len(),
+        1,
+        "a failed new-segment write must not leave a segment"
+    );
+    assert_ne!(object_expiry(&fake, &stored.key), old_base);
+    assert_ne!(object_expiry(&fake, &first_key), old_first);
+
+    fake.clear_failures();
+    let second = store
+        .append_text(&stored.id, &[b'b'; 50])
+        .await
+        .expect("the retry must append once");
+    assert!(second.segment_key.is_some());
+    assert_eq!(segment_keys(&fake, &stored.key).len(), 2);
+}
+
+#[tokio::test]
+async fn delete_racing_an_append_removes_the_late_segment() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"base", None, None, None)
+        .await
+        .expect("the base must store");
+    let base_key = stored.key.clone();
+    let id = stored.id.clone();
+
+    fake.hold(Gate::PutObject);
+    let append = tokio::spawn({
+        let store = store.clone();
+        let id = id.clone();
+        async move { store.append_text(&id, b"late segment").await }
+    });
+    fake.wait_until_blocked(Gate::PutObject).await;
+    store.delete(&id).await.expect("the delete must succeed");
+    fake.release();
+
+    let result = append.await.expect("the append task must not panic");
+    assert!(
+        matches!(result, Err(StoreError::NotFound(_))),
+        "an append that loses the base must return NotFound, got {result:?}"
+    );
+    assert!(fake.object(&base_key).is_none());
+    assert!(
+        segment_keys(&fake, &base_key).is_empty(),
+        "a late segment must not survive the delete"
+    );
+}
+
+#[tokio::test]
+async fn delete_relists_segments_that_arrive_before_the_base_delete() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"base", None, None, None)
+        .await
+        .expect("the base must store");
+    let base_key = stored.key.clone();
+    let id = stored.id.clone();
+
+    fake.hold(Gate::DeleteObject);
+    let delete = tokio::spawn({
+        let store = store.clone();
+        let id = id.clone();
+        async move { store.delete(&id).await }
+    });
+    fake.wait_until_blocked(Gate::DeleteObject).await;
+
+    let appended = store
+        .append_text(&id, b"late segment")
+        .await
+        .expect("the append must succeed while the base is still there");
+    let segment_key = appended.segment_key.expect("the segment key");
+    assert!(fake.object(&segment_key).is_some());
+
+    fake.release();
+    delete
+        .await
+        .expect("the delete task must not panic")
+        .expect("the delete must succeed");
+    assert!(fake.object(&base_key).is_none());
+    assert!(
+        fake.object(&segment_key).is_none(),
+        "the second segment listing must remove the late segment"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_segment_delete_returns_an_error_and_a_later_full_id_delete_cleans_it() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"base", None, None, None)
+        .await
+        .expect("the base must store");
+    let appended = store
+        .append_text(&stored.id, b"segment")
+        .await
+        .expect("the segment must append");
+    let segment_key = appended.segment_key.expect("the segment key");
+
+    fake.fail_delete_key(&segment_key);
+    let error = store
+        .delete(&stored.id)
+        .await
+        .expect_err("the segment delete must fail");
+    match error {
+        StoreError::PartialUpdate { step, key } => {
+            assert_eq!(step, "segment delete");
+            assert_eq!(key, segment_key);
+        }
+        other => panic!("expected a segment-delete step error, got {other:?}"),
+    }
+    assert!(
+        fake.object(&stored.key).is_none(),
+        "the base is deleted before the segment failure"
+    );
+    assert!(fake.object(&segment_key).is_some());
+
+    fake.clear_failures();
+    store
+        .delete(&stored.id)
+        .await
+        .expect("a later full-id delete must clean the segment");
+    assert!(fake.object(&segment_key).is_none());
+}
+
+#[tokio::test]
+async fn a_failed_base_delete_reports_the_step_and_keeps_the_paste() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"base", None, None, None)
+        .await
+        .expect("the base must store");
+    let appended = store
+        .append_text(&stored.id, b"segment")
+        .await
+        .expect("the segment must append");
+    let segment_key = appended.segment_key.expect("the segment key");
+
+    fake.fail_delete_key(&stored.key);
+    let error = store
+        .delete(&stored.id)
+        .await
+        .expect_err("the base delete must fail");
+    match error {
+        StoreError::PartialUpdate { step, key } => {
+            assert_eq!(step, "base delete");
+            assert_eq!(key, stored.key);
+        }
+        other => panic!("expected a base-delete step error, got {other:?}"),
+    }
+    assert!(fake.object(&stored.key).is_some());
+    assert!(fake.object(&segment_key).is_some());
+
+    fake.clear_failures();
+    store
+        .delete(&stored.id)
+        .await
+        .expect("the retry must delete the paste");
+    assert!(fake.object(&stored.key).is_none());
+    assert!(fake.object(&segment_key).is_none());
+}
+
+#[tokio::test]
+async fn a_failed_segment_list_before_delete_keeps_the_paste() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"base", None, None, None)
+        .await
+        .expect("the base must store");
+    let appended = store
+        .append_text(&stored.id, b"segment")
+        .await
+        .expect("the segment must append");
+    let segment_key = appended.segment_key.expect("the segment key");
+
+    fake.fail_list_prefix(
+        &format!("{}/", stored.key),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "InternalError",
+    );
+    let error = store
+        .delete(&stored.id)
+        .await
+        .expect_err("the segment list must fail");
+    match error {
+        StoreError::PartialUpdate { step, key } => {
+            assert_eq!(step, "segment list");
+            assert_eq!(key, stored.key);
+        }
+        other => panic!("expected a segment-list step error, got {other:?}"),
+    }
+    assert!(fake.object(&stored.key).is_some());
+    assert!(fake.object(&segment_key).is_some());
+
+    fake.clear_failures();
+    store
+        .delete(&stored.id)
+        .await
+        .expect("the retry must delete the paste");
+    assert!(fake.object(&stored.key).is_none());
+    assert!(fake.object(&segment_key).is_none());
 }

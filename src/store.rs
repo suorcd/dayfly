@@ -55,6 +55,10 @@ pub const LIST_SCAN_MAX_PAGES: usize = 10;
 pub const LIST_WINDOW_MAX_DAYS: usize = 366;
 /// Maximum number of appended segments for one paste.
 pub const MAX_SEGMENTS_PER_PASTE: usize = 4096;
+/// Attempts for one object in a multi-object expiry update.
+const MULTI_STEP_ATTEMPTS: usize = 3;
+/// Extra segment-prefix passes after a delete removes the base object.
+const DELETE_SEGMENT_PASSES: usize = 2;
 
 /// Extra segments the reader tolerates above the append cap.
 ///
@@ -103,6 +107,8 @@ pub enum StoreError {
     Io(String),
     #[error("s3 error: {0}")]
     S3(String),
+    #[error("multi-object update failed at the {step} step for {key}")]
+    PartialUpdate { step: &'static str, key: String },
 }
 
 impl From<std::io::Error> for StoreError {
@@ -441,6 +447,17 @@ where
 fn s3_failure(message: &str, error: impl std::fmt::Debug) -> StoreError {
     tracing::warn!("{message}: {error:?}");
     StoreError::S3(message.to_string())
+}
+
+fn partial_update_error(step: &'static str, key: &str, error: StoreError) -> StoreError {
+    match error {
+        // A missing bucket is a configuration fault, not a partial write.
+        StoreError::BucketUnavailable(_) => error,
+        _ => StoreError::PartialUpdate {
+            step,
+            key: key.to_string(),
+        },
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1599,32 +1616,73 @@ impl Store {
             .and_then(|words| self.normalize_alias(&words)))
     }
 
-    /// Delete the base object and every object under its segment prefix.
-    async fn delete_base_and_segments(&self, base_key: &str) -> Result<(), StoreError> {
-        let segments = self.list_segment_entries(base_key).await?;
+    /// Delete one object. DeleteObject is idempotent, so a missing key is
+    /// not an error.
+    async fn delete_object_key(&self, key: &str) -> Result<(), StoreError> {
         self.client
             .delete_object()
             .bucket(&self.bucket)
-            .key(base_key)
+            .key(key)
             .send()
             .await
-            .map_err(|e| map_sdk_error(e, base_key))?;
-        for (key, _) in segments {
-            self.client
-                .delete_object()
-                .bucket(&self.bucket)
-                .key(&key)
-                .send()
-                .await
-                .map_err(|e| map_sdk_error(e, &key))?;
-        }
+            .map_err(|e| map_sdk_error(e, key))?;
         Ok(())
+    }
+
+    /// Delete the base object and every object under its segment prefix.
+    ///
+    /// The first listing runs before the base delete. A listing failure
+    /// therefore leaves the paste intact. After the base is gone, the
+    /// function lists the prefix again and removes anything that arrived
+    /// during the delete. An append that is still in flight removes its
+    /// own segment when it sees that the base is gone.
+    async fn delete_base_and_segments(&self, base_key: &str) -> Result<(), StoreError> {
+        let segments = self
+            .list_segment_entries(base_key)
+            .await
+            .map_err(|error| partial_update_error("segment list", base_key, error))?;
+        self.delete_object_key(base_key)
+            .await
+            .map_err(|error| partial_update_error("base delete", base_key, error))?;
+        let mut first_error = None;
+        for (key, _) in segments {
+            if let Err(error) = self.delete_object_key(&key).await {
+                first_error.get_or_insert(partial_update_error("segment delete", &key, error));
+            }
+        }
+        for _ in 0..DELETE_SEGMENT_PASSES {
+            let remaining = match self.list_segment_entries(base_key).await {
+                Ok(remaining) => remaining,
+                Err(error) => {
+                    first_error.get_or_insert(partial_update_error(
+                        "segment list",
+                        base_key,
+                        error,
+                    ));
+                    break;
+                }
+            };
+            if remaining.is_empty() {
+                break;
+            }
+            for (key, _) in remaining {
+                if let Err(error) = self.delete_object_key(&key).await {
+                    first_error.get_or_insert(partial_update_error("segment delete", &key, error));
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn delete_by_words(&self, phrase: &str) -> Result<(), StoreError> {
         let target = self.read_alias(phrase).await?;
         self.delete_base_and_segments(&target).await?;
-        self.delete_alias_if_target(phrase, &target).await
+        self.delete_alias_if_target(phrase, &target)
+            .await
+            .map_err(|error| partial_update_error("alias delete", &alias_key(phrase), error))
     }
 
     /// Resolve a client ID to an S3 key.
@@ -2288,7 +2346,29 @@ impl Store {
             // extend it.
             object_meta.insert("expires-at".to_string(), expires_at.to_rfc3339());
         }
-        self.client
+        // A shortening append writes the base first, then the earlier
+        // segments, and the new segment last. A failure before the last
+        // write leaves no new content, so a retry does not duplicate the
+        // text. The base is already at the shorter expiry, so a partial
+        // failure cannot leave the paste readable under the old expiry.
+        if let (Some(ttl), Some(new_expiry)) = (shortened_ttl, expires_at) {
+            self.rewrite_expiry_step("base", &meta.key, new_expiry, ttl)
+                .await?;
+            let mut first_error = None;
+            for segment in &meta.segments[..previous_segments] {
+                if let Err(error) = self
+                    .rewrite_expiry_step("segment", &segment.key, new_expiry, ttl)
+                    .await
+                {
+                    first_error.get_or_insert(error);
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+        }
+        if let Err(error) = self
+            .client
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
@@ -2297,7 +2377,13 @@ impl Store {
             .set_metadata(Some(object_meta))
             .send()
             .await
-            .map_err(|e| map_sdk_error(e, &key))?;
+        {
+            tracing::warn!(key = %key, error = ?error, "append segment write failed");
+            return Err(StoreError::PartialUpdate {
+                step: "new segment",
+                key,
+            });
+        }
         meta.segments.push(Segment {
             sequence,
             suffix,
@@ -2306,11 +2392,32 @@ impl Store {
         });
         meta.size = new_size;
         meta.sha256 = None;
-        if let (Some(ttl), Some(expires_at)) = (shortened_ttl, expires_at) {
-            for segment in &meta.segments[..previous_segments] {
-                self.rewrite_expiry(&segment.key, expires_at, ttl).await?;
+        // A delete can remove the base after the first head and before
+        // this segment write. Check the base again. If it is gone, remove
+        // the segment, so an in-flight delete does not leave an orphan.
+        if let Err(error) = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(&meta.key)
+            .send()
+            .await
+        {
+            let mapped = map_sdk_error(error, &meta.key);
+            let mut removed = false;
+            for _ in 0..MULTI_STEP_ATTEMPTS {
+                if self.delete_object_key(&key).await.is_ok() {
+                    removed = true;
+                    break;
+                }
             }
-            self.rewrite_expiry(&meta.key, expires_at, ttl).await?;
+            if !removed {
+                tracing::warn!(
+                    key = %key,
+                    "cannot remove the segment after the base disappeared"
+                );
+            }
+            return Err(mapped);
         }
         meta.expires_at = expires_at;
         meta.expired = false;
@@ -2465,6 +2572,33 @@ impl Store {
         Ok(())
     }
 
+    /// Rewrite one object's expiry and retry a transient failure.
+    ///
+    /// The function returns [`StoreError::PartialUpdate`] when every
+    /// attempt fails. The message names the step and the object key. The
+    /// base object is the read-time authority, so the caller writes it in
+    /// the order that keeps the safe expiry.
+    async fn rewrite_expiry_step(
+        &self,
+        step: &'static str,
+        key: &str,
+        expires_at: DateTime<Utc>,
+        ttl: Ttl,
+    ) -> Result<(), StoreError> {
+        let mut last_error = None;
+        for _ in 0..MULTI_STEP_ATTEMPTS {
+            match self.rewrite_expiry(key, expires_at, ttl).await {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(partial_update_error(
+            step,
+            key,
+            last_error.unwrap_or_else(|| StoreError::S3("multi-object update failed".to_string())),
+        ))
+    }
+
     /// Change the expiry of an existing paste, every segment, and the alias.
     ///
     /// The new expiry is computed from now, so an extension is real. With
@@ -2491,14 +2625,57 @@ impl Store {
             return Err(StoreError::Expired(meta.id.clone()));
         }
         let ttl = Ttl::seconds((expires_at - now).num_seconds());
-        for segment in &meta.segments {
-            self.rewrite_expiry(&segment.key, expires_at, ttl).await?;
-        }
-        if let Some(words) = &meta.words {
-            self.rewrite_expiry(&alias_key(words), expires_at, ttl)
+        let shortening = meta.expires_at.is_some_and(|current| expires_at < current);
+        let mut first_error = None;
+        if shortening {
+            // The base is the read-time authority. Write it first, so a
+            // later failure cannot leave the old, longer expiry in force.
+            self.rewrite_expiry_step("base", &meta.key, expires_at, ttl)
                 .await?;
+            for segment in &meta.segments {
+                if let Err(error) = self
+                    .rewrite_expiry_step("segment", &segment.key, expires_at, ttl)
+                    .await
+                {
+                    first_error.get_or_insert(error);
+                }
+            }
+            if let Some(words) = &meta.words {
+                let key = alias_key(words);
+                if let Err(error) = self
+                    .rewrite_expiry_step("alias", &key, expires_at, ttl)
+                    .await
+                {
+                    first_error.get_or_insert(error);
+                }
+            }
+        } else {
+            // Keep the old base expiry until every other object is new.
+            for segment in &meta.segments {
+                if let Err(error) = self
+                    .rewrite_expiry_step("segment", &segment.key, expires_at, ttl)
+                    .await
+                {
+                    first_error.get_or_insert(error);
+                }
+            }
+            if let Some(words) = &meta.words {
+                let key = alias_key(words);
+                if let Err(error) = self
+                    .rewrite_expiry_step("alias", &key, expires_at, ttl)
+                    .await
+                {
+                    first_error.get_or_insert(error);
+                }
+            }
+            if first_error.is_none() {
+                self.rewrite_expiry_step("base", &meta.key, expires_at, ttl)
+                    .await?;
+            }
         }
-        self.rewrite_expiry(&meta.key, expires_at, ttl).await?;
+        if let Some(error) = first_error {
+            return Err(error);
+        }
         meta.expires_at = Some(expires_at);
         meta.expired = false;
         Ok(meta)
@@ -2687,7 +2864,9 @@ impl Store {
         let words = self.base_words(&key).await?;
         self.delete_base_and_segments(&key).await?;
         if let Some(words) = words {
-            self.delete_alias_if_target(&words, &key).await?;
+            self.delete_alias_if_target(&words, &key)
+                .await
+                .map_err(|error| partial_update_error("alias delete", &alias_key(&words), error))?;
         }
         Ok(())
     }

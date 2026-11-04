@@ -210,6 +210,7 @@ fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> 
         StoreError::Io(_)
         | StoreError::S3(_)
         | StoreError::BucketUnavailable(_)
+        | StoreError::PartialUpdate { .. }
         | StoreError::AliasUnavailable { .. } => {
             Err(rmcp::ErrorData::internal_error(e.to_string(), None))
         }
