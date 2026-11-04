@@ -286,6 +286,7 @@ pub(crate) fn status_for(e: &StoreError) -> StatusCode {
         StoreError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         StoreError::S3(_) => StatusCode::BAD_GATEWAY,
         StoreError::BucketUnavailable(_) => StatusCode::BAD_GATEWAY,
+        StoreError::PartialUpdate { .. } => StatusCode::BAD_GATEWAY,
     }
 }
 

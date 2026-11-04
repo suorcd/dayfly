@@ -80,6 +80,9 @@ pub struct FakeState {
     pub fail_list_prefixes: Vec<(String, StatusCode, String)>,
     pub fail_put_prefixes: Vec<String>,
     pub fail_get_prefixes: Vec<String>,
+    pub fail_copy_keys: Vec<String>,
+    pub fail_copy_once_keys: Vec<String>,
+    pub fail_delete_keys: Vec<String>,
     pub missing_bucket: bool,
 }
 
@@ -101,6 +104,10 @@ impl FakeState {
 pub enum Gate {
     /// Every HeadObject, including the alias probe.
     HeadObject,
+    /// Every plain PutObject, such as a new segment.
+    PutObject,
+    /// Every DeleteObject, such as the base object.
+    DeleteObject,
     /// CreateMultipartUpload.
     CreateMultipartUpload,
 }
@@ -435,6 +442,48 @@ impl FakeS3 {
             .push(prefix.to_string());
     }
 
+    /// Make every CopyObject whose destination is `key` fail.
+    pub fn fail_copy_key(&self, key: &str) {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .fail_copy_keys
+            .push(key.to_string());
+    }
+
+    /// Make the next CopyObject whose destination is `key` fail.
+    pub fn fail_copy_once(&self, key: &str) {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .fail_copy_once_keys
+            .push(key.to_string());
+    }
+
+    /// Make every DeleteObject for `key` fail.
+    pub fn fail_delete_key(&self, key: &str) {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .fail_delete_keys
+            .push(key.to_string());
+    }
+
+    /// Clear every injected failure. Held gates stay held.
+    pub fn clear_failures(&self) {
+        let mut state = self.state.lock().expect("fake state lock");
+        state.fail_ops.clear();
+        state.fail_part_number = None;
+        state.fail_head_keys.clear();
+        state.fail_head_errors.clear();
+        state.fail_list_prefixes.clear();
+        state.fail_put_prefixes.clear();
+        state.fail_get_prefixes.clear();
+        state.fail_copy_keys.clear();
+        state.fail_copy_once_keys.clear();
+        state.fail_delete_keys.clear();
+    }
+
     pub fn drop_upload(&self, upload_id: &str) {
         self.state
             .lock()
@@ -606,6 +655,12 @@ async fn handle_request(State(app): State<FakeApp>, req: Request) -> Response {
     let gate = match method.as_str() {
         "HEAD" => Some(Gate::HeadObject),
         "POST" if has_query_param(&uri, "uploads") => Some(Gate::CreateMultipartUpload),
+        "PUT"
+            if !headers.contains_key("x-amz-copy-source") && !has_query_param(&uri, "uploadId") =>
+        {
+            Some(Gate::PutObject)
+        }
+        "DELETE" => Some(Gate::DeleteObject),
         _ => None,
     };
     if let Some(gate) = gate {
@@ -807,6 +862,15 @@ fn parse_range(value: &str, size: u64) -> Option<(u64, u64)> {
 
 fn delete_object(state: &Arc<Mutex<FakeState>>, key: Option<String>) -> Response {
     let mut state = state.lock().expect("fake state lock");
+    if let Some(key) = key.as_deref() {
+        if state.fail_delete_keys.iter().any(|failed| failed == key) {
+            return s3_error(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "injected DeleteObject key failure",
+            );
+        }
+    }
     if let Some(key) = key {
         state.objects.remove(&key);
     }
@@ -833,6 +897,25 @@ fn copy_object(
             "missing object key",
         );
     };
+    if state.fail_copy_keys.contains(&key) {
+        return s3_error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "injected CopyObject key failure",
+        );
+    }
+    if let Some(index) = state
+        .fail_copy_once_keys
+        .iter()
+        .position(|failed| failed == &key)
+    {
+        state.fail_copy_once_keys.remove(index);
+        return s3_error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "injected one-shot CopyObject failure",
+        );
+    }
     let Some(source) = headers
         .get("x-amz-copy-source")
         .and_then(|v| v.to_str().ok())
