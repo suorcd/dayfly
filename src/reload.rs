@@ -214,6 +214,9 @@ fn changed_fields(old: &Config, new: &Config) -> Vec<&'static str> {
     if old.show_internal_paths != new.show_internal_paths {
         changed.push("DAYFLY_SHOW_INTERNAL_PATHS");
     }
+    if old.view_line_numbers != new.view_line_numbers {
+        changed.push("DAYFLY_VIEW_LINE_NUMBERS");
+    }
     if old.list_default_days != new.list_default_days {
         changed.push("DAYFLY_LIST_DEFAULT_DAYS");
     }

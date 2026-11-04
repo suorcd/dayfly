@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use dayfly::config::{Config, ConfigError};
 
-const VARS: [&str; 26] = [
+const VARS: [&str; 27] = [
     "S3_ENDPOINT",
     "S3_BUCKET",
     "S3_REGION",
@@ -36,6 +36,7 @@ const VARS: [&str; 26] = [
     "DAYFLY_INLINE_PDF",
     "DAYFLY_MCP_LOCAL_ROOT",
     "DAYFLY_FAVICON_PATH",
+    "DAYFLY_VIEW_LINE_NUMBERS",
 ];
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -105,6 +106,7 @@ fn minimal_environment_applies_documented_defaults() {
     assert!(config.show_words);
     assert!(!config.show_internal_paths);
     assert!(config.favicon.is_none());
+    assert!(!config.view_line_numbers);
     assert!(config.inline_pdf);
     assert_eq!(config.http_bearer_token, None);
     assert_eq!(config.mcp_local_root, None);
@@ -243,6 +245,7 @@ fn optional_values_override_the_defaults() {
     env::set_var("DAYFLY_HTTP_BIND", "0.0.0.0:9999");
     env::set_var("DAYFLY_SHOW_WORDS", "false");
     env::set_var("DAYFLY_SHOW_INTERNAL_PATHS", "true");
+    env::set_var("DAYFLY_VIEW_LINE_NUMBERS", "true");
     env::set_var("DAYFLY_INLINE_PDF", "false");
     env::set_var("DAYFLY_HTTP_BEARER_TOKEN", "token-value");
 
@@ -256,6 +259,7 @@ fn optional_values_override_the_defaults() {
     assert_eq!(config.http_bind, "0.0.0.0:9999");
     assert!(!config.show_words);
     assert!(config.show_internal_paths);
+    assert!(config.view_line_numbers);
     assert!(!config.inline_pdf);
     assert_eq!(config.http_bearer_token.as_deref(), Some("token-value"));
     assert_eq!(config.max_bytes_for_upload(None), 1234);

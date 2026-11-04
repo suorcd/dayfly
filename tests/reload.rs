@@ -102,6 +102,7 @@ async fn reload_swaps_credentials_token_caps_ttl_and_show_words() {
     new_config.list_requires_token = true;
     new_config.rate_limit_per_minute = 7;
     new_config.show_internal_paths = true;
+    new_config.view_line_numbers = true;
     new_config.list_default_days = 5;
     new_config.favicon = Some(dayfly::config::Favicon {
         bytes: std::sync::Arc::from(&b"icon"[..]),
@@ -124,6 +125,7 @@ async fn reload_swaps_credentials_token_caps_ttl_and_show_words() {
         "DAYFLY_LIST_REQUIRES_TOKEN",
         "DAYFLY_RATE_LIMIT_PER_MINUTE",
         "DAYFLY_SHOW_INTERNAL_PATHS",
+        "DAYFLY_VIEW_LINE_NUMBERS",
         "DAYFLY_LIST_DEFAULT_DAYS",
         "DAYFLY_FAVICON_PATH",
     ] {

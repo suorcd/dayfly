@@ -112,6 +112,10 @@ th:nth-child(4){text-align:center}
 .content-box{position:relative}
 .content-box pre{margin:0;padding-right:6rem}
 .copy-content{position:absolute;top:.5rem;right:.5rem}
+pre.numbered{counter-reset:line;white-space:pre;overflow-x:auto}
+pre.numbered .line{counter-increment:line}
+pre.numbered .ln{user-select:none}
+pre.numbered .ln::before{content:counter(line);display:inline-block;min-width:3ch;margin-right:1ch;text-align:right;opacity:.5}
 a.button{display:inline-block;font-size:1rem;padding:.35rem .8rem;cursor:pointer;background:rgba(19,62,124,.5);color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px;text-decoration:none}
 a.button:hover{text-decoration:none;box-shadow:0 0 10px rgba(10,189,198,.4)}
 .table-wrap{overflow-x:auto}
@@ -1300,6 +1304,31 @@ fn text_preview_type(main: &str) -> bool {
         )
 }
 
+/// Maximum lines that the view page numbers.
+const MAX_NUMBERED_LINES: usize = 5_000;
+
+/// Render the text preview, optionally with presentation-only line numbers.
+///
+/// The generated numbers never enter the DOM text: they come from a CSS
+/// counter on an empty span. `textContent` therefore equals `text`.
+fn text_pre_view(text: &str, line_numbers: bool) -> String {
+    if !line_numbers {
+        return format!("<pre>{}</pre>", html_escape(text));
+    }
+    let lines = text.bytes().filter(|byte| *byte == b'\n').count() + usize::from(!text.is_empty());
+    if lines > MAX_NUMBERED_LINES {
+        return format!("<pre>{}</pre>", html_escape(text));
+    }
+    let mut out = String::from("<pre class=\"numbered\">");
+    for line in text.split_inclusive('\n') {
+        out.push_str("<span class=\"line\"><span class=\"ln\" aria-hidden=\"true\"></span>");
+        out.push_str(&html_escape(line));
+        out.push_str("</span>");
+    }
+    out.push_str("</pre>");
+    out
+}
+
 async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response {
     if let Err(resp) = check_auth(state, headers) {
         return resp;
@@ -1353,12 +1382,12 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
         let slice = store.fetch_text(&meta.id, 0, Some(1_000_000)).await;
         match slice {
             Ok(s) => {
+                let pre = text_pre_view(&s.text, store.config.view_line_numbers);
                 body.push_str(&format!(
                     "<hr>\
                      <div class=\"content-box\"><button type=\"button\" class=\"copy-content\" \
                      aria-label=\"Copy paste content\" hidden>Copy</button>\
-                     <pre>{}</pre></div>",
-                    html_escape(&s.text)
+                     {pre}</div>"
                 ));
                 if s.truncated {
                     body.push_str("<p class=\"muted\">Text truncated at 1 MiB for this view. The raw route returns the full paste.</p>");
@@ -1518,6 +1547,7 @@ mod tests {
             show_words: false,
             show_internal_paths: false,
             inline_pdf: true,
+            view_line_numbers: false,
             allow_unauthenticated: false,
             list_requires_token: false,
             paste_tokens: false,
