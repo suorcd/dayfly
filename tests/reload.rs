@@ -108,6 +108,12 @@ async fn reload_swaps_credentials_token_caps_ttl_and_show_words() {
         bytes: std::sync::Arc::from(&b"icon"[..]),
         content_type: "image/x-icon",
     });
+    new_config.robots_txt = Some(dayfly::config::TextAsset {
+        bytes: std::sync::Arc::from(&b"User-agent: *\nDisallow: /\n"[..]),
+    });
+    new_config.security_txt = Some(dayfly::config::TextAsset {
+        bytes: std::sync::Arc::from(&b"Contact: https://example.invalid/\n"[..]),
+    });
 
     let report = reload_with_config(&state, new_config, "127.0.0.1:8080")
         .await
@@ -128,6 +134,8 @@ async fn reload_swaps_credentials_token_caps_ttl_and_show_words() {
         "DAYFLY_VIEW_LINE_NUMBERS",
         "DAYFLY_LIST_DEFAULT_DAYS",
         "DAYFLY_FAVICON_PATH",
+        "DAYFLY_ROBOTS_TXT_PATH",
+        "DAYFLY_SECURITY_TXT_PATH",
     ] {
         assert!(
             report.changed.contains(&field),

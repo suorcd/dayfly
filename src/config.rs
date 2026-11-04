@@ -184,6 +184,16 @@ pub struct Config {
     /// at startup and must be 1 MiB or smaller. When unset, the route
     /// returns 404.
     pub favicon: Option<Favicon>,
+    /// Optional `robots.txt` served at `/robots.txt`.
+    ///
+    /// The path comes from `DAYFLY_ROBOTS_TXT_PATH`. The file is read
+    /// once at startup. When unset, the route returns 404.
+    pub robots_txt: Option<TextAsset>,
+    /// Optional `security.txt` served at `/.well-known/security.txt`.
+    ///
+    /// The path comes from `DAYFLY_SECURITY_TXT_PATH`. The file is read
+    /// once at startup. When unset, the route returns 404.
+    pub security_txt: Option<TextAsset>,
 }
 
 /// A favicon image loaded at startup.
@@ -193,6 +203,13 @@ pub struct Favicon {
     pub bytes: Arc<[u8]>,
     /// Response content type for the bytes.
     pub content_type: &'static str,
+}
+
+/// A UTF-8 text file served at a fixed path.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TextAsset {
+    /// Raw file bytes.
+    pub bytes: Arc<[u8]>,
 }
 
 /// One setting that the environment file template and the parser share.
@@ -367,6 +384,18 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: None,
         required: false,
         help: "Optional path to a favicon served at /favicon.ico",
+    },
+    ConfigField {
+        name: "DAYFLY_ROBOTS_TXT_PATH",
+        value: None,
+        required: false,
+        help: "Optional path to a robots.txt file served at /robots.txt",
+    },
+    ConfigField {
+        name: "DAYFLY_SECURITY_TXT_PATH",
+        value: None,
+        required: false,
+        help: "Optional path to a security.txt file served at /.well-known/security.txt",
     },
 ];
 
@@ -817,6 +846,40 @@ fn local_root(value: Option<String>) -> Result<Option<PathBuf>, ConfigError> {
 /// Largest favicon accepted at startup.
 const MAX_FAVICON_BYTES: usize = 1024 * 1024;
 
+/// Largest text asset accepted at startup.
+const MAX_TEXT_ASSET_BYTES: usize = 1024 * 1024;
+
+/// Load an optional UTF-8 text file served at a fixed path.
+fn text_asset(value: Option<String>, name: &str) -> Result<Option<TextAsset>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let path = Path::new(value);
+    let bytes = std::fs::read(path)
+        .map_err(|e| ConfigError::Invalid(name.to_string(), format!("cannot read {value}: {e}")))?;
+    if bytes.is_empty() {
+        return Err(ConfigError::Invalid(
+            name.to_string(),
+            "the file is empty".to_string(),
+        ));
+    }
+    if bytes.len() > MAX_TEXT_ASSET_BYTES {
+        return Err(ConfigError::Invalid(
+            name.to_string(),
+            format!("the file is larger than {MAX_TEXT_ASSET_BYTES} bytes"),
+        ));
+    }
+    std::str::from_utf8(&bytes)
+        .map_err(|_| ConfigError::Invalid(name.to_string(), "the file is not UTF-8".to_string()))?;
+    Ok(Some(TextAsset {
+        bytes: Arc::from(bytes.into_boxed_slice()),
+    }))
+}
+
 /// Load the optional favicon file and pick its response content type.
 fn favicon(value: Option<String>) -> Result<Option<Favicon>, ConfigError> {
     let Some(value) = value else {
@@ -1226,6 +1289,11 @@ impl Config {
             )?)?,
             mcp_local_root: local_root(lookup("DAYFLY_MCP_LOCAL_ROOT"))?,
             favicon: favicon(lookup("DAYFLY_FAVICON_PATH"))?,
+            robots_txt: text_asset(lookup("DAYFLY_ROBOTS_TXT_PATH"), "DAYFLY_ROBOTS_TXT_PATH")?,
+            security_txt: text_asset(
+                lookup("DAYFLY_SECURITY_TXT_PATH"),
+                "DAYFLY_SECURITY_TXT_PATH",
+            )?,
         })
     }
 
@@ -1287,7 +1355,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} list_requires_token={} paste_tokens={} rate_limit_per_minute={} mcp_local_root={} favicon={}",
+            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} list_requires_token={} paste_tokens={} rate_limit_per_minute={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -1318,6 +1386,16 @@ impl Config {
                 "unset"
             },
             if self.favicon.is_some() {
+                "set"
+            } else {
+                "unset"
+            },
+            if self.robots_txt.is_some() {
+                "set"
+            } else {
+                "unset"
+            },
+            if self.security_txt.is_some() {
                 "set"
             } else {
                 "unset"
@@ -1659,6 +1737,8 @@ mod tests {
             http_bearer_token: None,
             mcp_local_root: None,
             favicon: None,
+            robots_txt: None,
+            security_txt: None,
         }
     }
 

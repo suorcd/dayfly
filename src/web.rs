@@ -1549,6 +1549,8 @@ mod tests {
             http_bearer_token: None,
             mcp_local_root: None,
             favicon: None,
+            robots_txt: None,
+            security_txt: None,
         }
     }
 
