@@ -224,7 +224,8 @@ both forms; the plain-text HTTP response returns only the URL. See
 
 The running service publishes `GET /.well-known/dayfly.json` without
 authentication. The document reports the crate version, the auth mode,
-the limits in force, and every API route. The frontend links to it.
+the content policy (`inline_pdf`), the limits in force, and every API
+route. The frontend links to it.
 
 The reference deployment serves it at
 [`/.well-known/dayfly.json`](https://dayfly.k.ser.ink/.well-known/dayfly.json).
@@ -335,6 +336,8 @@ permissions and the lower total cap.
 | `DAYFLY_HTTP_BEARER_TOKEN_FILE` | one form | (unset) | Path to a file that contains the bearer token; set this variable or `DAYFLY_HTTP_BEARER_TOKEN` |
 | `DAYFLY_MCP_LOCAL_ROOT` | no | (unset) | Directory for the MCP local-path tools. It must exist, or startup fails. When set, `store_file` and `fetch_file` refuse any path outside it, after resolving symlinks. When unset, the stdio transport accepts any readable path and the HTTP transport refuses both tools |
 | `DAYFLY_FAVICON_PATH` | no | (unset) | Path to a favicon served at `/favicon.ico`. The file is read at startup and must be 1 MiB or smaller. The content type follows the extension (`.ico`, `.png`, `.svg`, `.gif`, `.jpg`, `.webp`). Unset returns 404 |
+| `DAYFLY_ROBOTS_TXT_PATH` | no | (unset) | Path to a `robots.txt` served at `/robots.txt`. The file is read at startup and must be UTF-8 and 1 MiB or smaller. Unset returns 404 |
+| `DAYFLY_SECURITY_TXT_PATH` | no | (unset) | Path to a `security.txt` served at `/.well-known/security.txt`. The file is read at startup and must be UTF-8 and 1 MiB or smaller. Write the RFC 9116 fields, including `Contact` and `Expires`. Unset returns 404 |
 
 ### Retention by size
 
@@ -413,6 +416,7 @@ first, then the file. These settings take effect on the next request:
   `DAYFLY_RETENTION_MAX_DAYS`
 - `DAYFLY_SHOW_WORDS`
 - `DAYFLY_INLINE_PDF`
+- `DAYFLY_ROBOTS_TXT_PATH` and `DAYFLY_SECURITY_TXT_PATH`
 - `DAYFLY_TRUSTED_PROXIES`
 - `DAYFLY_LIST_REQUIRES_TOKEN`
 - `DAYFLY_PASTE_TOKENS`
@@ -1103,6 +1107,11 @@ comments.
   keep the stored Content-Type and the API disposition rules.
 - `GET /favicon.ico` — the file named by `DAYFLY_FAVICON_PATH`, or 404
   when unset. The file is read at startup and cached for one day.
+- `GET /robots.txt` — the file named by `DAYFLY_ROBOTS_TXT_PATH`, or 404
+  when unset. Served as `text/plain; charset=utf-8`.
+- `GET /.well-known/security.txt` — the file named by
+  `DAYFLY_SECURITY_TXT_PATH`, or 404 when unset. Served as
+  `text/plain; charset=utf-8`.
 
 Theme: the pages adapt the base look of the user's own site
 stylesheet, https://suorcd.us/style.css (verified live as the site's

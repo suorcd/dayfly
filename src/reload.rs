@@ -232,6 +232,12 @@ fn changed_fields(old: &Config, new: &Config) -> Vec<&'static str> {
     if old.favicon != new.favicon {
         changed.push("DAYFLY_FAVICON_PATH");
     }
+    if old.robots_txt != new.robots_txt {
+        changed.push("DAYFLY_ROBOTS_TXT_PATH");
+    }
+    if old.security_txt != new.security_txt {
+        changed.push("DAYFLY_SECURITY_TXT_PATH");
+    }
     if old.inline_pdf != new.inline_pdf {
         changed.push("DAYFLY_INLINE_PDF");
     }

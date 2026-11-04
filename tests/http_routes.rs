@@ -2660,6 +2660,7 @@ async fn well_known_service_description_reports_live_limits_without_auth() {
     assert_eq!(json["mcp_endpoint"], "/mcp");
     assert_eq!(json["auth"], "bearer");
     assert_eq!(json["paste_tokens"], false);
+    assert_eq!(json["policy"]["inline_pdf"], true);
     assert_eq!(json["limits"]["max_text_bytes"], 1_234);
     assert_eq!(json["limits"]["max_file_bytes"], 5_678);
     assert_eq!(json["limits"]["max_paste_bytes"], 1024 * 1024 * 1024);
@@ -2682,6 +2683,83 @@ async fn well_known_service_description_reports_live_limits_without_auth() {
     assert!(routes
         .iter()
         .any(|route| { route["method"] == "GET" && route["path"] == "/raw/{date}/{random}" }));
+}
+
+#[tokio::test]
+async fn well_known_service_description_reports_the_inline_pdf_policy() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config_with_caps(1_234, 5_678);
+    config.inline_pdf = false;
+    let store = Store::from_config(config)
+        .await
+        .expect("the test store must build");
+    let app = common::app(store);
+
+    let request = common::request("GET", "/.well-known/dayfly.json", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let json = common::json_body(&body);
+    assert_eq!(
+        json["policy"]["inline_pdf"], false,
+        "the service description must report the effective inline PDF policy"
+    );
+}
+
+#[tokio::test]
+async fn discovery_files_serve_text_without_auth_and_404_when_unset() {
+    let fake = FakeS3::start().await;
+    let mut config = common::config_with_token(fake.config(), "secret");
+    config.robots_txt = Some(dayfly::config::TextAsset {
+        bytes: Arc::from(&b"User-agent: *\nDisallow: /\n"[..]),
+    });
+    config.security_txt = Some(dayfly::config::TextAsset {
+        bytes: Arc::from(
+            &b"Contact: https://example.invalid/\nExpires: 2027-01-01T00:00:00Z\n"[..],
+        ),
+    });
+    let store = Store::from_config(config)
+        .await
+        .expect("the test store must build");
+    let app = common::app(store);
+
+    for (path, expected) in [
+        ("/robots.txt", &b"User-agent: *\nDisallow: /\n"[..]),
+        (
+            "/.well-known/security.txt",
+            &b"Contact: https://example.invalid/\nExpires: 2027-01-01T00:00:00Z\n"[..],
+        ),
+    ] {
+        let request = common::request("GET", path, &[], Vec::new());
+        let (status, headers, body) = common::send(&app, request).await;
+        assert_eq!(status, StatusCode::OK, "{path} must be public");
+        assert_eq!(
+            headers[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8",
+            "{path} must be plain text"
+        );
+        assert_eq!(
+            &body[..],
+            expected,
+            "{path} must serve the configured bytes"
+        );
+    }
+
+    let mut empty_config = fake.config();
+    empty_config.robots_txt = None;
+    empty_config.security_txt = None;
+    let empty_store = Store::from_config(empty_config)
+        .await
+        .expect("the empty test store must build");
+    let empty_app = common::app(empty_store);
+    for path in ["/robots.txt", "/.well-known/security.txt"] {
+        let request = common::request("GET", path, &[], Vec::new());
+        let (status, _, _) = common::send(&empty_app, request).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{path} must be 404 when unset"
+        );
+    }
 }
 
 #[tokio::test]

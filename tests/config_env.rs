@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use dayfly::config::{Config, ConfigError};
 
-const VARS: [&str; 27] = [
+const VARS: [&str; 29] = [
     "S3_ENDPOINT",
     "S3_BUCKET",
     "S3_REGION",
@@ -36,6 +36,8 @@ const VARS: [&str; 27] = [
     "DAYFLY_INLINE_PDF",
     "DAYFLY_MCP_LOCAL_ROOT",
     "DAYFLY_FAVICON_PATH",
+    "DAYFLY_ROBOTS_TXT_PATH",
+    "DAYFLY_SECURITY_TXT_PATH",
     "DAYFLY_VIEW_LINE_NUMBERS",
 ];
 
@@ -106,6 +108,8 @@ fn minimal_environment_applies_documented_defaults() {
     assert!(config.show_words);
     assert!(!config.show_internal_paths);
     assert!(config.favicon.is_none());
+    assert!(config.robots_txt.is_none());
+    assert!(config.security_txt.is_none());
     assert!(!config.view_line_numbers);
     assert!(config.inline_pdf);
     assert_eq!(config.http_bearer_token, None);
@@ -473,6 +477,64 @@ fn favicon_path_loads_the_file_and_rejects_bad_inputs() {
 }
 
 #[test]
+fn discovery_paths_load_text_files_and_reject_bad_inputs() {
+    let _guard = lock_env();
+    clear_env();
+    set_required();
+    let robots = env::temp_dir().join(format!("dayfly-robots-{}.txt", std::process::id()));
+    let security = env::temp_dir().join(format!("dayfly-security-{}.txt", std::process::id()));
+    std::fs::write(&robots, b"User-agent: *\nDisallow: /\n").expect("robots must write");
+    std::fs::write(
+        &security,
+        b"Contact: https://example.invalid/\nExpires: 2027-01-01T00:00:00Z\n",
+    )
+    .expect("security must write");
+    env::set_var("DAYFLY_ROBOTS_TXT_PATH", &robots);
+    env::set_var("DAYFLY_SECURITY_TXT_PATH", &security);
+
+    let config = Config::from_env().expect("discovery files must load");
+    assert_eq!(
+        &*config.robots_txt.expect("robots must be set").bytes,
+        b"User-agent: *\nDisallow: /\n"
+    );
+    assert_eq!(
+        &*config.security_txt.expect("security must be set").bytes,
+        b"Contact: https://example.invalid/\nExpires: 2027-01-01T00:00:00Z\n"
+    );
+
+    std::fs::write(&robots, b"").expect("the empty robots file must write");
+    let error = Config::from_env()
+        .err()
+        .expect("an empty robots file must fail config load");
+    assert!(
+        matches!(error, ConfigError::Invalid(ref field, _) if field == "DAYFLY_ROBOTS_TXT_PATH"),
+        "the error must name DAYFLY_ROBOTS_TXT_PATH, got {error}"
+    );
+
+    env::set_var("DAYFLY_ROBOTS_TXT_PATH", robots.with_extension("missing"));
+    let error = Config::from_env()
+        .err()
+        .expect("a missing robots file must fail config load");
+    assert!(
+        matches!(error, ConfigError::Invalid(ref field, _) if field == "DAYFLY_ROBOTS_TXT_PATH"),
+        "the error must name DAYFLY_ROBOTS_TXT_PATH, got {error}"
+    );
+
+    std::fs::write(&robots, [0xff, 0xfe]).expect("the non-UTF-8 robots file must write");
+    env::set_var("DAYFLY_ROBOTS_TXT_PATH", &robots);
+    let error = Config::from_env()
+        .err()
+        .expect("a non-UTF-8 robots file must fail config load");
+    assert!(
+        matches!(error, ConfigError::Invalid(ref field, _) if field == "DAYFLY_ROBOTS_TXT_PATH"),
+        "the error must name DAYFLY_ROBOTS_TXT_PATH, got {error}"
+    );
+
+    let _ = std::fs::remove_file(robots);
+    let _ = std::fs::remove_file(security);
+}
+
+#[test]
 fn file_cap_accepts_32_gib_and_rejects_a_part_overflow() {
     let _guard = lock_env();
     clear_env();
@@ -548,6 +610,8 @@ fn safe_summary_omits_credentials_and_token_presence() {
     assert!(summary.contains("show_words=true"));
     assert!(summary.contains("show_internal_paths=false"));
     assert!(summary.contains("favicon=unset"));
+    assert!(summary.contains("robots_txt=unset"));
+    assert!(summary.contains("security_txt=unset"));
     assert!(summary.contains("inline_pdf=true"));
     for secret in ["test-access", "test-secret", "summary-secret"] {
         assert!(

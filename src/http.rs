@@ -21,8 +21,8 @@ use axum::extract::{
     ConnectInfo, DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State,
 };
 use axum::http::header::{
-    ACCEPT, ALLOW, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST,
-    IF_NONE_MATCH, RANGE, RETRY_AFTER,
+    ACCEPT, ALLOW, AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE,
+    ETAG, HOST, IF_NONE_MATCH, RANGE, RETRY_AFTER,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
@@ -37,7 +37,7 @@ use serde::Serialize;
 use subtle::ConstantTimeEq;
 
 use crate::client_addr::{self, ClientAddr};
-use crate::config::MAX_TTL_SECONDS;
+use crate::config::{TextAsset, MAX_TTL_SECONDS};
 use crate::content_type::content_disposition;
 use crate::rate_limit::RateLimiter;
 use crate::store::{
@@ -1513,6 +1513,16 @@ pub const API_ROUTE_DOCS: &[ApiRoute] = &[
         path: "/.well-known/dayfly.json",
         purpose: "Read this machine-readable service description.",
     },
+    ApiRoute {
+        method: "GET",
+        path: "/robots.txt",
+        purpose: "Read the crawler policy.",
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/.well-known/security.txt",
+        purpose: "Read the security contact policy.",
+    },
 ];
 
 /// Serve the unauthenticated service document.
@@ -1539,6 +1549,9 @@ async fn service_description(State(state): State<AppState>) -> Response {
             "none"
         },
         "paste_tokens": config.paste_tokens,
+        "policy": {
+            "inline_pdf": config.inline_pdf,
+        },
         "limits": {
             "max_text_bytes": config.max_text_bytes,
             "max_file_bytes": config.max_file_bytes,
@@ -1555,6 +1568,33 @@ async fn service_description(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
+/// Serve the optional `robots.txt` file.
+async fn robots_txt(State(state): State<AppState>) -> Response {
+    text_asset_response(state.store().config.robots_txt.as_ref())
+}
+
+/// Serve the optional `security.txt` file.
+async fn security_txt(State(state): State<AppState>) -> Response {
+    text_asset_response(state.store().config.security_txt.as_ref())
+}
+
+/// Serve a configured text asset, or 404 when it is unset.
+fn text_asset_response(asset: Option<&TextAsset>) -> Response {
+    let Some(asset) = asset else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=3600"),
+    );
+    (headers, asset.bytes.to_vec()).into_response()
+}
+
 /// API routes, without state attached. [`app_router`] merges these with the
 /// human UI routes and attaches a single shared [`AppState`].
 pub fn api_router() -> Router<AppState> {
@@ -1569,6 +1609,8 @@ pub fn api_router() -> Router<AppState> {
     Router::new()
         .merge(upload_routes)
         .route("/.well-known/dayfly.json", get(service_description))
+        .route("/robots.txt", get(robots_txt))
+        .route("/.well-known/security.txt", get(security_txt))
         .route(
             "/v1/pastes/{date}/{random}",
             get(download_dated)
@@ -1649,6 +1691,8 @@ mod tests {
             http_bearer_token: None,
             mcp_local_root: None,
             favicon: None,
+            robots_txt: None,
+            security_txt: None,
         }
     }
 
