@@ -330,6 +330,7 @@ permissions and the lower total cap.
 | `DAYFLY_SHOW_WORDS` | no | `true` | Show the generated word alias in the human UI: create redirects, the view page, and the paste list. Display only; the JSON/MCP responses still include `words`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_SHOW_INTERNAL_PATHS` | no | `false` | Show the canonical date and ID under the alias in the human paste list. Off labels the column "Link" and shows only the alias. Display only; view URLs and API responses still accept the canonical ID. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_INLINE_PDF` | no | `true` | Serve a PDF download inline. Set this to `false` on a public instance so a PDF is an attachment. HTML and SVG are always attachments. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
+| `DAYFLY_VIEW_LINE_NUMBERS` | no | `false` | Number the lines of a text paste on the view page. The numbers are presentation only: a CSS counter renders them, they are not selectable, and the Copy button does not include them. Pastes above 5,000 lines render unnumbered. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_HTTP_BEARER_TOKEN` | one form | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model); set this variable or `DAYFLY_HTTP_BEARER_TOKEN_FILE`. An unset value disables auth; a set empty or whitespace-only value is a startup error |
 | `DAYFLY_HTTP_BEARER_TOKEN_FILE` | one form | (unset) | Path to a file that contains the bearer token; set this variable or `DAYFLY_HTTP_BEARER_TOKEN` |
 | `DAYFLY_MCP_LOCAL_ROOT` | no | (unset) | Directory for the MCP local-path tools. It must exist, or startup fails. When set, `store_file` and `fetch_file` refuse any path outside it, after resolving symlinks. When unset, the stdio transport accepts any readable path and the HTTP transport refuses both tools |
@@ -1076,7 +1077,9 @@ comments.
   (capped at 1 MiB for the page; the raw route and the API return the
   full paste) with a Copy button inside the box, including the escaped
   source of HTML and SVG, safe images inline, other types via the raw
-  link. The Copy and Copy link buttons appear only when JavaScript
+  link. When `DAYFLY_VIEW_LINE_NUMBERS` is true, text up to 5,000 lines
+  gets presentation-only line numbers that the Copy button does not
+  include. The Copy and Copy link buttons appear only when JavaScript
   runs.
 - `GET /raw/<id>` — the unformatted bytes. Markup types (`text/html`,
   `application/xhtml+xml`, `image/svg+xml`, and XML) and unknown

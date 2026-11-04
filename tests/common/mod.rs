@@ -216,6 +216,7 @@ impl FakeS3 {
             show_words: false,
             show_internal_paths: false,
             inline_pdf: true,
+            view_line_numbers: false,
             allow_unauthenticated: false,
             list_requires_token: false,
             paste_tokens: false,

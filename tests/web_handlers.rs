@@ -1392,6 +1392,62 @@ async fn view_page_offers_a_paste_token_field_when_enabled() {
 }
 
 #[tokio::test]
+async fn view_page_numbers_lines_without_changing_the_text() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.view_line_numbers = true;
+    let store = Store::from_config(config)
+        .await
+        .expect("the store must build");
+    let text = "a < b\nsecond\n";
+    let stored = store
+        .store_text(text.as_bytes(), None, None, None)
+        .await
+        .expect("text must store");
+    let app = common::app(store);
+
+    let request = common::request("GET", &format!("/view/{}", stored.id), &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    let marker = "<pre class=\"numbered\">";
+    let start = page.find(marker).expect("the numbered pre must render") + marker.len();
+    let end = start + page[start..].find("</pre>").expect("the pre must close");
+    let inner = &page[start..end];
+    let plain = inner
+        .replace("<span class=\"line\">", "")
+        .replace("<span class=\"ln\" aria-hidden=\"true\"></span>", "")
+        .replace("</span>", "")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&amp;", "&");
+    assert_eq!(plain, text, "textContent must equal the paste text");
+    assert!(page.contains("pre.numbered .ln{user-select:none}"));
+
+    let many = "x\n".repeat(5_001);
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.view_line_numbers = true;
+    let store = Store::from_config(config)
+        .await
+        .expect("the store must build");
+    let stored = store
+        .store_text(many.as_bytes(), None, None, None)
+        .await
+        .expect("the large text must store");
+    let app = common::app(store);
+    let request = common::request("GET", &format!("/view/{}", stored.id), &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        !page.contains("class=\"numbered\""),
+        "a paste over the line cap must render unnumbered"
+    );
+}
+
+#[tokio::test]
 async fn view_page_marks_truncated_large_text() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;

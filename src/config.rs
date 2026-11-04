@@ -151,6 +151,12 @@ pub struct Config {
     /// Default: `true`. Set this to `false` on a public instance so a PDF
     /// is served as an attachment. HTML and SVG are always attachments.
     pub inline_pdf: bool,
+    /// Whether the view page numbers the lines of a text paste.
+    ///
+    /// Default: `false`. The numbers are presentation only: a CSS
+    /// counter renders them, they are not selectable, and they never
+    /// enter the copied text.
+    pub view_line_numbers: bool,
     /// Optional bearer token for the binary's own HTTP endpoint.
     /// This is NOT the S3/Garage credential and is not a replacement for
     /// it: the Garage key/secret stay in S3_ACCESS_KEY_ID /
@@ -337,6 +343,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("true"),
         required: false,
         help: "Serve PDF downloads inline",
+    },
+    ConfigField {
+        name: "DAYFLY_VIEW_LINE_NUMBERS",
+        value: Some("false"),
+        required: false,
+        help: "Number the lines of a text paste on the view page",
     },
     ConfigField {
         name: "DAYFLY_HTTP_BEARER_TOKEN",
@@ -1183,6 +1195,11 @@ impl Config {
                 "DAYFLY_INLINE_PDF",
                 field_default("DAYFLY_INLINE_PDF") == Some("true"),
             )?,
+            view_line_numbers: optional_bool(
+                &lookup,
+                "DAYFLY_VIEW_LINE_NUMBERS",
+                field_default("DAYFLY_VIEW_LINE_NUMBERS") == Some("true"),
+            )?,
             allow_unauthenticated: optional_bool(
                 &lookup,
                 "DAYFLY_ALLOW_UNAUTHENTICATED",
@@ -1270,7 +1287,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} trusted_proxies={} list_requires_token={} paste_tokens={} rate_limit_per_minute={} mcp_local_root={} favicon={}",
+            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} list_requires_token={} paste_tokens={} rate_limit_per_minute={} mcp_local_root={} favicon={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -1290,6 +1307,7 @@ impl Config {
             self.show_words,
             self.show_internal_paths,
             self.inline_pdf,
+            self.view_line_numbers,
             self.trusted_proxies.len(),
             self.list_requires_token,
             self.paste_tokens,
@@ -1633,6 +1651,7 @@ mod tests {
             show_words: true,
             show_internal_paths: false,
             inline_pdf: true,
+            view_line_numbers: false,
             allow_unauthenticated: false,
             list_requires_token: false,
             paste_tokens: false,
