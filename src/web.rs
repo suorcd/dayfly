@@ -62,7 +62,6 @@ use crate::store::{
 /// #133e7c, border #0abdc6). Dark-only, no light-mode switch in v1.
 const CSS: &str = r#"
 body{font-family:"JetBrainsMono Nerd Font","JetBrains Mono",Hack,"Fira Code",ui-monospace,Menlo,Consolas,monospace;line-height:1.6;color:#e3e8fc;background:#091833;max-width:1200px;margin:0 auto;padding:20px}
-body.wide{max-width:1600px}
 header{padding-bottom:1rem;background:linear-gradient(to bottom,transparent 96%,transparent 100%)}
 header::after{content:"";display:block;height:2px;margin-top:1rem;background:linear-gradient(to right,#ea00d9,transparent)}
 nav{display:flex;gap:1rem;flex-wrap:wrap;align-items:center}
@@ -339,13 +338,8 @@ fn page(title: &str, active: Option<&str>, show_heading: bool, body: &str) -> Ht
     } else {
         String::new()
     };
-    let body_class = if active == Some("/pastes") {
-        " class=\"wide\""
-    } else {
-        ""
-    };
     Html(format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title} — dayfly</title>\n<style>{CSS}</style>\n</head>\n<body{body_class}>\n<header><nav><span class=\"prompt\">~/dayfly $</span>{nav}</nav></header>\n{heading}{body}\n<footer>dayfly — internal use only · &copy; 2026 suorcd</footer>\n</body>\n</html>\n"
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title} — dayfly</title>\n<style>{CSS}</style>\n</head>\n<body>\n<header><nav><span class=\"prompt\">~/dayfly $</span>{nav}</nav></header>\n{heading}{body}\n<footer>dayfly — internal use only · &copy; 2026 suorcd</footer>\n</body>\n</html>\n"
     ))
 }
 

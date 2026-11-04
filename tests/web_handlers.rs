@@ -1597,3 +1597,41 @@ async fn upload_error_page_never_shows_a_paste_url() {
     assert!(!page.contains("/v1/pastes/"));
     assert!(fake.keys().is_empty());
 }
+
+#[tokio::test]
+async fn list_page_uses_the_same_body_width_as_the_paste_page() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"layout", None, None, None)
+        .await
+        .expect("the paste must store");
+    let app = common::app(store);
+
+    let request = common::request("GET", "/pastes", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let list = html_text(&body);
+
+    let request = common::request("GET", &format!("/view/{}", stored.id), &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let view = html_text(&body);
+
+    assert!(
+        list.contains("<body>"),
+        "the list page must use the shared body width: {list}"
+    );
+    assert!(
+        view.contains("<body>"),
+        "the paste page must use the shared body width: {view}"
+    );
+    assert!(
+        !list.contains("class=\"wide\""),
+        "the list page must not widen the body"
+    );
+    assert!(
+        !view.contains("class=\"wide\""),
+        "the paste page must not widen the body"
+    );
+}
