@@ -66,6 +66,29 @@ enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Apply a bucket lifecycle configuration.
+    Lifecycle {
+        #[command(subcommand)]
+        action: LifecycleAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum LifecycleAction {
+    /// Merge rules from a JSON document into the bucket lifecycle config.
+    Apply {
+        /// Path to the S3 lifecycle JSON document.
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+        /// Print the plan without writing to the bucket.
+        #[arg(long)]
+        dry_run: bool,
+        /// Allow an expiration at or below the maximum TTL.
+        ///
+        /// An object can then be deleted before its read-time expiry.
+        #[arg(long)]
+        allow_short_expiration: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -471,6 +494,44 @@ async fn main() -> anyhow::Result<()> {
                 app.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await?;
+        }
+        Some(Command::Lifecycle { action }) => {
+            let LifecycleAction::Apply {
+                file,
+                dry_run,
+                allow_short_expiration,
+            } = action;
+            let text = std::fs::read_to_string(&file)
+                .map_err(|error| anyhow::anyhow!("cannot read {}: {error}", file.display()))?;
+            let document = dayfly::lifecycle::Document::parse(&text)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            if allow_short_expiration {
+                tracing::warn!(
+                    "lifecycle apply allows a short expiration; an object can be deleted before its read-time expiry"
+                );
+            }
+            let configured = document
+                .rules(config.max_ttl_days, allow_short_expiration)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let existing = store.lifecycle_rules().await?;
+            let merged = dayfly::lifecycle::merge(existing, configured);
+            let total = merged.rules.len();
+            let kept = merged.kept;
+            for rule in &merged.rules {
+                println!("{}", dayfly::lifecycle::describe(rule));
+            }
+            if dry_run {
+                println!(
+                    "dry run: bucket {} would hold {total} rule(s), {kept} kept",
+                    store.bucket
+                );
+            } else {
+                store.put_lifecycle_rules(merged.rules).await?;
+                println!(
+                    "applied {total} rule(s) to bucket {} ({kept} kept)",
+                    store.bucket
+                );
+            }
         }
         Some(Command::Config { .. }) => {
             unreachable!("config commands return before the store starts")

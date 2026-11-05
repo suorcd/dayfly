@@ -9,6 +9,7 @@ pub mod client_addr;
 pub mod config;
 pub mod content_type;
 pub mod http;
+pub mod lifecycle;
 pub mod mcp;
 pub mod rate_limit;
 pub mod reload;

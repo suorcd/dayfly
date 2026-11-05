@@ -288,6 +288,7 @@ pub(crate) fn status_for(e: &StoreError) -> StatusCode {
         | StoreError::InvalidDate(_)
         | StoreError::InvalidRange(_)
         | StoreError::TtlOutOfRange(_)
+        | StoreError::InvalidLifecycle(_)
         | StoreError::LengthMismatch { .. } => StatusCode::BAD_REQUEST,
         StoreError::InvalidPath(_) => StatusCode::BAD_REQUEST,
         // The local-path tools are MCP-only. If one of these reaches an

@@ -203,6 +203,7 @@ fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> 
         | StoreError::InvalidDate(_)
         | StoreError::InvalidRange(_)
         | StoreError::TtlOutOfRange(_)
+        | StoreError::InvalidLifecycle(_)
         | StoreError::InvalidPath(_)
         | StoreError::PathOutsideRoot(_)
         | StoreError::LocalFilesDisabled
