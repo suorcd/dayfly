@@ -163,6 +163,35 @@ async fn index_page_renders_the_combined_form_and_the_default_ttl() {
 }
 
 #[tokio::test]
+async fn configured_footer_replaces_the_internal_use_text() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.site_name = Some("dayfly".to_string());
+    config.contact = Some("abuse@example.com".to_string());
+    config.aup_url = Some("https://example.com/aup".to_string());
+    let store = Store::from_config(config)
+        .await
+        .expect("fake S3 config must build without network access");
+    let app = common::app(store);
+
+    let request = common::request("GET", "/", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(!page.contains("internal use only"), "{page}");
+    assert!(
+        page.contains(
+            "<footer>dayfly · <a href=\"mailto:abuse@example.com\">abuse@example.com</a>"
+        ),
+        "the configured footer must show the site name and contact: {page}"
+    );
+    assert!(
+        page.contains("<a href=\"https://example.com/aup\">acceptable use</a>"),
+        "the configured footer must link the acceptable-use page: {page}"
+    );
+}
+
+#[tokio::test]
 async fn index_page_shows_curl_examples_for_the_request_base() {
     let fake = FakeS3::start().await;
     let app = common::app(fake.store().await);

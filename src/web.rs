@@ -48,6 +48,7 @@ use axum::{Form, Router};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
+use crate::config::Config;
 use crate::http::{
     check_auth, check_list_access, check_paste_control, public_base, read_metadata_field,
     status_for, AppState, ListAccessError, MultipartFieldError, MULTIPART_METADATA_MAX_BYTES,
@@ -327,7 +328,13 @@ const COPY_LINK_SCRIPT: &str = r#"<script>
 })();
 </script>"#;
 
-fn page(title: &str, active: Option<&str>, show_heading: bool, body: &str) -> Html<String> {
+fn page(
+    footer: &Footer,
+    title: &str,
+    active: Option<&str>,
+    show_heading: bool,
+    body: &str,
+) -> Html<String> {
     let title = html_escape(title);
     let nav: String = NAV_ITEMS
         .iter()
@@ -338,9 +345,61 @@ fn page(title: &str, active: Option<&str>, show_heading: bool, body: &str) -> Ht
     } else {
         String::new()
     };
+    let footer = footer.render();
     Html(format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title} — dayfly</title>\n<style>{CSS}</style>\n</head>\n<body>\n<header><nav><span class=\"prompt\">~/dayfly $</span>{nav}</nav></header>\n{heading}{body}\n<footer>dayfly — internal use only · &copy; 2026 suorcd</footer>\n</body>\n</html>\n"
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title} — dayfly</title>\n<style>{CSS}</style>\n</head>\n<body>\n<header><nav><span class=\"prompt\">~/dayfly $</span>{nav}</nav></header>\n{heading}{body}\n<footer>{footer}</footer>\n</body>\n</html>\n"
     ))
+}
+
+/// Footer content derived from the active configuration.
+///
+/// The default is `dayfly — internal use only`. A configured site name
+/// replaces that text. An optional contact and acceptable-use link follow
+/// the site name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Footer {
+    site_name: Option<String>,
+    contact: Option<String>,
+    aup_url: Option<String>,
+}
+
+impl Footer {
+    pub(crate) fn from_config(config: &Config) -> Self {
+        Self {
+            site_name: config.site_name.clone(),
+            contact: config.contact.clone(),
+            aup_url: config.aup_url.clone(),
+        }
+    }
+
+    /// Render the footer as HTML.
+    fn render(&self) -> String {
+        let mut parts = vec![match &self.site_name {
+            Some(name) => html_escape(name),
+            None => "dayfly — internal use only".to_string(),
+        }];
+        if let Some(contact) = &self.contact {
+            parts.push(contact_html(contact));
+        }
+        if let Some(url) = &self.aup_url {
+            let url = html_escape(url);
+            parts.push(format!("<a href=\"{url}\">acceptable use</a>"));
+        }
+        parts.push("&copy; 2026 suorcd".to_string());
+        parts.join(" · ")
+    }
+}
+
+/// Render a contact as a link when it has a known form.
+fn contact_html(contact: &str) -> String {
+    let escaped = html_escape(contact);
+    if contact.starts_with("http://") || contact.starts_with("https://") {
+        format!("<a href=\"{escaped}\">{escaped}</a>")
+    } else if contact.contains('@') && !contact.chars().any(char::is_whitespace) {
+        format!("<a href=\"mailto:{escaped}\">{escaped}</a>")
+    } else {
+        escaped
+    }
 }
 
 fn nav_link(href: &str, label: &str, active: Option<&str>) -> String {
@@ -352,7 +411,7 @@ fn nav_link(href: &str, label: &str, active: Option<&str>) -> String {
 }
 
 /// A themed 404 page for a path that matches no route.
-pub(crate) fn not_found_page(path: &str) -> Html<String> {
+pub(crate) fn not_found_page(footer: &Footer, path: &str) -> Html<String> {
     let path = html_escape(path);
     let body = format!(
         "<div class=\"not-found\">\
@@ -372,12 +431,13 @@ pub(crate) fn not_found_page(path: &str) -> Html<String> {
          <a class=\"button\" href=\"/\">cd /</a>\
          </div>"
     );
-    page("Not found", None, false, &body)
+    page(footer, "Not found", None, false, &body)
 }
 
 /// A styled 405 page for a path that does not accept the method.
-pub(crate) fn method_not_allowed_page(path: &str) -> Html<String> {
+pub(crate) fn method_not_allowed_page(footer: &Footer, path: &str) -> Html<String> {
     page(
+        footer,
         "Method not allowed",
         None,
         true,
@@ -608,6 +668,7 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
         return resp;
     }
     let store = state.store();
+    let footer = Footer::from_config(&store.config);
     let default_ttl = store.config.default_ttl_days;
     let max_file_bytes = store.config.max_file_paste_bytes();
     let max_file_human = human_size(max_file_bytes);
@@ -635,7 +696,7 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
     if let Some(base) = public_base(&headers) {
         body.push_str(&curl_hint(&base, store.config.http_bearer_token.is_some()));
     }
-    page("New paste", Some("/"), false, &body).into_response()
+    page(&footer, "New paste", Some("/"), false, &body).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -658,10 +719,11 @@ async fn text_submit_handler(
     }
     let filename = form.filename.filter(|f| !f.trim().is_empty());
     let store = state.store();
+    let footer = Footer::from_config(&store.config);
     let ttl = match form.ttl_days {
         Some(days) => match Ttl::checked_days(days) {
             Ok(ttl) => Some(ttl),
-            Err(e) => return bad_request_page(&e.to_string()),
+            Err(e) => return bad_request_page(&footer, &e.to_string()),
         },
         None => None,
     };
@@ -672,11 +734,11 @@ async fn text_submit_handler(
         Ok(stored) => {
             Redirect::to(&stored_view_target(&stored, store.config.show_words)).into_response()
         }
-        Err(e) => error_page(e),
+        Err(e) => error_page(&footer, e),
     }
 }
 
-fn error_page(e: StoreError) -> Response {
+fn error_page(footer: &Footer, e: StoreError) -> Response {
     let status = status_for(&e);
     let msg = match &e {
         StoreError::TooLarge { limit } => {
@@ -687,6 +749,7 @@ fn error_page(e: StoreError) -> Response {
     (
         status,
         page(
+            footer,
             "Error",
             None,
             true,
@@ -697,10 +760,11 @@ fn error_page(e: StoreError) -> Response {
 }
 
 /// A clear 401 page instead of an empty table that looks like "no pastes".
-fn unauthorized_page(message: &str) -> Response {
+fn unauthorized_page(footer: &Footer, message: &str) -> Response {
     (
         StatusCode::UNAUTHORIZED,
         page(
+            footer,
             "Unauthorized",
             None,
             true,
@@ -714,10 +778,11 @@ fn unauthorized_page(message: &str) -> Response {
 }
 
 /// A malformed multipart body is a client error, not a missing field.
-fn bad_request_page(message: &str) -> Response {
+fn bad_request_page(footer: &Footer, message: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
         page(
+            footer,
             "Error",
             None,
             true,
@@ -824,10 +889,14 @@ async fn upload_submit_handler(
         return forbidden_page();
     }
     let store = state.store();
+    let footer = Footer::from_config(&store.config);
     if !multipart_length_allows(&store, &headers) {
-        return error_page(StoreError::TooLarge {
-            limit: store.config.max_file_paste_bytes(),
-        });
+        return error_page(
+            &footer,
+            StoreError::TooLarge {
+                limit: store.config.max_file_paste_bytes(),
+            },
+        );
     }
     let mut ttl: Option<Ttl> = None;
     // Stream the file field inside the loop, not moved out of it: an
@@ -837,36 +906,43 @@ async fn upload_submit_handler(
         let field = match multipart.next_field().await {
             Ok(Some(field)) => field,
             Ok(None) => break,
-            Err(e) => return bad_request_page(&format!("invalid multipart body: {e}")),
+            Err(e) => return bad_request_page(&footer, &format!("invalid multipart body: {e}")),
         };
         let name = field.name().unwrap_or("").to_string();
         if name == "file" {
             return match store_file_field(&store, field, ttl).await {
                 Ok(stored) => Redirect::to(&stored_view_target(&stored, store.config.show_words))
                     .into_response(),
-                Err(e) => error_page(e),
+                Err(e) => error_page(&footer, e),
             };
         }
         if name == "ttl_days" {
             match read_metadata_field(field).await {
                 Ok(text) => match Ttl::parse_days(&text) {
                     Ok(parsed) => ttl = Some(parsed),
-                    Err(e) => return bad_request_page(&e.to_string()),
+                    Err(e) => return bad_request_page(&footer, &e.to_string()),
                 },
                 Err(MultipartFieldError::TooLarge) => {
-                    return error_page(StoreError::TooLarge {
-                        limit: MULTIPART_METADATA_MAX_BYTES as u64,
-                    });
+                    return error_page(
+                        &footer,
+                        StoreError::TooLarge {
+                            limit: MULTIPART_METADATA_MAX_BYTES as u64,
+                        },
+                    );
                 }
                 Err(MultipartFieldError::Malformed(message)) => {
-                    return bad_request_page(&format!("invalid multipart body: {message}"));
+                    return bad_request_page(
+                        &footer,
+                        &format!("invalid multipart body: {message}"),
+                    );
                 }
             }
         }
     }
-    error_page(StoreError::InvalidId(
-        "upload requires a 'file' field".into(),
-    ))
+    error_page(
+        &footer,
+        StoreError::InvalidId("upload requires a 'file' field".into()),
+    )
 }
 
 /// Combined browser create route: one multipart form carries the TTL, an
@@ -884,10 +960,14 @@ async fn create_submit_handler(
         return forbidden_page();
     }
     let store = state.store();
+    let footer = Footer::from_config(&store.config);
     if !multipart_length_allows(&store, &headers) {
-        return error_page(StoreError::TooLarge {
-            limit: store.config.max_file_paste_bytes(),
-        });
+        return error_page(
+            &footer,
+            StoreError::TooLarge {
+                limit: store.config.max_file_paste_bytes(),
+            },
+        );
     }
 
     let mut ttl: Option<Ttl> = None;
@@ -899,22 +979,28 @@ async fn create_submit_handler(
         let field = match multipart.next_field().await {
             Ok(Some(field)) => field,
             Ok(None) => break,
-            Err(e) => return bad_request_page(&format!("invalid multipart body: {e}")),
+            Err(e) => return bad_request_page(&footer, &format!("invalid multipart body: {e}")),
         };
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
             "ttl_days" => match read_metadata_field(field).await {
                 Ok(value) => match Ttl::parse_days(&value) {
                     Ok(parsed) => ttl = Some(parsed),
-                    Err(e) => return bad_request_page(&e.to_string()),
+                    Err(e) => return bad_request_page(&footer, &e.to_string()),
                 },
                 Err(MultipartFieldError::TooLarge) => {
-                    return error_page(StoreError::TooLarge {
-                        limit: MULTIPART_METADATA_MAX_BYTES as u64,
-                    });
+                    return error_page(
+                        &footer,
+                        StoreError::TooLarge {
+                            limit: MULTIPART_METADATA_MAX_BYTES as u64,
+                        },
+                    );
                 }
                 Err(MultipartFieldError::Malformed(message)) => {
-                    return bad_request_page(&format!("invalid multipart body: {message}"));
+                    return bad_request_page(
+                        &footer,
+                        &format!("invalid multipart body: {message}"),
+                    );
                 }
             },
             "filename" => match read_metadata_field(field).await {
@@ -926,23 +1012,35 @@ async fn create_submit_handler(
                     };
                 }
                 Err(MultipartFieldError::TooLarge) => {
-                    return error_page(StoreError::TooLarge {
-                        limit: MULTIPART_METADATA_MAX_BYTES as u64,
-                    });
+                    return error_page(
+                        &footer,
+                        StoreError::TooLarge {
+                            limit: MULTIPART_METADATA_MAX_BYTES as u64,
+                        },
+                    );
                 }
                 Err(MultipartFieldError::Malformed(message)) => {
-                    return bad_request_page(&format!("invalid multipart body: {message}"));
+                    return bad_request_page(
+                        &footer,
+                        &format!("invalid multipart body: {message}"),
+                    );
                 }
             },
             "text" => match read_text_field(field, text_limit).await {
                 Ok(bytes) => text = Some(bytes),
                 Err(MultipartFieldError::TooLarge) => {
-                    return error_page(StoreError::TooLarge {
-                        limit: store.config.max_text_paste_bytes(),
-                    });
+                    return error_page(
+                        &footer,
+                        StoreError::TooLarge {
+                            limit: store.config.max_text_paste_bytes(),
+                        },
+                    );
                 }
                 Err(MultipartFieldError::Malformed(message)) => {
-                    return bad_request_page(&format!("invalid multipart body: {message}"));
+                    return bad_request_page(
+                        &footer,
+                        &format!("invalid multipart body: {message}"),
+                    );
                 }
             },
             "file" => {
@@ -956,7 +1054,7 @@ async fn create_submit_handler(
                         Redirect::to(&stored_view_target(&stored, store.config.show_words))
                             .into_response()
                     }
-                    Err(e) => error_page(e),
+                    Err(e) => error_page(&footer, e),
                 };
             }
             _ => {}
@@ -964,10 +1062,10 @@ async fn create_submit_handler(
     }
 
     let Some(bytes) = text else {
-        return bad_request_page("provide text or a file");
+        return bad_request_page(&footer, "provide text or a file");
     };
     if bytes.is_empty() {
-        return bad_request_page("provide text or a file");
+        return bad_request_page(&footer, "provide text or a file");
     }
     match store
         .store_text(&bytes, text_filename.as_deref(), None, ttl)
@@ -976,7 +1074,7 @@ async fn create_submit_handler(
         Ok(stored) => {
             Redirect::to(&stored_view_target(&stored, store.config.show_words)).into_response()
         }
-        Err(e) => error_page(e),
+        Err(e) => error_page(&footer, e),
     }
 }
 
@@ -1130,6 +1228,7 @@ async fn list_handler(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    let footer = Footer::from_config(&state.store().config);
     if let Err(error) = check_list_access(&state, &headers) {
         return match error {
             // A configured token already gated this page, and the shared
@@ -1137,6 +1236,7 @@ async fn list_handler(
             ListAccessError::Unauthorized(response) => response,
             // This case would otherwise have rendered an open, empty list.
             ListAccessError::MissingToken => unauthorized_page(
+                &footer,
                 "Listing is gated by DAYFLY_LIST_REQUIRES_TOKEN, but no bearer token \
                  is configured. Set DAYFLY_HTTP_BEARER_TOKEN, or turn the setting off.",
             ),
@@ -1144,7 +1244,7 @@ async fn list_handler(
     }
     let (sort, order) = match parse_sort_order(&query) {
         Ok(value) => value,
-        Err(message) => return bad_request_page(&message),
+        Err(message) => return bad_request_page(&footer, &message),
     };
     let date = query.get("date").cloned().unwrap_or_default();
     let start = query.get("start").cloned().unwrap_or_default();
@@ -1155,7 +1255,7 @@ async fn list_handler(
         query.get("end").map(String::as_str),
     ) {
         Ok(request) => request,
-        Err(e) => return error_page(e),
+        Err(e) => return error_page(&footer, e),
     };
     // list_window already filters expired objects (HeadObject per key),
     // so this page is consistent with the API's read-time expiry check.
@@ -1180,7 +1280,7 @@ async fn list_handler(
     };
     let mut items = match items {
         Ok(items) => items,
-        Err(e) => return error_page(e),
+        Err(e) => return error_page(&footer, e),
     };
     sort_pastes(&mut items, sort, order);
 
@@ -1246,6 +1346,7 @@ async fn list_handler(
         );
     }
     page(
+        &footer,
         "Current pastes",
         Some("/pastes"),
         false,
@@ -1280,9 +1381,11 @@ async fn delete_submit_handler(
     if !same_origin_allowed(&headers) {
         return forbidden_page();
     }
-    match state.store().delete(&form.id).await {
+    let store = state.store();
+    let footer = Footer::from_config(&store.config);
+    match store.delete(&form.id).await {
         Ok(()) => Redirect::to("/pastes").into_response(),
-        Err(e) => error_page(e),
+        Err(e) => error_page(&footer, e),
     }
 }
 
@@ -1328,12 +1431,13 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
         return resp;
     }
     let store = state.store();
+    let footer = Footer::from_config(&store.config);
     let meta = match store.head_metadata(id).await {
         Ok(m) => m,
-        Err(e) => return error_page(e),
+        Err(e) => return error_page(&footer, e),
     };
     if meta.expired {
-        return error_page(StoreError::Expired(meta.id));
+        return error_page(&footer, StoreError::Expired(meta.id));
     }
     let id_esc = html_escape(&meta.id);
     let main = meta.content_type.split(';').next().unwrap_or("").trim();
@@ -1387,7 +1491,7 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
                     body.push_str("<p class=\"muted\">Text truncated at 1 MiB for this view. The raw route returns the full paste.</p>");
                 }
             }
-            Err(e) => return error_page(e),
+            Err(e) => return error_page(&footer, e),
         }
     } else if main.starts_with("image/") && main != "image/svg+xml" {
         // Safe images inline. SVG and HTML are never rendered inline
@@ -1398,7 +1502,7 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
         ));
     }
     body.push_str(COPY_LINK_SCRIPT);
-    page(display_name, None, true, &body).into_response()
+    page(&footer, display_name, None, true, &body).into_response()
 }
 
 async fn favicon_handler(State(state): State<AppState>) -> Response {
@@ -1551,6 +1655,9 @@ mod tests {
             favicon: None,
             robots_txt: None,
             security_txt: None,
+            site_name: None,
+            contact: None,
+            aup_url: None,
         }
     }
 
@@ -1890,18 +1997,29 @@ mod tests {
     #[test]
     fn error_page_uses_the_shared_status_mapping() {
         assert_eq!(
-            error_page(StoreError::Io("disk".to_string())).status(),
+            error_page(&Footer::default(), StoreError::Io("disk".to_string())).status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
         assert_eq!(
-            error_page(StoreError::S3("s3".to_string())).status(),
+            error_page(&Footer::default(), StoreError::S3("s3".to_string())).status(),
             StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            error_page(&Footer::default(), StoreError::QuotaExceeded).status(),
+            StatusCode::INSUFFICIENT_STORAGE
         );
     }
 
     #[test]
     fn page_escapes_the_title() {
-        let rendered = page("<script>alert(1)</script>", None, true, "").0;
+        let rendered = page(
+            &Footer::default(),
+            "<script>alert(1)</script>",
+            None,
+            true,
+            "",
+        )
+        .0;
         assert!(
             rendered.contains("<title>&lt;script&gt;alert(1)&lt;/script&gt; — dayfly</title>"),
             "the title tag must be escaped: {rendered}"
@@ -1911,6 +2029,50 @@ mod tests {
             "the heading must be escaped: {rendered}"
         );
         assert!(!rendered.contains("<script>alert(1)</script>"));
+    }
+
+    #[test]
+    fn footer_defaults_to_internal_use() {
+        let rendered = page(&Footer::default(), "Home", None, true, "").0;
+        assert!(
+            rendered.contains("<footer>dayfly — internal use only · &copy; 2026 suorcd</footer>"),
+            "the default footer must keep the internal-use text: {rendered}"
+        );
+    }
+
+    #[test]
+    fn footer_site_name_replaces_internal_use() {
+        let footer = Footer {
+            site_name: Some("dayfly".to_string()),
+            ..Footer::default()
+        };
+        assert_eq!(footer.render(), "dayfly · &copy; 2026 suorcd");
+    }
+
+    #[test]
+    fn footer_links_contact_and_acceptable_use() {
+        let footer = Footer {
+            site_name: Some("pastes.example".to_string()),
+            contact: Some("abuse@example.com".to_string()),
+            aup_url: Some("https://example.com/aup".to_string()),
+        };
+        assert_eq!(
+            footer.render(),
+            "pastes.example · <a href=\"mailto:abuse@example.com\">abuse@example.com</a> · \
+             <a href=\"https://example.com/aup\">acceptable use</a> · &copy; 2026 suorcd"
+        );
+    }
+
+    #[test]
+    fn footer_escapes_configured_values() {
+        let footer = Footer {
+            site_name: Some("<script>alert(1)</script>".to_string()),
+            contact: Some("\"><script>alert(2)</script>".to_string()),
+            aup_url: Some("https://example.com/\"x".to_string()),
+        };
+        let rendered = footer.render();
+        assert!(!rendered.contains("<script>"));
+        assert!(rendered.contains("&lt;script&gt;"));
     }
 
     #[test]

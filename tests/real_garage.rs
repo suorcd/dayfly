@@ -58,6 +58,9 @@ fn test_config() -> Config {
         favicon: None,
         robots_txt: None,
         security_txt: None,
+        site_name: None,
+        contact: None,
+        aup_url: None,
     }
 }
 

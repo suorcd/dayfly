@@ -456,6 +456,12 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Serve { bind }) => {
             let bind_addr = serve_bind.unwrap_or(bind.unwrap_or_else(|| config.http_bind.clone()));
             let state = AppState::new(store);
+            // Report the bucket lifecycle rules once. The check is best
+            // effort and does not delay the listener.
+            let lifecycle_state = state.clone();
+            tokio::spawn(async move {
+                lifecycle_state.store().log_lifecycle_rules().await;
+            });
             let app = http::app_router(state.clone());
             let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
             tracing::info!("HTTP listening on {bind_addr}");

@@ -69,6 +69,41 @@ by guessing:
 - **Agents hold no S3 credentials.** The binary is the only S3
   credential holder.
 
+### Garage permissions
+
+The binary needs only **read** and **write** permission on the bucket.
+It does not need **owner**. In Garage, owner is for `DeleteBucket`, the
+website configuration, and the CORS configuration. The lifecycle
+endpoints use the ordinary permissions:
+
+| Operation | Permission |
+| --- | --- |
+| `GetObject`, `HeadObject`, `ListObjectsV2`, `ListMultipartUploads` | read |
+| `PutObject`, `DeleteObject`, `CreateMultipartUpload`, `CompleteMultipartUpload` | write |
+| `GetBucketLifecycleConfiguration` | read |
+| `PutBucketLifecycleConfiguration`, `DeleteBucketLifecycle` | write |
+
+The Garage **admin API** is a separate service with separate bearer
+tokens. Its scopes name endpoints, not buckets. An S3 access key does
+not authenticate to it, and the owner flag on that key does not grant
+access. For example, an admin token with the `GetBucketInfo` scope can
+read bucket metadata, but no S3 key can. Create such a token with
+`garage admin-token create --scope GetBucketInfo`.
+
+Garage does not expose bucket quotas through the S3 API. The admin API
+`GetBucketInfo` response carries `quotas`, `bytes`, `objects`, and
+`lifecycleRules`. Dayfly does not call the admin API. It relies on the
+write path: when a bucket quota is reached, Garage rejects the write
+with `403 Forbidden` and a quota message, and dayfly returns 507.
+
+### Bucket lifecycle status
+
+At startup and after a configuration reload, dayfly reads
+`GetBucketLifecycleConfiguration` and logs each rule at `info` with its
+ID, status, prefix, expiration days, and abort-incomplete-upload days.
+It logs one warning when the bucket has no rule, or when the call
+fails. The check is best effort and does not delay the listener.
+
 ## Access model — read this before deploying
 
 The bucket is **private, NOT open, NOT anonymous**. No public bucket
@@ -338,6 +373,9 @@ permissions and the lower total cap.
 | `DAYFLY_FAVICON_PATH` | no | (unset) | Path to a favicon served at `/favicon.ico`. The file is read at startup and must be 1 MiB or smaller. The content type follows the extension (`.ico`, `.png`, `.svg`, `.gif`, `.jpg`, `.webp`). Unset returns 404 |
 | `DAYFLY_ROBOTS_TXT_PATH` | no | (unset) | Path to a `robots.txt` served at `/robots.txt`. The file is read at startup and must be UTF-8 and 1 MiB or smaller. Unset returns 404 |
 | `DAYFLY_SECURITY_TXT_PATH` | no | (unset) | Path to a `security.txt` served at `/.well-known/security.txt`. The file is read at startup and must be UTF-8 and 1 MiB or smaller. Write the RFC 9116 fields, including `Contact` and `Expires`. Unset returns 404 |
+| `DAYFLY_SITE_NAME` | no | (unset) | Site name for the human UI footer, at most 80 characters. Unset keeps `dayfly — internal use only`. Set it on a public instance to replace that text |
+| `DAYFLY_CONTACT` | no | (unset) | Takedown contact for the human UI footer, at most 200 characters. An `http://` or `https://` value becomes a link and a value with `@` becomes a `mailto:` link. Other values are plain text |
+| `DAYFLY_AUP_URL` | no | (unset) | Acceptable-use URL for the human UI footer, at most 500 characters. It must use `http://` or `https://`. The footer links the text "acceptable use" to it |
 
 ### Retention by size
 
@@ -422,6 +460,7 @@ first, then the file. These settings take effect on the next request:
 - `DAYFLY_PASTE_TOKENS`
 - `DAYFLY_RATE_LIMIT_PER_MINUTE`
 - `DAYFLY_HTTP_BEARER_TOKEN` or `DAYFLY_HTTP_BEARER_TOKEN_FILE`
+- `DAYFLY_SITE_NAME`, `DAYFLY_CONTACT`, and `DAYFLY_AUP_URL`
 
 These settings need a restart:
 
@@ -781,9 +820,9 @@ the joined paste, so an append changes it. `HEAD` returns the same tag.
 Error responses are machine-readable JSON, e.g.
 `{"error": "payload too large: limit is 1073741824 bytes"}` with HTTP
 413 for oversize, 400 for invalid input, 404 for not found, 410 for
-expired, 416 for an unsatisfiable range, and 502 for S3 errors. An
-upload body shorter than its `Content-Length` returns 400 and stores
-nothing.
+expired, 416 for an unsatisfiable range, 507 for a bucket quota limit,
+and 502 for other S3 errors. An upload body shorter than its
+`Content-Length` returns 400 and stores nothing.
 
 One status code needs reading carefully, because the current
 behaviour is narrower than the list above suggests. `DELETE` is
@@ -1058,9 +1097,16 @@ flip HTML/SVG to inline.
 
 Server-rendered HTML with a small vanilla-JS drag-and-drop
 enhancement and copy buttons for the body and the view link; no
-JavaScript framework, no build step. Plain forms and links otherwise. Internal use only — same private-network /
-binary-auth model as the API, no public sharing, accounts, or
-comments.
+JavaScript framework, no build step. Plain forms and links otherwise.
+Internal use by default — same private-network / binary-auth model as
+the API, no accounts or comments.
+
+The footer shows `dayfly — internal use only · © 2026 suorcd` by
+default. `DAYFLY_SITE_NAME` replaces the internal-use text with the site
+name. `DAYFLY_CONTACT` adds a takedown contact and `DAYFLY_AUP_URL`
+adds an acceptable-use link. The values are HTML-escaped. A public
+instance sets the site name and leaves the default for a private
+instance.
 
 - `GET /` — combined new-paste form: paste text or drop and choose a
   file, with a TTL selector in whole days (1, 3, 7, 14, 30, 90 days;

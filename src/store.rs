@@ -107,6 +107,8 @@ pub enum StoreError {
     Io(String),
     #[error("s3 error: {0}")]
     S3(String),
+    #[error("bucket storage quota is reached: try again after a paste expires or is deleted")]
+    QuotaExceeded,
     #[error("multi-object update failed at the {step} step for {key}")]
     PartialUpdate { step: &'static str, key: String },
 }
@@ -425,6 +427,10 @@ where
     R: std::fmt::Debug,
 {
     if let SdkError::ServiceError(ctx) = &err {
+        if is_quota_error(ctx.err().code(), ctx.err().message()) {
+            tracing::warn!(bucket_object = id, "bucket storage quota is reached");
+            return StoreError::QuotaExceeded;
+        }
         match ctx.err().code() {
             Some("NoSuchKey") | Some("NoSuchVersion") | Some("NotFound") => {
                 return StoreError::NotFound(id.to_string());
@@ -436,6 +442,16 @@ where
         }
     }
     s3_failure("an object store request failed", err)
+}
+
+/// Whether an S3 error reports a bucket quota limit.
+///
+/// Garage rejects a write with `403 Forbidden` and a message that contains
+/// "Bucket size quota is reached" or "Object quota is reached". The S3
+/// error code is `Forbidden`, so the message is the stable signal.
+fn is_quota_error(code: Option<&str>, message: Option<&str>) -> bool {
+    code.is_some_and(|code| code == "Forbidden" || code == "QuotaExceeded")
+        && message.is_some_and(|message| message.contains("quota is reached"))
 }
 
 /// Log an object store failure and return a client-safe error.
@@ -1370,6 +1386,61 @@ impl Store {
             alias_lock: Arc::new(AsyncMutex::new(())),
             alias_candidates: None,
         })
+    }
+
+    /// Log the bucket lifecycle rules, best effort.
+    ///
+    /// The call needs read permission on the bucket. A missing rule or an
+    /// S3 error logs one warning. Startup and serving continue.
+    pub async fn log_lifecycle_rules(&self) {
+        let result = self
+            .client
+            .get_bucket_lifecycle_configuration()
+            .bucket(self.bucket.clone())
+            .send()
+            .await;
+        match result {
+            Ok(output) => {
+                let rules = output.rules();
+                if rules.is_empty() {
+                    tracing::warn!(
+                        bucket = %self.bucket,
+                        "bucket has no lifecycle rules; expired objects stay in storage until a client or an operator deletes them"
+                    );
+                }
+                for rule in rules {
+                    tracing::info!(
+                        bucket = %self.bucket,
+                        rule = rule.id().unwrap_or(""),
+                        status = ?rule.status(),
+                        prefix = ?rule.filter().and_then(|filter| filter.prefix()),
+                        expire_days = ?rule.expiration().and_then(|expiration| expiration.days()),
+                        abort_after_days = ?rule.abort_incomplete_multipart_upload().and_then(|abort| abort.days_after_initiation()),
+                        "bucket lifecycle rule"
+                    );
+                }
+            }
+            Err(error) => {
+                let absent = match &error {
+                    SdkError::ServiceError(ctx) => {
+                        ctx.err().code() == Some("NoSuchLifecycleConfiguration")
+                            || ctx.raw().status().as_u16() == 404
+                    }
+                    _ => false,
+                };
+                if absent {
+                    tracing::warn!(
+                        bucket = %self.bucket,
+                        "bucket has no lifecycle configuration; expired objects stay in storage until a client or an operator deletes them"
+                    );
+                } else {
+                    tracing::warn!(
+                        bucket = %self.bucket,
+                        "cannot read the bucket lifecycle configuration: {error:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// Normalize an alias with the configured maximum word count.
@@ -3012,6 +3083,34 @@ pub fn default_list_window(now: DateTime<Utc>, days: u32) -> (NaiveDate, NaiveDa
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn garage_quota_errors_are_recognised() {
+        assert!(is_quota_error(
+            Some("Forbidden"),
+            Some(
+                "Bucket size quota is reached, maximum total size of objects for this bucket: 1000. \
+                 The bucket is already 900 bytes, and this object would add 200 bytes."
+            )
+        ));
+        assert!(is_quota_error(
+            Some("Forbidden"),
+            Some("Object quota is reached, maximum objects for this bucket: 10")
+        ));
+    }
+
+    #[test]
+    fn other_forbidden_errors_are_not_quota_errors() {
+        assert!(!is_quota_error(
+            Some("Forbidden"),
+            Some("Operation is not allowed for this key.")
+        ));
+        assert!(!is_quota_error(
+            Some("NoSuchKey"),
+            Some("The specified key does not exist.")
+        ));
+        assert!(!is_quota_error(None, None));
+    }
 
     #[tokio::test]
     async fn hash_file_prefix_stops_one_byte_past_the_expected_length() {

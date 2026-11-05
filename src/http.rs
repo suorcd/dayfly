@@ -44,7 +44,7 @@ use crate::store::{
     parse_list_window_request, parse_range_header, ListWindowRequest, PasteMetadata, Store,
     StoreError, StoreHandle, Ttl, TtlParseError, MULTIPART_CHUNK_BYTES,
 };
-use crate::web::api_write_allowed;
+use crate::web::{api_write_allowed, Footer};
 
 /// Maximum bytes for one multipart metadata text field.
 ///
@@ -285,6 +285,7 @@ pub(crate) fn status_for(e: &StoreError) -> StatusCode {
         StoreError::TooManySegments { .. } => StatusCode::CONFLICT,
         StoreError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         StoreError::S3(_) => StatusCode::BAD_GATEWAY,
+        StoreError::QuotaExceeded => StatusCode::INSUFFICIENT_STORAGE,
         StoreError::BucketUnavailable(_) => StatusCode::BAD_GATEWAY,
         StoreError::PartialUpdate { .. } => StatusCode::BAD_GATEWAY,
     }
@@ -1230,7 +1231,10 @@ pub fn app_router(state: AppState) -> Router {
         .merge(mcp_router(state.clone()))
         .merge(crate::web::ui_router(state.clone()))
         .fallback(fallback_handler)
-        .layer(middleware::from_fn(map_method_not_allowed))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            map_method_not_allowed,
+        ))
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1255,7 +1259,7 @@ fn error_wants_json(path: &str, headers: &HeaderMap) -> bool {
 }
 
 /// A styled 404 page for an unknown page, and JSON for API paths.
-async fn fallback_handler(uri: Uri, headers: HeaderMap) -> Response {
+async fn fallback_handler(State(state): State<AppState>, uri: Uri, headers: HeaderMap) -> Response {
     let path = uri.path();
     if error_wants_json(path, &headers) {
         (
@@ -1264,12 +1268,21 @@ async fn fallback_handler(uri: Uri, headers: HeaderMap) -> Response {
         )
             .into_response()
     } else {
-        (StatusCode::NOT_FOUND, crate::web::not_found_page(path)).into_response()
+        let footer = Footer::from_config(&state.store().config);
+        (
+            StatusCode::NOT_FOUND,
+            crate::web::not_found_page(&footer, path),
+        )
+            .into_response()
     }
 }
 
 /// Replace the empty 405 body with the styled page or a JSON error.
-async fn map_method_not_allowed(request: Request, next: Next) -> Response {
+async fn map_method_not_allowed(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
     let path = request.uri().path().to_string();
     let wants_json = error_wants_json(&path, request.headers());
     let response = next.run(request).await;
@@ -1286,7 +1299,7 @@ async fn map_method_not_allowed(request: Request, next: Next) -> Response {
     } else {
         (
             StatusCode::METHOD_NOT_ALLOWED,
-            crate::web::method_not_allowed_page(&path),
+            crate::web::method_not_allowed_page(&Footer::from_config(&state.store().config), &path),
         )
             .into_response()
     };
@@ -1693,6 +1706,9 @@ mod tests {
             favicon: None,
             robots_txt: None,
             security_txt: None,
+            site_name: None,
+            contact: None,
+            aup_url: None,
         }
     }
 

@@ -194,7 +194,31 @@ pub struct Config {
     /// The path comes from `DAYFLY_SECURITY_TXT_PATH`. The file is read
     /// once at startup. When unset, the route returns 404.
     pub security_txt: Option<TextAsset>,
+    /// Optional site name for the human UI footer.
+    ///
+    /// The value comes from `DAYFLY_SITE_NAME`. When unset, the footer
+    /// keeps the default `dayfly — internal use only` text. When set, the
+    /// site name replaces that text.
+    pub site_name: Option<String>,
+    /// Optional takedown contact for the human UI footer.
+    ///
+    /// The value comes from `DAYFLY_CONTACT`. An `http://` or `https://`
+    /// value becomes a link. A value with `@` becomes a `mailto:` link.
+    /// Any other value is plain text.
+    pub contact: Option<String>,
+    /// Optional acceptable-use URL for the human UI footer.
+    ///
+    /// The value comes from `DAYFLY_AUP_URL` and must use `http://` or
+    /// `https://`. The footer links the text "acceptable use" to it.
+    pub aup_url: Option<String>,
 }
+
+/// Maximum characters in `DAYFLY_SITE_NAME`.
+const MAX_SITE_NAME_CHARS: usize = 80;
+/// Maximum characters in `DAYFLY_CONTACT`.
+const MAX_CONTACT_CHARS: usize = 200;
+/// Maximum characters in `DAYFLY_AUP_URL`.
+const MAX_AUP_URL_CHARS: usize = 500;
 
 /// A favicon image loaded at startup.
 #[derive(Clone, PartialEq, Eq)]
@@ -397,6 +421,24 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         required: false,
         help: "Optional path to a security.txt file served at /.well-known/security.txt",
     },
+    ConfigField {
+        name: "DAYFLY_SITE_NAME",
+        value: None,
+        required: false,
+        help: "Optional site name for the human UI footer; replaces the default internal-use text",
+    },
+    ConfigField {
+        name: "DAYFLY_CONTACT",
+        value: None,
+        required: false,
+        help: "Optional takedown contact for the human UI footer, an email address or an http(s) URL",
+    },
+    ConfigField {
+        name: "DAYFLY_AUP_URL",
+        value: None,
+        required: false,
+        help: "Optional acceptable-use URL for the human UI footer",
+    },
 ];
 
 fn field_default(name: &str) -> Option<&'static str> {
@@ -475,6 +517,53 @@ where
         Some(v) if !v.trim().is_empty() => v.trim().to_string(),
         _ => default.to_string(),
     }
+}
+
+/// Read an optional free-text setting.
+///
+/// An empty value means unset. A value above `max_chars` or one with a
+/// control character is an error.
+fn optional_text<F>(lookup: &F, name: &str, max_chars: usize) -> Result<Option<String>, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(value) = lookup(name) else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.chars().count() > max_chars {
+        return Err(ConfigError::Invalid(
+            name.to_string(),
+            format!("expected at most {max_chars} characters"),
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ConfigError::Invalid(
+            name.to_string(),
+            "control characters are not allowed".to_string(),
+        ));
+    }
+    Ok(Some(value.to_string()))
+}
+
+/// Read an optional absolute URL that uses HTTP or HTTPS.
+fn optional_url<F>(lookup: &F, name: &str, max_chars: usize) -> Result<Option<String>, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(value) = optional_text(lookup, name, max_chars)? else {
+        return Ok(None);
+    };
+    if !(value.starts_with("http://") || value.starts_with("https://")) {
+        return Err(ConfigError::Invalid(
+            name.to_string(),
+            "expected an http:// or https:// URL".to_string(),
+        ));
+    }
+    Ok(Some(value))
 }
 
 fn optional_u64<F>(lookup: &F, name: &str, default: u64) -> Result<u64, ConfigError>
@@ -1294,6 +1383,9 @@ impl Config {
                 lookup("DAYFLY_SECURITY_TXT_PATH"),
                 "DAYFLY_SECURITY_TXT_PATH",
             )?,
+            site_name: optional_text(&lookup, "DAYFLY_SITE_NAME", MAX_SITE_NAME_CHARS)?,
+            contact: optional_text(&lookup, "DAYFLY_CONTACT", MAX_CONTACT_CHARS)?,
+            aup_url: optional_url(&lookup, "DAYFLY_AUP_URL", MAX_AUP_URL_CHARS)?,
         })
     }
 
@@ -1739,6 +1831,9 @@ mod tests {
             favicon: None,
             robots_txt: None,
             security_txt: None,
+            site_name: None,
+            contact: None,
+            aup_url: None,
         }
     }
 
@@ -2260,6 +2355,60 @@ mod tests {
                 assert_eq!(name, "DAYFLY_HTTP_BEARER_TOKEN");
                 assert!(message.contains("empty"), "got: {message}");
             }
+            other => panic!("expected ConfigError::Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn footer_settings_are_optional() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("base env must parse");
+        assert_eq!(config.site_name, None);
+        assert_eq!(config.contact, None);
+        assert_eq!(config.aup_url, None);
+    }
+
+    #[test]
+    fn footer_settings_parse() {
+        let mut entries = base_env();
+        entries.push(("DAYFLY_SITE_NAME".to_string(), " dayfly ".to_string()));
+        entries.push((
+            "DAYFLY_CONTACT".to_string(),
+            "abuse@example.com".to_string(),
+        ));
+        entries.push((
+            "DAYFLY_AUP_URL".to_string(),
+            "https://example.com/aup".to_string(),
+        ));
+        let config = Config::from_lookup(lookup_from(&entries)).expect("footer env must parse");
+        assert_eq!(config.site_name.as_deref(), Some("dayfly"));
+        assert_eq!(config.contact.as_deref(), Some("abuse@example.com"));
+        assert_eq!(config.aup_url.as_deref(), Some("https://example.com/aup"));
+    }
+
+    #[test]
+    fn acceptable_use_url_must_use_http() {
+        let mut entries = base_env();
+        entries.push((
+            "DAYFLY_AUP_URL".to_string(),
+            "javascript:alert(1)".to_string(),
+        ));
+        let err = expect_error(Config::from_lookup(lookup_from(&entries)));
+        match err {
+            ConfigError::Invalid(name, message) => {
+                assert_eq!(name, "DAYFLY_AUP_URL");
+                assert!(message.contains("http"), "got: {message}");
+            }
+            other => panic!("expected ConfigError::Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn site_name_rejects_control_characters() {
+        let mut entries = base_env();
+        entries.push(("DAYFLY_SITE_NAME".to_string(), "day\nfly".to_string()));
+        let err = expect_error(Config::from_lookup(lookup_from(&entries)));
+        match err {
+            ConfigError::Invalid(name, _) => assert_eq!(name, "DAYFLY_SITE_NAME"),
             other => panic!("expected ConfigError::Invalid, got {other:?}"),
         }
     }
