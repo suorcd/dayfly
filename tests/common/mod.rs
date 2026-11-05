@@ -233,6 +233,9 @@ impl FakeS3 {
             favicon: None,
             robots_txt: None,
             security_txt: None,
+            site_name: None,
+            contact: None,
+            aup_url: None,
         }
     }
 

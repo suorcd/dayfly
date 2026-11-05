@@ -98,6 +98,13 @@ pub async fn reload_with_config(
         .await
         .map_err(|error| error.to_string())?;
     state.replace_store(new_store);
+    // The new configuration selects the same bucket in most reloads. Log
+    // the lifecycle rules again so a rule change made outside dayfly is
+    // visible without a restart.
+    let lifecycle_state = state.clone();
+    tokio::spawn(async move {
+        lifecycle_state.store().log_lifecycle_rules().await;
+    });
     Ok(ReloadReport { changed, warnings })
 }
 
@@ -246,6 +253,15 @@ fn changed_fields(old: &Config, new: &Config) -> Vec<&'static str> {
     }
     if old.http_bearer_token != new.http_bearer_token {
         changed.push("DAYFLY_HTTP_BEARER_TOKEN");
+    }
+    if old.site_name != new.site_name {
+        changed.push("DAYFLY_SITE_NAME");
+    }
+    if old.contact != new.contact {
+        changed.push("DAYFLY_CONTACT");
+    }
+    if old.aup_url != new.aup_url {
+        changed.push("DAYFLY_AUP_URL");
     }
     changed
 }

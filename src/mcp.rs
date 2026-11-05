@@ -195,7 +195,8 @@ fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> 
         | StoreError::Expired(_)
         | StoreError::TooLarge { .. }
         | StoreError::TooManySegments { .. }
-        | StoreError::RangeNotSatisfiable => Ok(CallToolResult::error(vec![ContentBlock::text(
+        | StoreError::RangeNotSatisfiable
+        | StoreError::QuotaExceeded => Ok(CallToolResult::error(vec![ContentBlock::text(
             e.to_string(),
         )])),
         StoreError::InvalidId(_)
