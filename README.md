@@ -38,8 +38,9 @@ is needed. See "No database in v1" below.
   such as `90m` or `1h30m`. A bare integer is always seconds: `7` is
   seven seconds, and `7d` is seven days. `ttl_days` remains as a
   positive whole-day form. The default is 7 days, configurable via
-  `DAYFLY_DEFAULT_TTL_DAYS`. `DAYFLY_RETENTION_BY_SIZE` can shorten
-  that TTL for a large paste. The API and MCP layer compare stored
+  `DAYFLY_DEFAULT_TTL_DAYS`. `DAYFLY_MIN_TTL_DAYS` and
+  `DAYFLY_MAX_TTL_DAYS` bound an explicit TTL.
+  `DAYFLY_RETENTION_BY_SIZE` can shorten that TTL for a large paste. The API and MCP layer compare stored
   `expires-at` metadata with now and enforce expiry on read. S3
   lifecycle deletion is a separate, asynchronous sweeper (see
   `docs/lifecycle-example.json`): it is day-rounded and may run after
@@ -162,17 +163,26 @@ front this service, and do not leave a path around them: a direct
 connection from an unlisted address is attributed to that address. This
 setting is what makes a per-client limit meaningful behind an ingress.
 
+`DAYFLY_LIST_ENABLED` turns listing off for every transport. With the
+default `true`, listing works. With `false`, the human `/pastes` page,
+`GET /v1/pastes`, and the MCP `list_recent` tool all refuse with 403 and
+the message "Listing is turned off on this instance." This is the
+setting for a public instance: no paste is listable, even by its
+creator. There is no owner or creator field, so the instance cannot
+filter a list by author.
+
 `DAYFLY_LIST_REQUIRES_TOKEN` separates "public downloads" from "private
-listing". With the default `false`, listing follows the global token
-rule: gated when `DAYFLY_HTTP_BEARER_TOKEN` is set, open when it is not.
-When `true`, `GET /v1/pastes` and the human `/pastes` page require the
-bearer token even if reads are otherwise anonymous. If the setting is on
-and no token is configured, both routes refuse with 401 and a message
-naming the missing variable: there is nothing to check against, and an
-open list is what the setting prevents. The human page renders a 401
-page rather than an empty table. A browser cannot send an
-`Authorization` header, so put an authenticating proxy in front of
-`/pastes`, or use the API with the token.
+listing" when listing is on. With the default `false`, listing follows
+the global token rule: gated when `DAYFLY_HTTP_BEARER_TOKEN` is set,
+open when it is not. When `true`, `GET /v1/pastes` and the human
+`/pastes` page require the bearer token even if reads are otherwise
+anonymous. If the setting is on and no token is configured, both routes
+refuse with 401 and a message naming the missing variable: there is
+nothing to check against, and an open list is what the setting prevents.
+The human page renders a 401 page rather than an empty table. A browser
+cannot send an `Authorization` header, so put an authenticating proxy in
+front of `/pastes`, or use the API with the token. `DAYFLY_LIST_ENABLED`
+wins over this setting.
 
 `DAYFLY_RATE_LIMIT_PER_MINUTE` caps requests per client per minute. It
 is a token bucket keyed on the resolved client address: the burst is the
@@ -352,7 +362,10 @@ permissions and the lower total cap.
 | `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error. A new paste must also fit `DAYFLY_MAX_PASTE_BYTES`, so the lower cap wins. The maximum is 52428800000 bytes: 10,000 parts of 5 MiB |
 | `DAYFLY_MAX_PASTE_BYTES` | no | 1073741824 (1 GiB) | Max total size for one paste, including the base object and every appended segment. A new paste or an append that would exceed the cap fails and writes no object |
 | `DAYFLY_ALIAS_WORDS` | no | 3 | Number of words in a new alias. Allowed range 3 to 6. Resolution accepts 3 words up to this value |
-| `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be at least 1 and at most 3650. The name and meaning are unchanged |
+| `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be within `DAYFLY_MIN_TTL_DAYS` (at least 1) and `DAYFLY_MAX_TTL_DAYS` |
+| `DAYFLY_MIN_TTL_DAYS` | no | 0 | Minimum TTL in whole days for an explicit TTL. `0` allows a TTL shorter than one day. A shorter value is rejected with 400 and `the minimum TTL is N days` |
+| `DAYFLY_MAX_TTL_DAYS` | no | 3650 | Maximum TTL in whole days. A longer value is rejected with 400 and `the maximum TTL is N days`. Must be from 1 to 3650 |
+| `DAYFLY_TTL_CHOICES` | no | `1,3,7,14,30,90` | Comma-separated whole-day choices for the browser TTL selector. Each value must be within the minimum and maximum. The default TTL is added when absent |
 | `DAYFLY_LIST_DEFAULT_DAYS` | no | 2 | Number of days in the default paste list window, ending today in UTC. Must be 1 to 366. The default of 2 covers yesterday and today |
 | `DAYFLY_RETENTION_BY_SIZE` | no | `false` | Clamp the expiry of a paste to a curve based on its total size. The clamp only shortens. Off keeps the exact requested TTL. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_RETENTION_MIN_DAYS` | no | 30 | Minimum retention in whole days at `DAYFLY_MAX_PASTE_BYTES`. Must be at least 1 and at most 3650, and must not exceed `DAYFLY_RETENTION_MAX_DAYS` |
@@ -361,6 +374,7 @@ permissions and the lower total cap.
 | `DAYFLY_TRUSTED_PROXIES` | no | (empty) | Comma-separated CIDR blocks (bare addresses are single hosts) of reverse proxies whose `X-Forwarded-For` header is believed. Empty keeps the socket peer as the client and ignores forwarding headers. The chain is walked from the right; a malformed or over-long chain falls back to the peer with one warning. Set this before any per-client limit behind an ingress |
 | `DAYFLY_RATE_LIMIT_PER_MINUTE` | no | 0 | Maximum requests per client per minute. 0 disables the limiter and allocates no counters. The burst is this value, and the bucket refills at this rate. Over the limit → 429 with `Retry-After`. Keyed on the resolved client address, so set `DAYFLY_TRUSTED_PROXIES` behind an ingress. Per process; resets on restart |
 | `DAYFLY_ALLOW_UNAUTHENTICATED` | no | `false` | Accept a non-loopback bind with no bearer token. Startup refuses that bind without this value, and with it the service writes one warning. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
+| `DAYFLY_LIST_ENABLED` | no | `true` | Allow listing on every transport. `false` makes `/pastes`, `GET /v1/pastes`, and the MCP `list_recent` tool return 403 with "Listing is turned off on this instance." It wins over `DAYFLY_LIST_REQUIRES_TOKEN`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_LIST_REQUIRES_TOKEN` | no | `false` | Require the bearer token for `GET /v1/pastes` and the human `/pastes` page even when reads are anonymous. With this on and no token configured, both routes refuse with 401: there is nothing to check. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_PASTE_TOKENS` | no | `false` | Return a 128-bit management token at creation. The JSON store response carries `paste_token`; the plain response carries `X-Paste-Token`. The token authorizes `DELETE` and `PATCH` for that paste. Only its SHA-256 is stored. The bearer token remains universal. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_SHOW_WORDS` | no | `true` | Show the generated word alias in the human UI: create redirects, the view page, and the paste list. Display only; the JSON/MCP responses still include `words`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
@@ -449,13 +463,15 @@ first, then the file. These settings take effect on the next request:
 - `DAYFLY_MAX_TEXT_BYTES`, `DAYFLY_MAX_FILE_BYTES`, and
   `DAYFLY_MAX_PASTE_BYTES`
 - `DAYFLY_ALIAS_WORDS`
-- `DAYFLY_DEFAULT_TTL_DAYS`
+- `DAYFLY_DEFAULT_TTL_DAYS`, `DAYFLY_MIN_TTL_DAYS`,
+  `DAYFLY_MAX_TTL_DAYS`, and `DAYFLY_TTL_CHOICES`
 - `DAYFLY_RETENTION_BY_SIZE`, `DAYFLY_RETENTION_MIN_DAYS`, and
   `DAYFLY_RETENTION_MAX_DAYS`
 - `DAYFLY_SHOW_WORDS`
 - `DAYFLY_INLINE_PDF`
 - `DAYFLY_ROBOTS_TXT_PATH` and `DAYFLY_SECURITY_TXT_PATH`
 - `DAYFLY_TRUSTED_PROXIES`
+- `DAYFLY_LIST_ENABLED`
 - `DAYFLY_LIST_REQUIRES_TOKEN`
 - `DAYFLY_PASTE_TOKENS`
 - `DAYFLY_RATE_LIMIT_PER_MINUTE`
@@ -639,8 +655,10 @@ one form, a header wins over the query parameter.
 
 A malformed or zero TTL returns 400 with a JSON error. It does not
 fall back to the default. `DAYFLY_DEFAULT_TTL_DAYS` sets the default
-in positive whole days when no TTL is given; its name and meaning are
-unchanged. The maximum TTL is 3650 days; a longer value returns 400.
+in positive whole days when no TTL is given. `DAYFLY_MIN_TTL_DAYS` and
+`DAYFLY_MAX_TTL_DAYS` bound an explicit TTL; a value outside the range
+returns 400 with the limit in the message. The hard maximum is 3650
+days. Set the minimum to `1` to reject sub-day TTLs.
 
 ```sh
 # Sub-day TTL: one hour and thirty minutes.

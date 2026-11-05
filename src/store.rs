@@ -93,6 +93,8 @@ pub enum StoreError {
     InvalidRange(String),
     #[error("range not satisfiable")]
     RangeNotSatisfiable,
+    #[error("{0}")]
+    TtlOutOfRange(String),
     #[error("could not allocate a word alias after {attempts} attempts")]
     AliasUnavailable { attempts: usize },
     #[error("paste has more than {limit} appended segments")]
@@ -1140,6 +1142,15 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+/// "1 day" or "N days", for a TTL error message.
+fn days_label(days: u32) -> String {
+    if days == 1 {
+        "1 day".to_string()
+    } else {
+        format!("{days} days")
+    }
+}
+
 fn expires_at_for(created_at: DateTime<Utc>, ttl: Ttl) -> DateTime<Utc> {
     created_at
         .checked_add_signed(ttl.duration())
@@ -1807,17 +1818,39 @@ impl Store {
     /// Clamp a TTL to the size curve when `retention_by_size` is on.
     ///
     /// With the setting off, the original TTL comes back unchanged, so
-    /// every existing TTL form keeps its exact expiry.
+    /// every existing TTL form keeps its exact expiry. The clamp never
+    /// goes below the configured minimum TTL.
     fn clamp_ttl_to_size(&self, ttl: Ttl, size: u64) -> Ttl {
         if !self.config.retention_by_size {
             return ttl;
         }
-        let limit = self.config.retention_seconds(size);
+        let floor = i64::from(self.config.min_ttl_days) * 86_400;
+        let limit = self.config.retention_seconds(size).max(floor);
         if ttl.num_seconds() > limit {
             Ttl::seconds(limit)
         } else {
             ttl
         }
+    }
+
+    /// Reject a TTL outside the configured range.
+    fn validate_ttl(&self, ttl: Ttl) -> Result<Ttl, StoreError> {
+        let seconds = ttl.num_seconds();
+        let min_seconds = i64::from(self.config.min_ttl_days) * 86_400;
+        if min_seconds > 0 && seconds < min_seconds {
+            return Err(StoreError::TtlOutOfRange(format!(
+                "the minimum TTL is {}",
+                days_label(self.config.min_ttl_days)
+            )));
+        }
+        let max_seconds = i64::from(self.config.max_ttl_days) * 86_400;
+        if seconds > max_seconds {
+            return Err(StoreError::TtlOutOfRange(format!(
+                "the maximum TTL is {}",
+                days_label(self.config.max_ttl_days)
+            )));
+        }
+        Ok(ttl)
     }
 
     pub async fn store_text(
@@ -1832,6 +1865,7 @@ impl Store {
             return Err(StoreError::TooLarge { limit: max_bytes });
         }
         let ttl = ttl.unwrap_or_else(|| Ttl::days(self.config.default_ttl_days));
+        let ttl = self.validate_ttl(ttl)?;
         let ttl = self.clamp_ttl_to_size(ttl, text.len() as u64);
         let created_at = Utc::now();
         let random_id = generate_random_id();
@@ -1929,6 +1963,7 @@ impl Store {
             });
         }
         let mut ttl = ttl.unwrap_or_else(|| Ttl::days(self.config.default_ttl_days));
+        ttl = self.validate_ttl(ttl)?;
         ttl = self.clamp_ttl_to_size(ttl, len);
         let created_at = Utc::now();
         let random_id = generate_random_id();
@@ -2203,6 +2238,7 @@ impl Store {
             }
         }
         let ttl = ttl.unwrap_or_else(|| Ttl::days(self.config.default_ttl_days));
+        let ttl = self.validate_ttl(ttl)?;
         // A text paste has no filename. Buffer the whole body, bounded
         // by the text cap, so detection sees every byte and text is
         // served inline. A file upload keeps the streaming path, because
@@ -2677,6 +2713,7 @@ impl Store {
     /// value for the current total size. An expired paste is rejected
     /// before any object is rewritten.
     pub async fn set_ttl(&self, id: &str, ttl: Ttl) -> Result<PasteMetadata, StoreError> {
+        let ttl = self.validate_ttl(ttl)?;
         let mut meta = self.head_metadata(id).await?;
         Self::check_not_expired(&meta)?;
         let now = Utc::now();

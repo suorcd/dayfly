@@ -637,6 +637,78 @@ async fn gated_listing_returns_200_with_a_configured_token() {
 }
 
 #[tokio::test]
+async fn disabled_listing_returns_a_clear_error() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.list_enabled = false;
+    let store = Store::from_config(config)
+        .await
+        .expect("a store with listing off must build");
+    let app = common::app(store);
+
+    let request = common::request("GET", "/v1/pastes", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let response = common::json_body(&body);
+    assert_eq!(response["error"], "listing_disabled");
+    assert_eq!(
+        response["detail"],
+        "Listing is turned off on this instance."
+    );
+}
+
+#[tokio::test]
+async fn ttl_bounds_apply_to_http_uploads() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.min_ttl_days = 1;
+    config.max_ttl_days = 3;
+    config.ttl_choices = vec![1, 2, 3];
+    let store = Store::from_config(config)
+        .await
+        .expect("a store with a TTL range must build");
+    let app = common::app(store);
+
+    let body = b"ttl".to_vec();
+    let short = common::request(
+        "POST",
+        "/upload?format=json",
+        &[("x-ttl", "6h".to_string()), content_length(body.len())],
+        body.clone(),
+    );
+    let (status, _, response) = common::send(&app, short).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8_lossy(&response).contains("minimum TTL is 1 day"),
+        "got: {}",
+        String::from_utf8_lossy(&response)
+    );
+
+    let long = common::request(
+        "POST",
+        "/upload?format=json",
+        &[("x-ttl", "4d".to_string()), content_length(body.len())],
+        body.clone(),
+    );
+    let (status, _, response) = common::send(&app, long).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8_lossy(&response).contains("maximum TTL is 3 days"),
+        "got: {}",
+        String::from_utf8_lossy(&response)
+    );
+
+    let at_max = common::request(
+        "POST",
+        "/upload?format=json",
+        &[("x-ttl", "3d".to_string()), content_length(body.len())],
+        body,
+    );
+    let (status, _, _) = common::send(&app, at_max).await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
 async fn pdf_inline_control_and_inline_sandbox_policy() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;

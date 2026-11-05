@@ -472,6 +472,18 @@ fn mixed_ttl_forms_are_rejected() {
 }
 
 #[test]
+fn list_recent_reports_that_listing_is_off() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let mut client = McpClient::spawn(&fake, &[("DAYFLY_LIST_ENABLED", "0")]);
+
+    let error = client
+        .call_tool("list_recent", json!({}))
+        .expect_err("listing must be off");
+    assert_tool_error(error, "Listing is turned off on this instance.");
+}
+
+#[test]
 fn list_recent_filters_expired_objects_through_mcp() {
     let runtime = runtime();
     let fake = runtime.block_on(FakeS3::start());
