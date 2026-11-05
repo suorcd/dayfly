@@ -230,6 +230,18 @@ fn changed_fields(old: &Config, new: &Config) -> Vec<&'static str> {
     if old.list_requires_token != new.list_requires_token {
         changed.push("DAYFLY_LIST_REQUIRES_TOKEN");
     }
+    if old.list_enabled != new.list_enabled {
+        changed.push("DAYFLY_LIST_ENABLED");
+    }
+    if old.min_ttl_days != new.min_ttl_days {
+        changed.push("DAYFLY_MIN_TTL_DAYS");
+    }
+    if old.max_ttl_days != new.max_ttl_days {
+        changed.push("DAYFLY_MAX_TTL_DAYS");
+    }
+    if old.ttl_choices != new.ttl_choices {
+        changed.push("DAYFLY_TTL_CHOICES");
+    }
     if old.rate_limit_per_minute != new.rate_limit_per_minute {
         changed.push("DAYFLY_RATE_LIMIT_PER_MINUTE");
     }

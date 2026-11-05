@@ -10,7 +10,7 @@ use bytes::Bytes;
 use chrono::{Duration, Utc};
 use common::{FailOp, FakeS3, Gate};
 use dayfly::store::{
-    normalize_words, normalize_words_up_to, parse_segment_key, segment_key, StoreError, Ttl,
+    normalize_words, normalize_words_up_to, parse_segment_key, segment_key, Store, StoreError, Ttl,
     MAX_FETCH_TEXT_BYTES, MAX_SEGMENTS_PER_PASTE, MULTIPART_CHUNK_BYTES, SEGMENT_SUFFIX_LEN,
 };
 use futures::stream;
@@ -3957,4 +3957,56 @@ async fn a_failed_segment_list_before_delete_keeps_the_paste() {
         .expect("the retry must delete the paste");
     assert!(fake.object(&stored.key).is_none());
     assert!(fake.object(&segment_key).is_none());
+}
+
+#[tokio::test]
+async fn configured_ttl_range_rejects_out_of_range_values() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.min_ttl_days = 1;
+    config.max_ttl_days = 3;
+    config.ttl_choices = vec![1, 2, 3];
+    let store = Store::from_config(config)
+        .await
+        .expect("fake S3 config must build without network access");
+
+    let short = store
+        .store_text(
+            b"short",
+            None,
+            None,
+            Some(Ttl::parse("6h").expect("6h must parse")),
+        )
+        .await;
+    match short {
+        Err(StoreError::TtlOutOfRange(message)) => {
+            assert!(message.contains("minimum TTL is 1 day"), "got: {message}");
+        }
+        other => panic!("expected a minimum TTL error, got {other:?}"),
+    }
+
+    let long = store
+        .store_text(
+            b"long",
+            None,
+            None,
+            Some(Ttl::parse("4d").expect("4d must parse")),
+        )
+        .await;
+    match long {
+        Err(StoreError::TtlOutOfRange(message)) => {
+            assert!(message.contains("maximum TTL is 3 days"), "got: {message}");
+        }
+        other => panic!("expected a maximum TTL error, got {other:?}"),
+    }
+
+    store
+        .store_text(
+            b"ok",
+            None,
+            None,
+            Some(Ttl::parse("3d").expect("3d must parse")),
+        )
+        .await
+        .expect("a TTL at the maximum must be accepted");
 }

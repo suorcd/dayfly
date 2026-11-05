@@ -21,9 +21,11 @@ pub const MAX_MULTIPART_BYTES: u64 = MAX_MULTIPART_PARTS * STREAM_PART_BYTES as 
 /// duration from producing a far-future `expires-at` and keeps the service
 /// description's limit finite.
 pub const MAX_TTL_DAYS: u32 = 3650;
-
 /// Maximum TTL accepted from an API client, in seconds.
 pub const MAX_TTL_SECONDS: i64 = MAX_TTL_DAYS as i64 * 86_400;
+
+/// Message returned by every listing route when listing is off.
+pub const LISTING_DISABLED_MESSAGE: &str = "Listing is turned off on this instance.";
 
 /// Minimum number of words in a generated alias.
 pub const MIN_ALIAS_WORDS: u8 = 3;
@@ -68,6 +70,22 @@ pub struct Config {
     /// specify one. Zero is invalid because it would create a paste that
     /// is already expired.
     pub default_ttl_days: u32,
+    /// Minimum TTL in whole days for an explicit TTL.
+    ///
+    /// Default: `0`, so a TTL can be shorter than one day. When this is
+    /// above zero, a request below the minimum is rejected.
+    pub min_ttl_days: u32,
+    /// Maximum TTL in whole days.
+    ///
+    /// Default: [`MAX_TTL_DAYS`]. A request above the maximum is rejected.
+    /// The value must be from 1 to [`MAX_TTL_DAYS`].
+    pub max_ttl_days: u32,
+    /// Whole-day choices for the browser TTL selector.
+    ///
+    /// Default: `1,3,7,14,30,90`. Every choice must be from
+    /// [`Self::min_ttl_days`] to [`Self::max_ttl_days`]. The default TTL
+    /// is added when it is absent.
+    pub ttl_choices: Vec<u32>,
     /// Number of days in the default paste list window, ending today in
     /// UTC.
     ///
@@ -119,6 +137,12 @@ pub struct Config {
     /// With no token configured, both routes refuse: there is nothing to
     /// check against, and an open list is what this setting prevents.
     pub list_requires_token: bool,
+    /// Whether any listing route works.
+    ///
+    /// Default: `true`. When this is `false`, the human `/pastes` page,
+    /// `GET /v1/pastes`, and the MCP `list_recent` tool refuse with one
+    /// message. This setting wins over [`Self::list_requires_token`].
+    pub list_enabled: bool,
     /// Whether a new paste gets a management token.
     ///
     /// Default: `false`. When this is `true`, creation returns a random
@@ -308,6 +332,24 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         help: "Default TTL in whole days",
     },
     ConfigField {
+        name: "DAYFLY_MIN_TTL_DAYS",
+        value: Some("0"),
+        required: false,
+        help: "Minimum TTL in whole days; 0 allows a shorter TTL",
+    },
+    ConfigField {
+        name: "DAYFLY_MAX_TTL_DAYS",
+        value: Some("3650"),
+        required: false,
+        help: "Maximum TTL in whole days",
+    },
+    ConfigField {
+        name: "DAYFLY_TTL_CHOICES",
+        value: Some("1,3,7,14,30,90"),
+        required: false,
+        help: "Comma-separated whole-day choices for the browser TTL selector",
+    },
+    ConfigField {
         name: "DAYFLY_LIST_DEFAULT_DAYS",
         value: Some("2"),
         required: false,
@@ -348,6 +390,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("false"),
         required: false,
         help: "Start a non-loopback bind with no bearer token",
+    },
+    ConfigField {
+        name: "DAYFLY_LIST_ENABLED",
+        value: Some("true"),
+        required: false,
+        help: "Allow any listing route",
     },
     ConfigField {
         name: "DAYFLY_LIST_REQUIRES_TOKEN",
@@ -588,6 +636,61 @@ where
         }),
         _ => Ok(default),
     }
+}
+
+/// Parse and check `DAYFLY_TTL_CHOICES`.
+///
+/// Every choice must be from `min_ttl_days` (at least 1) to `max_ttl_days`.
+/// The default TTL is added when it is absent. The result is sorted and
+/// has no duplicates.
+fn ttl_choices<F>(
+    lookup: &F,
+    default_ttl_days: u32,
+    min_ttl_days: u32,
+    max_ttl_days: u32,
+) -> Result<Vec<u32>, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let min = min_ttl_days.max(1);
+    let raw = lookup("DAYFLY_TTL_CHOICES")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "1,3,7,14,30,90".to_string());
+    let mut choices = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(ConfigError::Invalid(
+                "DAYFLY_TTL_CHOICES".to_string(),
+                "expected a comma-separated list of whole days".to_string(),
+            ));
+        }
+        let days: u32 = part.parse().map_err(|_| {
+            ConfigError::Invalid(
+                "DAYFLY_TTL_CHOICES".to_string(),
+                "expected a comma-separated list of whole days".to_string(),
+            )
+        })?;
+        if days < min || days > max_ttl_days {
+            return Err(ConfigError::Invalid(
+                "DAYFLY_TTL_CHOICES".to_string(),
+                format!("each value must be from {min} to {max_ttl_days}"),
+            ));
+        }
+        choices.push(days);
+    }
+    if choices.is_empty() {
+        return Err(ConfigError::Invalid(
+            "DAYFLY_TTL_CHOICES".to_string(),
+            "expected at least one value".to_string(),
+        ));
+    }
+    if !choices.contains(&default_ttl_days) {
+        choices.push(default_ttl_days);
+    }
+    choices.sort_unstable();
+    choices.dedup();
+    Ok(choices)
 }
 
 /// Parse a boolean setting. Accepts the usual spellings so an env file can
@@ -1209,23 +1312,41 @@ impl Config {
         if bucket.is_empty() {
             return Err(ConfigError::EmptyBucket);
         }
+        let min_ttl_days = optional_u32(&lookup, "DAYFLY_MIN_TTL_DAYS", 0)?;
+        let max_ttl_days = optional_u32(&lookup, "DAYFLY_MAX_TTL_DAYS", MAX_TTL_DAYS)?;
+        if max_ttl_days == 0 || max_ttl_days > MAX_TTL_DAYS {
+            return Err(ConfigError::Invalid(
+                "DAYFLY_MAX_TTL_DAYS".to_string(),
+                format!("expected an integer from 1 to {MAX_TTL_DAYS}"),
+            ));
+        }
+        if min_ttl_days > max_ttl_days {
+            return Err(ConfigError::Invalid(
+                "DAYFLY_MIN_TTL_DAYS".to_string(),
+                "must not exceed DAYFLY_MAX_TTL_DAYS".to_string(),
+            ));
+        }
         let default_ttl_days = optional_u32(
             &lookup,
             "DAYFLY_DEFAULT_TTL_DAYS",
             field_u32("DAYFLY_DEFAULT_TTL_DAYS", 7),
         )?;
-        if default_ttl_days == 0 {
+        if default_ttl_days == 0 || default_ttl_days < min_ttl_days.max(1) {
             return Err(ConfigError::Invalid(
                 "DAYFLY_DEFAULT_TTL_DAYS".to_string(),
-                "expected a positive integer".to_string(),
+                format!(
+                    "expected an integer from {} to {max_ttl_days}",
+                    min_ttl_days.max(1)
+                ),
             ));
         }
-        if default_ttl_days > MAX_TTL_DAYS {
+        if default_ttl_days > max_ttl_days {
             return Err(ConfigError::Invalid(
                 "DAYFLY_DEFAULT_TTL_DAYS".to_string(),
-                format!("expected at most {MAX_TTL_DAYS} days"),
+                format!("expected at most {max_ttl_days} days"),
             ));
         }
+        let ttl_choices = ttl_choices(&lookup, default_ttl_days, min_ttl_days, max_ttl_days)?;
         let list_default_days = optional_u32(
             &lookup,
             "DAYFLY_LIST_DEFAULT_DAYS",
@@ -1318,6 +1439,9 @@ impl Config {
             )?,
             alias_words,
             default_ttl_days,
+            min_ttl_days,
+            max_ttl_days,
+            ttl_choices,
             list_default_days,
             retention_by_size: optional_bool(
                 &lookup,
@@ -1361,6 +1485,11 @@ impl Config {
                 &lookup,
                 "DAYFLY_LIST_REQUIRES_TOKEN",
                 field_default("DAYFLY_LIST_REQUIRES_TOKEN") == Some("true"),
+            )?,
+            list_enabled: optional_bool(
+                &lookup,
+                "DAYFLY_LIST_ENABLED",
+                field_default("DAYFLY_LIST_ENABLED") != Some("false"),
             )?,
             paste_tokens: optional_bool(
                 &lookup,
@@ -1812,6 +1941,9 @@ mod tests {
             max_paste_bytes: 1024 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,
+            min_ttl_days: 0,
+            max_ttl_days: 3650,
+            ttl_choices: vec![1, 3, 7, 14, 30, 90],
             list_default_days: 2,
             retention_by_size: false,
             retention_min_days: 30,
@@ -1824,6 +1956,7 @@ mod tests {
             view_line_numbers: false,
             allow_unauthenticated: false,
             list_requires_token: false,
+            list_enabled: true,
             paste_tokens: false,
             rate_limit_per_minute: 0,
             http_bearer_token: None,
@@ -2383,6 +2516,69 @@ mod tests {
         assert_eq!(config.site_name.as_deref(), Some("dayfly"));
         assert_eq!(config.contact.as_deref(), Some("abuse@example.com"));
         assert_eq!(config.aup_url.as_deref(), Some("https://example.com/aup"));
+    }
+
+    #[test]
+    fn ttl_range_defaults_keep_the_wide_range() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("base env must parse");
+        assert_eq!(config.min_ttl_days, 0);
+        assert_eq!(config.max_ttl_days, MAX_TTL_DAYS);
+        assert_eq!(config.ttl_choices, vec![1, 3, 7, 14, 30, 90]);
+        assert!(config.list_enabled);
+    }
+
+    #[test]
+    fn ttl_range_parses_a_public_profile() {
+        let mut entries = base_env();
+        entries.push(("DAYFLY_MIN_TTL_DAYS".to_string(), "1".to_string()));
+        entries.push(("DAYFLY_MAX_TTL_DAYS".to_string(), "3".to_string()));
+        entries.push(("DAYFLY_TTL_CHOICES".to_string(), "1,2,3".to_string()));
+        entries.push(("DAYFLY_DEFAULT_TTL_DAYS".to_string(), "1".to_string()));
+        entries.push(("DAYFLY_LIST_ENABLED".to_string(), "false".to_string()));
+        let config = Config::from_lookup(lookup_from(&entries)).expect("public profile must parse");
+        assert_eq!(config.min_ttl_days, 1);
+        assert_eq!(config.max_ttl_days, 3);
+        assert_eq!(config.ttl_choices, vec![1, 2, 3]);
+        assert_eq!(config.default_ttl_days, 1);
+        assert!(!config.list_enabled);
+    }
+
+    #[test]
+    fn default_ttl_must_fit_the_range() {
+        let mut entries = base_env();
+        entries.push(("DAYFLY_MIN_TTL_DAYS".to_string(), "2".to_string()));
+        entries.push(("DAYFLY_MAX_TTL_DAYS".to_string(), "3".to_string()));
+        entries.push(("DAYFLY_DEFAULT_TTL_DAYS".to_string(), "1".to_string()));
+        let err = expect_error(Config::from_lookup(lookup_from(&entries)));
+        match err {
+            ConfigError::Invalid(name, _) => assert_eq!(name, "DAYFLY_DEFAULT_TTL_DAYS"),
+            other => panic!("expected ConfigError::Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn minimum_ttl_must_not_exceed_the_maximum() {
+        let mut entries = base_env();
+        entries.push(("DAYFLY_MIN_TTL_DAYS".to_string(), "4".to_string()));
+        entries.push(("DAYFLY_MAX_TTL_DAYS".to_string(), "3".to_string()));
+        let err = expect_error(Config::from_lookup(lookup_from(&entries)));
+        match err {
+            ConfigError::Invalid(name, _) => assert_eq!(name, "DAYFLY_MIN_TTL_DAYS"),
+            other => panic!("expected ConfigError::Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ttl_choices_must_fit_the_range() {
+        let mut entries = base_env();
+        entries.push(("DAYFLY_MAX_TTL_DAYS".to_string(), "3".to_string()));
+        entries.push(("DAYFLY_DEFAULT_TTL_DAYS".to_string(), "1".to_string()));
+        entries.push(("DAYFLY_TTL_CHOICES".to_string(), "1,7".to_string()));
+        let err = expect_error(Config::from_lookup(lookup_from(&entries)));
+        match err {
+            ConfigError::Invalid(name, _) => assert_eq!(name, "DAYFLY_TTL_CHOICES"),
+            other => panic!("expected ConfigError::Invalid, got {other:?}"),
+        }
     }
 
     #[test]

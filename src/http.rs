@@ -37,7 +37,7 @@ use serde::Serialize;
 use subtle::ConstantTimeEq;
 
 use crate::client_addr::{self, ClientAddr};
-use crate::config::{TextAsset, MAX_TTL_SECONDS};
+use crate::config::TextAsset;
 use crate::content_type::content_disposition;
 use crate::rate_limit::RateLimiter;
 use crate::store::{
@@ -233,6 +233,18 @@ pub(crate) fn check_list_access(
     check_auth(state, headers).map_err(ListAccessError::Unauthorized)
 }
 
+/// One response for every route when listing is off.
+fn listing_disabled_response() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "listing_disabled",
+            "detail": crate::config::LISTING_DISABLED_MESSAGE,
+        })),
+    )
+        .into_response()
+}
+
 fn list_access_response(error: ListAccessError) -> Response {
     match error {
         ListAccessError::Unauthorized(response) => response,
@@ -275,6 +287,7 @@ pub(crate) fn status_for(e: &StoreError) -> StatusCode {
         StoreError::InvalidId(_)
         | StoreError::InvalidDate(_)
         | StoreError::InvalidRange(_)
+        | StoreError::TtlOutOfRange(_)
         | StoreError::LengthMismatch { .. } => StatusCode::BAD_REQUEST,
         StoreError::InvalidPath(_) => StatusCode::BAD_REQUEST,
         // The local-path tools are MCP-only. If one of these reaches an
@@ -934,6 +947,9 @@ async fn list_handler(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    if !state.store().config.list_enabled {
+        return listing_disabled_response();
+    }
     if let Err(error) = check_list_access(&state, &headers) {
         return list_access_response(error);
     }
@@ -1562,6 +1578,7 @@ async fn service_description(State(state): State<AppState>) -> Response {
             "none"
         },
         "paste_tokens": config.paste_tokens,
+        "listing_enabled": config.list_enabled,
         "policy": {
             "inline_pdf": config.inline_pdf,
         },
@@ -1571,7 +1588,9 @@ async fn service_description(State(state): State<AppState>) -> Response {
             "max_paste_bytes": config.max_paste_bytes,
             "default_ttl_seconds": u64::from(config.default_ttl_days) * 86_400,
             "list_default_days": config.list_default_days,
-            "max_ttl_seconds": MAX_TTL_SECONDS,
+            "min_ttl_seconds": u64::from(config.min_ttl_days) * 86_400,
+            "max_ttl_seconds": u64::from(config.max_ttl_days) * 86_400,
+            "ttl_choices_days": config.ttl_choices,
             "retention_by_size": config.retention_by_size,
             "retention_min_seconds": u64::from(config.retention_min_days) * 86_400,
             "retention_max_seconds": u64::from(config.retention_max_days) * 86_400,
@@ -1687,6 +1706,9 @@ mod tests {
             max_paste_bytes: 1024 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,
+            min_ttl_days: 0,
+            max_ttl_days: 3650,
+            ttl_choices: vec![1, 3, 7, 14, 30, 90],
             list_default_days: 2,
             retention_by_size: false,
             retention_min_days: 30,
@@ -1699,6 +1721,7 @@ mod tests {
             view_line_numbers: false,
             allow_unauthenticated: false,
             list_requires_token: false,
+            list_enabled: true,
             paste_tokens: false,
             rate_limit_per_minute: 0,
             http_bearer_token: None,

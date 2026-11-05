@@ -48,7 +48,7 @@ use axum::{Form, Router};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use crate::config::Config;
+use crate::config::{Config, LISTING_DISABLED_MESSAGE};
 use crate::http::{
     check_auth, check_list_access, check_paste_control, public_base, read_metadata_field,
     status_for, AppState, ListAccessError, MultipartFieldError, MULTIPART_METADATA_MAX_BYTES,
@@ -574,8 +574,8 @@ fn days_remaining_label(expires_at: Option<DateTime<Utc>>) -> String {
     }
 }
 
-fn ttl_options(selected: u32) -> String {
-    let mut days = vec![1u32, 3, 7, 14, 30, 90];
+fn ttl_options(config: &Config, selected: u32) -> String {
+    let mut days = config.ttl_choices.clone();
     if !days.contains(&selected) {
         // The configured default can be any positive day count. Render it
         // even when it is not one of the common choices, so the browser
@@ -690,7 +690,7 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
 <button type="submit">Create paste</button>
 </div>
 </form>"#,
-        ttl_options(default_ttl),
+        ttl_options(&store.config, default_ttl),
     );
     body.push_str(DROPZONE_SCRIPT);
     if let Some(base) = public_base(&headers) {
@@ -1228,7 +1228,21 @@ async fn list_handler(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let footer = Footer::from_config(&state.store().config);
+    let store = state.store();
+    let footer = Footer::from_config(&store.config);
+    if !store.config.list_enabled {
+        return (
+            StatusCode::FORBIDDEN,
+            page(
+                &footer,
+                "Listing turned off",
+                Some("/pastes"),
+                true,
+                &format!("<p>{}</p>", html_escape(LISTING_DISABLED_MESSAGE)),
+            ),
+        )
+            .into_response();
+    }
     if let Err(error) = check_list_access(&state, &headers) {
         return match error {
             // A configured token already gated this page, and the shared
@@ -1636,6 +1650,9 @@ mod tests {
             max_paste_bytes: 1024 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,
+            min_ttl_days: 0,
+            max_ttl_days: 3650,
+            ttl_choices: vec![1, 3, 7, 14, 30, 90],
             list_default_days: 2,
             retention_by_size: false,
             retention_min_days: 30,
@@ -1648,6 +1665,7 @@ mod tests {
             view_line_numbers: false,
             allow_unauthenticated: false,
             list_requires_token: false,
+            list_enabled: true,
             paste_tokens: false,
             rate_limit_per_minute: 0,
             http_bearer_token: None,

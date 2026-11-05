@@ -163,6 +163,53 @@ async fn index_page_renders_the_combined_form_and_the_default_ttl() {
 }
 
 #[tokio::test]
+async fn disabled_listing_renders_the_turned_off_page() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.list_enabled = false;
+    let store = Store::from_config(config)
+        .await
+        .expect("fake S3 config must build without network access");
+    let app = common::app(store);
+
+    let request = common::request("GET", "/pastes", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let page = html_text(&body);
+    assert!(
+        page.contains("Listing is turned off on this instance."),
+        "the page must say listing is off: {page}"
+    );
+}
+
+#[tokio::test]
+async fn ttl_selector_uses_the_configured_choices() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.default_ttl_days = 1;
+    config.ttl_choices = vec![1, 2, 3];
+    let store = Store::from_config(config)
+        .await
+        .expect("fake S3 config must build without network access");
+    let app = common::app(store);
+
+    let request = common::request("GET", "/", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    for days in [1, 2, 3] {
+        assert!(
+            page.contains(&format!("<option value=\"{days}\"")),
+            "missing TTL choice {days}: {page}"
+        );
+    }
+    assert!(
+        !page.contains("<option value=\"7\""),
+        "the default choices must not appear: {page}"
+    );
+}
+
+#[tokio::test]
 async fn configured_footer_replaces_the_internal_use_text() {
     let fake = FakeS3::start().await;
     let mut config = fake.config();

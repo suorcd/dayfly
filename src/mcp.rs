@@ -202,6 +202,7 @@ fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> 
         StoreError::InvalidId(_)
         | StoreError::InvalidDate(_)
         | StoreError::InvalidRange(_)
+        | StoreError::TtlOutOfRange(_)
         | StoreError::InvalidPath(_)
         | StoreError::PathOutsideRoot(_)
         | StoreError::LocalFilesDisabled
@@ -617,21 +618,23 @@ impl Pastebin {
         &self,
         Parameters(params): Parameters<ListRecentParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let store = self.current_store();
+        if !store.config.list_enabled {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                crate::config::LISTING_DISABLED_MESSAGE,
+            )]));
+        }
         let request = try_store!(list_request(&params));
         let limit = params.limit.unwrap_or(100);
         let items = match &request {
             ListWindowRequest::Date(date) => {
-                try_store!(self.current_store().list_recent(Some(date), limit).await)
+                try_store!(store.list_recent(Some(date), limit).await)
             }
             ListWindowRequest::Range { start, end } => {
-                try_store!(
-                    self.current_store()
-                        .list_window(Some(start), Some(end), limit)
-                        .await
-                )
+                try_store!(store.list_window(Some(start), Some(end), limit).await)
             }
             ListWindowRequest::Default => {
-                try_store!(self.current_store().list_window(None, None, limit).await)
+                try_store!(store.list_window(None, None, limit).await)
             }
         };
         result_json(serde_json::json!({
