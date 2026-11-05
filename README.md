@@ -1420,21 +1420,32 @@ Run these checks against a real Garage instance:
   deletes objects past their TTL, plus aborts incomplete
   multipart uploads.
 
-## Lifecycle example
+## Lifecycle configuration
 
 `docs/lifecycle-example.json` is an **example only**. It is not
-applied automatically. Apply the file manually to a test bucket first.
-Garage lifecycle support depends on the Garage version. Verify
-`Expiration` and `AbortIncompleteMultipartUpload` on the exact Garage
-build before production use.
+applied automatically. Apply the file with:
 
-The rule expires objects after 90 days. 90 days is the longest TTL
-the human frontend offers. API clients can set a longer TTL, so do not
-set the rule below the longest TTL you use. Otherwise, the sweeper can
-delete an object that the API still serves. Deletion is day-rounded
-and asynchronous, and it can run after the TTL. Objects are already
-unreadable through the API when `expires-at` passes, regardless of
-when the sweeper runs.
+```sh
+dayfly lifecycle apply --file docs/lifecycle-example.json
+```
+
+The command reads the bucket configuration, replaces a rule with the
+same `ID`, and keeps every other rule. It then writes the merged set.
+`--dry-run` prints the plan without a write.
+
+The call needs read and write permission on the bucket. Garage does not
+require owner permission for a lifecycle write. Garage lifecycle support
+depends on the Garage version. Verify `Expiration` and
+`AbortIncompleteMultipartUpload` on the exact Garage build before
+production use.
+
+An `Expiration.Days` value at or below `DAYFLY_MAX_TTL_DAYS` is
+rejected, because the sweeper could delete an object before its
+read-time expiry. Use `--allow-short-expiration` only when you accept
+that risk. Without the override, keep the rule longer than the longest
+TTL in use. Deletion is day-rounded and asynchronous, and it can run
+after the TTL. Objects are already unreadable through the API when
+`expires-at` passes, regardless of when the sweeper runs.
 
 The example rule covers `pastes/` only. An alias object lives under
 `words/`. Add a second rule with the `words/` prefix to sweep expired

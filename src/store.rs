@@ -29,7 +29,9 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{Builder as S3ConfigBuilder, Region};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, MetadataDirective};
+use aws_sdk_s3::types::{
+    CompletedMultipartUpload, CompletedPart, LifecycleRule, MetadataDirective,
+};
 use aws_sdk_s3::Client;
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -95,6 +97,8 @@ pub enum StoreError {
     RangeNotSatisfiable,
     #[error("{0}")]
     TtlOutOfRange(String),
+    #[error("invalid lifecycle configuration: {0}")]
+    InvalidLifecycle(String),
     #[error("could not allocate a word alias after {attempts} attempts")]
     AliasUnavailable { attempts: usize },
     #[error("paste has more than {limit} appended segments")]
@@ -1399,11 +1403,10 @@ impl Store {
         })
     }
 
-    /// Log the bucket lifecycle rules, best effort.
+    /// The bucket lifecycle rules, or an empty set when none is set.
     ///
-    /// The call needs read permission on the bucket. A missing rule or an
-    /// S3 error logs one warning. Startup and serving continue.
-    pub async fn log_lifecycle_rules(&self) {
+    /// The call needs read permission on the bucket.
+    pub async fn lifecycle_rules(&self) -> Result<Vec<LifecycleRule>, StoreError> {
         let result = self
             .client
             .get_bucket_lifecycle_configuration()
@@ -1411,15 +1414,55 @@ impl Store {
             .send()
             .await;
         match result {
-            Ok(output) => {
-                let rules = output.rules();
-                if rules.is_empty() {
-                    tracing::warn!(
-                        bucket = %self.bucket,
-                        "bucket has no lifecycle rules; expired objects stay in storage until a client or an operator deletes them"
-                    );
+            Ok(output) => Ok(output.rules().to_vec()),
+            Err(error) => {
+                let absent = match &error {
+                    SdkError::ServiceError(ctx) => {
+                        ctx.err().code() == Some("NoSuchLifecycleConfiguration")
+                            || ctx.raw().status().as_u16() == 404
+                    }
+                    _ => false,
+                };
+                if absent {
+                    Ok(Vec::new())
+                } else {
+                    Err(map_sdk_error(error, &self.bucket))
                 }
-                for rule in rules {
+            }
+        }
+    }
+
+    /// Replace the bucket lifecycle rules.
+    ///
+    /// The call needs write permission on the bucket. Garage does not
+    /// require owner permission for this endpoint.
+    pub async fn put_lifecycle_rules(&self, rules: Vec<LifecycleRule>) -> Result<(), StoreError> {
+        let configuration = crate::lifecycle::configuration(rules)
+            .map_err(|error| StoreError::InvalidLifecycle(error.to_string()))?;
+        self.client
+            .put_bucket_lifecycle_configuration()
+            .bucket(self.bucket.clone())
+            .lifecycle_configuration(configuration)
+            .send()
+            .await
+            .map_err(|error| map_sdk_error(error, &self.bucket))?;
+        Ok(())
+    }
+
+    /// Log the bucket lifecycle rules, best effort.
+    ///
+    /// The call needs read permission on the bucket. A missing rule or an
+    /// S3 error logs one warning. Startup and serving continue.
+    pub async fn log_lifecycle_rules(&self) {
+        match self.lifecycle_rules().await {
+            Ok(rules) if rules.is_empty() => {
+                tracing::warn!(
+                    bucket = %self.bucket,
+                    "bucket has no lifecycle rules; expired objects stay in storage until a client or an operator deletes them"
+                );
+            }
+            Ok(rules) => {
+                for rule in &rules {
                     tracing::info!(
                         bucket = %self.bucket,
                         rule = rule.id().unwrap_or(""),
@@ -1432,24 +1475,10 @@ impl Store {
                 }
             }
             Err(error) => {
-                let absent = match &error {
-                    SdkError::ServiceError(ctx) => {
-                        ctx.err().code() == Some("NoSuchLifecycleConfiguration")
-                            || ctx.raw().status().as_u16() == 404
-                    }
-                    _ => false,
-                };
-                if absent {
-                    tracing::warn!(
-                        bucket = %self.bucket,
-                        "bucket has no lifecycle configuration; expired objects stay in storage until a client or an operator deletes them"
-                    );
-                } else {
-                    tracing::warn!(
-                        bucket = %self.bucket,
-                        "cannot read the bucket lifecycle configuration: {error:?}"
-                    );
-                }
+                tracing::warn!(
+                    bucket = %self.bucket,
+                    "cannot read the bucket lifecycle configuration: {error:?}"
+                );
             }
         }
     }
