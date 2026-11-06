@@ -28,8 +28,8 @@ is needed. See "No database in v1" below.
 - Each new paste also gets a word alias, three words by default, for
   example `abacus-abdomen-zoology`. The alias is a second name for the
   same paste, not a second paste.
-- Filename, content-type, created date, and TTL are stored in object
-  metadata. The S3 `Content-Length` gives the size. A `sha256` value is
+- Filename, title, tags, content-type, created date, and TTL are stored
+  in object metadata. The S3 `Content-Length` gives the size. A `sha256` value is
   stored when the hash is known before the object is created. A
   multipart stream cannot know the hash in advance, so it omits the
   value. The TTL is stored as exact seconds and as whole days when the
@@ -568,6 +568,10 @@ MCP tools: `store_text`, `store_file`, `append_text`, `set_ttl`,
 metadata — binary content is never sent over JSON-RPC),
 `fetch_metadata`, `delete_paste`, `list_recent`, `get_info`.
 
+`store_text` and `store_file` accept `title` and `tags`. The title is
+at most 200 bytes. Tags are at most 8 values and 512 bytes in total.
+`fetch_metadata` and `list_recent` return both fields.
+
 When `DAYFLY_PASTE_TOKENS` is on, `store_text` and `store_file` return
 `paste_token`. `delete_paste`, `set_ttl`, and `append_text` accept a
 `paste_token` argument. A configured bearer token is checked by the
@@ -644,6 +648,18 @@ curl --data-binary @- -H 'Accept: application/json' \
 
 When `DAYFLY_PASTE_TOKENS` is on, the JSON response adds `paste_token`
 and the plain response adds an `X-Paste-Token` header.
+
+Send `X-Title` and `X-Tags` to name and group a paste. `X-Tags` is a
+comma-separated list. The store trims the title, lowercases and
+deduplicates the tags, and accepts at most 8 tags and 512 bytes of tags.
+A title is at most 200 bytes. The JSON response and the metadata route
+return `title` and `tags`.
+
+```sh
+printf 'build failed\n' | curl --data-binary @- \
+  -H 'X-Title: Build log' -H 'X-Tags: ops,build' \
+  http://127.0.0.1:8080/upload
+```
 
 `POST /v1/pastes` is an alias for `POST /upload`.
 
@@ -830,6 +846,10 @@ curl 'http://127.0.0.1:8080/v1/pastes?date=2026-10-28&limit=100'
 # List an inclusive range across a date boundary:
 curl 'http://127.0.0.1:8080/v1/pastes?start=2026-10-28&end=2026-10-29&limit=100'
 
+# Filter the returned page by text or tag:
+curl 'http://127.0.0.1:8080/v1/pastes?q=build'
+curl 'http://127.0.0.1:8080/v1/pastes?tag=ops'
+
 # Read the next page with the cursor from the previous response:
 curl 'http://127.0.0.1:8080/v1/pastes?date=2026-10-28&limit=100&after_date=2026-10-28&after_key=pastes%2F2026-10-28%2FAbC123...'
 ```
@@ -846,6 +866,10 @@ to read the next page; one part alone returns 400 with code
 `invalid_cursor`. The cursor follows scan order (newest date first,
 then S3 key order), not the sorted order of the returned items.
 
+`q` matches the alias, title, filename, or ID. `tag` matches one tag.
+The filter applies to the items in the returned page. Use the cursor to
+read further pages.
+
 Downloads return an `ETag`. Send it as `If-None-Match` to get
 `304 Not Modified` when the paste has not changed. The validator covers
 the joined paste, so an append changes it. `HEAD` returns the same tag.
@@ -861,8 +885,8 @@ Every HTTP error carries a stable `code`. The current values are:
 `unauthorized`, `forbidden`, `listing_disabled`, `not_found`,
 `expired`, `too_large`, `length_mismatch`, `too_many_segments`,
 `range_not_satisfiable`, `invalid_request`, `invalid_id`,
-`invalid_date`, `invalid_range`, `invalid_cursor`, `invalid_ttl`,
-`invalid_lifecycle`,
+`invalid_date`, `invalid_range`, `invalid_cursor`, `invalid_title`,
+`invalid_tags`, `invalid_ttl`, `invalid_lifecycle`,
 `invalid_path`, `path_outside_root`, `local_files_disabled`,
 `alias_unavailable`, `io_error`, `s3_error`, `quota_exceeded`,
 `bucket_unavailable`, `partial_update`, `rate_limited`, and
@@ -1161,7 +1185,8 @@ instance.
 
 - `GET /` — combined new-paste form: paste text or drop and choose a
   file, with a TTL selector in whole days (1, 3, 7, 14, 30, 90 days;
-  the API also accepts sub-day TTLs). One "Create paste" button posts
+  the API also accepts sub-day TTLs). Optional title and tags fields
+  name and group the paste. One "Create paste" button posts
   multipart data to `POST /ui/create`; a selected file takes
   precedence over the text fields. Without JavaScript, the native file
   picker and textarea still work. The page shows the configured file
@@ -1176,8 +1201,8 @@ instance.
   canonical ID.
 - `GET /pastes` — current pastes, built from the bucket scan (no
   database): alias when enabled (with the canonical ID as secondary
-  text when `DAYFLY_SHOW_INTERNAL_PATHS` is true), filename if any,
-  content type, size, created date, and TTL in days
+  text when `DAYFLY_SHOW_INTERNAL_PATHS` is true), title, filename if
+  any, content type, size, created date, and TTL in days
   remaining, and a delete action per row. Expired items are
   filtered out, consistent with the API's read-time expiry check. The
   Start and End inputs start with the default window:
@@ -1186,11 +1211,13 @@ instance.
   and `?order=asc|desc` to sort. The default is `created` descending.
   The Size and Created headers are links. A click toggles the
   direction and keeps the date filters. A missing created or expiry
-  value sorts last in both directions.
-- `GET /view/<id>` — one paste: the alias as the page heading, then
-  Download, Raw, and Copy link actions, with a right-aligned Metadata &
-  delete toggle on the same row. The toggle opens a full-width box with
-  the metadata and the delete form. Then the content: text in `<pre>`
+  value sorts last in both directions. The Search and Tag inputs filter
+  the returned rows with `q` and `tag`.
+- `GET /view/<id>` — one paste: the title as the page heading when it
+  exists, otherwise the alias, then Download, Raw, and Copy link
+  actions, with a right-aligned Metadata & delete toggle on the same
+  row. The toggle opens a full-width box with the title, tags,
+  metadata, and the delete form. Then the content: text in `<pre>`
   (capped at 1 MiB for the page; the raw route and the API return the
   full paste) with a Copy button inside the box, including the escaped
   source of HTML and SVG, safe images inline, other types via the raw
@@ -1543,6 +1570,9 @@ recorded here so readers can plan around them.
   `DAYFLY_ALIAS_WORDS=4` or more when aliases are public. The alias is a
   second name, not a bearer token. Use the bearer token and the private
   network.
+- **A title and tags use S3 user metadata.** Keep them small: 200 bytes
+  for the title and 512 bytes for tags. AWS-compatible stores cap user
+  metadata at 2 KB per object; verify the limit on your Garage build.
 - **The HTTP endpoint is intended for a private network.** The
   bearer token comparison is constant time for equal-length tokens.
   A length difference still leaks through timing. The write-route origin

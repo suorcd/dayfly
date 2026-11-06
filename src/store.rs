@@ -95,6 +95,10 @@ pub enum StoreError {
     InvalidRange(String),
     #[error("invalid list cursor: {0}")]
     InvalidCursor(String),
+    #[error("invalid title: {0}")]
+    InvalidTitle(String),
+    #[error("invalid tags: {0}")]
+    InvalidTags(String),
     #[error("range not satisfiable")]
     RangeNotSatisfiable,
     #[error("{0}")]
@@ -137,6 +141,8 @@ impl StoreError {
             StoreError::InvalidDate(_) => "invalid_date",
             StoreError::InvalidRange(_) => "invalid_range",
             StoreError::InvalidCursor(_) => "invalid_cursor",
+            StoreError::InvalidTitle(_) => "invalid_title",
+            StoreError::InvalidTags(_) => "invalid_tags",
             StoreError::RangeNotSatisfiable => "range_not_satisfiable",
             StoreError::TtlOutOfRange(_) => "invalid_ttl",
             StoreError::InvalidLifecycle(_) => "invalid_lifecycle",
@@ -516,6 +522,25 @@ fn partial_update_error(step: &'static str, key: &str, error: StoreError) -> Sto
     }
 }
 
+/// Optional fields for a new paste.
+///
+/// The store normalizes the title and tags. A caller can pass raw values
+/// from a header, a form, or an MCP argument.
+#[derive(Debug, Clone, Default)]
+pub struct PasteFields {
+    pub filename: Option<String>,
+    pub content_type: Option<String>,
+    pub title: Option<String>,
+    pub tags: Vec<String>,
+}
+
+/// Maximum title length in bytes.
+pub const MAX_TITLE_BYTES: usize = 200;
+/// Maximum number of tags on one paste.
+pub const MAX_TAGS: usize = 8;
+/// Maximum total tag length in bytes, including separators.
+pub const MAX_TAGS_BYTES: usize = 512;
+
 #[derive(Debug, Clone)]
 pub struct StoredPaste {
     /// Full paste ID returned to clients: "<yyyy-mm-dd>/<random-id>".
@@ -527,6 +552,10 @@ pub struct StoredPaste {
     pub sha256: String,
     pub content_type: String,
     pub filename: Option<String>,
+    /// Human-readable name for the paste.
+    pub title: Option<String>,
+    /// Normalized tags.
+    pub tags: Vec<String>,
     /// "client" | "sniffed" | "extension" | "text" | "fallback".
     pub detection_source: Option<String>,
     /// "explicit -> sniffed" when a sniffed signature overrode the client.
@@ -546,6 +575,10 @@ pub struct PasteMetadata {
     /// Word alias, when the base object records one.
     pub words: Option<String>,
     pub filename: Option<String>,
+    /// Human-readable name for the paste.
+    pub title: Option<String>,
+    /// Normalized tags.
+    pub tags: Vec<String>,
     pub content_type: String,
     pub detection_source: Option<String>,
     pub detection_conflict: Option<String>,
@@ -621,6 +654,10 @@ pub struct PasteSummary {
     pub key: String,
     /// Word alias, when the base object records one.
     pub words: Option<String>,
+    /// Human-readable name for the paste.
+    pub title: Option<String>,
+    /// Normalized tags.
+    pub tags: Vec<String>,
     pub size: u64,
     pub last_modified: Option<DateTime<Utc>>,
     /// From HeadObject, when available. `None` means the object has no
@@ -1215,6 +1252,49 @@ fn expires_at_for(created_at: DateTime<Utc>, ttl: Ttl) -> DateTime<Utc> {
         .unwrap_or(DateTime::<Utc>::MAX_UTC)
 }
 
+/// Trim a title and enforce its byte limit.
+fn normalize_title(title: Option<&str>) -> Result<Option<String>, StoreError> {
+    let Some(title) = title else {
+        return Ok(None);
+    };
+    let title = title.trim();
+    if title.is_empty() {
+        return Ok(None);
+    }
+    if title.len() > MAX_TITLE_BYTES {
+        return Err(StoreError::InvalidTitle(format!(
+            "title is longer than {MAX_TITLE_BYTES} bytes"
+        )));
+    }
+    Ok(Some(title.to_string()))
+}
+
+/// Lowercase, trim, and deduplicate tags, then enforce the limits.
+fn normalize_tags(tags: &[String]) -> Result<Vec<String>, StoreError> {
+    let mut out: Vec<String> = Vec::new();
+    for tag in tags {
+        let tag = tag.trim().to_lowercase();
+        if tag.is_empty() {
+            continue;
+        }
+        if !out.contains(&tag) {
+            out.push(tag);
+        }
+    }
+    if out.len() > MAX_TAGS {
+        return Err(StoreError::InvalidTags(format!(
+            "at most {MAX_TAGS} tags are allowed"
+        )));
+    }
+    let total = out.iter().map(String::len).sum::<usize>() + out.len().saturating_sub(1);
+    if total > MAX_TAGS_BYTES {
+        return Err(StoreError::InvalidTags(format!(
+            "tags are longer than {MAX_TAGS_BYTES} bytes"
+        )));
+    }
+    Ok(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn metadata_for(
     filename: Option<&str>,
@@ -1225,6 +1305,8 @@ fn metadata_for(
     ttl: Ttl,
     created_at: DateTime<Utc>,
     detection: &Detection,
+    title: Option<&str>,
+    tags: &[String],
 ) -> (HashMap<String, String>, DateTime<Utc>) {
     let expires_at = expires_at_for(created_at, ttl);
     let mut meta = HashMap::new();
@@ -1232,6 +1314,15 @@ fn metadata_for(
         if !f.is_empty() {
             meta.insert("filename".to_string(), encode_filename(f));
         }
+    }
+    if let Some(title) = title {
+        meta.insert("title".to_string(), encode_filename(title));
+    }
+    if !tags.is_empty() {
+        meta.insert(
+            "tags".to_string(),
+            serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string()),
+        );
     }
     // sha256 and size are unknown until the upload completes. Omit both
     // keys then, so HeadObject does not report an empty hash or a zero
@@ -1943,6 +2034,25 @@ impl Store {
         content_type: Option<&str>,
         ttl: Option<Ttl>,
     ) -> Result<StoredPaste, StoreError> {
+        let fields = PasteFields {
+            filename: filename.map(str::to_string),
+            content_type: content_type.map(str::to_string),
+            ..PasteFields::default()
+        };
+        self.store_text_with_fields(text, &fields, ttl).await
+    }
+
+    /// Store text with optional title and tags.
+    pub async fn store_text_with_fields(
+        &self,
+        text: &[u8],
+        fields: &PasteFields,
+        ttl: Option<Ttl>,
+    ) -> Result<StoredPaste, StoreError> {
+        let filename = fields.filename.as_deref();
+        let content_type = fields.content_type.as_deref();
+        let title = normalize_title(fields.title.as_deref())?;
+        let tags = normalize_tags(&fields.tags)?;
         let max_bytes = self.config.max_text_paste_bytes();
         if u64::try_from(text.len()).unwrap_or(u64::MAX) > max_bytes {
             return Err(StoreError::TooLarge { limit: max_bytes });
@@ -1976,6 +2086,8 @@ impl Store {
             ttl,
             created_at,
             &detection,
+            title.as_deref(),
+            &tags,
         );
         if let Err(e) = self
             .client
@@ -2005,6 +2117,8 @@ impl Store {
             sha256: sha,
             content_type: ct,
             filename: filename.map(|s| s.to_string()),
+            title,
+            tags,
             detection_source: Some(detection.source.to_string()),
             detection_conflict: detection.conflict,
             expires_at,
@@ -2027,6 +2141,25 @@ impl Store {
         content_type: Option<&str>,
         ttl: Option<Ttl>,
     ) -> Result<StoredPaste, StoreError> {
+        let fields = PasteFields {
+            filename: filename.map(str::to_string),
+            content_type: content_type.map(str::to_string),
+            ..PasteFields::default()
+        };
+        self.store_file_path_with_fields(path, &fields, ttl).await
+    }
+
+    /// Store a local file with optional title and tags.
+    pub async fn store_file_path_with_fields(
+        &self,
+        path: &Path,
+        fields: &PasteFields,
+        ttl: Option<Ttl>,
+    ) -> Result<StoredPaste, StoreError> {
+        let filename = fields.filename.as_deref();
+        let content_type = fields.content_type.as_deref();
+        let title = normalize_title(fields.title.as_deref())?;
+        let tags = normalize_tags(&fields.tags)?;
         let mut file = File::open(path).await?;
         // Metadata from the handle, not the path: one file, one view.
         let file_meta = file.metadata().await?;
@@ -2103,6 +2236,8 @@ impl Store {
                     ttl,
                     created_at,
                     &detection,
+                    title.as_deref(),
+                    &tags,
                 );
                 if let Err(e) = self
                     .client
@@ -2132,6 +2267,8 @@ impl Store {
                     sha256: sha,
                     content_type: ct,
                     filename: display_name,
+                    title,
+                    tags,
                     detection_source: Some(detection.source.to_string()),
                     detection_conflict: detection.conflict,
                     expires_at,
@@ -2227,6 +2364,8 @@ impl Store {
             ttl,
             created_at,
             &detection,
+            title.as_deref(),
+            &tags,
         );
         let mut sink = AwsUploadSink {
             client: self.client.clone(),
@@ -2270,6 +2409,8 @@ impl Store {
             sha256: outcome.sha256,
             content_type: ct,
             filename: display_name,
+            title,
+            tags,
             detection_source: Some(detection.source.to_string()),
             detection_conflict: detection.conflict,
             expires_at,
@@ -2312,6 +2453,31 @@ impl Store {
     where
         S: futures::Stream<Item = Result<Bytes, StoreError>> + Send + Unpin,
     {
+        let fields = PasteFields {
+            filename: filename.map(str::to_string),
+            content_type: content_type.map(str::to_string),
+            ..PasteFields::default()
+        };
+        self.store_stream_with_fields(stream, &fields, ttl, known_length, max_bytes)
+            .await
+    }
+
+    /// Store a streamed upload with optional title and tags.
+    pub async fn store_stream_with_fields<S>(
+        &self,
+        stream: S,
+        fields: &PasteFields,
+        ttl: Option<Ttl>,
+        known_length: Option<u64>,
+        max_bytes: u64,
+    ) -> Result<StoredPaste, StoreError>
+    where
+        S: futures::Stream<Item = Result<Bytes, StoreError>> + Send + Unpin,
+    {
+        let filename = fields.filename.as_deref();
+        let content_type = fields.content_type.as_deref();
+        let title = normalize_title(fields.title.as_deref())?;
+        let tags = normalize_tags(&fields.tags)?;
         // The total paste cap also bounds creation. Clamp here so a direct
         // caller cannot create a paste above it.
         let max_bytes = max_bytes.min(self.config.max_paste_bytes);
@@ -2334,7 +2500,15 @@ impl Store {
                     return Err(StoreError::LengthMismatch { expected, actual });
                 }
             }
-            return self.store_text(&body, None, content_type, Some(ttl)).await;
+            let text_fields = PasteFields {
+                filename: None,
+                content_type: fields.content_type.clone(),
+                title: fields.title.clone(),
+                tags: fields.tags.clone(),
+            };
+            return self
+                .store_text_with_fields(&body, &text_fields, Some(ttl))
+                .await;
         }
         // A known length gives the exact size. Without one, use the
         // request cap: the final size cannot exceed it, so the shorter
@@ -2369,6 +2543,8 @@ impl Store {
             ttl,
             created_at,
             &detection,
+            title.as_deref(),
+            &tags,
         );
         let mut sink = AwsUploadSink {
             client: self.client.clone(),
@@ -2401,6 +2577,8 @@ impl Store {
             sha256: outcome.sha256,
             content_type: ct,
             filename: display_name,
+            title,
+            tags,
             detection_source: Some(detection.source.to_string()),
             detection_conflict: detection.conflict,
             expires_at,
@@ -2694,6 +2872,11 @@ impl Store {
                 .get("words")
                 .and_then(|words| self.normalize_alias(words)),
             filename: meta.get("filename").map(|s| decode_filename(s)),
+            title: meta.get("title").map(|s| decode_filename(s)),
+            tags: meta
+                .get("tags")
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                .unwrap_or_default(),
             content_type,
             detection_source: meta.get("detection-source").cloned(),
             detection_conflict: meta.get("detection-conflict").cloned(),
@@ -3180,6 +3363,8 @@ impl Store {
                         id,
                         key: key.to_string(),
                         words: meta.words,
+                        title: meta.title,
+                        tags: meta.tags,
                         size: meta.size,
                         last_modified: obj
                             .last_modified()
@@ -3726,6 +3911,8 @@ mod tests {
             Ttl::days(7),
             created,
             &detection,
+            None,
+            &[],
         );
         assert_eq!(meta.get("detection-source").unwrap(), "text");
         assert_eq!(
@@ -3818,6 +4005,8 @@ mod tests {
             Ttl::parse("1h").unwrap(),
             created,
             &detection,
+            None,
+            &[],
         );
         assert_eq!(expires, created + chrono::Duration::hours(1));
         assert_eq!(meta.get("ttl-seconds").unwrap(), "3600");
@@ -3846,12 +4035,16 @@ mod tests {
             Ttl::parse("1h").unwrap(),
             created,
             &detection,
+            None,
+            &[],
         );
         let paste = |now: DateTime<Utc>| PasteMetadata {
             id: "2026-10-28/abc".to_string(),
             key: "pastes/2026-10-28/abc".to_string(),
             words: None,
             filename: None,
+            title: None,
+            tags: Vec::new(),
             content_type: "text/plain".to_string(),
             detection_source: Some("text".to_string()),
             detection_conflict: None,
@@ -3893,6 +4086,8 @@ mod tests {
             Ttl::days(3),
             created,
             &detection,
+            None,
+            &[],
         );
         assert_eq!(meta.get("expires-at").unwrap(), "2026-10-31T00:00:00+00:00");
         assert_eq!(meta.get("created-at").unwrap(), "2026-10-28T00:00:00+00:00");
@@ -3926,6 +4121,8 @@ mod tests {
             Ttl::days(7),
             created,
             &detection,
+            None,
+            &[],
         );
         assert!(
             !meta.contains_key("sha256"),
@@ -3966,6 +4163,8 @@ mod token_tests {
             Ttl::days(1),
             created,
             &detection,
+            None,
+            &[],
         );
         assert_eq!(meta.get("paste-token-sha256").unwrap(), "abc123");
 
@@ -3978,6 +4177,8 @@ mod token_tests {
             Ttl::days(1),
             created,
             &detection,
+            None,
+            &[],
         );
         assert!(!meta.contains_key("paste-token-sha256"));
     }

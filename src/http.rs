@@ -41,8 +41,8 @@ use crate::config::TextAsset;
 use crate::content_type::content_disposition;
 use crate::rate_limit::RateLimiter;
 use crate::store::{
-    parse_list_window_request, parse_range_header, ListCursor, ListWindowRequest, PasteMetadata,
-    Store, StoreError, StoreHandle, Ttl, TtlParseError, MULTIPART_CHUNK_BYTES,
+    parse_list_window_request, parse_range_header, ListCursor, ListWindowRequest, PasteFields,
+    PasteMetadata, Store, StoreError, StoreHandle, Ttl, TtlParseError, MULTIPART_CHUNK_BYTES,
 };
 use crate::web::{api_write_allowed, Footer};
 
@@ -293,6 +293,8 @@ pub(crate) fn status_for(e: &StoreError) -> StatusCode {
         | StoreError::InvalidDate(_)
         | StoreError::InvalidRange(_)
         | StoreError::InvalidCursor(_)
+        | StoreError::InvalidTitle(_)
+        | StoreError::InvalidTags(_)
         | StoreError::TtlOutOfRange(_)
         | StoreError::InvalidLifecycle(_)
         | StoreError::LengthMismatch { .. } => StatusCode::BAD_REQUEST,
@@ -375,6 +377,8 @@ struct UploadEnvelope {
     expires_at: String,
     content_type: String,
     filename: Option<String>,
+    title: Option<String>,
+    tags: Vec<String>,
     detection_source: Option<String>,
     detection_conflict: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -387,6 +391,8 @@ struct MetaEnvelope {
     key: String,
     words: Option<String>,
     filename: Option<String>,
+    title: Option<String>,
+    tags: Vec<String>,
     content_type: String,
     detection_source: Option<String>,
     detection_conflict: Option<String>,
@@ -404,6 +410,8 @@ impl From<PasteMetadata> for MetaEnvelope {
             key: meta.key,
             words: meta.words,
             filename: meta.filename,
+            title: meta.title,
+            tags: meta.tags,
             content_type: meta.content_type,
             detection_source: meta.detection_source,
             detection_conflict: meta.detection_conflict,
@@ -552,6 +560,8 @@ fn upload_response(
                 expires_at: stored.expires_at.to_rfc3339(),
                 content_type: stored.content_type.clone(),
                 filename: stored.filename.clone(),
+                title: stored.title.clone(),
+                tags: stored.tags.clone(),
                 detection_source: stored.detection_source.clone(),
                 detection_conflict: stored.detection_conflict.clone(),
                 paste_token: stored.paste_token.clone(),
@@ -598,6 +608,11 @@ async fn upload_dispatch(
     } else {
         let filename =
             header_str(&headers, "x-filename").or_else(|| query.get("filename").cloned());
+        let title = header_str(&headers, "x-title").or_else(|| query.get("title").cloned());
+        let tags = header_str(&headers, "x-tags")
+            .or_else(|| query.get("tags").cloned())
+            .map(|value| split_tags(&value))
+            .unwrap_or_default();
         let ttl = match parse_ttl(&headers, &query).and_then(TtlSelection::resolve) {
             Ok(ttl) => ttl,
             Err(e) => return ttl_error_response(e),
@@ -619,17 +634,16 @@ async fn upload_dispatch(
         let explicit = if content_type.is_empty() {
             None
         } else {
-            Some(content_type.as_str())
+            Some(content_type.clone())
+        };
+        let fields = PasteFields {
+            filename,
+            content_type: explicit,
+            title,
+            tags,
         };
         match store
-            .store_stream(
-                Box::pin(stream),
-                filename.as_deref(),
-                explicit,
-                ttl,
-                known_length,
-                max_bytes,
-            )
+            .store_stream_with_fields(Box::pin(stream), &fields, ttl, known_length, max_bytes)
             .await
         {
             Ok(stored) => upload_response(&headers, &query, &stored),
@@ -660,6 +674,11 @@ async fn multipart_inner(
     }
     let mut filename: Option<String> =
         header_str(&headers, "x-filename").or_else(|| query.get("filename").cloned());
+    let mut title = header_str(&headers, "x-title").or_else(|| query.get("title").cloned());
+    let mut tags = header_str(&headers, "x-tags")
+        .or_else(|| query.get("tags").cloned())
+        .map(|value| split_tags(&value))
+        .unwrap_or_default();
     let mut ttl_selection = match parse_ttl(&headers, &query) {
         Ok(selection) => selection,
         Err(e) => return ttl_error_response(e),
@@ -697,15 +716,14 @@ async fn multipart_inner(
                     Err(e) => Some((Err(StoreError::Io(e.to_string())), f)),
                 }
             });
+            let fields = PasteFields {
+                filename,
+                content_type: field_content_type,
+                title,
+                tags,
+            };
             return match store
-                .store_stream(
-                    Box::pin(stream),
-                    filename.as_deref(),
-                    field_content_type.as_deref(),
-                    ttl,
-                    None,
-                    max_bytes,
-                )
+                .store_stream_with_fields(Box::pin(stream), &fields, ttl, None, max_bytes)
                 .await
             {
                 Ok(stored) => upload_response(&headers, &query, &stored),
@@ -719,6 +737,30 @@ async fn multipart_inner(
                         filename = Some(text.trim().to_string());
                     }
                 }
+                Err(MultipartFieldError::TooLarge) => {
+                    return error_response(StoreError::TooLarge {
+                        limit: MULTIPART_METADATA_MAX_BYTES as u64,
+                    });
+                }
+                Err(MultipartFieldError::Malformed(message)) => {
+                    return bad_request(format!("invalid multipart body: {message}"));
+                }
+            }
+        } else if name == "title" {
+            match read_metadata_field(field).await {
+                Ok(text) => title = Some(text),
+                Err(MultipartFieldError::TooLarge) => {
+                    return error_response(StoreError::TooLarge {
+                        limit: MULTIPART_METADATA_MAX_BYTES as u64,
+                    });
+                }
+                Err(MultipartFieldError::Malformed(message)) => {
+                    return bad_request(format!("invalid multipart body: {message}"));
+                }
+            }
+        } else if name == "tags" {
+            match read_metadata_field(field).await {
+                Ok(text) => tags = split_tags(&text),
                 Err(MultipartFieldError::TooLarge) => {
                     return error_response(StoreError::TooLarge {
                         limit: MULTIPART_METADATA_MAX_BYTES as u64,
@@ -964,6 +1006,11 @@ fn parse_list_query(query: &HashMap<String, String>) -> Result<ListWindowRequest
     )
 }
 
+/// Split a comma-separated tag header or query value.
+pub(crate) fn split_tags(value: &str) -> Vec<String> {
+    value.split(',').map(str::to_string).collect()
+}
+
 /// Parse the optional stateless listing cursor.
 ///
 /// The two parts are supplied together. One part alone is a client error,
@@ -1022,31 +1069,63 @@ async fn list_handler(
                 .await
         }
     };
-    match result {
-        Ok(page) => Json(serde_json::json!({
-            "date": query.get("date"),
-            "start": query.get("start"),
-            "end": query.get("end"),
-            "truncated": page.truncated,
-            "next": page.next.map(|cursor| serde_json::json!({
-                "date": cursor.date,
-                "start_after": cursor.start_after,
-            })),
-            "items": page.items.iter().map(|i| serde_json::json!({
-                "id": i.id,
-                "key": i.key,
-                "words": i.words,
-                "size": i.size,
-                "last_modified": i.last_modified.map(|d| d.to_rfc3339()),
-                "expires_at": i.expires_at.map(|d| d.to_rfc3339()),
-                "created_at": i.created_at.map(|d| d.to_rfc3339()),
-                "content_type": i.content_type,
-                "filename": i.filename,
-            })).collect::<Vec<_>>(),
-        }))
-        .into_response(),
-        Err(e) => error_response(e),
-    }
+    let mut page = match result {
+        Ok(page) => page,
+        Err(e) => return error_response(e),
+    };
+    let q = query
+        .get("q")
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty());
+    let tag = query
+        .get("tag")
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty());
+    page.items.retain(|item| {
+        let q_ok = q.as_ref().is_none_or(|q| {
+            item.id.to_lowercase().contains(q)
+                || item
+                    .words
+                    .as_deref()
+                    .is_some_and(|words| words.to_lowercase().contains(q))
+                || item
+                    .title
+                    .as_deref()
+                    .is_some_and(|title| title.to_lowercase().contains(q))
+                || item
+                    .filename
+                    .as_deref()
+                    .is_some_and(|filename| filename.to_lowercase().contains(q))
+        });
+        let tag_ok = tag
+            .as_ref()
+            .is_none_or(|tag| item.tags.iter().any(|item_tag| item_tag == tag));
+        q_ok && tag_ok
+    });
+    Json(serde_json::json!({
+        "date": query.get("date"),
+        "start": query.get("start"),
+        "end": query.get("end"),
+        "truncated": page.truncated,
+        "next": page.next.map(|cursor| serde_json::json!({
+            "date": cursor.date,
+            "start_after": cursor.start_after,
+        })),
+        "items": page.items.iter().map(|i| serde_json::json!({
+            "id": i.id,
+            "key": i.key,
+            "words": i.words,
+            "title": i.title,
+            "tags": i.tags,
+            "size": i.size,
+            "last_modified": i.last_modified.map(|d| d.to_rfc3339()),
+            "expires_at": i.expires_at.map(|d| d.to_rfc3339()),
+            "created_at": i.created_at.map(|d| d.to_rfc3339()),
+            "content_type": i.content_type,
+            "filename": i.filename,
+        })).collect::<Vec<_>>(),
+    }))
+    .into_response()
 }
 
 // --- Thin route handlers: two-segment (date/random) and one-segment

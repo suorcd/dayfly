@@ -1251,6 +1251,57 @@ async fn list_route_pages_with_a_cursor_and_reports_truncation() {
 }
 
 #[tokio::test]
+async fn upload_accepts_a_title_and_tags_and_list_filters_on_them() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let request = common::request(
+        "POST",
+        "/upload",
+        &[
+            ("content-type", "text/plain".to_string()),
+            ("accept", "application/json".to_string()),
+            ("x-title", "Build log".to_string()),
+            ("x-tags", "ops,build".to_string()),
+        ],
+        b"body".to_vec(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let stored = common::json_body(&body);
+    assert_eq!(stored["title"], "Build log");
+    assert_eq!(stored["tags"], json!(["ops", "build"]));
+    let id = stored["id"].as_str().expect("id").to_string();
+
+    let request = common::request("GET", &format!("/v1/pastes/{id}/meta"), &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let meta = common::json_body(&body);
+    assert_eq!(meta["title"], "Build log");
+    assert_eq!(meta["tags"], json!(["ops", "build"]));
+
+    let request = common::request("GET", "/v1/pastes?q=build", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = common::json_body(&body);
+    assert_eq!(listed["items"].as_array().expect("items").len(), 1);
+    assert_eq!(listed["items"][0]["id"], id);
+    assert_eq!(listed["items"][0]["title"], "Build log");
+    assert_eq!(listed["items"][0]["tags"], json!(["ops", "build"]));
+
+    let request = common::request("GET", "/v1/pastes?tag=ops", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = common::json_body(&body);
+    assert_eq!(listed["items"].as_array().expect("items").len(), 1);
+
+    let request = common::request("GET", "/v1/pastes?q=missing", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = common::json_body(&body);
+    assert_eq!(listed["items"].as_array().expect("items").len(), 0);
+}
+
+#[tokio::test]
 async fn list_route_rejects_half_a_cursor() {
     let fake = FakeS3::start().await;
     let app = common::app(fake.store().await);
