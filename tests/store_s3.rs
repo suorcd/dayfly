@@ -10,8 +10,9 @@ use bytes::Bytes;
 use chrono::{Duration, Utc};
 use common::{FailOp, FakeS3, Gate};
 use dayfly::store::{
-    normalize_words, normalize_words_up_to, parse_segment_key, segment_key, Store, StoreError, Ttl,
-    MAX_FETCH_TEXT_BYTES, MAX_SEGMENTS_PER_PASTE, MULTIPART_CHUNK_BYTES, SEGMENT_SUFFIX_LEN,
+    normalize_words, normalize_words_up_to, parse_segment_key, segment_key, PasteFields, Store,
+    StoreError, Ttl, MAX_FETCH_TEXT_BYTES, MAX_SEGMENTS_PER_PASTE, MULTIPART_CHUNK_BYTES,
+    SEGMENT_SUFFIX_LEN,
 };
 use futures::stream;
 use sha2::{Digest, Sha256};
@@ -2061,6 +2062,55 @@ async fn list_window_follows_continuation_tokens() {
         list_calls >= 2,
         "the continuation token must fetch a second page, saw {list_calls} list calls"
     );
+}
+
+#[tokio::test]
+async fn store_text_round_trips_title_and_normalized_tags() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let fields = PasteFields {
+        title: Some("  Build log  ".to_string()),
+        tags: vec!["Ops".to_string(), "ops".to_string(), " build ".to_string()],
+        ..PasteFields::default()
+    };
+    let stored = store
+        .store_text_with_fields(b"body", &fields, Some(Ttl::days(1)))
+        .await
+        .expect("a titled paste must store");
+    assert_eq!(stored.title.as_deref(), Some("Build log"));
+    assert_eq!(stored.tags, vec!["ops".to_string(), "build".to_string()]);
+
+    let meta = store
+        .head_metadata(&stored.id)
+        .await
+        .expect("metadata must be readable");
+    assert_eq!(meta.title.as_deref(), Some("Build log"));
+    assert_eq!(meta.tags, vec!["ops".to_string(), "build".to_string()]);
+}
+
+#[tokio::test]
+async fn store_text_rejects_an_oversized_title_or_tags() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let title_fields = PasteFields {
+        title: Some("x".repeat(201)),
+        ..PasteFields::default()
+    };
+    let error = store
+        .store_text_with_fields(b"body", &title_fields, None)
+        .await
+        .expect_err("an oversized title must be rejected");
+    assert!(matches!(error, StoreError::InvalidTitle(_)));
+
+    let tag_fields = PasteFields {
+        tags: (0..9).map(|n| format!("tag-{n}")).collect(),
+        ..PasteFields::default()
+    };
+    let error = store
+        .store_text_with_fields(b"body", &tag_fields, None)
+        .await
+        .expect_err("too many tags must be rejected");
+    assert!(matches!(error, StoreError::InvalidTags(_)));
 }
 
 #[tokio::test]

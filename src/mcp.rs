@@ -167,6 +167,8 @@ fn metadata_json(meta: PasteMetadata) -> serde_json::Value {
         "key": meta.key,
         "words": meta.words,
         "filename": meta.filename,
+        "title": meta.title,
+        "tags": meta.tags,
         "content_type": meta.content_type,
         "detection_source": meta.detection_source,
         "detection_conflict": meta.detection_conflict,
@@ -223,6 +225,8 @@ fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> 
         | StoreError::InvalidDate(_)
         | StoreError::InvalidRange(_)
         | StoreError::InvalidCursor(_)
+        | StoreError::InvalidTitle(_)
+        | StoreError::InvalidTags(_)
         | StoreError::TtlOutOfRange(_)
         | StoreError::InvalidLifecycle(_)
         | StoreError::InvalidPath(_)
@@ -281,6 +285,10 @@ pub struct StoreTextParams {
     pub text: String,
     pub filename: Option<String>,
     pub content_type: Option<String>,
+    /// Human-readable name for the paste. At most 200 bytes.
+    pub title: Option<String>,
+    /// Tags for the paste. At most 8 tags and 512 bytes in total.
+    pub tags: Option<Vec<String>>,
     /// TTL as seconds or a duration such as "1h", "1h30m", or "2d".
     /// Do not set both `ttl` and `ttl_days`.
     pub ttl: Option<String>,
@@ -295,6 +303,10 @@ pub struct StoreFileParams {
     pub path: String,
     pub filename: Option<String>,
     pub content_type: Option<String>,
+    /// Human-readable name for the paste. At most 200 bytes.
+    pub title: Option<String>,
+    /// Tags for the paste. At most 8 tags and 512 bytes in total.
+    pub tags: Option<Vec<String>>,
     /// TTL as seconds or a duration such as "1h", "1h30m", or "2d".
     /// Do not set both `ttl` and `ttl_days`.
     pub ttl: Option<String>,
@@ -430,14 +442,15 @@ impl Pastebin {
         Parameters(params): Parameters<StoreTextParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let ttl = resolve_ttl(params.ttl.as_deref(), params.ttl_days)?;
+        let fields = crate::store::PasteFields {
+            filename: params.filename,
+            content_type: params.content_type,
+            title: params.title,
+            tags: params.tags.unwrap_or_default(),
+        };
         let stored = try_store!(
             self.current_store()
-                .store_text(
-                    params.text.as_bytes(),
-                    params.filename.as_deref(),
-                    params.content_type.as_deref(),
-                    ttl,
-                )
+                .store_text_with_fields(params.text.as_bytes(), &fields, ttl)
                 .await
         );
         let mut value = serde_json::json!({
@@ -448,6 +461,8 @@ impl Pastebin {
             "sha256": stored.sha256,
             "content_type": stored.content_type,
             "filename": stored.filename,
+            "title": stored.title,
+            "tags": stored.tags,
             "detection_source": stored.detection_source,
             "detection_conflict": stored.detection_conflict,
             "expires_at": stored.expires_at.to_rfc3339(),
@@ -470,14 +485,15 @@ impl Pastebin {
             Ok(path) => path,
             Err(e) => return store_error_result(e),
         };
+        let fields = crate::store::PasteFields {
+            filename: params.filename,
+            content_type: params.content_type,
+            title: params.title,
+            tags: params.tags.unwrap_or_default(),
+        };
         let stored = try_store!(
             self.current_store()
-                .store_file_path(
-                    path.as_path(),
-                    params.filename.as_deref(),
-                    params.content_type.as_deref(),
-                    ttl,
-                )
+                .store_file_path_with_fields(path.as_path(), &fields, ttl)
                 .await
         );
         let mut value = serde_json::json!({
@@ -488,6 +504,8 @@ impl Pastebin {
             "sha256": stored.sha256,
             "content_type": stored.content_type,
             "filename": stored.filename,
+            "title": stored.title,
+            "tags": stored.tags,
             "detection_source": stored.detection_source,
             "detection_conflict": stored.detection_conflict,
             "expires_at": stored.expires_at.to_rfc3339(),
@@ -522,6 +540,8 @@ impl Pastebin {
             "sha256": appended.meta.sha256,
             "content_type": appended.meta.content_type,
             "filename": appended.meta.filename,
+            "title": appended.meta.title,
+            "tags": appended.meta.tags,
             "created_at": appended.meta.created_at.map(|d| d.to_rfc3339()),
             "expires_at": appended.meta.expires_at.map(|d| d.to_rfc3339()),
             "segments": appended.meta.segments.len(),
@@ -715,6 +735,8 @@ impl Pastebin {
                 "id": i.id,
                 "key": i.key,
                 "words": i.words,
+                "title": i.title,
+                "tags": i.tags,
                 "size": i.size,
                 "last_modified": i.last_modified.map(|d| d.to_rfc3339()),
                 "expires_at": i.expires_at.map(|d| d.to_rfc3339()),

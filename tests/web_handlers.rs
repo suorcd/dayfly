@@ -593,6 +593,58 @@ async fn create_submit_creates_a_text_paste_with_filename_and_ttl() {
 }
 
 #[tokio::test]
+async fn create_submit_stores_a_title_and_tags_and_list_filters_on_them() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let boundary = "web-create-title";
+    let body = common::multipart_fields_only(
+        boundary,
+        &[
+            ("ttl_days", "1"),
+            ("title", "Build log"),
+            ("tags", "ops,build"),
+            ("text", "hello world"),
+        ],
+    );
+    let headers = multipart_headers(boundary, body.len());
+    let request = common::request("POST", "/ui/create", &headers, body);
+    let (status, response_headers, _body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let id = id_from_redirect(&response_headers);
+    let object = fake
+        .object(&format!("pastes/{id}"))
+        .expect("the text must be stored");
+    assert_eq!(
+        object.metadata.get("title").map(String::as_str),
+        Some("Build%20log")
+    );
+    assert_eq!(
+        object.metadata.get("tags").map(String::as_str),
+        Some("[\"ops\",\"build\"]")
+    );
+
+    let request = common::request("GET", "/pastes?q=build", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(page.contains("Build log"));
+    assert!(page.contains(&id));
+
+    let request = common::request("GET", "/pastes?q=missing", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(!page.contains("Build log"));
+
+    let request = common::request("GET", &format!("/view/{id}"), &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(page.contains("Build log"));
+    assert!(page.contains("ops, build"));
+}
+
+#[tokio::test]
 async fn favicon_route_serves_the_configured_bytes() {
     let fake = FakeS3::start().await;
     let mut config = fake.config();

@@ -37,6 +37,8 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN, REFERER};
 use axum::http::uri::{Authority, Uri};
@@ -51,11 +53,12 @@ use serde::Deserialize;
 use crate::config::{Config, LISTING_DISABLED_MESSAGE};
 use crate::http::{
     check_auth, check_list_access, check_paste_control, public_base, read_metadata_field,
-    status_for, AppState, ListAccessError, MultipartFieldError, MULTIPART_METADATA_MAX_BYTES,
+    split_tags, status_for, AppState, ListAccessError, MultipartFieldError,
+    MULTIPART_METADATA_MAX_BYTES,
 };
 use crate::store::{
-    default_list_window, parse_list_window_request, ListWindowRequest, PasteSummary, Store,
-    StoreError, StoredPaste, Ttl,
+    default_list_window, parse_list_window_request, ListWindowRequest, PasteFields, PasteSummary,
+    Store, StoreError, StoredPaste, Ttl,
 };
 
 /// Adapted base look from suorcd.us/style.css, palette cyberpunkNeon
@@ -679,6 +682,10 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
 <p><label>Keep for <select name="ttl_days">{}</select></label> <span class="hint" title="The selector uses whole days. API clients can send a sub-day TTL with X-TTL. Expiry is checked on read; the bucket sweeper is day-rounded. The bucket itself is private; only this binary talks to Garage.">i</span></p>
 <p><label>Filename (optional, text only) <input type="text" name="filename" id="filename"></label></p>
 </div>
+<div class="form-row">
+<p><label>Title (optional) <input type="text" name="title" id="title"></label></p>
+<p><label>Tags (optional, comma separated) <input type="text" name="tags" id="tags"></label></p>
+</div>
 <p class="muted">Max file size: {max_file_human}. A selected file takes precedence and disables the text fields.</p>
 <div class="form-actions">
 <label class="dropzone compact" id="dropzone">
@@ -703,6 +710,8 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
 struct TextForm {
     text: String,
     filename: Option<String>,
+    title: Option<String>,
+    tags: Option<String>,
     ttl_days: Option<u32>,
 }
 
@@ -727,8 +736,14 @@ async fn text_submit_handler(
         },
         None => None,
     };
+    let fields = PasteFields {
+        filename,
+        content_type: None,
+        title: form.title,
+        tags: form.tags.as_deref().map(split_tags).unwrap_or_default(),
+    };
     match store
-        .store_text(form.text.as_bytes(), filename.as_deref(), None, ttl)
+        .store_text_with_fields(form.text.as_bytes(), &fields, ttl)
         .await
     {
         Ok(stored) => {
@@ -833,10 +848,12 @@ fn multipart_length_allows(store: &Store, headers: &HeaderMap) -> bool {
 async fn store_file_field(
     store: &Store,
     field: axum::extract::multipart::Field<'_>,
+    fields: &PasteFields,
     ttl: Option<Ttl>,
 ) -> Result<StoredPaste, StoreError> {
     let field_content_type = field.content_type().map(|s| s.to_string());
-    let filename = field.file_name().map(|s| s.to_string());
+    let part_filename = field.file_name().map(|s| s.to_string());
+    let filename = part_filename.or_else(|| fields.filename.clone());
     let max_bytes = store.config.max_bytes_for_upload(filename.as_deref());
     let stream = futures::stream::unfold(field, |mut f| async move {
         match f.chunk().await {
@@ -845,15 +862,14 @@ async fn store_file_field(
             Err(e) => Some((Err(StoreError::Io(e.to_string())), f)),
         }
     });
+    let fields = PasteFields {
+        filename,
+        content_type: field_content_type.or_else(|| fields.content_type.clone()),
+        title: fields.title.clone(),
+        tags: fields.tags.clone(),
+    };
     store
-        .store_stream(
-            Box::pin(stream),
-            filename.as_deref(),
-            field_content_type.as_deref(),
-            ttl,
-            None,
-            max_bytes,
-        )
+        .store_stream_with_fields(Box::pin(stream), &fields, ttl, None, max_bytes)
         .await
 }
 
@@ -899,6 +915,7 @@ async fn upload_submit_handler(
         );
     }
     let mut ttl: Option<Ttl> = None;
+    let mut fields = PasteFields::default();
     // Stream the file field inside the loop, not moved out of it: an
     // axum Field borrows its Multipart, so holding it across a
     // next_field call does not compile (see http.rs for the same note).
@@ -910,11 +927,77 @@ async fn upload_submit_handler(
         };
         let name = field.name().unwrap_or("").to_string();
         if name == "file" {
-            return match store_file_field(&store, field, ttl).await {
+            return match store_file_field(&store, field, &fields, ttl).await {
                 Ok(stored) => Redirect::to(&stored_view_target(&stored, store.config.show_words))
                     .into_response(),
                 Err(e) => error_page(&footer, e),
             };
+        }
+        if name == "title" {
+            match read_metadata_field(field).await {
+                Ok(value) => fields.title = Some(value),
+                Err(MultipartFieldError::TooLarge) => {
+                    return error_page(
+                        &footer,
+                        StoreError::TooLarge {
+                            limit: MULTIPART_METADATA_MAX_BYTES as u64,
+                        },
+                    );
+                }
+                Err(MultipartFieldError::Malformed(message)) => {
+                    return bad_request_page(
+                        &footer,
+                        &format!("invalid multipart body: {message}"),
+                    );
+                }
+            }
+            continue;
+        }
+        if name == "tags" {
+            match read_metadata_field(field).await {
+                Ok(value) => fields.tags = split_tags(&value),
+                Err(MultipartFieldError::TooLarge) => {
+                    return error_page(
+                        &footer,
+                        StoreError::TooLarge {
+                            limit: MULTIPART_METADATA_MAX_BYTES as u64,
+                        },
+                    );
+                }
+                Err(MultipartFieldError::Malformed(message)) => {
+                    return bad_request_page(
+                        &footer,
+                        &format!("invalid multipart body: {message}"),
+                    );
+                }
+            }
+            continue;
+        }
+        if name == "filename" {
+            match read_metadata_field(field).await {
+                Ok(value) => {
+                    fields.filename = if value.trim().is_empty() {
+                        None
+                    } else {
+                        Some(value)
+                    };
+                }
+                Err(MultipartFieldError::TooLarge) => {
+                    return error_page(
+                        &footer,
+                        StoreError::TooLarge {
+                            limit: MULTIPART_METADATA_MAX_BYTES as u64,
+                        },
+                    );
+                }
+                Err(MultipartFieldError::Malformed(message)) => {
+                    return bad_request_page(
+                        &footer,
+                        &format!("invalid multipart body: {message}"),
+                    );
+                }
+            }
+            continue;
         }
         if name == "ttl_days" {
             match read_metadata_field(field).await {
@@ -973,6 +1056,8 @@ async fn create_submit_handler(
     let mut ttl: Option<Ttl> = None;
     let mut text: Option<Vec<u8>> = None;
     let mut text_filename: Option<String> = None;
+    let mut title: Option<String> = None;
+    let mut tags: Vec<String> = Vec::new();
     let text_limit = usize::try_from(store.config.max_text_paste_bytes()).unwrap_or(usize::MAX);
 
     loop {
@@ -1026,6 +1111,40 @@ async fn create_submit_handler(
                     );
                 }
             },
+            "title" => match read_metadata_field(field).await {
+                Ok(value) => title = Some(value),
+                Err(MultipartFieldError::TooLarge) => {
+                    return error_page(
+                        &footer,
+                        StoreError::TooLarge {
+                            limit: MULTIPART_METADATA_MAX_BYTES as u64,
+                        },
+                    );
+                }
+                Err(MultipartFieldError::Malformed(message)) => {
+                    return bad_request_page(
+                        &footer,
+                        &format!("invalid multipart body: {message}"),
+                    );
+                }
+            },
+            "tags" => match read_metadata_field(field).await {
+                Ok(value) => tags = split_tags(&value),
+                Err(MultipartFieldError::TooLarge) => {
+                    return error_page(
+                        &footer,
+                        StoreError::TooLarge {
+                            limit: MULTIPART_METADATA_MAX_BYTES as u64,
+                        },
+                    );
+                }
+                Err(MultipartFieldError::Malformed(message)) => {
+                    return bad_request_page(
+                        &footer,
+                        &format!("invalid multipart body: {message}"),
+                    );
+                }
+            },
             "text" => match read_text_field(field, text_limit).await {
                 Ok(bytes) => text = Some(bytes),
                 Err(MultipartFieldError::TooLarge) => {
@@ -1049,7 +1168,13 @@ async fn create_submit_handler(
                 if !field.file_name().is_some_and(|name| !name.is_empty()) {
                     continue;
                 }
-                return match store_file_field(&store, field, ttl).await {
+                let fields = PasteFields {
+                    filename: text_filename.clone(),
+                    content_type: None,
+                    title: title.clone(),
+                    tags: tags.clone(),
+                };
+                return match store_file_field(&store, field, &fields, ttl).await {
                     Ok(stored) => {
                         Redirect::to(&stored_view_target(&stored, store.config.show_words))
                             .into_response()
@@ -1067,10 +1192,13 @@ async fn create_submit_handler(
     if bytes.is_empty() {
         return bad_request_page(&footer, "provide text or a file");
     }
-    match store
-        .store_text(&bytes, text_filename.as_deref(), None, ttl)
-        .await
-    {
+    let fields = PasteFields {
+        filename: text_filename,
+        content_type: None,
+        title,
+        tags,
+    };
+    match store.store_text_with_fields(&bytes, &fields, ttl).await {
         Ok(stored) => {
             Redirect::to(&stored_view_target(&stored, store.config.show_words)).into_response()
         }
@@ -1263,6 +1391,8 @@ async fn list_handler(
     let date = query.get("date").cloned().unwrap_or_default();
     let start = query.get("start").cloned().unwrap_or_default();
     let end = query.get("end").cloned().unwrap_or_default();
+    let q = query.get("q").cloned().unwrap_or_default();
+    let tag = query.get("tag").cloned().unwrap_or_default();
     let request = match parse_list_window_request(
         query.get("date").map(String::as_str),
         query.get("start").map(String::as_str),
@@ -1296,6 +1426,29 @@ async fn list_handler(
         Ok(items) => items,
         Err(e) => return error_page(&footer, e),
     };
+    let q_lower = q.trim().to_lowercase();
+    let tag_lower = tag.trim().to_lowercase();
+    if !q_lower.is_empty() || !tag_lower.is_empty() {
+        items.retain(|item| {
+            let q_ok = q_lower.is_empty()
+                || item.id.to_lowercase().contains(&q_lower)
+                || item
+                    .words
+                    .as_deref()
+                    .is_some_and(|words| words.to_lowercase().contains(&q_lower))
+                || item
+                    .title
+                    .as_deref()
+                    .is_some_and(|title| title.to_lowercase().contains(&q_lower))
+                || item
+                    .filename
+                    .as_deref()
+                    .is_some_and(|filename| filename.to_lowercase().contains(&q_lower));
+            let tag_ok =
+                tag_lower.is_empty() || item.tags.iter().any(|item_tag| item_tag == &tag_lower);
+            q_ok && tag_ok
+        });
+    }
     sort_pastes(&mut items, sort, order);
 
     let mut filters = Vec::new();
@@ -1307,6 +1460,15 @@ async fn list_handler(
     }
     if !end.is_empty() {
         filters.push(format!("end={end}"));
+    }
+    if !q.is_empty() {
+        filters.push(format!("q={}", utf8_percent_encode(&q, NON_ALPHANUMERIC)));
+    }
+    if !tag.is_empty() {
+        filters.push(format!(
+            "tag={}",
+            utf8_percent_encode(&tag, NON_ALPHANUMERIC)
+        ));
     }
     let filters = filters.join("&");
     let size_header = sort_header("Size", PasteSort::Size, sort, order, &filters);
@@ -1343,9 +1505,14 @@ async fn list_handler(
         };
         let content_type = html_escape(item.content_type.as_deref().unwrap_or("—"));
         let filename = filename_cell(item.filename.as_deref());
+        let title_cell = item
+            .title
+            .as_deref()
+            .map(html_escape)
+            .unwrap_or_else(|| "—".to_string());
         let (size_value, size_unit) = human_size_parts(item.size);
         rows.push_str(&format!(
-            "<tr><td>{link_cell}</td>\
+            "<tr><td>{link_cell}</td><td>{title_cell}</td>\
              {filename}<td><span class=\"content-type-cell\" title=\"{content_type}\">{content_type}</span></td>\
              <td class=\"size-cell\"><span class=\"size-number\">{size_value}</span><span class=\"size-unit\">{size_unit}</span></td>\
              <td>{}</td><td>{}</td>\
@@ -1356,7 +1523,7 @@ async fn list_handler(
     }
     if rows.is_empty() {
         rows.push_str(
-            "<tr><td colspan=\"7\" class=\"muted\">No current pastes in this window.</td></tr>\n",
+            "<tr><td colspan=\"8\" class=\"muted\">No current pastes in this window.</td></tr>\n",
         );
     }
     page(
@@ -1365,10 +1532,12 @@ async fn list_handler(
         Some("/pastes"),
         false,
         &format!(
-            r#"<div class="list-panel"><form method="get" action="/pastes"><p><label>Start <input type="date" name="start" value="{}"></label> <label>End <input type="date" name="end" value="{}"></label> <button type="submit">Show range</button> <span class="hint" title="Dates are UTC. With no dates, the page shows the last {default_days} days, ending today in UTC. Set DAYFLY_LIST_DEFAULT_DAYS to change that. Built from a direct bucket scan (ListObjectsV2 for each date prefix, plus HeadObject per paste). No database. Listing is O(n) in objects scanned and gets slower as the bucket grows — that slowdown is the trigger for adding a database later.">i</span></p></form>
-{token_note}<div class="table-wrap"><table><colgroup><col class="col-link"><col class="col-filename"><col class="col-content-type"><col class="col-size"><col class="col-created"><col class="col-ttl"><col class="col-action"></colgroup><thead><tr><th>{link_header}</th><th>Filename</th><th>Content-Type</th><th>{size_header}</th><th>{created_header}</th><th class="ttl-header" title="days">TTL</th><th>Action</th></tr></thead><tbody>{}</tbody></table></div></div>"#,
+            r#"<div class="list-panel"><form method="get" action="/pastes"><p><label>Start <input type="date" name="start" value="{}"></label> <label>End <input type="date" name="end" value="{}"></label> <label>Search <input type="search" name="q" value="{}"></label> <label>Tag <input type="text" name="tag" value="{}"></label> <button type="submit">Show range</button> <span class="hint" title="Dates are UTC. With no dates, the page shows the last {default_days} days, ending today in UTC. Set DAYFLY_LIST_DEFAULT_DAYS to change that. Built from a direct bucket scan (ListObjectsV2 for each date prefix, plus HeadObject per paste). No database. Listing is O(n) in objects scanned and gets slower as the bucket grows — that slowdown is the trigger for adding a database later.">i</span></p></form>
+{token_note}<div class="table-wrap"><table><colgroup><col class="col-link"><col class="col-title"><col class="col-filename"><col class="col-content-type"><col class="col-size"><col class="col-created"><col class="col-ttl"><col class="col-action"></colgroup><thead><tr><th>{link_header}</th><th>Title</th><th>Filename</th><th>Content-Type</th><th>{size_header}</th><th>{created_header}</th><th class="ttl-header" title="days">TTL</th><th>Action</th></tr></thead><tbody>{}</tbody></table></div></div>"#,
             html_escape(&start_value),
             html_escape(&end_value),
+            html_escape(&q),
+            html_escape(&tag),
             rows,
             default_days = store.config.list_default_days,
         ),
@@ -1455,13 +1624,24 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
     }
     let id_esc = html_escape(&meta.id);
     let main = meta.content_type.split(';').next().unwrap_or("").trim();
-    let display_name = if store.config.show_words {
+    let target_name = if store.config.show_words {
         meta.words.as_deref().unwrap_or(meta.id.as_str())
     } else {
         meta.id.as_str()
     };
-    let target_esc = html_escape(display_name);
-    let download_name = html_escape(meta.filename.as_deref().unwrap_or(display_name));
+    let heading = meta.title.as_deref().unwrap_or(target_name);
+    let target_esc = html_escape(target_name);
+    let download_name = html_escape(meta.filename.as_deref().unwrap_or(target_name));
+    let title_display = meta
+        .title
+        .as_deref()
+        .map(html_escape)
+        .unwrap_or_else(|| "—".to_string());
+    let tags_display = if meta.tags.is_empty() {
+        "—".to_string()
+    } else {
+        html_escape(&meta.tags.join(", "))
+    };
     let token_field = if store.config.paste_tokens {
         "<p><label>Paste token <input type=\"text\" name=\"paste_token\"></label></p>"
     } else {
@@ -1477,10 +1657,12 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
          <input type=\"checkbox\" id=\"metadata-toggle\" class=\"metadata-toggle\">\
          <label for=\"metadata-toggle\" class=\"metadata-label\">Metadata &amp; delete</label>\
          <div class=\"metadata-panel\">\
-         <p>Filename: {}</p><p>Content-Type: {}</p><p>Size: {}</p><p>Created: {}</p><p>Expires: {} ({})</p>\
+         <p>Title: {}</p><p>Tags: {}</p><p>Filename: {}</p><p>Content-Type: {}</p><p>Size: {}</p><p>Created: {}</p><p>Expires: {} ({})</p>\
          <form method=\"post\" action=\"/ui/delete\"><input type=\"hidden\" name=\"id\" value=\"{id_esc}\">{token_field}<button type=\"submit\">Delete this paste</button></form>\
          </div>\
          </div>",
+        title_display,
+        tags_display,
         html_escape(meta.filename.as_deref().unwrap_or("—")),
         html_escape(&meta.content_type),
         human_size(meta.size),
@@ -1516,7 +1698,7 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
         ));
     }
     body.push_str(COPY_LINK_SCRIPT);
-    page(&footer, display_name, None, true, &body).into_response()
+    page(&footer, heading, None, true, &body).into_response()
 }
 
 async fn favicon_handler(State(state): State<AppState>) -> Response {
@@ -1845,6 +2027,8 @@ mod tests {
             id: id.to_string(),
             key: format!("pastes/{id}"),
             words: None,
+            title: None,
+            tags: Vec::new(),
             size,
             last_modified: created_at,
             expires_at,

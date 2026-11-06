@@ -290,6 +290,42 @@ fn store_text_fetch_metadata_list_and_delete_round_trip() {
 }
 
 #[test]
+fn store_text_round_trips_title_and_tags_through_mcp() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let mut client = McpClient::spawn(&fake, &[]);
+
+    let stored = client
+        .call_tool(
+            "store_text",
+            json!({
+                "text": "body",
+                "title": "Build log",
+                "tags": ["Ops", "ops", "build"],
+                "ttl_days": 1,
+            }),
+        )
+        .expect("store_text must succeed");
+    assert_eq!(stored["title"], "Build log");
+    assert_eq!(stored["tags"], json!(["ops", "build"]));
+
+    let meta = client
+        .call_tool("fetch_metadata", json!({"id": stored["id"]}))
+        .expect("fetch_metadata must succeed");
+    assert_eq!(meta["title"], "Build log");
+    assert_eq!(meta["tags"], json!(["ops", "build"]));
+
+    let listed = client
+        .call_tool(
+            "list_recent",
+            json!({"date": stored["id"].as_str().unwrap().split_once('/').unwrap().0}),
+        )
+        .expect("list_recent must succeed");
+    assert_eq!(listed["items"][0]["title"], "Build log");
+    assert_eq!(listed["items"][0]["tags"], json!(["ops", "build"]));
+}
+
+#[test]
 fn list_recent_returns_a_cursor_for_the_next_page() {
     let runtime = runtime();
     let fake = runtime.block_on(FakeS3::start());
