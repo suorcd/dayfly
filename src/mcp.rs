@@ -222,6 +222,7 @@ fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> 
         StoreError::InvalidId(_)
         | StoreError::InvalidDate(_)
         | StoreError::InvalidRange(_)
+        | StoreError::InvalidCursor(_)
         | StoreError::TtlOutOfRange(_)
         | StoreError::InvalidLifecycle(_)
         | StoreError::InvalidPath(_)
@@ -369,6 +370,11 @@ pub struct ListRecentParams {
     pub start: Option<String>,
     /// Inclusive window end, YYYY-MM-DD. Requires start.
     pub end: Option<String>,
+    /// Cursor date from the previous `next` object, YYYY-MM-DD.
+    /// Requires after_key.
+    pub after_date: Option<String>,
+    /// Cursor key from the previous `next` object. Requires after_date.
+    pub after_key: Option<String>,
     pub limit: Option<usize>,
 }
 
@@ -645,7 +651,7 @@ impl Pastebin {
     }
 
     #[tool(
-        description = "List current pastes for one date or an inclusive date range. date=YYYY-MM-DD takes precedence over start and end. A range needs both start and end (YYYY-MM-DD), and start must be <= end. With no dates, the window is the last DAYFLY_LIST_DEFAULT_DAYS days, ending today in UTC (2 days by default). This scans the bucket directly (ListObjectsV2 + HeadObject per key) and filters expired objects; it is prefix listing, not search or sort, and is O(n) in objects scanned."
+        description = "List current pastes for one date or an inclusive date range. date=YYYY-MM-DD takes precedence over start and end. A range needs both start and end (YYYY-MM-DD), and start must be <= end. With no dates, the window is the last DAYFLY_LIST_DEFAULT_DAYS days, ending today in UTC (2 days by default). The result reports truncated and next. Pass next.date as after_date and next.start_after as after_key to read the next page. This scans the bucket directly (ListObjectsV2 + HeadObject per key) and filters expired objects; it is prefix listing, not search or sort, and is O(n) in objects scanned."
     )]
     async fn list_recent(
         &self,
@@ -659,23 +665,53 @@ impl Pastebin {
             ));
         }
         let request = try_store!(list_request(&params));
+        let cursor = match (&params.after_date, &params.after_key) {
+            (None, None) => None,
+            (Some(date), Some(start_after)) => Some(crate::store::ListCursor {
+                date: date.clone(),
+                start_after: start_after.clone(),
+            }),
+            _ => {
+                return Err(rmcp::ErrorData::invalid_params(
+                    "after_date and after_key must be supplied together",
+                    Some(serde_json::json!({"code": "invalid_cursor"})),
+                ))
+            }
+        };
         let limit = params.limit.unwrap_or(100);
-        let items = match &request {
+        let page = match &request {
             ListWindowRequest::Date(date) => {
-                try_store!(store.list_recent(Some(date), limit).await)
+                try_store!(
+                    store
+                        .list_recent_page(Some(date), limit, cursor.as_ref())
+                        .await
+                )
             }
             ListWindowRequest::Range { start, end } => {
-                try_store!(store.list_window(Some(start), Some(end), limit).await)
+                try_store!(
+                    store
+                        .list_window_page(Some(start), Some(end), limit, cursor.as_ref())
+                        .await
+                )
             }
             ListWindowRequest::Default => {
-                try_store!(store.list_window(None, None, limit).await)
+                try_store!(
+                    store
+                        .list_window_page(None, None, limit, cursor.as_ref())
+                        .await
+                )
             }
         };
         result_json(serde_json::json!({
             "date": params.date,
             "start": params.start,
             "end": params.end,
-            "items": items.iter().map(|i| serde_json::json!({
+            "truncated": page.truncated,
+            "next": page.next.map(|cursor| serde_json::json!({
+                "date": cursor.date,
+                "start_after": cursor.start_after,
+            })),
+            "items": page.items.iter().map(|i| serde_json::json!({
                 "id": i.id,
                 "key": i.key,
                 "words": i.words,
@@ -924,6 +960,8 @@ mod tests {
             date: date.map(str::to_string),
             start: start.map(str::to_string),
             end: end.map(str::to_string),
+            after_date: None,
+            after_key: None,
             limit: None,
         }
     }
