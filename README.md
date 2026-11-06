@@ -652,7 +652,10 @@ When `DAYFLY_PASTE_TOKENS` is on, the JSON response adds `paste_token`
 and the plain response adds an `X-Paste-Token` header.
 
 Send `X-Title` and `X-Tags` to name and group a paste. `X-Tags` is a
-comma-separated list. The store trims the title, lowercases and
+comma-separated list. The metadata headers accept UTF-8 values, so
+`X-Title: 日本語` and an emoji filename work. A client that cannot send
+non-ASCII header bytes can use the multipart form fields or the MCP
+arguments instead. The store trims the title, lowercases and
 deduplicates the tags, and accepts at most 8 tags and 512 bytes of tags.
 A title is at most 200 bytes. The JSON response and the metadata route
 return `title` and `tags`.
@@ -1174,8 +1177,11 @@ Download responses set `Content-Disposition: inline` for safe types
 (`text/plain`, `text/csv`, `text/markdown`, images except SVG, and PDF
 when `DAYFLY_INLINE_PDF` is true) and `attachment` for everything else
 — **specifically including `text/html` and `image/svg+xml`, which are
-always served as attachments, never rendered inline**. Every download
-carries `X-Content-Type-Options: nosniff`. An inline response also
+always served as attachments, never rendered inline**. A text response
+adds `charset=utf-8` when the stored type has no charset. A filename
+with non-ASCII characters is sent with the RFC 5987 `filename*=UTF-8''`
+form and an ASCII fallback in `filename`. Every download carries
+`X-Content-Type-Options: nosniff`. An inline response also
 carries `Content-Security-Policy: sandbox`, so a served document cannot
 run script in the service's origin even if a type slips through
 detection. The human view page shows text in `<pre>`, including the

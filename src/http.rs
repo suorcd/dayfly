@@ -434,6 +434,22 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Read a header value that may carry UTF-8 bytes.
+///
+/// The upload metadata headers (`X-Filename`, `X-Title`, `X-Tags`) are
+/// user text, not protocol tokens. HTTP permits obs-text bytes, and curl
+/// sends UTF-8 directly. Fall back to the raw bytes when `to_str` rejects
+/// them. Do not use this for credentials or protocol headers.
+fn header_str_utf8(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers.get(name).and_then(|value| {
+        value.to_str().ok().map(str::to_string).or_else(|| {
+            std::str::from_utf8(value.as_bytes())
+                .ok()
+                .map(str::to_string)
+        })
+    })
+}
+
 /// True when `If-None-Match` names the current entity tag.
 ///
 /// S3 clients send a comma-separated list, a weak `W/` prefix, or `*`.
@@ -610,9 +626,9 @@ async fn upload_dispatch(
         }
     } else {
         let filename =
-            header_str(&headers, "x-filename").or_else(|| query.get("filename").cloned());
-        let title = header_str(&headers, "x-title").or_else(|| query.get("title").cloned());
-        let tags = header_str(&headers, "x-tags")
+            header_str_utf8(&headers, "x-filename").or_else(|| query.get("filename").cloned());
+        let title = header_str_utf8(&headers, "x-title").or_else(|| query.get("title").cloned());
+        let tags = header_str_utf8(&headers, "x-tags")
             .or_else(|| query.get("tags").cloned())
             .map(|value| split_tags(&value))
             .unwrap_or_default();
@@ -676,9 +692,9 @@ async fn multipart_inner(
         }
     }
     let mut filename: Option<String> =
-        header_str(&headers, "x-filename").or_else(|| query.get("filename").cloned());
-    let mut title = header_str(&headers, "x-title").or_else(|| query.get("title").cloned());
-    let mut tags = header_str(&headers, "x-tags")
+        header_str_utf8(&headers, "x-filename").or_else(|| query.get("filename").cloned());
+    let mut title = header_str_utf8(&headers, "x-title").or_else(|| query.get("title").cloned());
+    let mut tags = header_str_utf8(&headers, "x-tags")
         .or_else(|| query.get("tags").cloned())
         .map(|value| split_tags(&value))
         .unwrap_or_default();
@@ -882,6 +898,20 @@ pub(crate) async fn raw_inner(state: &AppState, headers: &HeaderMap, id: &str) -
 /// A browser renders markup types when it loads them inline, and their
 /// scripts run on the dayfly origin. The raw route keeps the bytes and
 /// shows them as text instead.
+/// Declare UTF-8 on a text response when the stored type has no charset.
+///
+/// The store treats text as UTF-8. A browser that sees `text/plain` with
+/// no charset may guess another encoding and show non-Latin text as
+/// mojibake.
+fn with_text_charset(content_type: String) -> String {
+    let main = content_type.split(';').next().unwrap_or("").trim();
+    if main.starts_with("text/") && !content_type.to_ascii_lowercase().contains("charset=") {
+        format!("{content_type}; charset=utf-8")
+    } else {
+        content_type
+    }
+}
+
 fn raw_view_type(content_type: &str) -> bool {
     let main = content_type.split(';').next().unwrap_or("").trim();
     matches!(
@@ -954,7 +984,7 @@ async fn download_response(
     let content_type = if raw_fallback && raw_view_type(&meta.content_type) {
         "text/plain; charset=utf-8".to_string()
     } else {
-        meta.content_type.clone()
+        with_text_charset(meta.content_type.clone())
     };
     resp_headers.insert(
         CONTENT_TYPE,
