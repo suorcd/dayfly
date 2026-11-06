@@ -93,6 +93,8 @@ pub enum StoreError {
     InvalidDate(String),
     #[error("invalid range: {0}")]
     InvalidRange(String),
+    #[error("invalid list cursor: {0}")]
+    InvalidCursor(String),
     #[error("range not satisfiable")]
     RangeNotSatisfiable,
     #[error("{0}")]
@@ -134,6 +136,7 @@ impl StoreError {
             StoreError::InvalidId(_) => "invalid_id",
             StoreError::InvalidDate(_) => "invalid_date",
             StoreError::InvalidRange(_) => "invalid_range",
+            StoreError::InvalidCursor(_) => "invalid_cursor",
             StoreError::RangeNotSatisfiable => "range_not_satisfiable",
             StoreError::TtlOutOfRange(_) => "invalid_ttl",
             StoreError::InvalidLifecycle(_) => "invalid_lifecycle",
@@ -626,6 +629,26 @@ pub struct PasteSummary {
     pub created_at: Option<DateTime<Utc>>,
     pub content_type: Option<String>,
     pub filename: Option<String>,
+}
+
+/// A stateless cursor for the next listing page.
+///
+/// `date` is the UTC date prefix to resume. `start_after` is the last
+/// S3 key that the previous page scanned. The next scan starts after
+/// that key on that date, then continues to older dates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListCursor {
+    pub date: String,
+    pub start_after: String,
+}
+
+/// One listing page and its cursor state.
+#[derive(Debug, Clone)]
+pub struct ListPage {
+    pub items: Vec<PasteSummary>,
+    /// The limit was reached. Another page may exist.
+    pub truncated: bool,
+    pub next: Option<ListCursor>,
 }
 
 pub const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -3039,7 +3062,7 @@ impl Store {
         Ok(())
     }
 
-    /// List current pastes for an inclusive date window.
+    /// List one page of current pastes for an inclusive date window.
     ///
     /// No dates select the default window: the last
     /// `DAYFLY_LIST_DEFAULT_DAYS` days, ending today in UTC. A
@@ -3065,25 +3088,58 @@ impl Store {
     /// grows. That slowdown is exactly the trigger for adding a database
     /// later — it is documented in README, not hidden, and no database
     /// schema is invented in v1. This is not search.
-    pub async fn list_window(
+    ///
+    /// A cursor resumes after the last key of the previous page. The
+    /// cursor is stateless: `date` names the prefix, and `start_after`
+    /// is passed to `ListObjectsV2`. The next page may be empty when the
+    /// previous page ended exactly at the end of the bucket.
+    pub async fn list_window_page(
         &self,
         start: Option<&str>,
         end: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<PasteSummary>, StoreError> {
+        cursor: Option<&ListCursor>,
+    ) -> Result<ListPage, StoreError> {
         let request = parse_list_window_request(None, start, end)?;
         let (start_date, end_date) =
             resolve_list_window(&request, Utc::now(), self.config.list_default_days)?;
         let limit = limit.clamp(1, 1000);
+        let mut cursor_date = None;
+        if let Some(cursor) = cursor {
+            let date = NaiveDate::parse_from_str(&cursor.date, "%Y-%m-%d").map_err(|_| {
+                StoreError::InvalidCursor(format!("date must be YYYY-MM-DD: {}", cursor.date))
+            })?;
+            if date < start_date || date > end_date {
+                return Err(StoreError::InvalidCursor(format!(
+                    "date {} is outside the listing window",
+                    cursor.date
+                )));
+            }
+            let prefix = format!("pastes/{}/", cursor.date);
+            if !cursor.start_after.starts_with(&prefix) {
+                return Err(StoreError::InvalidCursor(format!(
+                    "key {} does not belong to date {}",
+                    cursor.start_after, cursor.date
+                )));
+            }
+            cursor_date = Some(date);
+        }
         let mut summaries = Vec::new();
+        let mut last_included: Option<ListCursor> = None;
         let dates: Vec<NaiveDate> = inclusive_dates(start_date, end_date).collect();
         for date in dates.into_iter().rev() {
             if summaries.len() >= limit {
                 break;
             }
+            if cursor_date.is_some_and(|cursor| date > cursor) {
+                continue;
+            }
             let date_str = date.format("%Y-%m-%d").to_string();
             let prefix = format!("pastes/{date_str}/");
             let mut token: Option<String> = None;
+            let mut start_after = cursor
+                .filter(|cursor| cursor.date == date_str)
+                .map(|cursor| cursor.start_after.clone());
             for _ in 0..LIST_SCAN_MAX_PAGES {
                 let mut req = self
                     .client
@@ -3093,6 +3149,8 @@ impl Store {
                     .max_keys(1000);
                 if let Some(t) = token.as_deref() {
                     req = req.continuation_token(t);
+                } else if let Some(key) = start_after.take() {
+                    req = req.start_after(key);
                 }
                 let out = req.send().await.map_err(|e| map_sdk_error(e, &date_str))?;
                 for obj in out.contents() {
@@ -3131,13 +3189,20 @@ impl Store {
                         content_type: Some(meta.content_type),
                         filename: meta.filename,
                     });
+                    last_included = Some(ListCursor {
+                        date: date_str.clone(),
+                        start_after: key.to_string(),
+                    });
                 }
-                let truncated = out.is_truncated().unwrap_or(false);
-                token = match (truncated, out.next_continuation_token()) {
+                if summaries.len() >= limit {
+                    break;
+                }
+                let page_truncated = out.is_truncated().unwrap_or(false);
+                token = match (page_truncated, out.next_continuation_token()) {
                     (true, Some(t)) => Some(t.to_string()),
                     _ => None,
                 };
-                if token.is_none() || summaries.len() >= limit {
+                if token.is_none() {
                     break;
                 }
             }
@@ -3147,7 +3212,41 @@ impl Store {
             let b_date = b.id.split_once('/').map(|(date, _)| date).unwrap_or("");
             a_date.cmp(b_date).then_with(|| a.key.cmp(&b.key))
         });
-        Ok(summaries)
+        let truncated = summaries.len() >= limit;
+        let next = if truncated { last_included } else { None };
+        Ok(ListPage {
+            items: summaries,
+            truncated,
+            next,
+        })
+    }
+
+    /// Compatibility wrapper that returns only the page items.
+    pub async fn list_window(
+        &self,
+        start: Option<&str>,
+        end: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PasteSummary>, StoreError> {
+        Ok(self.list_window_page(start, end, limit, None).await?.items)
+    }
+
+    /// One page of recent pastes. A date means one day. No date
+    /// delegates to the default window of
+    /// [`list_window_page`](Self::list_window_page).
+    pub async fn list_recent_page(
+        &self,
+        date: Option<&str>,
+        limit: usize,
+        cursor: Option<&ListCursor>,
+    ) -> Result<ListPage, StoreError> {
+        match date {
+            Some(date) => {
+                self.list_window_page(Some(date), Some(date), limit, cursor)
+                    .await
+            }
+            None => self.list_window_page(None, None, limit, cursor).await,
+        }
     }
 
     /// Compatibility wrapper. A date means one day. No date delegates to the
@@ -3157,10 +3256,7 @@ impl Store {
         date: Option<&str>,
         limit: usize,
     ) -> Result<Vec<PasteSummary>, StoreError> {
-        match date {
-            Some(date) => self.list_window(Some(date), Some(date), limit).await,
-            None => self.list_window(None, None, limit).await,
-        }
+        Ok(self.list_recent_page(date, limit, None).await?.items)
     }
 }
 

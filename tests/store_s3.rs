@@ -2064,6 +2064,111 @@ async fn list_window_follows_continuation_tokens() {
 }
 
 #[tokio::test]
+async fn list_window_pages_with_a_stateless_cursor() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let valid = future_metadata(5);
+    for key in ["aaa", "bbb", "ccc", "ddd", "eee"] {
+        fake.seed(
+            &format!("pastes/{today}/{key}"),
+            b"abcde",
+            "text/plain",
+            &common::metadata_refs(&valid),
+        );
+    }
+
+    let first = store
+        .list_window_page(Some(&today), Some(&today), 2, None)
+        .await
+        .expect("the first page must succeed");
+    assert_eq!(first.items.len(), 2);
+    assert!(first.truncated);
+    let first_next = first.next.clone().expect("the first page needs a cursor");
+    assert_eq!(first_next.date, today);
+    assert_eq!(
+        first_next.start_after,
+        first.items.last().expect("two items").key
+    );
+
+    let second = store
+        .list_window_page(Some(&today), Some(&today), 2, Some(&first_next))
+        .await
+        .expect("the second page must succeed");
+    let second_ids: Vec<&str> = second.items.iter().map(|item| item.id.as_str()).collect();
+    assert_eq!(
+        second_ids,
+        vec![format!("{today}/ccc"), format!("{today}/ddd")]
+    );
+    assert!(second.truncated);
+    let second_next = second.next.expect("the second page needs a cursor");
+
+    let third = store
+        .list_window_page(Some(&today), Some(&today), 2, Some(&second_next))
+        .await
+        .expect("the third page must succeed");
+    assert_eq!(third.items.len(), 1);
+    assert_eq!(third.items[0].id, format!("{today}/eee"));
+    assert!(!third.truncated);
+    assert!(third.next.is_none());
+}
+
+#[tokio::test]
+async fn list_window_cursor_moves_to_an_older_date() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let now = Utc::now();
+    let today = now.format("%Y-%m-%d").to_string();
+    let yesterday = (now - Duration::days(1)).format("%Y-%m-%d").to_string();
+    let valid = future_metadata(5);
+    for key in ["aaa", "bbb"] {
+        fake.seed(
+            &format!("pastes/{today}/{key}"),
+            b"abcde",
+            "text/plain",
+            &common::metadata_refs(&valid),
+        );
+    }
+    for key in ["aaa", "bbb", "ccc"] {
+        fake.seed(
+            &format!("pastes/{yesterday}/{key}"),
+            b"abcde",
+            "text/plain",
+            &common::metadata_refs(&valid),
+        );
+    }
+
+    let first = store
+        .list_window_page(Some(&yesterday), Some(&today), 2, None)
+        .await
+        .expect("the first page must succeed");
+    assert_eq!(first.items.len(), 2);
+    assert!(first.truncated);
+    let next = first.next.expect("the first page needs a cursor");
+
+    let second = store
+        .list_window_page(Some(&yesterday), Some(&today), 2, Some(&next))
+        .await
+        .expect("the second page must succeed");
+    let ids: Vec<&str> = second.items.iter().map(|item| item.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![format!("{yesterday}/aaa"), format!("{yesterday}/bbb")]
+    );
+    assert!(second.truncated);
+    let next = second.next.expect("the second page needs a cursor");
+
+    let third = store
+        .list_window_page(Some(&yesterday), Some(&today), 2, Some(&next))
+        .await
+        .expect("the third page must succeed");
+    assert_eq!(third.items.len(), 1);
+    assert_eq!(third.items[0].id, format!("{yesterday}/ccc"));
+    assert!(!third.truncated);
+    assert!(third.next.is_none());
+}
+
+#[tokio::test]
 async fn list_recent_rejects_an_invalid_date() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;

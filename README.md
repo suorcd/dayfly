@@ -310,8 +310,12 @@ The scan starts at the newest date and moves to older dates. The
 `limit` applies to the newest dates. Within one date, the limit applies
 in S3 key order. Paste IDs are random, so key order is not creation
 order. An older date can be omitted when the limit is reached. Results
-are sorted by date ascending, then by key. The response has no
-truncation field in v1; use a narrower date range to see older objects.
+are sorted by date ascending, then by key. The response reports
+`truncated` and `next`. `next` is `{date, start_after}` or null. Pass
+`next.date` as `after_date` and `next.start_after` as `after_key` to
+read the next page. The cursor is stateless and follows scan order, not
+the sorted display order. A page that ends exactly at the end of the
+bucket can still return `truncated: true`; the next page is then empty.
 
 ## Configuration
 
@@ -825,6 +829,9 @@ curl 'http://127.0.0.1:8080/v1/pastes?date=2026-10-28&limit=100'
 
 # List an inclusive range across a date boundary:
 curl 'http://127.0.0.1:8080/v1/pastes?start=2026-10-28&end=2026-10-29&limit=100'
+
+# Read the next page with the cursor from the previous response:
+curl 'http://127.0.0.1:8080/v1/pastes?date=2026-10-28&limit=100&after_date=2026-10-28&after_key=pastes%2F2026-10-28%2FAbC123...'
 ```
 
 `date` takes precedence over `start` and `end`. Supply both `start` and
@@ -832,6 +839,12 @@ curl 'http://127.0.0.1:8080/v1/pastes?start=2026-10-28&end=2026-10-29&limit=100'
 order, then in S3 key order within each date. The limit applies to the
 newest dates first, then to key order within a date. Key order is not
 creation order because IDs are random. An older date can be omitted.
+
+The JSON response carries `truncated` and `next`. `next` is
+`{date, start_after}` or null. Supply both `after_date` and `after_key`
+to read the next page; one part alone returns 400 with code
+`invalid_cursor`. The cursor follows scan order (newest date first,
+then S3 key order), not the sorted order of the returned items.
 
 Downloads return an `ETag`. Send it as `If-None-Match` to get
 `304 Not Modified` when the paste has not changed. The validator covers
@@ -848,7 +861,8 @@ Every HTTP error carries a stable `code`. The current values are:
 `unauthorized`, `forbidden`, `listing_disabled`, `not_found`,
 `expired`, `too_large`, `length_mismatch`, `too_many_segments`,
 `range_not_satisfiable`, `invalid_request`, `invalid_id`,
-`invalid_date`, `invalid_range`, `invalid_ttl`, `invalid_lifecycle`,
+`invalid_date`, `invalid_range`, `invalid_cursor`, `invalid_ttl`,
+`invalid_lifecycle`,
 `invalid_path`, `path_outside_root`, `local_files_disabled`,
 `alias_unavailable`, `io_error`, `s3_error`, `quota_exceeded`,
 `bucket_unavailable`, `partial_update`, `rate_limited`, and

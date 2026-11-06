@@ -1198,6 +1198,70 @@ async fn list_route_does_not_echo_the_s3_error_detail() {
 }
 
 #[tokio::test]
+async fn list_route_pages_with_a_cursor_and_reports_truncation() {
+    let fake = FakeS3::start().await;
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let metadata = common::stored_metadata(
+        &(Utc::now() + Duration::days(1)).to_rfc3339(),
+        "text/plain",
+        5,
+        "abcde",
+    );
+    for key in ["aaa", "bbb", "ccc"] {
+        fake.seed(
+            &format!("pastes/{today}/{key}"),
+            b"abcde",
+            "text/plain",
+            &common::metadata_refs(&metadata),
+        );
+    }
+    let app = common::app(fake.store().await);
+
+    let request = common::request(
+        "GET",
+        &format!("/v1/pastes?date={today}&limit=2"),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let first = common::json_body(&body);
+    assert_eq!(first["truncated"], true);
+    assert_eq!(first["items"].as_array().expect("items").len(), 2);
+    let next = &first["next"];
+    assert_eq!(next["date"], today);
+    let next_key = next["start_after"]
+        .as_str()
+        .expect("the cursor must carry a key")
+        .replace('/', "%2F");
+
+    let request = common::request(
+        "GET",
+        &format!("/v1/pastes?date={today}&limit=2&after_date={today}&after_key={next_key}"),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let second = common::json_body(&body);
+    assert_eq!(second["items"].as_array().expect("items").len(), 1);
+    assert_eq!(second["items"][0]["id"], format!("{today}/ccc"));
+    assert_eq!(second["truncated"], false);
+    assert!(second["next"].is_null());
+}
+
+#[tokio::test]
+async fn list_route_rejects_half_a_cursor() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+
+    let request = common::request("GET", "/v1/pastes?after_date=2026-10-28", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(common::json_body(&body)["code"], "invalid_cursor");
+}
+
+#[tokio::test]
 async fn failed_uploads_return_an_error_and_never_a_paste_url() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;

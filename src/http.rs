@@ -41,8 +41,8 @@ use crate::config::TextAsset;
 use crate::content_type::content_disposition;
 use crate::rate_limit::RateLimiter;
 use crate::store::{
-    parse_list_window_request, parse_range_header, ListWindowRequest, PasteMetadata, Store,
-    StoreError, StoreHandle, Ttl, TtlParseError, MULTIPART_CHUNK_BYTES,
+    parse_list_window_request, parse_range_header, ListCursor, ListWindowRequest, PasteMetadata,
+    Store, StoreError, StoreHandle, Ttl, TtlParseError, MULTIPART_CHUNK_BYTES,
 };
 use crate::web::{api_write_allowed, Footer};
 
@@ -292,6 +292,7 @@ pub(crate) fn status_for(e: &StoreError) -> StatusCode {
         StoreError::InvalidId(_)
         | StoreError::InvalidDate(_)
         | StoreError::InvalidRange(_)
+        | StoreError::InvalidCursor(_)
         | StoreError::TtlOutOfRange(_)
         | StoreError::InvalidLifecycle(_)
         | StoreError::LengthMismatch { .. } => StatusCode::BAD_REQUEST,
@@ -963,6 +964,23 @@ fn parse_list_query(query: &HashMap<String, String>) -> Result<ListWindowRequest
     )
 }
 
+/// Parse the optional stateless listing cursor.
+///
+/// The two parts are supplied together. One part alone is a client error,
+/// because the server cannot choose the missing half.
+fn parse_list_cursor(query: &HashMap<String, String>) -> Result<Option<ListCursor>, StoreError> {
+    match (query.get("after_date"), query.get("after_key")) {
+        (None, None) => Ok(None),
+        (Some(date), Some(start_after)) => Ok(Some(ListCursor {
+            date: date.clone(),
+            start_after: start_after.clone(),
+        })),
+        _ => Err(StoreError::InvalidCursor(
+            "after_date and after_key must be supplied together".to_string(),
+        )),
+    }
+}
+
 async fn list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -982,20 +1000,39 @@ async fn list_handler(
         .get("limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(100);
+    let cursor = match parse_list_cursor(&query) {
+        Ok(cursor) => cursor,
+        Err(e) => return error_response(e),
+    };
     let store = state.store();
     let result = match &window {
-        ListWindowRequest::Date(date) => store.list_recent(Some(date), limit).await,
-        ListWindowRequest::Range { start, end } => {
-            store.list_window(Some(start), Some(end), limit).await
+        ListWindowRequest::Date(date) => {
+            store
+                .list_recent_page(Some(date), limit, cursor.as_ref())
+                .await
         }
-        ListWindowRequest::Default => store.list_window(None, None, limit).await,
+        ListWindowRequest::Range { start, end } => {
+            store
+                .list_window_page(Some(start), Some(end), limit, cursor.as_ref())
+                .await
+        }
+        ListWindowRequest::Default => {
+            store
+                .list_window_page(None, None, limit, cursor.as_ref())
+                .await
+        }
     };
     match result {
-        Ok(items) => Json(serde_json::json!({
+        Ok(page) => Json(serde_json::json!({
             "date": query.get("date"),
             "start": query.get("start"),
             "end": query.get("end"),
-            "items": items.iter().map(|i| serde_json::json!({
+            "truncated": page.truncated,
+            "next": page.next.map(|cursor| serde_json::json!({
+                "date": cursor.date,
+                "start_after": cursor.start_after,
+            })),
+            "items": page.items.iter().map(|i| serde_json::json!({
                 "id": i.id,
                 "key": i.key,
                 "words": i.words,

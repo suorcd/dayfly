@@ -1120,11 +1120,13 @@ fn list_objects(state: &Arc<Mutex<FakeState>>, uri: &Uri) -> Response {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1000);
     let token = query_param(uri, "continuation-token");
+    let start_after = query_param(uri, "start-after");
     let mut entries: Vec<(&String, &S3Object)> = state
         .objects
         .iter()
         .filter(|(key, _)| key.starts_with(&prefix))
         .filter(|(key, _)| token.as_deref().is_none_or(|t| key.as_str() > t))
+        .filter(|(key, _)| start_after.as_deref().is_none_or(|s| key.as_str() > s))
         .collect();
     let truncated = entries.len() > max_keys;
     entries.truncate(max_keys);

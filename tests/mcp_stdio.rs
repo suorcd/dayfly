@@ -9,7 +9,7 @@ mod common;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use common::FakeS3;
 use serde_json::{json, Value};
 
@@ -287,6 +287,51 @@ fn store_text_fetch_metadata_list_and_delete_round_trip() {
         .call_tool("fetch_metadata", json!({"id": id}))
         .expect_err("a deleted paste must not be found");
     assert_tool_error(error, "paste not found");
+}
+
+#[test]
+fn list_recent_returns_a_cursor_for_the_next_page() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let metadata = common::stored_metadata(
+        &(Utc::now() + Duration::days(1)).to_rfc3339(),
+        "text/plain",
+        5,
+        "abcde",
+    );
+    for key in ["aaa", "bbb", "ccc"] {
+        fake.seed(
+            &format!("pastes/{today}/{key}"),
+            b"abcde",
+            "text/plain",
+            &common::metadata_refs(&metadata),
+        );
+    }
+    let mut client = McpClient::spawn(&fake, &[]);
+
+    let first = client
+        .call_tool("list_recent", json!({"date": today, "limit": 2}))
+        .expect("the first page must succeed");
+    assert_eq!(first["truncated"], true);
+    assert_eq!(first["items"].as_array().expect("items").len(), 2);
+    let next = &first["next"];
+
+    let second = client
+        .call_tool(
+            "list_recent",
+            json!({
+                "date": today,
+                "limit": 2,
+                "after_date": next["date"],
+                "after_key": next["start_after"],
+            }),
+        )
+        .expect("the second page must succeed");
+    assert_eq!(second["items"].as_array().expect("items").len(), 1);
+    assert_eq!(second["items"][0]["id"], format!("{today}/ccc"));
+    assert_eq!(second["truncated"], false);
+    assert!(second["next"].is_null());
 }
 
 #[test]
