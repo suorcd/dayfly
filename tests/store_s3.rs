@@ -10,9 +10,9 @@ use bytes::Bytes;
 use chrono::{Duration, Utc};
 use common::{FailOp, FakeS3, Gate};
 use dayfly::store::{
-    normalize_words, normalize_words_up_to, parse_segment_key, segment_key, PasteFields, Store,
-    StoreError, Ttl, MAX_FETCH_TEXT_BYTES, MAX_SEGMENTS_PER_PASTE, MULTIPART_CHUNK_BYTES,
-    SEGMENT_SUFFIX_LEN,
+    normalize_words, normalize_words_up_to, parse_segment_key, segment_key, PasteFields,
+    SearchOptions, Store, StoreError, Ttl, MAX_FETCH_TEXT_BYTES, MAX_SEGMENTS_PER_PASTE,
+    MULTIPART_CHUNK_BYTES, SEGMENT_SUFFIX_LEN,
 };
 use futures::stream;
 use sha2::{Digest, Sha256};
@@ -2062,6 +2062,198 @@ async fn list_window_follows_continuation_tokens() {
         list_calls >= 2,
         "the continuation token must fetch a second page, saw {list_calls} list calls"
     );
+}
+
+#[tokio::test]
+async fn search_text_finds_literal_lines_and_offsets() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"alpha\nbeta\ngamma\n", None, Some("text/plain"), None)
+        .await
+        .expect("the text must store");
+    let result = store
+        .search_text(&stored.id, "beta", SearchOptions::default())
+        .await
+        .expect("the search must succeed");
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.hits[0].line, 2);
+    assert_eq!(result.hits[0].byte_offset, 6);
+    assert_eq!(result.hits[0].preview, "beta");
+    assert_eq!(result.hits[0].ranges, vec![(0, 4)]);
+    assert_eq!(result.scanned_bytes, 17);
+    assert!(!result.truncated);
+    assert!(result.next_offset.is_none());
+}
+
+#[tokio::test]
+async fn search_text_finds_a_match_across_a_segment_boundary() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"hello ", None, Some("text/plain"), None)
+        .await
+        .expect("the base must store");
+    store
+        .append_text(&stored.id, b"world\n")
+        .await
+        .expect("the segment must store");
+    let result = store
+        .search_text(&stored.id, "hello world", SearchOptions::default())
+        .await
+        .expect("the search must succeed");
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.hits[0].line, 1);
+    assert_eq!(result.hits[0].preview, "hello world");
+    assert_eq!(result.hits[0].ranges, vec![(0, 11)]);
+}
+
+#[tokio::test]
+async fn search_text_returns_context_lines() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(
+            b"one\ntwo\nthree\nfour\nfive\n",
+            None,
+            Some("text/plain"),
+            None,
+        )
+        .await
+        .expect("the text must store");
+    let result = store
+        .search_text(
+            &stored.id,
+            "three",
+            SearchOptions {
+                context_lines: 1,
+                ..SearchOptions::default()
+            },
+        )
+        .await
+        .expect("the search must succeed");
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.hits[0].line, 3);
+    assert_eq!(result.hits[0].preview, "two\nthree\nfour");
+    assert_eq!(result.hits[0].ranges, vec![(4, 9)]);
+}
+
+#[tokio::test]
+async fn search_text_caps_matches_and_resumes_from_next_offset() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(
+            b"hit one\nhit two\nhit three\nhit four\nhit five\n",
+            None,
+            Some("text/plain"),
+            None,
+        )
+        .await
+        .expect("the text must store");
+    let options = SearchOptions {
+        max_matches: 2,
+        ..SearchOptions::default()
+    };
+    let first = store
+        .search_text(&stored.id, "hit", options)
+        .await
+        .expect("the first search must succeed");
+    assert_eq!(first.hits.len(), 2);
+    assert!(first.truncated);
+    let next = first.next_offset.expect("the first page needs an offset");
+
+    let second = store
+        .search_text(
+            &stored.id,
+            "hit",
+            SearchOptions {
+                after_offset: next,
+                ..options
+            },
+        )
+        .await
+        .expect("the second search must succeed");
+    assert_eq!(second.hits.len(), 2);
+    assert!(second.truncated);
+
+    let third = store
+        .search_text(
+            &stored.id,
+            "hit",
+            SearchOptions {
+                after_offset: second.next_offset.expect("the second page needs an offset"),
+                ..options
+            },
+        )
+        .await
+        .expect("the third search must succeed");
+    assert_eq!(third.hits.len(), 1);
+    assert!(!third.truncated);
+    assert!(third.next_offset.is_none());
+}
+
+#[tokio::test]
+async fn search_text_rejects_binary_and_invalid_regex() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let binary = store
+        .store_text(b"\x00\x01\x02", None, None, None)
+        .await
+        .expect("the binary object must store");
+    let error = store
+        .search_text(&binary.id, "x", SearchOptions::default())
+        .await
+        .expect_err("a binary paste must be rejected");
+    assert!(matches!(error, StoreError::NotText(_)));
+
+    let text = store
+        .store_text(b"alpha\n", None, Some("text/plain"), None)
+        .await
+        .expect("the text must store");
+    let error = store
+        .search_text(
+            &text.id,
+            "(",
+            SearchOptions {
+                regex: true,
+                ..SearchOptions::default()
+            },
+        )
+        .await
+        .expect_err("an invalid regex must be rejected");
+    assert!(matches!(error, StoreError::InvalidSearch(_)));
+}
+
+#[tokio::test]
+async fn fetch_text_tail_and_line_range_return_the_requested_slice() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"one\ntwo\nthree\n", None, Some("text/plain"), None)
+        .await
+        .expect("the text must store");
+
+    let tail = store
+        .fetch_text_tail(&stored.id, 5)
+        .await
+        .expect("the tail must read");
+    assert_eq!(tail.text, "hree\n");
+
+    let lines = store
+        .fetch_text_lines(&stored.id, 2, 3)
+        .await
+        .expect("the line range must read");
+    assert_eq!(lines.text, "two\nthree\n");
+    assert_eq!(lines.total_bytes, 14);
+    assert!(!lines.truncated);
+
+    let one_line = store
+        .fetch_text_lines(&stored.id, 2, 2)
+        .await
+        .expect("one line must read");
+    assert_eq!(one_line.text, "two\n");
+    assert!(one_line.truncated);
 }
 
 #[tokio::test]

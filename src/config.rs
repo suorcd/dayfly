@@ -63,6 +63,11 @@ pub struct Config {
     /// object and every appended segment. A new paste above this cap
     /// fails with `TooLarge` and writes no object. Default: 1 GiB.
     pub max_paste_bytes: u64,
+    /// Maximum bytes that one text search reads. Default: 64 MiB.
+    ///
+    /// The search returns `truncated` when it reaches this cap. The
+    /// caller resumes with `next_offset`.
+    pub search_max_bytes: u64,
     /// Number of words in a new alias. The allowed range is 3 to 6.
     /// Resolution accepts 3 words up to this value. Default: 3.
     pub alias_words: u8,
@@ -318,6 +323,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("1073741824"),
         required: false,
         help: "Maximum total paste size in bytes, including appends",
+    },
+    ConfigField {
+        name: "DAYFLY_SEARCH_MAX_BYTES",
+        value: Some("67108864"),
+        required: false,
+        help: "Maximum bytes that one text search reads",
     },
     ConfigField {
         name: "DAYFLY_ALIAS_WORDS",
@@ -1401,6 +1412,17 @@ impl Config {
                 format!("expected at most {MAX_MULTIPART_BYTES} bytes: 10,000 parts of 5 MiB"),
             ));
         }
+        let search_max_bytes = optional_u64(
+            &lookup,
+            "DAYFLY_SEARCH_MAX_BYTES",
+            field_u64("DAYFLY_SEARCH_MAX_BYTES", 64 * 1024 * 1024),
+        )?;
+        if search_max_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "DAYFLY_SEARCH_MAX_BYTES".to_string(),
+                "expected a positive number of bytes".to_string(),
+            ));
+        }
         let alias_words = optional_u32(
             &lookup,
             "DAYFLY_ALIAS_WORDS",
@@ -1437,6 +1459,7 @@ impl Config {
                 "DAYFLY_MAX_PASTE_BYTES",
                 field_u64("DAYFLY_MAX_PASTE_BYTES", 1024 * 1024 * 1024),
             )?,
+            search_max_bytes,
             alias_words,
             default_ttl_days,
             min_ttl_days,
@@ -1576,7 +1599,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} list_requires_token={} paste_tokens={} rate_limit_per_minute={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
+            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} search_max_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} list_requires_token={} paste_tokens={} rate_limit_per_minute={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -1587,6 +1610,7 @@ impl Config {
             self.max_text_bytes,
             self.max_file_bytes,
             self.max_paste_bytes,
+            self.search_max_bytes,
             self.alias_words,
             self.default_ttl_days,
             self.list_default_days,
@@ -1939,6 +1963,7 @@ mod tests {
             max_text_bytes,
             max_file_bytes,
             max_paste_bytes: 1024 * 1024 * 1024,
+            search_max_bytes: 64 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,
             min_ttl_days: 0,

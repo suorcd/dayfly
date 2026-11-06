@@ -189,6 +189,7 @@ fn tools_list_exposes_every_dayfly_tool() {
         "fetch_metadata",
         "delete_paste",
         "list_recent",
+        "search_text",
         "get_info",
     ] {
         assert!(
@@ -287,6 +288,40 @@ fn store_text_fetch_metadata_list_and_delete_round_trip() {
         .call_tool("fetch_metadata", json!({"id": id}))
         .expect_err("a deleted paste must not be found");
     assert_tool_error(error, "paste not found");
+}
+
+#[test]
+fn search_text_and_line_reads_work_through_mcp() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let mut client = McpClient::spawn(&fake, &[]);
+
+    let stored = client
+        .call_tool(
+            "store_text",
+            json!({"text": "one\ntwo\nthree\n", "ttl_days": 1}),
+        )
+        .expect("store_text must succeed");
+    let id = stored["id"].as_str().expect("id").to_string();
+
+    let found = client
+        .call_tool("search_text", json!({"id": &id, "query": "two"}))
+        .expect("search_text must succeed");
+    assert_eq!(found["hits"][0]["line"], 2);
+    assert_eq!(found["hits"][0]["preview"], "two");
+
+    let tail = client
+        .call_tool("fetch_text", json!({"id": &id, "tail_bytes": 5}))
+        .expect("tail_bytes must succeed");
+    assert_eq!(tail["text"], "hree\n");
+
+    let lines = client
+        .call_tool(
+            "fetch_text",
+            json!({"id": &id, "line_start": 2, "line_end": 3}),
+        )
+        .expect("line_start and line_end must succeed");
+    assert_eq!(lines["text"], "two\nthree\n");
 }
 
 #[test]

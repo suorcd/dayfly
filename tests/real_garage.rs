@@ -37,6 +37,7 @@ fn test_config() -> Config {
         max_text_bytes: 10 * 1024 * 1024,
         max_file_bytes: 1024 * 1024 * 1024,
         max_paste_bytes: 1024 * 1024 * 1024,
+        search_max_bytes: 64 * 1024 * 1024,
         alias_words: 3,
         default_ttl_days: 1,
         min_ttl_days: 0,
