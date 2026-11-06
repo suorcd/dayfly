@@ -1306,6 +1306,36 @@ S3_ENDPOINT=... S3_BUCKET=... S3_ACCESS_KEY_ID=... S3_SECRET_ACCESS_KEY=... \
 nix flake check
 ```
 
+### Cleaning local build outputs
+
+Remove the local build outputs of the current flake with:
+
+```sh
+nix run .#clean
+# or directly:
+./scripts/clean.sh
+```
+
+The command removes the `result` and `result-*` symlinks, `target/`,
+and `.direnv/`. It finds `flake.nix` in the current directory or a
+parent directory. Use `--root PATH` to name another flake. Use
+`--dry-run` to print the paths without removing them.
+
+Run `./scripts/clean.sh --help` or `nix run .#clean -- --help` to show
+all options.
+
+Add `--rust-cache` to remove the Cargo registry cache, the Cargo git
+cache, and the sccache cache:
+
+```sh
+nix run .#clean -- --rust-cache
+./scripts/clean.sh --rust-cache
+```
+
+The command does not delete Nix store paths. It removes the result
+symlinks, which are GC roots. Run `nix store gc` to delete the
+unlinked build outputs.
+
 The flake also builds the OCI image:
 
 ```sh
