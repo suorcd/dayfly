@@ -48,6 +48,17 @@
             # No system libraries are needed: TLS goes through Rust crates
             # (rustls), not OpenSSL, and no C build steps exist.
           };
+          # Local cleanup for the current checkout. It removes the result
+          # symlinks, target/, and .direnv/; --rust-cache also clears the
+          # Cargo and sccache caches.
+          clean = pkgs.writeShellApplication {
+            name = "dayfly-clean";
+            runtimeInputs = [
+              pkgs.coreutils
+              pkgs.findutils
+            ];
+            text = builtins.readFile ./scripts/clean.sh;
+          };
           # OCI image for the HTTP server. Layered rather than one blob so a
           # registry stores the dependency layers once across versions instead
           # of re-uploading the whole binary every release. The name and tag
@@ -85,7 +96,7 @@
         in
         {
           default = dayfly;
-          inherit container;
+          inherit clean container;
         }
       );
 
@@ -111,6 +122,10 @@
         default = {
           type = "app";
           program = "${self.packages.${system}.default}/bin/dayfly";
+        };
+        clean = {
+          type = "app";
+          program = "${self.packages.${system}.clean}/bin/dayfly-clean";
         };
       });
     };

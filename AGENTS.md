@@ -85,7 +85,11 @@ cargo build --release
 nix develop   # shell with cargo, rustc, rust-analyzer, clippy, rustfmt
 nix build     # builds packages.default
 nix flake check
+nix run .#clean -- --dry-run  # list the local build outputs
 ```
+
+The `clean` app removes the `result*` symlinks, `target/`, and
+`.direnv/`. Add `--rust-cache` to remove the Cargo and sccache caches.
 
 What a pass looks like, on a machine with Nix:
 
