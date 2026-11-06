@@ -153,7 +153,10 @@ pub(crate) fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Re
 fn unauthorized_response() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        Json(serde_json::json!({"error": "unauthorized"})),
+        Json(serde_json::json!({
+            "error": "unauthorized",
+            "code": "unauthorized",
+        })),
     )
         .into_response()
 }
@@ -239,6 +242,7 @@ fn listing_disabled_response() -> Response {
         StatusCode::FORBIDDEN,
         Json(serde_json::json!({
             "error": "listing_disabled",
+            "code": "listing_disabled",
             "detail": crate::config::LISTING_DISABLED_MESSAGE,
         })),
     )
@@ -252,6 +256,7 @@ fn list_access_response(error: ListAccessError) -> Response {
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
                 "error": "unauthorized",
+                "code": "unauthorized",
                 "detail": ListAccessError::MISSING_TOKEN_MESSAGE,
             })),
         )
@@ -307,14 +312,24 @@ pub(crate) fn status_for(e: &StoreError) -> StatusCode {
 
 fn error_response(e: StoreError) -> Response {
     let status = status_for(&e);
-    (status, Json(serde_json::json!({"error": e.to_string()}))).into_response()
+    (
+        status,
+        Json(serde_json::json!({
+            "error": e.to_string(),
+            "code": e.code(),
+        })),
+    )
+        .into_response()
 }
 
 /// A malformed multipart body is a client error, not an S3 or I/O failure.
 fn bad_request(message: String) -> Response {
     (
         StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({"error": message})),
+        Json(serde_json::json!({
+            "error": message,
+            "code": "invalid_request",
+        })),
     )
         .into_response()
 }
@@ -324,7 +339,8 @@ fn forbidden_write() -> Response {
     (
         StatusCode::FORBIDDEN,
         Json(serde_json::json!({
-            "error": "forbidden: request origin does not match the Host header"
+            "error": "forbidden: request origin does not match the Host header",
+            "code": "forbidden",
         })),
     )
         .into_response()
@@ -339,7 +355,8 @@ fn upload_error_response(e: StoreError, text_paste: bool) -> Response {
             Json(serde_json::json!({
                 "error": format!(
                     "payload too large: limit is {limit} bytes for a text paste; send X-Filename for larger files"
-                )
+                ),
+                "code": "too_large",
             })),
         )
             .into_response(),
@@ -815,7 +832,10 @@ async fn download_response(
                         axum::http::header::CONTENT_RANGE,
                         format!("bytes */{}", meta.size),
                     )],
-                    Json(serde_json::json!({"error": "range not satisfiable"})),
+                    Json(serde_json::json!({
+                        "error": "range not satisfiable",
+                        "code": "range_not_satisfiable",
+                    })),
                 )
                     .into_response();
             }
@@ -1215,6 +1235,7 @@ async fn rate_limit(State(state): State<AppState>, request: Request, next: Next)
                     [(RETRY_AFTER, header)],
                     Json(serde_json::json!({
                         "error": "rate_limited",
+                        "code": "rate_limited",
                         "retry_after_seconds": retry_after,
                     })),
                 )
@@ -1281,7 +1302,10 @@ async fn fallback_handler(State(state): State<AppState>, uri: Uri, headers: Head
     if error_wants_json(path, &headers) {
         (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("not found: {path}")})),
+            Json(serde_json::json!({
+                "error": format!("not found: {path}"),
+                "code": "not_found",
+            })),
         )
             .into_response()
     } else {
@@ -1310,7 +1334,10 @@ async fn map_method_not_allowed(
     let mut replacement = if wants_json {
         (
             StatusCode::METHOD_NOT_ALLOWED,
-            Json(serde_json::json!({"error": format!("method not allowed: {path}")})),
+            Json(serde_json::json!({
+                "error": format!("method not allowed: {path}"),
+                "code": "method_not_allowed",
+            })),
         )
             .into_response()
     } else {
@@ -1555,9 +1582,11 @@ pub const API_ROUTE_DOCS: &[ApiRoute] = &[
     },
 ];
 
-/// Serve the unauthenticated service document.
-async fn service_description(State(state): State<AppState>) -> Response {
-    let store = state.store();
+/// Build the machine-readable service description.
+///
+/// The HTTP well-known route and the MCP `get_info` tool both call this
+/// function, so the two descriptions cannot drift.
+pub fn service_info(store: &Store) -> serde_json::Value {
     let config = &store.config;
     let routes: Vec<serde_json::Value> = API_ROUTE_DOCS
         .iter()
@@ -1569,7 +1598,7 @@ async fn service_description(State(state): State<AppState>) -> Response {
             })
         })
         .collect();
-    Json(serde_json::json!({
+    serde_json::json!({
         "name": "dayfly",
         "version": env!("CARGO_PKG_VERSION"),
         "mcp_endpoint": "/mcp",
@@ -1580,6 +1609,7 @@ async fn service_description(State(state): State<AppState>) -> Response {
         },
         "paste_tokens": config.paste_tokens,
         "listing_enabled": config.list_enabled,
+        "listing_requires_token": config.list_requires_token,
         "policy": {
             "inline_pdf": config.inline_pdf,
         },
@@ -1595,10 +1625,15 @@ async fn service_description(State(state): State<AppState>) -> Response {
             "retention_by_size": config.retention_by_size,
             "retention_min_seconds": u64::from(config.retention_min_days) * 86_400,
             "retention_max_seconds": u64::from(config.retention_max_days) * 86_400,
+            "alias_words": config.alias_words,
         },
         "routes": routes,
-    }))
-    .into_response()
+    })
+}
+
+/// Serve the unauthenticated service document.
+async fn service_description(State(state): State<AppState>) -> Response {
+    Json(service_info(&state.store())).into_response()
 }
 
 /// Serve the optional `robots.txt` file.
@@ -2143,10 +2178,10 @@ mod tests {
             .await
             .expect("error body must be readable");
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            String::from_utf8_lossy(&body),
-            r#"{"error":"unauthorized"}"#
-        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("the error body must be JSON");
+        assert_eq!(value["error"], "unauthorized");
+        assert_eq!(value["code"], "unauthorized");
     }
 
     #[tokio::test]
@@ -2683,10 +2718,10 @@ mod tests {
         let state = test_state_with_token(TEST_TOKEN).await;
         let (status, _, body) = mcp_oneshot(state, None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            String::from_utf8_lossy(&body),
-            r#"{"error":"unauthorized"}"#
-        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("the error body must be JSON");
+        assert_eq!(value["error"], "unauthorized");
+        assert_eq!(value["code"], "unauthorized");
     }
 
     #[tokio::test]
@@ -2695,10 +2730,10 @@ mod tests {
         let auth = HeaderValue::from_static("Bearer wrong-horse-battery-staple");
         let (status, _, body) = mcp_oneshot(state, Some(auth)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            String::from_utf8_lossy(&body),
-            r#"{"error":"unauthorized"}"#
-        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("the error body must be JSON");
+        assert_eq!(value["error"], "unauthorized");
+        assert_eq!(value["code"], "unauthorized");
     }
 
     /// The right credential must pass auth and reach the MCP handler, which

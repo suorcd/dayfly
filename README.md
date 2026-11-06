@@ -270,7 +270,9 @@ both forms; the plain-text HTTP response returns only the URL. See
 The running service publishes `GET /.well-known/dayfly.json` without
 authentication. The document reports the crate version, the auth mode,
 the content policy (`inline_pdf`), the limits in force, and every API
-route. The frontend links to it.
+route. The frontend links to it. The MCP tool `get_info` returns the
+same document, plus the local-path tool mode for the transport. Both
+read one function, so they cannot drift.
 
 The reference deployment serves it at
 [`/.well-known/dayfly.json`](https://dayfly.k.ser.ink/.well-known/dayfly.json).
@@ -560,7 +562,7 @@ not corrupted.
 MCP tools: `store_text`, `store_file`, `append_text`, `set_ttl`,
 `fetch_text`, `fetch_file` (downloads to a local path and returns
 metadata — binary content is never sent over JSON-RPC),
-`fetch_metadata`, `delete_paste`, `list_recent`.
+`fetch_metadata`, `delete_paste`, `list_recent`, `get_info`.
 
 When `DAYFLY_PASTE_TOKENS` is on, `store_text` and `store_file` return
 `paste_token`. `delete_paste`, `set_ttl`, and `append_text` accept a
@@ -836,11 +838,28 @@ Downloads return an `ETag`. Send it as `If-None-Match` to get
 the joined paste, so an append changes it. `HEAD` returns the same tag.
 
 Error responses are machine-readable JSON, e.g.
-`{"error": "payload too large: limit is 1073741824 bytes"}` with HTTP
-413 for oversize, 400 for invalid input, 404 for not found, 410 for
-expired, 416 for an unsatisfiable range, 507 for a bucket quota limit,
-and 502 for other S3 errors. An upload body shorter than its
-`Content-Length` returns 400 and stores nothing.
+`{"error": "payload too large: limit is 1073741824 bytes", "code":
+"too_large"}` with HTTP 413 for oversize, 400 for invalid input, 404
+for not found, 410 for expired, 416 for an unsatisfiable range, 507
+for a bucket quota limit, and 502 for other S3 errors. An upload body
+shorter than its `Content-Length` returns 400 and stores nothing.
+
+Every HTTP error carries a stable `code`. The current values are:
+`unauthorized`, `forbidden`, `listing_disabled`, `not_found`,
+`expired`, `too_large`, `length_mismatch`, `too_many_segments`,
+`range_not_satisfiable`, `invalid_request`, `invalid_id`,
+`invalid_date`, `invalid_range`, `invalid_ttl`, `invalid_lifecycle`,
+`invalid_path`, `path_outside_root`, `local_files_disabled`,
+`alias_unavailable`, `io_error`, `s3_error`, `quota_exceeded`,
+`bucket_unavailable`, `partial_update`, `rate_limited`, and
+`method_not_allowed`. Do not parse the `error` text; branch on the
+`code`.
+
+The MCP tools use the same codes. A domain error returns a tool result
+with `isError` set and a JSON text block:
+`{"code": "not_found", "message": "paste not found: ..."}`. A bad
+argument stays a JSON-RPC `-32602` error, and an internal fault stays a
+JSON-RPC `-32603` error; both carry the code in the error `data`.
 
 One status code needs reading carefully, because the current
 behaviour is narrower than the list above suggests. `DELETE` is

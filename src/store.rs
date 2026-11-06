@@ -119,6 +119,37 @@ pub enum StoreError {
     PartialUpdate { step: &'static str, key: String },
 }
 
+impl StoreError {
+    /// A stable machine-readable code for this error.
+    ///
+    /// Clients use the code to choose a recovery path. Do not change an
+    /// existing code; add a new one when a new error class appears.
+    pub fn code(&self) -> &'static str {
+        match self {
+            StoreError::NotFound(_) => "not_found",
+            StoreError::BucketUnavailable(_) => "bucket_unavailable",
+            StoreError::Expired(_) => "expired",
+            StoreError::TooLarge { .. } => "too_large",
+            StoreError::LengthMismatch { .. } => "length_mismatch",
+            StoreError::InvalidId(_) => "invalid_id",
+            StoreError::InvalidDate(_) => "invalid_date",
+            StoreError::InvalidRange(_) => "invalid_range",
+            StoreError::RangeNotSatisfiable => "range_not_satisfiable",
+            StoreError::TtlOutOfRange(_) => "invalid_ttl",
+            StoreError::InvalidLifecycle(_) => "invalid_lifecycle",
+            StoreError::AliasUnavailable { .. } => "alias_unavailable",
+            StoreError::TooManySegments { .. } => "too_many_segments",
+            StoreError::LocalFilesDisabled => "local_files_disabled",
+            StoreError::PathOutsideRoot(_) => "path_outside_root",
+            StoreError::InvalidPath(_) => "invalid_path",
+            StoreError::Io(_) => "io_error",
+            StoreError::S3(_) => "s3_error",
+            StoreError::QuotaExceeded => "quota_exceeded",
+            StoreError::PartialUpdate { .. } => "partial_update",
+        }
+    }
+}
+
 impl From<std::io::Error> for StoreError {
     fn from(e: std::io::Error) -> Self {
         StoreError::Io(e.to_string())
