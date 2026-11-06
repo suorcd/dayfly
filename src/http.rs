@@ -42,7 +42,8 @@ use crate::content_type::content_disposition;
 use crate::rate_limit::RateLimiter;
 use crate::store::{
     parse_list_window_request, parse_range_header, ListCursor, ListWindowRequest, PasteFields,
-    PasteMetadata, Store, StoreError, StoreHandle, Ttl, TtlParseError, MULTIPART_CHUNK_BYTES,
+    PasteMetadata, SearchOptions, Store, StoreError, StoreHandle, Ttl, TtlParseError,
+    MULTIPART_CHUNK_BYTES,
 };
 use crate::web::{api_write_allowed, Footer};
 
@@ -295,6 +296,7 @@ pub(crate) fn status_for(e: &StoreError) -> StatusCode {
         | StoreError::InvalidCursor(_)
         | StoreError::InvalidTitle(_)
         | StoreError::InvalidTags(_)
+        | StoreError::InvalidSearch(_)
         | StoreError::TtlOutOfRange(_)
         | StoreError::InvalidLifecycle(_)
         | StoreError::LengthMismatch { .. } => StatusCode::BAD_REQUEST,
@@ -302,6 +304,7 @@ pub(crate) fn status_for(e: &StoreError) -> StatusCode {
         // The local-path tools are MCP-only. If one of these reaches an
         // HTTP route, the caller asked for something it does not offer.
         StoreError::LocalFilesDisabled | StoreError::PathOutsideRoot(_) => StatusCode::FORBIDDEN,
+        StoreError::NotText(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
         StoreError::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
         StoreError::AliasUnavailable { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         StoreError::TooManySegments { .. } => StatusCode::CONFLICT,
@@ -804,6 +807,61 @@ async fn meta_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
     }
 }
 
+/// Parse a query flag. The accepted true values match the config booleans.
+fn query_flag(query: &HashMap<String, String>, name: &str) -> bool {
+    query.get(name).is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+async fn search_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    query: &HashMap<String, String>,
+) -> Response {
+    if let Err(resp) = check_auth(state, headers) {
+        return resp;
+    }
+    let Some(text) = query.get("q").filter(|value| !value.is_empty()) else {
+        return bad_request("q is required".to_string());
+    };
+    let options = SearchOptions {
+        regex: query_flag(query, "regex"),
+        ignore_case: query_flag(query, "ignore_case"),
+        context_lines: query
+            .get("context")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0),
+        max_matches: query
+            .get("limit")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(50),
+        after_offset: query
+            .get("after_offset")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0),
+    };
+    match state.store().search_text(id, text, options).await {
+        Ok(result) => Json(serde_json::json!({
+            "hits": result.hits.iter().map(|hit| serde_json::json!({
+                "line": hit.line,
+                "byte_offset": hit.byte_offset,
+                "preview": hit.preview,
+                "ranges": hit.ranges,
+            })).collect::<Vec<_>>(),
+            "scanned_bytes": result.scanned_bytes,
+            "truncated": result.truncated,
+            "next_offset": result.next_offset,
+        }))
+        .into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
 pub(crate) async fn download_inner(
     state: &AppState,
     headers: &HeaderMap,
@@ -1193,6 +1251,24 @@ async fn meta_bare(
     Path(random): Path<String>,
 ) -> Response {
     meta_inner(&state, &headers, &random).await
+}
+
+async fn search_dated(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((date, random)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    search_inner(&state, &headers, &format!("{date}/{random}"), &query).await
+}
+
+async fn search_bare(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(random): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    search_inner(&state, &headers, &random, &query).await
 }
 
 async fn set_ttl_dated(
@@ -1662,6 +1738,16 @@ pub const API_ROUTE_DOCS: &[ApiRoute] = &[
         purpose: "Read metadata for a bare ID or alias.",
     },
     ApiRoute {
+        method: "GET",
+        path: "/v1/pastes/{date}/{random}/search",
+        purpose: "Search one text paste with the full ID.",
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/v1/pastes/{random}/search",
+        purpose: "Search one text paste with a bare ID or alias.",
+    },
+    ApiRoute {
         method: "POST",
         path: "/v1/pastes/{date}/{random}/append",
         purpose: "Append bytes to a paste with the full ID.",
@@ -1733,6 +1819,7 @@ pub fn service_info(store: &Store) -> serde_json::Value {
             "max_text_bytes": config.max_text_bytes,
             "max_file_bytes": config.max_file_bytes,
             "max_paste_bytes": config.max_paste_bytes,
+            "search_max_bytes": config.search_max_bytes,
             "default_ttl_seconds": u64::from(config.default_ttl_days) * 86_400,
             "list_default_days": config.list_default_days,
             "min_ttl_seconds": u64::from(config.min_ttl_days) * 86_400,
@@ -1811,6 +1898,8 @@ pub fn api_router() -> Router<AppState> {
         )
         .route("/v1/pastes/{date}/{random}/meta", get(meta_dated))
         .route("/v1/pastes/{random}/meta", get(meta_bare))
+        .route("/v1/pastes/{date}/{random}/search", get(search_dated))
+        .route("/v1/pastes/{random}/search", get(search_bare))
         .route("/v1/pastes/{date}/{random}/append", post(append_dated))
         .route("/v1/pastes/{random}/append", post(append_bare))
         .route("/raw/{date}/{random}", get(raw_dated))
@@ -1856,6 +1945,7 @@ mod tests {
             max_text_bytes,
             max_file_bytes,
             max_paste_bytes: 1024 * 1024 * 1024,
+            search_max_bytes: 64 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,
             min_ttl_days: 0,

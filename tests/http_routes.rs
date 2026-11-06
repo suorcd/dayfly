@@ -1251,6 +1251,64 @@ async fn list_route_pages_with_a_cursor_and_reports_truncation() {
 }
 
 #[tokio::test]
+async fn search_route_returns_hits_and_rejects_binary_and_bad_patterns() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let text = store
+        .store_text(b"alpha\nbeta\ngamma\n", None, Some("text/plain"), None)
+        .await
+        .expect("the text must store");
+    let binary = store
+        .store_text(b"\x00\x01\x02", None, None, None)
+        .await
+        .expect("the binary object must store");
+    let app = common::app(store);
+
+    let request = common::request(
+        "GET",
+        &format!("/v1/pastes/{}/search?q=beta", text.id),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let result = common::json_body(&body);
+    assert_eq!(result["hits"][0]["line"], 2);
+    assert_eq!(result["hits"][0]["preview"], "beta");
+    assert_eq!(result["truncated"], false);
+
+    let request = common::request(
+        "GET",
+        &format!("/v1/pastes/{}/search?q=%28&regex=true", text.id),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(common::json_body(&body)["code"], "invalid_search");
+
+    let request = common::request(
+        "GET",
+        &format!("/v1/pastes/{}/search?q=x", binary.id),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(common::json_body(&body)["code"], "not_text");
+
+    let request = common::request(
+        "GET",
+        &format!("/v1/pastes/{}/search", text.id),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(common::json_body(&body)["code"], "invalid_request");
+}
+
+#[tokio::test]
 async fn upload_accepts_a_title_and_tags_and_list_filters_on_them() {
     let fake = FakeS3::start().await;
     let app = common::app(fake.store().await);
@@ -2851,6 +2909,7 @@ async fn well_known_service_description_reports_live_limits_without_auth() {
     assert_eq!(json["limits"]["max_text_bytes"], 1_234);
     assert_eq!(json["limits"]["max_file_bytes"], 5_678);
     assert_eq!(json["limits"]["max_paste_bytes"], 1024 * 1024 * 1024);
+    assert_eq!(json["limits"]["search_max_bytes"], 64 * 1024 * 1024);
     assert_eq!(json["limits"]["default_ttl_seconds"], 7 * 86_400);
     assert_eq!(json["limits"]["list_default_days"], 2);
     assert_eq!(json["limits"]["max_ttl_seconds"], 3_650 * 86_400);

@@ -219,6 +219,7 @@ fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> 
         | StoreError::Expired(_)
         | StoreError::TooLarge { .. }
         | StoreError::TooManySegments { .. }
+        | StoreError::NotText(_)
         | StoreError::RangeNotSatisfiable
         | StoreError::QuotaExceeded => Ok(tool_error(e.code(), e.to_string())),
         StoreError::InvalidId(_)
@@ -227,6 +228,7 @@ fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> 
         | StoreError::InvalidCursor(_)
         | StoreError::InvalidTitle(_)
         | StoreError::InvalidTags(_)
+        | StoreError::InvalidSearch(_)
         | StoreError::TtlOutOfRange(_)
         | StoreError::InvalidLifecycle(_)
         | StoreError::InvalidPath(_)
@@ -347,6 +349,31 @@ pub struct FetchTextParams {
     pub id: String,
     pub offset: Option<u64>,
     pub limit: Option<u64>,
+    /// Read the last N bytes. Do not combine with offset, limit, or a
+    /// line range.
+    pub tail_bytes: Option<u64>,
+    /// First line, 1-based. Use with line_end.
+    pub line_start: Option<u64>,
+    /// Last line, 1-based and inclusive. Use with line_start.
+    pub line_end: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchTextParams {
+    /// Full or bare paste ID, or a word alias.
+    pub id: String,
+    /// Literal text, or a regular expression when regex is true.
+    pub query: String,
+    /// Treat query as a regular expression.
+    pub regex: Option<bool>,
+    /// Match without regard to case.
+    pub ignore_case: Option<bool>,
+    /// Lines of context before and after a hit. Maximum 5.
+    pub context_lines: Option<usize>,
+    /// Maximum hits. Maximum 500.
+    pub max_matches: Option<usize>,
+    /// Start the scan at this byte offset from the previous next_offset.
+    pub after_offset: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -568,22 +595,79 @@ impl Pastebin {
     }
 
     #[tool(
-        description = "Fetch a text paste by id or word alias, with optional byte offset and limit. A call returns at most 8 MiB. Large pastes should be read in slices, not whole."
+        description = "Fetch a text paste by id or word alias. Use offset and limit for bytes, tail_bytes for the end, or line_start and line_end for a 1-based line range. A call returns at most 8 MiB. Large pastes should be read in slices, not whole."
     )]
     async fn fetch_text(
         &self,
         Parameters(params): Parameters<FetchTextParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let slice = try_store!(
-            self.current_store()
-                .fetch_text(&params.id, params.offset.unwrap_or(0), params.limit)
-                .await
-        );
+        let store = self.current_store();
+        let slice = if let Some(tail) = params.tail_bytes {
+            if params.offset.is_some()
+                || params.limit.is_some()
+                || params.line_start.is_some()
+                || params.line_end.is_some()
+            {
+                return Err(rmcp::ErrorData::invalid_params(
+                    "use tail_bytes or offset/limit or line_start/line_end, not more than one form",
+                    None,
+                ));
+            }
+            try_store!(store.fetch_text_tail(&params.id, tail).await)
+        } else if params.line_start.is_some() || params.line_end.is_some() {
+            if params.offset.is_some() || params.limit.is_some() {
+                return Err(rmcp::ErrorData::invalid_params(
+                    "use line_start/line_end or offset/limit, not both",
+                    None,
+                ));
+            }
+            let start = params.line_start.unwrap_or(1);
+            let end = params.line_end.unwrap_or(start);
+            try_store!(store.fetch_text_lines(&params.id, start, end).await)
+        } else {
+            try_store!(
+                store
+                    .fetch_text(&params.id, params.offset.unwrap_or(0), params.limit)
+                    .await
+            )
+        };
         result_json(serde_json::json!({
             "text": slice.text,
             "total_bytes": slice.total_bytes,
             "returned_bytes": slice.returned_bytes,
             "truncated": slice.truncated,
+        }))
+    }
+
+    #[tool(
+        description = "Search one text paste by id or word alias. Returns matching lines with a 1-based line number, the byte offset of the line, a preview with optional context, and match byte ranges in the preview. Set regex for a regular expression and ignore_case for case-insensitive matching. The scan is bounded by DAYFLY_SEARCH_MAX_BYTES; when truncated is true, pass next_offset as after_offset to read the next page."
+    )]
+    async fn search_text(
+        &self,
+        Parameters(params): Parameters<SearchTextParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let options = crate::store::SearchOptions {
+            regex: params.regex.unwrap_or(false),
+            ignore_case: params.ignore_case.unwrap_or(false),
+            context_lines: params.context_lines.unwrap_or(0),
+            max_matches: params.max_matches.unwrap_or(50),
+            after_offset: params.after_offset.unwrap_or(0),
+        };
+        let result = try_store!(
+            self.current_store()
+                .search_text(&params.id, &params.query, options)
+                .await
+        );
+        result_json(serde_json::json!({
+            "hits": result.hits.iter().map(|hit| serde_json::json!({
+                "line": hit.line,
+                "byte_offset": hit.byte_offset,
+                "preview": hit.preview,
+                "ranges": hit.ranges,
+            })).collect::<Vec<_>>(),
+            "scanned_bytes": result.scanned_bytes,
+            "truncated": result.truncated,
+            "next_offset": result.next_offset,
         }))
     }
 

@@ -240,7 +240,8 @@ Operations, in both MCP tools and HTTP endpoints:
 | Store text | `store_text` | `POST /upload` or `POST /v1/pastes` (raw body, no filename) |
 | Store file (multipart for large files) | `store_file` (local path) | `POST /upload` (raw body with `X-Filename`, or `-F file=@...`) |
 | Append text | `append_text` | `POST /v1/pastes/<id-or-alias>/append` (plain text body) |
-| Fetch text (offset/limit) | `fetch_text` | `GET /v1/pastes/<id-or-alias>` (raw; use `Range` for slices) |
+| Fetch text (offset/limit, tail, or line range) | `fetch_text` | `GET /v1/pastes/<id-or-alias>` (raw; use `Range` for slices) |
+| Search text (literal or regex) | `search_text` | `GET /v1/pastes/<id-or-alias>/search?q=...` |
 | Fetch file (streaming, Range) | `fetch_file` (downloads to a local path) | `GET /v1/pastes/<id-or-alias>` with `Range` → 206 |
 | Fetch metadata (HeadObject equivalent) | `fetch_metadata` | `GET /v1/pastes/<id-or-alias>/meta`, or `HEAD /v1/pastes/<id-or-alias>` |
 | Change expiry | `set_ttl` | `PATCH /v1/pastes/<id-or-alias>` with `X-TTL` or `X-TTL-Days` |
@@ -367,6 +368,7 @@ permissions and the lower total cap.
 | `DAYFLY_MAX_TEXT_BYTES` | no | 104857600 (100 MiB) | Max text paste size for MCP `store_text`, the human text form, and `POST /upload` without a filename; oversize → 413. A new paste must also fit `DAYFLY_MAX_PASTE_BYTES`, so the lower cap wins. A filename (including a multipart filename) uses `DAYFLY_MAX_FILE_BYTES` instead |
 | `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error. A new paste must also fit `DAYFLY_MAX_PASTE_BYTES`, so the lower cap wins. The maximum is 52428800000 bytes: 10,000 parts of 5 MiB |
 | `DAYFLY_MAX_PASTE_BYTES` | no | 1073741824 (1 GiB) | Max total size for one paste, including the base object and every appended segment. A new paste or an append that would exceed the cap fails and writes no object |
+| `DAYFLY_SEARCH_MAX_BYTES` | no | 67108864 (64 MiB) | Max bytes that one text search reads. The search returns `truncated` at the cap and the caller resumes with `next_offset`. Must be a positive number of bytes |
 | `DAYFLY_ALIAS_WORDS` | no | 3 | Number of words in a new alias. Allowed range 3 to 6. Resolution accepts 3 words up to this value |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be within `DAYFLY_MIN_TTL_DAYS` (at least 1) and `DAYFLY_MAX_TTL_DAYS` |
 | `DAYFLY_MIN_TTL_DAYS` | no | 0 | Minimum TTL in whole days for an explicit TTL. `0` allows a TTL shorter than one day. A shorter value is rejected with 400 and `the minimum TTL is N days` |
@@ -466,8 +468,8 @@ first, then the file. These settings take effect on the next request:
 
 - `S3_ENDPOINT`, `S3_BUCKET`, `S3_REGION`, and both S3 credentials
   (`S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY` or their `_FILE` forms)
-- `DAYFLY_MAX_TEXT_BYTES`, `DAYFLY_MAX_FILE_BYTES`, and
-  `DAYFLY_MAX_PASTE_BYTES`
+- `DAYFLY_MAX_TEXT_BYTES`, `DAYFLY_MAX_FILE_BYTES`,
+  `DAYFLY_MAX_PASTE_BYTES`, and `DAYFLY_SEARCH_MAX_BYTES`
 - `DAYFLY_ALIAS_WORDS`
 - `DAYFLY_DEFAULT_TTL_DAYS`, `DAYFLY_MIN_TTL_DAYS`,
   `DAYFLY_MAX_TTL_DAYS`, and `DAYFLY_TTL_CHOICES`
@@ -564,8 +566,8 @@ Logging goes to stderr only, never stdout, so the JSON-RPC stream is
 not corrupted.
 
 MCP tools: `store_text`, `store_file`, `append_text`, `set_ttl`,
-`fetch_text`, `fetch_file` (downloads to a local path and returns
-metadata — binary content is never sent over JSON-RPC),
+`fetch_text`, `search_text`, `fetch_file` (downloads to a local path and
+returns metadata — binary content is never sent over JSON-RPC),
 `fetch_metadata`, `delete_paste`, `list_recent`, `get_info`.
 
 `store_text` and `store_file` accept `title` and `tags`. The title is
@@ -870,6 +872,28 @@ then S3 key order), not the sorted order of the returned items.
 The filter applies to the items in the returned page. Use the cursor to
 read further pages.
 
+### Search text
+
+```sh
+# The query is literal unless regex=true.
+curl 'http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123.../search?q=error&context=1'
+curl 'http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123.../search?q=error%5B0-9%5D%2B&regex=true&ignore_case=true'
+
+# Resume after the previous next_offset.
+curl 'http://127.0.0.1:8080/v1/pastes/2026-10-28/AbC123.../search?q=error&after_offset=12345'
+```
+
+The search response carries `hits`, `scanned_bytes`, `truncated`, and
+`next_offset`. A hit carries `line` (1-based), `byte_offset` (the start
+of the matching line), `preview` (the line with optional context, at
+most 4 KiB), and `ranges` (match byte ranges within the preview). The
+search is line-oriented: a match cannot span two lines. It reads at
+most `DAYFLY_SEARCH_MAX_BYTES` per call. When `truncated` is true, send
+`next_offset` as `after_offset` to read the next page. The search uses
+no index and is O(bytes read). A binary paste returns 415 with code
+`not_text`. An invalid regular expression returns 400 with code
+`invalid_search`.
+
 Downloads return an `ETag`. Send it as `If-None-Match` to get
 `304 Not Modified` when the paste has not changed. The validator covers
 the joined paste, so an append changes it. `HEAD` returns the same tag.
@@ -886,7 +910,8 @@ Every HTTP error carries a stable `code`. The current values are:
 `expired`, `too_large`, `length_mismatch`, `too_many_segments`,
 `range_not_satisfiable`, `invalid_request`, `invalid_id`,
 `invalid_date`, `invalid_range`, `invalid_cursor`, `invalid_title`,
-`invalid_tags`, `invalid_ttl`, `invalid_lifecycle`,
+`invalid_tags`, `invalid_search`, `not_text`, `invalid_ttl`,
+`invalid_lifecycle`,
 `invalid_path`, `path_outside_root`, `local_files_disabled`,
 `alias_unavailable`, `io_error`, `s3_error`, `quota_exceeded`,
 `bucket_unavailable`, `partial_update`, `rate_limited`, and
@@ -1570,6 +1595,10 @@ recorded here so readers can plan around them.
   `DAYFLY_ALIAS_WORDS=4` or more when aliases are public. The alias is a
   second name, not a bearer token. Use the bearer token and the private
   network.
+- **Search is line-oriented and has no index.** A match cannot span two
+  lines. One call reads at most `DAYFLY_SEARCH_MAX_BYTES`; a larger paste
+  needs `next_offset` pages. A long line is cut at the 4 KiB preview
+  limit, and its match range can be omitted.
 - **A title and tags use S3 user metadata.** Keep them small: 200 bytes
   for the title and 512 bytes for tags. AWS-compatible stores cap user
   metadata at 2 KB per object; verify the limit on your Garage build.

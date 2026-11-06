@@ -99,6 +99,10 @@ pub enum StoreError {
     InvalidTitle(String),
     #[error("invalid tags: {0}")]
     InvalidTags(String),
+    #[error("invalid search: {0}")]
+    InvalidSearch(String),
+    #[error("paste is not text: {0}")]
+    NotText(String),
     #[error("range not satisfiable")]
     RangeNotSatisfiable,
     #[error("{0}")]
@@ -143,6 +147,8 @@ impl StoreError {
             StoreError::InvalidCursor(_) => "invalid_cursor",
             StoreError::InvalidTitle(_) => "invalid_title",
             StoreError::InvalidTags(_) => "invalid_tags",
+            StoreError::InvalidSearch(_) => "invalid_search",
+            StoreError::NotText(_) => "not_text",
             StoreError::RangeNotSatisfiable => "range_not_satisfiable",
             StoreError::TtlOutOfRange(_) => "invalid_ttl",
             StoreError::InvalidLifecycle(_) => "invalid_lifecycle",
@@ -636,6 +642,152 @@ pub struct TextSlice {
     pub total_bytes: u64,
     pub returned_bytes: u64,
     pub truncated: bool,
+}
+
+/// Options for one text search.
+#[derive(Debug, Clone, Copy)]
+pub struct SearchOptions {
+    /// Treat the query as a regular expression.
+    pub regex: bool,
+    /// Match without regard to case.
+    pub ignore_case: bool,
+    /// Lines of context before and after a match. Maximum 5.
+    pub context_lines: usize,
+    /// Maximum number of hits. Maximum 500.
+    pub max_matches: usize,
+    /// Start the scan at this byte offset, from the previous `next_offset`.
+    pub after_offset: u64,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            regex: false,
+            ignore_case: false,
+            context_lines: 0,
+            max_matches: 50,
+            after_offset: 0,
+        }
+    }
+}
+
+/// One search hit. Line and offset are 1-based and absolute.
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    /// 1-based line number of the matching line.
+    pub line: u64,
+    /// Byte offset of the start of the matching line in the joined paste.
+    pub byte_offset: u64,
+    /// Matched line with the requested context, at most 4 KiB.
+    pub preview: String,
+    /// Match byte ranges within `preview`.
+    pub ranges: Vec<(usize, usize)>,
+}
+
+/// The result of one text search.
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub hits: Vec<SearchHit>,
+    /// Bytes read from `after_offset` to the end of the scan.
+    pub scanned_bytes: u64,
+    /// The scan stopped at the match limit or the byte cap.
+    pub truncated: bool,
+    /// Resume here for the next page.
+    pub next_offset: Option<u64>,
+}
+
+/// Maximum bytes for one search query.
+pub const MAX_SEARCH_QUERY_BYTES: usize = 4_096;
+/// Maximum hits in one search result.
+pub const MAX_SEARCH_MATCHES: usize = 500;
+/// Maximum context lines on each side of a hit.
+pub const MAX_SEARCH_CONTEXT_LINES: usize = 5;
+/// Maximum preview length in bytes.
+pub const MAX_SEARCH_PREVIEW_BYTES: usize = 4_096;
+
+/// Whether a content type can be searched as text.
+pub(crate) fn is_text_content_type(content_type: &str) -> bool {
+    let main = content_type.split(';').next().unwrap_or("").trim();
+    main.starts_with("text/")
+        || matches!(
+            main,
+            "application/json" | "application/xml" | "application/javascript" | "image/svg+xml"
+        )
+}
+
+/// One line in the searched byte buffer.
+struct SearchLine<'a> {
+    /// Absolute start offset in the joined paste.
+    start: u64,
+    /// Absolute offset just after the newline, or the end of the paste.
+    end: u64,
+    text: &'a [u8],
+}
+
+/// Split a byte buffer into lines and keep absolute offsets.
+fn split_search_lines(bytes: &[u8], base: u64) -> Vec<SearchLine<'_>> {
+    let mut lines = Vec::new();
+    let mut start = base;
+    let mut cursor = 0;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+        let mut text = &bytes[cursor..index];
+        if text.ends_with(b"\r") {
+            text = &text[..text.len() - 1];
+        }
+        lines.push(SearchLine {
+            start,
+            end: base + index as u64 + 1,
+            text,
+        });
+        start = base + index as u64 + 1;
+        cursor = index + 1;
+    }
+    if cursor < bytes.len() {
+        let mut text = &bytes[cursor..];
+        if text.ends_with(b"\r") {
+            text = &text[..text.len() - 1];
+        }
+        lines.push(SearchLine {
+            start,
+            end: base + bytes.len() as u64,
+            text,
+        });
+    }
+    lines
+}
+
+/// Build the preview for one match, with context lines and capped size.
+fn build_search_preview(
+    lines: &[SearchLine<'_>],
+    index: usize,
+    match_start: usize,
+    match_end: usize,
+    context: usize,
+) -> (String, Vec<(usize, usize)>) {
+    let first = index.saturating_sub(context);
+    let last = (index + context + 1).min(lines.len());
+    let mut preview = Vec::new();
+    let mut ranges = Vec::new();
+    let mut offset = 0usize;
+    for (position, line) in lines[first..last].iter().enumerate() {
+        if position > 0 {
+            preview.push(b'\n');
+            offset += 1;
+        }
+        if first + position == index {
+            ranges.push((offset + match_start, offset + match_end));
+        }
+        preview.extend_from_slice(line.text);
+        offset += line.text.len();
+    }
+    if preview.len() > MAX_SEARCH_PREVIEW_BYTES {
+        preview.truncate(MAX_SEARCH_PREVIEW_BYTES);
+        ranges.retain(|(_, end)| *end <= MAX_SEARCH_PREVIEW_BYTES);
+    }
+    (String::from_utf8_lossy(&preview).to_string(), ranges)
 }
 
 /// Result of one append. `meta` describes the whole paste after the
@@ -3168,6 +3320,199 @@ impl Store {
             returned_bytes: returned,
             truncated: offset + returned < meta.size,
         })
+    }
+
+    /// Search one text paste for a literal string or a regular expression.
+    ///
+    /// The search reads at most [`Config::search_max_bytes`] from
+    /// `after_offset`. It scans the base object and every segment through
+    /// the existing segment plan. A line is the unit of a hit. The scan is
+    /// O(bytes read), and it uses no index.
+    pub async fn search_text(
+        &self,
+        id: &str,
+        query: &str,
+        options: SearchOptions,
+    ) -> Result<SearchResult, StoreError> {
+        let meta = self.head_metadata(id).await?;
+        Self::check_not_expired(&meta)?;
+        if !is_text_content_type(&meta.content_type) {
+            return Err(StoreError::NotText(meta.content_type));
+        }
+        if query.is_empty() {
+            return Err(StoreError::InvalidSearch("query is empty".to_string()));
+        }
+        if query.len() > MAX_SEARCH_QUERY_BYTES {
+            return Err(StoreError::InvalidSearch(format!(
+                "query is longer than {MAX_SEARCH_QUERY_BYTES} bytes"
+            )));
+        }
+        let pattern = if options.regex {
+            query.to_string()
+        } else {
+            regex::escape(query)
+        };
+        let re = regex::bytes::RegexBuilder::new(&pattern)
+            .case_insensitive(options.ignore_case)
+            .size_limit(1 << 20)
+            .build()
+            .map_err(|e| StoreError::InvalidSearch(e.to_string()))?;
+        let context_lines = options.context_lines.min(MAX_SEARCH_CONTEXT_LINES);
+        let max_matches = options.max_matches.clamp(1, MAX_SEARCH_MATCHES);
+        let total = meta.size;
+        let after = options.after_offset.min(total);
+        let scan_end = total.min(after.saturating_add(self.config.search_max_bytes));
+        let prefix_newlines = self.count_newlines(&meta.plan(), 0, after).await?;
+        let bytes = if after < scan_end {
+            self.fetch_range_with_plan(&meta.plan(), after, scan_end - 1)
+                .await?
+        } else {
+            Vec::new()
+        };
+        let lines = split_search_lines(&bytes, after);
+        let mut hits = Vec::new();
+        let mut truncated = false;
+        let mut last_line_end = scan_end;
+        'lines: for (index, line) in lines.iter().enumerate() {
+            if hits.len() >= max_matches {
+                truncated = true;
+                break;
+            }
+            let matches: Vec<(usize, usize)> = re
+                .find_iter(line.text)
+                .map(|m| (m.start(), m.end()))
+                .collect();
+            for (start, end) in matches {
+                if hits.len() >= max_matches {
+                    truncated = true;
+                    break 'lines;
+                }
+                let (preview, ranges) =
+                    build_search_preview(&lines, index, start, end, context_lines);
+                hits.push(SearchHit {
+                    line: prefix_newlines + 1 + index as u64,
+                    byte_offset: line.start,
+                    preview,
+                    ranges,
+                });
+                last_line_end = line.end;
+            }
+        }
+        if scan_end < total {
+            truncated = true;
+        }
+        let next_offset = if truncated {
+            Some(if hits.is_empty() {
+                scan_end
+            } else {
+                last_line_end
+            })
+        } else {
+            None
+        };
+        Ok(SearchResult {
+            hits,
+            scanned_bytes: scan_end.saturating_sub(after),
+            truncated,
+            next_offset,
+        })
+    }
+
+    /// Read the last `tail_bytes` of a paste.
+    pub async fn fetch_text_tail(
+        &self,
+        id: &str,
+        tail_bytes: u64,
+    ) -> Result<TextSlice, StoreError> {
+        let meta = self.head_metadata(id).await?;
+        Self::check_not_expired(&meta)?;
+        let start = meta.size.saturating_sub(tail_bytes);
+        self.fetch_text(id, start, Some(tail_bytes)).await
+    }
+
+    /// Read a 1-based inclusive line range from a paste.
+    ///
+    /// The method scans the paste to find the byte offsets of the lines.
+    /// The returned slice is still capped by [`MAX_FETCH_TEXT_BYTES`].
+    pub async fn fetch_text_lines(
+        &self,
+        id: &str,
+        line_start: u64,
+        line_end: u64,
+    ) -> Result<TextSlice, StoreError> {
+        if line_start == 0 || line_end < line_start {
+            return Err(StoreError::InvalidSearch(
+                "line_start must be at least 1 and line_end must be at least line_start"
+                    .to_string(),
+            ));
+        }
+        let meta = self.head_metadata(id).await?;
+        Self::check_not_expired(&meta)?;
+        let (start, end) = self
+            .line_range_offsets(&meta.plan(), meta.size, line_start, line_end)
+            .await?;
+        self.fetch_text(id, start, Some(end.saturating_sub(start)))
+            .await
+    }
+
+    /// Count newlines in `start..end`.
+    async fn count_newlines(
+        &self,
+        plan: &SegmentPlan,
+        start: u64,
+        end: u64,
+    ) -> Result<u64, StoreError> {
+        let mut count = 0u64;
+        let mut cur = start;
+        while cur < end {
+            let chunk_end = (cur + MULTIPART_CHUNK_BYTES as u64 - 1).min(end - 1);
+            let bytes = self.fetch_range_with_plan(plan, cur, chunk_end).await?;
+            count += bytes.iter().filter(|byte| **byte == b'\n').count() as u64;
+            cur = chunk_end + 1;
+        }
+        Ok(count)
+    }
+
+    /// Find the byte offsets of an inclusive line range.
+    async fn line_range_offsets(
+        &self,
+        plan: &SegmentPlan,
+        total: u64,
+        line_start: u64,
+        line_end: u64,
+    ) -> Result<(u64, u64), StoreError> {
+        let mut line = 1u64;
+        let mut start = 0u64;
+        let mut wanted_start = None;
+        let mut cur = 0u64;
+        while cur < total {
+            let chunk_end = (cur + MULTIPART_CHUNK_BYTES as u64 - 1).min(total - 1);
+            let bytes = self.fetch_range_with_plan(plan, cur, chunk_end).await?;
+            for (index, byte) in bytes.iter().enumerate() {
+                if *byte != b'\n' {
+                    continue;
+                }
+                let end = cur + index as u64 + 1;
+                if line == line_start {
+                    wanted_start = Some(start);
+                }
+                if line == line_end {
+                    return Ok((wanted_start.unwrap_or(start), end));
+                }
+                line += 1;
+                start = end;
+            }
+            cur = chunk_end + 1;
+        }
+        if line == line_start {
+            wanted_start = Some(start);
+        }
+        if let Some(wanted) = wanted_start {
+            if line_end >= line {
+                return Ok((wanted, total));
+            }
+        }
+        Ok((total, total))
     }
 
     /// Download a paste to a local file in 8 MiB range chunks, so the
