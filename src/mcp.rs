@@ -48,6 +48,15 @@ enum LocalFiles {
 }
 
 impl LocalFiles {
+    /// The mode name for the service description.
+    fn mode_name(&self) -> &'static str {
+        match self {
+            LocalFiles::Open => "open",
+            LocalFiles::Root(_) => "root",
+            LocalFiles::Deny => "deny",
+        }
+    }
+
     /// Resolve the mode for one transport.
     ///
     /// A configured root applies to both transports. Without one, the
@@ -139,6 +148,18 @@ fn result_json(value: serde_json::Value) -> Result<CallToolResult, rmcp::ErrorDa
     )]))
 }
 
+/// A domain error that the client can inspect and handle.
+///
+/// The tool result keeps `isError` set, and the text is JSON with a
+/// stable `code` and a human-readable `message`.
+fn tool_error(code: &str, message: impl Into<String>) -> CallToolResult {
+    let value = serde_json::json!({
+        "code": code,
+        "message": message.into(),
+    });
+    CallToolResult::error(vec![ContentBlock::text(value.to_string())])
+}
+
 /// The metadata shape shared by `fetch_metadata` and `set_ttl`.
 fn metadata_json(meta: PasteMetadata) -> serde_json::Value {
     serde_json::json!({
@@ -177,9 +198,10 @@ async fn check_paste_token(
     if ok {
         Ok(())
     } else {
-        Err(CallToolResult::error(vec![ContentBlock::text(
+        Err(tool_error(
+            "unauthorized",
             "unauthorized: a valid paste token is required",
-        )]))
+        ))
     }
 }
 
@@ -196,9 +218,7 @@ fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> 
         | StoreError::TooLarge { .. }
         | StoreError::TooManySegments { .. }
         | StoreError::RangeNotSatisfiable
-        | StoreError::QuotaExceeded => Ok(CallToolResult::error(vec![ContentBlock::text(
-            e.to_string(),
-        )])),
+        | StoreError::QuotaExceeded => Ok(tool_error(e.code(), e.to_string())),
         StoreError::InvalidId(_)
         | StoreError::InvalidDate(_)
         | StoreError::InvalidRange(_)
@@ -207,16 +227,18 @@ fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> 
         | StoreError::InvalidPath(_)
         | StoreError::PathOutsideRoot(_)
         | StoreError::LocalFilesDisabled
-        | StoreError::LengthMismatch { .. } => {
-            Err(rmcp::ErrorData::invalid_params(e.to_string(), None))
-        }
+        | StoreError::LengthMismatch { .. } => Err(rmcp::ErrorData::invalid_params(
+            e.to_string(),
+            Some(serde_json::json!({"code": e.code()})),
+        )),
         StoreError::Io(_)
         | StoreError::S3(_)
         | StoreError::BucketUnavailable(_)
         | StoreError::PartialUpdate { .. }
-        | StoreError::AliasUnavailable { .. } => {
-            Err(rmcp::ErrorData::internal_error(e.to_string(), None))
-        }
+        | StoreError::AliasUnavailable { .. } => Err(rmcp::ErrorData::internal_error(
+            e.to_string(),
+            Some(serde_json::json!({"code": e.code()})),
+        )),
     }
 }
 
@@ -613,6 +635,16 @@ impl Pastebin {
     }
 
     #[tool(
+        description = "Report the service version, auth mode, listing state, size and TTL limits, alias word count, API routes, and the local-path tool mode for this transport. Use this before an upload to choose a valid size and TTL."
+    )]
+    async fn get_info(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let store = self.current_store();
+        let mut value = crate::http::service_info(&store);
+        value["mcp_local_files"] = serde_json::Value::String(self.local.mode_name().to_string());
+        result_json(value)
+    }
+
+    #[tool(
         description = "List current pastes for one date or an inclusive date range. date=YYYY-MM-DD takes precedence over start and end. A range needs both start and end (YYYY-MM-DD), and start must be <= end. With no dates, the window is the last DAYFLY_LIST_DEFAULT_DAYS days, ending today in UTC (2 days by default). This scans the bucket directly (ListObjectsV2 + HeadObject per key) and filters expired objects; it is prefix listing, not search or sort, and is O(n) in objects scanned."
     )]
     async fn list_recent(
@@ -621,9 +653,10 @@ impl Pastebin {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let store = self.current_store();
         if !store.config.list_enabled {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(
+            return Ok(tool_error(
+                "listing_disabled",
                 crate::config::LISTING_DISABLED_MESSAGE,
-            )]));
+            ));
         }
         let request = try_store!(list_request(&params));
         let limit = params.limit.unwrap_or(100);
@@ -797,17 +830,19 @@ mod tests {
 
     fn assert_tool_error(e: StoreError) {
         let expected = e.to_string();
+        let code = e.code();
         let result =
             store_error_result(e).expect("a routine result must not become a protocol error");
         assert_eq!(result.is_error, Some(true));
         assert_eq!(result.content.len(), 1);
-        assert!(
-            matches!(
-                &result.content[0],
-                ContentBlock::Text(t) if t.text == expected
-            ),
-            "the store message must survive the mapping: {expected}"
-        );
+        let text = match &result.content[0] {
+            ContentBlock::Text(t) => &t.text,
+            other => panic!("expected a text block, got {other:?}"),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(text).expect("a domain error must be JSON");
+        assert_eq!(value["code"], code);
+        assert_eq!(value["message"], expected);
     }
 
     #[test]

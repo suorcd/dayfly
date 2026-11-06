@@ -2778,6 +2778,56 @@ async fn well_known_service_description_reports_the_inline_pdf_policy() {
 }
 
 #[tokio::test]
+async fn api_error_responses_carry_a_stable_code() {
+    let fake = FakeS3::start().await;
+
+    let app = common::app(fake.store().await);
+    let request = common::request("GET", "/v1/pastes/2026-10-28/missing", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(common::json_body(&body)["code"], "not_found");
+
+    let request = common::request("GET", "/v1/pastes?date=not-a-date", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(common::json_body(&body)["code"], "invalid_date");
+
+    let config = common::config_with_token(fake.config(), "secret");
+    let app = common::app(
+        Store::from_config(config)
+            .await
+            .expect("the token store must build"),
+    );
+    let request = common::request("GET", "/v1/pastes", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(common::json_body(&body)["code"], "unauthorized");
+
+    let mut config = fake.config();
+    config.list_enabled = false;
+    let app = common::app(
+        Store::from_config(config)
+            .await
+            .expect("the no-list store must build"),
+    );
+    let request = common::request("GET", "/v1/pastes", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(common::json_body(&body)["code"], "listing_disabled");
+
+    let app = app_router(AppState::new(fake.store().await));
+    let request = common::request("GET", "/v1/nope", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(common::json_body(&body)["code"], "not_found");
+
+    let request = common::request("POST", "/v1/pastes/2026-10-28/missing", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(common::json_body(&body)["code"], "method_not_allowed");
+}
+
+#[tokio::test]
 async fn discovery_files_serve_text_without_auth_and_404_when_unset() {
     let fake = FakeS3::start().await;
     let mut config = common::config_with_token(fake.config(), "secret");

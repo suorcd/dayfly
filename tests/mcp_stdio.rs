@@ -189,11 +189,47 @@ fn tools_list_exposes_every_dayfly_tool() {
         "fetch_metadata",
         "delete_paste",
         "list_recent",
+        "get_info",
     ] {
         assert!(
             names.contains(&expected),
             "missing tool {expected}: {names:?}"
         );
+    }
+}
+
+#[test]
+fn get_info_reports_live_limits_and_domain_errors_have_a_stable_code() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let mut client = McpClient::spawn(&fake, &[]);
+
+    let info = client
+        .call_tool("get_info", json!({}))
+        .expect("get_info must succeed");
+    assert_eq!(info["name"], "dayfly");
+    assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(info["auth"], "none");
+    assert_eq!(info["listing_enabled"], true);
+    assert_eq!(info["mcp_local_files"], "open");
+    assert!(info["limits"]["max_text_bytes"].as_u64().is_some());
+    assert!(info["limits"]["max_paste_bytes"].as_u64().is_some());
+    assert!(info["routes"]
+        .as_array()
+        .is_some_and(|routes| !routes.is_empty()));
+
+    let error = client
+        .call_tool("fetch_text", json!({"id": "2026-10-28/missing"}))
+        .expect_err("a missing paste must be an error");
+    match error {
+        ToolCallError::Tool { message } => {
+            let value: Value = serde_json::from_str(&message).expect("a domain error must be JSON");
+            assert_eq!(value["code"], "not_found");
+            assert!(value["message"]
+                .as_str()
+                .is_some_and(|text| text.contains("paste not found")));
+        }
+        other => panic!("expected a tool error result, got {other:?}"),
     }
 }
 
