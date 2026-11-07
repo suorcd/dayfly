@@ -144,6 +144,8 @@ details form{background:none;border:0;padding:0;border-radius:0;backdrop-filter:
 .dropzone .muted{display:block}
 .dropzone .error{color:#ff6b6b;border-color:#ff6b6b}
 .dropzone.compact{display:inline-flex;flex-direction:column;align-items:flex-start;gap:.35rem;width:auto;max-width:100%;margin:0;padding:.45rem .8rem;border-width:1px;text-align:left;font-size:.95rem}
+.dropzone.compact .badge{align-self:center;text-align:center}
+.dropzone.compact .dropzone-limit{align-self:center;text-align:center}
 .dropzone-line{display:inline-flex;flex-wrap:wrap;align-items:baseline;gap:.4rem}
 .badge{display:inline-block;max-width:100%;font-size:.8rem;line-height:1.4;padding:.05rem .5rem;border:1px solid #0abdc6;border-radius:999px;color:#0abdc6;background:rgba(10,189,198,.12);overflow-wrap:anywhere}
 .form-actions{display:flex;flex-wrap:wrap;gap:.75rem;align-items:stretch;margin-top:1rem}
@@ -153,6 +155,15 @@ form > p:last-child{margin-bottom:0}
 .form-row{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem 1.25rem}
 .form-row p{margin:0}
 .form-row input{min-width:16rem;max-width:100%}
+.optional-bar{display:grid;grid-template-columns:1fr auto;align-items:center;gap:.5rem;margin-bottom:1rem}
+.optional-bar p{margin:0}
+.optional-toggle{position:absolute;opacity:0;width:1px;height:1px}
+.optional-label{grid-column:2;text-align:right;cursor:pointer;color:#0abdc6}
+.optional-label::before{content:"▶ "}
+.optional-toggle:checked ~ .optional-label::before{content:"▼ "}
+.optional-toggle:focus-visible ~ .optional-label{outline:1px dashed #0abdc6;outline-offset:.2rem}
+.optional-panel{grid-column:1/-1;display:none;margin-top:.5rem;padding:1rem;border:1px dashed #0abdc6;border-radius:8px;background:rgba(19,62,124,.35)}
+.optional-toggle:checked ~ .optional-panel{display:block}
 .form-actions .dropzone.compact{justify-content:center}
 .form-actions button[type=button]{align-self:center}
 .form-actions button[type=submit]{margin-left:auto}
@@ -181,8 +192,9 @@ const DROPZONE_SCRIPT: &str = r#"<script>
   const clear = document.getElementById('clear-file');
   const text = document.getElementById('text');
   const filename = document.getElementById('filename');
+  const precedence = document.getElementById('file-precedence');
   const form = document.querySelector('form[action="/ui/create"]');
-  if (!form || !zone || !input || !status || !clear || !text || !filename) return;
+  if (!form || !zone || !input || !status || !clear || !text || !filename || !precedence) return;
 
   const maxBytes = Number(form.dataset.maxFileBytes) || 0;
   const humanSize = (bytes) => {
@@ -203,6 +215,7 @@ const DROPZONE_SCRIPT: &str = r#"<script>
       status.classList.add('error');
       input.value = '';
       clear.hidden = true;
+      precedence.hidden = true;
       text.disabled = false;
       filename.disabled = false;
       return;
@@ -211,11 +224,13 @@ const DROPZONE_SCRIPT: &str = r#"<script>
     if (file) {
       status.textContent = 'Selected: ' + file.name;
       clear.hidden = false;
+      precedence.hidden = false;
       text.disabled = true;
       filename.disabled = true;
     } else {
       status.textContent = 'No file selected';
       clear.hidden = true;
+      precedence.hidden = true;
       text.disabled = false;
       filename.disabled = false;
     }
@@ -232,6 +247,7 @@ const DROPZONE_SCRIPT: &str = r#"<script>
       event.preventDefault();
       status.textContent = 'File is too large: ' + humanSize(file.size) + ' (limit ' + humanSize(maxBytes) + ')';
       status.classList.add('error');
+      precedence.hidden = true;
       text.disabled = false;
       filename.disabled = false;
     }
@@ -678,20 +694,25 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
     let mut body = format!(
         r#"<form method="post" action="/ui/create" enctype="multipart/form-data" data-max-file-bytes="{max_file_bytes}">
 <p><label>Text<br><textarea name="text" id="text"></textarea></label></p>
-<div class="form-row">
+<div class="optional-bar">
 <p><label>Keep for <select name="ttl_days">{}</select></label> <span class="hint" title="The selector uses whole days. API clients can send a sub-day TTL with X-TTL. Expiry is checked on read; the bucket sweeper is day-rounded. The bucket itself is private; only this binary talks to Garage.">i</span></p>
-<p><label>Filename (optional, text only) <input type="text" name="filename" id="filename"></label></p>
-</div>
+<input type="checkbox" id="optional-toggle" class="optional-toggle">
+<label for="optional-toggle" class="optional-label">More details</label>
+<div class="optional-panel">
 <div class="form-row">
+<p><label>Filename (optional, text only) <input type="text" name="filename" id="filename"></label></p>
 <p><label>Title (optional) <input type="text" name="title" id="title"></label></p>
 <p><label>Tags (optional, comma separated) <input type="text" name="tags" id="tags"></label></p>
 </div>
-<p class="muted">Max file size: {max_file_human}. A selected file takes precedence and disables the text fields.</p>
+</div>
+</div>
+<p class="muted" id="file-precedence" hidden>A selected file takes precedence and disables the text fields.</p>
 <div class="form-actions">
 <label class="dropzone compact" id="dropzone">
 <input type="file" name="file" id="file" aria-label="Choose a file">
 <span class="dropzone-line"><span class="dropzone-title">Drop a file</span><span class="muted">or click to choose one</span></span>
 <span class="badge" id="file-status" aria-live="polite" aria-atomic="true">No file selected</span>
+<span class="muted dropzone-limit">Max file size: {max_file_human}.</span>
 </label>
 <button type="button" id="clear-file" hidden>Remove file</button>
 <button type="submit">Create paste</button>

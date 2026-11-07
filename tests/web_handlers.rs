@@ -351,6 +351,83 @@ async fn index_page_escapes_the_base_url_in_the_curl_examples() {
 }
 
 #[tokio::test]
+async fn index_page_groups_optional_fields_and_hides_the_file_precedence_note() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let request = common::request("GET", "/", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+
+    assert!(
+        page.contains("<label>Keep for <select name=\"ttl_days\">"),
+        "the TTL selector must stay on the Keep for line: {page}"
+    );
+    assert!(
+        page.contains(".optional-bar{display:grid;grid-template-columns:1fr auto;align-items:center;gap:.5rem;margin-bottom:1rem}"),
+        "the whole Keep for line must break before the panel: {page}"
+    );
+    let ttl_at = page.find("name=\"ttl_days\"").expect("the TTL selector");
+    let toggle_at = page
+        .find("id=\"optional-toggle\"")
+        .unwrap_or_else(|| panic!("the optional toggle is missing: {page}"));
+    let label_at = page
+        .find("<label for=\"optional-toggle\" class=\"optional-label\">More details</label>")
+        .unwrap_or_else(|| panic!("the more-details label is missing: {page}"));
+    let panel_at = page
+        .find("<div class=\"optional-panel\">")
+        .unwrap_or_else(|| panic!("the optional panel is missing: {page}"));
+    assert!(
+        ttl_at < toggle_at && toggle_at < label_at && label_at < panel_at,
+        "the More details toggle must sit on the same row as Keep for, before the panel"
+    );
+    for field in ["name=\"filename\"", "name=\"title\"", "name=\"tags\""] {
+        let at = page
+            .find(field)
+            .unwrap_or_else(|| panic!("missing optional field {field}"));
+        assert!(panel_at < at, "{field} must be inside the optional panel");
+    }
+    assert!(
+        page.contains(".optional-toggle:checked ~ .optional-panel{display:block}"),
+        "the More details toggle must open the panel: {page}"
+    );
+    assert!(
+        page.contains(".optional-label::before{content:\"▶ \"}"),
+        "the More details label must use the same collapse marker: {page}"
+    );
+    let badge_at = page
+        .find("id=\"file-status\"")
+        .expect("the file status badge");
+    let limit_at = page
+        .find("Max file size: 1 GiB.")
+        .expect("the max file size note");
+    let dropzone_end = badge_at
+        + page[badge_at..]
+            .find("</label>")
+            .expect("the drop zone end");
+    assert!(
+        badge_at < limit_at && limit_at < dropzone_end,
+        "the max file size note must sit inside the drop zone, under the status"
+    );
+    assert!(
+        page.contains(".dropzone.compact .badge{align-self:center;text-align:center}"),
+        "the file status must be centered in the drop zone: {page}"
+    );
+    assert!(
+        page.contains("id=\"file-precedence\" hidden"),
+        "the precedence note must start hidden: {page}"
+    );
+    assert!(
+        page.contains("A selected file takes precedence and disables the text fields."),
+        "the precedence note must still exist"
+    );
+    assert!(
+        page.contains("precedence.hidden ="),
+        "the script must toggle the precedence note"
+    );
+}
+
+#[tokio::test]
 async fn index_page_selects_a_default_outside_the_fixed_list() {
     let fake = FakeS3::start().await;
     let mut config = fake.config();
