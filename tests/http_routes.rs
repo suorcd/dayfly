@@ -1726,6 +1726,7 @@ async fn failed_bearer_check_logs_method_path_and_client() {
     let fake = FakeS3::start().await;
     let mut store = fake.store().await;
     store.config.http_bearer_token = Some("correct-horse-battery-staple".to_string());
+    store.config.expose_creator_addr = true;
     let app = dayfly::http::app_router(AppState::new(store));
 
     let captured = CapturedLog::default();
@@ -1756,7 +1757,7 @@ async fn failed_bearer_check_logs_method_path_and_client() {
     assert!(logs.contains("WARN"), "expected one warning, got: {logs}");
     assert!(logs.contains("method=GET"), "got: {logs}");
     assert!(logs.contains("path=/v1/pastes/example"), "got: {logs}");
-    assert!(logs.contains("client=Some(127.0.0.1)"), "got: {logs}");
+    assert!(logs.contains("client=127.0.0.1"), "got: {logs}");
     assert!(
         !logs.contains("127.0.0.1:4567"),
         "the peer port must not be logged"
@@ -1791,6 +1792,7 @@ async fn failed_bearer_check_logs_the_forwarded_client() {
     let mut store = fake.store().await;
     store.config.http_bearer_token = Some("correct-horse-battery-staple".to_string());
     store.config.trusted_proxies = vec!["10.0.0.0/8".parse().expect("proxy CIDR must parse")];
+    store.config.expose_creator_addr = true;
     let app = dayfly::http::app_router(AppState::new(store));
 
     let captured = CapturedLog::default();
@@ -1822,12 +1824,51 @@ async fn failed_bearer_check_logs_the_forwarded_client() {
 
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).expect("logs must be UTF-8");
     assert!(
-        logs.contains("client=Some(203.0.113.9)"),
+        logs.contains("client=203.0.113.9"),
         "the forwarded client must be logged, got: {logs}"
     );
     assert!(
-        !logs.contains("client=Some(10.0.0.5)"),
+        !logs.contains("client=10.0.0.5"),
         "the proxy must not be logged as the client, got: {logs}"
+    );
+}
+
+#[tokio::test]
+async fn failed_bearer_check_omits_the_client_when_exposure_is_off() {
+    let fake = FakeS3::start().await;
+    let mut store = fake.store().await;
+    store.config.http_bearer_token = Some("correct-horse-battery-staple".to_string());
+    let app = dayfly::http::app_router(AppState::new(store));
+
+    let captured = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let mut request = common::request(
+        "GET",
+        "/v1/pastes/example",
+        &[(
+            "authorization",
+            "Bearer wrong-horse-battery-staple".to_string(),
+        )],
+        Vec::new(),
+    );
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 4567))));
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).expect("logs must be UTF-8");
+    assert!(logs.contains("client="), "got: {logs}");
+    assert!(
+        !logs.contains("127.0.0.1"),
+        "the address must not be logged when exposure is off: {logs}"
     );
 }
 
@@ -2200,7 +2241,10 @@ async fn mcp_post(
     if let Some(session_id) = session_id {
         headers.push(("mcp-session-id", session_id.to_string()));
     }
-    let request = common::request("POST", "/mcp", &headers, body.to_string().into_bytes());
+    let mut request = common::request("POST", "/mcp", &headers, body.to_string().into_bytes());
+    request.extensions_mut().insert(ConnectInfo(
+        "127.0.0.1:1234".parse::<SocketAddr>().expect("test peer"),
+    ));
     common::send(app, request).await
 }
 
@@ -2263,6 +2307,68 @@ async fn initialize_mcp_session(app: &Router) -> String {
         String::from_utf8_lossy(&body)
     );
     session
+}
+
+#[tokio::test]
+async fn mcp_http_store_text_records_and_exposes_the_creator() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.expose_creator_addr = true;
+    let store = Store::from_config(config)
+        .await
+        .expect("the exposing store must build");
+    let app = common::full_app(store);
+    let session = initialize_mcp_session(&app).await;
+
+    let (status, _, body) = mcp_post(&app, &store_text_body(2, "hello"), Some(&session)).await;
+    assert_eq!(status, StatusCode::OK);
+    let stored = stored_paste(&sse_json(&body));
+    let key = stored["key"].as_str().expect("stored key");
+    assert_eq!(
+        fake.object(key)
+            .expect("the stored object must exist")
+            .metadata
+            .get("created-by")
+            .map(String::as_str),
+        Some("127.0.0.1"),
+        "the HTTP MCP transport must record the client address"
+    );
+
+    let meta_request = json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {"name": "fetch_metadata", "arguments": {"id": stored["id"]}}
+    });
+    let (status, _, body) = mcp_post(&app, &meta_request, Some(&session)).await;
+    assert_eq!(status, StatusCode::OK);
+    let meta = stored_paste(&sse_json(&body));
+    assert_eq!(meta["created_by"], "127.0.0.1");
+}
+
+#[tokio::test]
+async fn mcp_http_fetch_metadata_hides_the_creator_by_default() {
+    let fake = FakeS3::start().await;
+    let app = common::full_app(fake.store().await);
+    let session = initialize_mcp_session(&app).await;
+
+    let (status, _, body) = mcp_post(&app, &store_text_body(2, "hello"), Some(&session)).await;
+    assert_eq!(status, StatusCode::OK);
+    let stored = stored_paste(&sse_json(&body));
+
+    let meta_request = json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {"name": "fetch_metadata", "arguments": {"id": stored["id"]}}
+    });
+    let (status, _, body) = mcp_post(&app, &meta_request, Some(&session)).await;
+    assert_eq!(status, StatusCode::OK);
+    let meta = stored_paste(&sse_json(&body));
+    assert!(
+        meta.get("created_by").is_none(),
+        "created_by must be absent by default: {meta}"
+    );
 }
 
 #[tokio::test]
@@ -3008,6 +3114,7 @@ async fn well_known_service_description_reports_live_limits_without_auth() {
     assert_eq!(json["mcp_endpoint"], "/mcp");
     assert_eq!(json["auth"], "bearer");
     assert_eq!(json["paste_tokens"], false);
+    assert_eq!(json["expose_creator_addr"], false);
     assert_eq!(json["policy"]["inline_pdf"], true);
     assert_eq!(json["limits"]["max_text_bytes"], 1_234);
     assert_eq!(json["limits"]["max_file_bytes"], 5_678);

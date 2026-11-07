@@ -277,6 +277,9 @@ fn changed_fields(old: &Config, new: &Config) -> Vec<&'static str> {
     if old.paste_tokens != new.paste_tokens {
         changed.push("DAYFLY_PASTE_TOKENS");
     }
+    if old.expose_creator_addr != new.expose_creator_addr {
+        changed.push("DAYFLY_EXPOSE_CREATOR_ADDR");
+    }
     if old.http_bearer_token != new.http_bearer_token {
         changed.push("DAYFLY_HTTP_BEARER_TOKEN");
     }

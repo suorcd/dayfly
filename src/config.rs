@@ -205,6 +205,14 @@ pub struct Config {
     /// `DELETE`, `PATCH`, and `append` for that paste, as an alternative to
     /// the bearer token. The bearer token remains a universal key.
     pub paste_tokens: bool,
+    /// Whether API responses return the stored creator address.
+    ///
+    /// Default: `false`. The base object always records `created-by` when
+    /// the transport has a client address. The meta route, the `HEAD`
+    /// response, and the MCP `fetch_metadata` tool include it only when
+    /// this is `true`. The access log also includes the client address
+    /// only when this is `true`. An address is personal data.
+    pub expose_creator_addr: bool,
     /// Maximum requests per client per minute. Zero disables the limiter.
     ///
     /// Default: `0`. The limit is a token bucket per resolved client
@@ -487,6 +495,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("false"),
         required: false,
         help: "Return a per-paste management token at creation",
+    },
+    ConfigField {
+        name: "DAYFLY_EXPOSE_CREATOR_ADDR",
+        value: Some("false"),
+        required: false,
+        help: "Return the stored creator address in metadata responses and access logs",
     },
     ConfigField {
         name: "DAYFLY_RATE_LIMIT_PER_MINUTE",
@@ -1666,6 +1680,11 @@ impl Config {
                 "DAYFLY_PASTE_TOKENS",
                 field_default("DAYFLY_PASTE_TOKENS") == Some("true"),
             )?,
+            expose_creator_addr: optional_bool(
+                &lookup,
+                "DAYFLY_EXPOSE_CREATOR_ADDR",
+                field_default("DAYFLY_EXPOSE_CREATOR_ADDR") == Some("true"),
+            )?,
             rate_limit_per_minute: optional_u32(
                 &lookup,
                 "DAYFLY_RATE_LIMIT_PER_MINUTE",
@@ -1746,7 +1765,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} search_max_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} list_requires_token={} paste_tokens={} rate_limit_per_minute={} log_format={} metrics_bind={} metrics_allowed_networks={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
+            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} search_max_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} list_requires_token={} paste_tokens={} expose_creator_addr={} rate_limit_per_minute={} log_format={} metrics_bind={} metrics_allowed_networks={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -1771,6 +1790,7 @@ impl Config {
             self.trusted_proxies.len(),
             self.list_requires_token,
             self.paste_tokens,
+            self.expose_creator_addr,
             self.rate_limit_per_minute,
             self.log_format.as_str(),
             self.metrics_bind
@@ -2139,6 +2159,7 @@ mod tests {
             list_requires_token: false,
             list_enabled: true,
             paste_tokens: false,
+            expose_creator_addr: false,
             rate_limit_per_minute: 0,
             http_bearer_token: None,
             mcp_local_root: None,
@@ -2257,6 +2278,34 @@ mod tests {
         ));
         let config = Config::from_lookup(lookup_from(&pairs)).expect("rate limit config");
         assert_eq!(config.rate_limit_per_minute, 120);
+    }
+
+    #[test]
+    fn expose_creator_addr_defaults_to_false_and_accepts_true() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert!(!config.expose_creator_addr);
+
+        let mut pairs = base_env();
+        pairs.push(("DAYFLY_EXPOSE_CREATOR_ADDR".to_string(), "1".to_string()));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("exposure config");
+        assert!(config.expose_creator_addr);
+    }
+
+    #[test]
+    fn expose_creator_addr_rejects_a_non_boolean() {
+        let mut pairs = base_env();
+        pairs.push((
+            "DAYFLY_EXPOSE_CREATOR_ADDR".to_string(),
+            "sometimes".to_string(),
+        ));
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        match error {
+            ConfigError::Invalid(name, message) => {
+                assert_eq!(name, "DAYFLY_EXPOSE_CREATOR_ADDR");
+                assert!(message.contains("true or false"), "message: {message}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]

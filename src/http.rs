@@ -422,11 +422,13 @@ struct MetaEnvelope {
     sha256: Option<String>,
     created_at: Option<String>,
     expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_by: Option<String>,
     expired: bool,
 }
 
-impl From<PasteMetadata> for MetaEnvelope {
-    fn from(meta: PasteMetadata) -> Self {
+impl MetaEnvelope {
+    fn from_meta(meta: PasteMetadata, expose_creator_addr: bool) -> Self {
         Self {
             id: meta.id,
             key: meta.key,
@@ -441,6 +443,11 @@ impl From<PasteMetadata> for MetaEnvelope {
             sha256: meta.sha256,
             created_at: meta.created_at.map(|d| d.to_rfc3339()),
             expires_at: meta.expires_at.map(|d| d.to_rfc3339()),
+            created_by: if expose_creator_addr {
+                meta.created_by
+            } else {
+                None
+            },
             expired: meta.expired,
         }
     }
@@ -637,10 +644,14 @@ async fn upload_dispatch(
         return forbidden_write();
     }
     let store = state.store();
+    let created_by = req
+        .extensions()
+        .get::<ClientAddr>()
+        .map(|address| address.0.to_string());
     let content_type = header_str(&headers, CONTENT_TYPE.as_str()).unwrap_or_default();
     if content_type.starts_with("multipart/form-data") {
         match Multipart::from_request(req, &()).await {
-            Ok(multipart) => multipart_inner(store, headers, query, multipart).await,
+            Ok(multipart) => multipart_inner(store, headers, query, multipart, created_by).await,
             Err(e) => bad_request(format!("invalid multipart body: {e}")),
         }
     } else {
@@ -679,6 +690,7 @@ async fn upload_dispatch(
             content_type: explicit,
             title,
             tags,
+            created_by,
         };
         match store
             .store_stream_with_fields(Box::pin(stream), &fields, ttl, known_length, max_bytes)
@@ -695,6 +707,7 @@ async fn multipart_inner(
     headers: HeaderMap,
     query: HashMap<String, String>,
     mut multipart: Multipart,
+    created_by: Option<String>,
 ) -> Response {
     let max_request = store
         .config
@@ -759,6 +772,7 @@ async fn multipart_inner(
                 content_type: field_content_type,
                 title,
                 tags,
+                created_by,
             };
             return match store
                 .store_stream_with_fields(Box::pin(stream), &fields, ttl, None, max_bytes)
@@ -836,8 +850,9 @@ async fn meta_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
         return resp;
     }
     let store = state.store();
+    let expose_creator_addr = store.config.expose_creator_addr;
     match store.head_metadata_live(id).await {
-        Ok(meta) => Json(MetaEnvelope::from(meta)).into_response(),
+        Ok(meta) => Json(MetaEnvelope::from_meta(meta, expose_creator_addr)).into_response(),
         Err(e) => error_response(e),
     }
 }
@@ -1056,6 +1071,13 @@ async fn download_response(
         HeaderValue::from_str(&length.to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("0")),
     );
+    if is_head && store.config.expose_creator_addr {
+        if let Some(address) = &meta.created_by {
+            if let Ok(value) = HeaderValue::from_str(address) {
+                resp_headers.insert(HeaderName::from_static("x-created-by"), value);
+            }
+        }
+    }
     if is_head || meta.size == 0 {
         let status = if range.is_some() && meta.size > 0 {
             StatusCode::PARTIAL_CONTENT
@@ -1360,8 +1382,10 @@ async fn set_ttl_inner(
         Ok(None) => return bad_request("a TTL is required".to_string()),
         Err(e) => return ttl_error_response(e),
     };
-    match state.store().set_ttl(id, ttl).await {
-        Ok(meta) => Json(MetaEnvelope::from(meta)).into_response(),
+    let store = state.store();
+    let expose_creator_addr = store.config.expose_creator_addr;
+    match store.set_ttl(id, ttl).await {
+        Ok(meta) => Json(MetaEnvelope::from_meta(meta, expose_creator_addr)).into_response(),
         Err(e) => error_response(e),
     }
 }
@@ -1423,17 +1447,25 @@ async fn client_context(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|info| info.0);
-    let trusted = {
+    let (trusted, expose_creator_addr) = {
         let store = state.store();
-        store.config.trusted_proxies.clone()
+        (
+            store.config.trusted_proxies.clone(),
+            store.config.expose_creator_addr,
+        )
     };
     let client =
         peer.map(
             |peer| match client_addr::resolve(peer.ip(), request.headers(), &trusted) {
                 Ok(address) => address,
                 Err(reason) => {
+                    let peer_label = if expose_creator_addr {
+                        peer.to_string()
+                    } else {
+                        String::new()
+                    };
                     tracing::warn!(
-                        peer = %peer,
+                        peer = %peer_label,
                         reason = %reason,
                         method = %request.method(),
                         path = %request.uri().path(),
@@ -1450,7 +1482,14 @@ async fn client_context(
     let path = request.uri().path().to_string();
     let response = next.run(request).await;
     if response.status() == StatusCode::UNAUTHORIZED {
-        tracing::warn!(%method, %path, client = ?client, "auth check failed");
+        let client_label = if expose_creator_addr {
+            client
+                .map(|address| address.to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        tracing::warn!(%method, %path, client = %client_label, "auth check failed");
     }
     response
 }
@@ -1562,11 +1601,15 @@ async fn access_log(State(state): State<AppState>, request: Request, next: Next)
     let paste_id = paste_id_from_path(request.uri().path())
         .unwrap_or("")
         .to_string();
-    let client = request
-        .extensions()
-        .get::<ClientAddr>()
-        .map(|address| address.0.to_string())
-        .unwrap_or_default();
+    let client = if state.store().config.expose_creator_addr {
+        request
+            .extensions()
+            .get::<ClientAddr>()
+            .map(|address| address.0.to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let request_bytes = request
         .headers()
         .get(CONTENT_LENGTH)
@@ -1868,7 +1911,12 @@ async fn metrics_source_check(
     if permitted {
         next.run(request).await
     } else {
-        tracing::warn!(client = %peer, "metrics scrape refused");
+        let client = if state.store().config.expose_creator_addr {
+            peer.to_string()
+        } else {
+            String::new()
+        };
+        tracing::warn!(client = %client, "metrics scrape refused");
         StatusCode::FORBIDDEN.into_response()
     }
 }
@@ -2094,6 +2142,7 @@ pub fn service_info(store: &Store) -> serde_json::Value {
             "none"
         },
         "paste_tokens": config.paste_tokens,
+        "expose_creator_addr": config.expose_creator_addr,
         "listing_enabled": config.list_enabled,
         "listing_requires_token": config.list_requires_token,
         "policy": {
@@ -2252,6 +2301,7 @@ mod tests {
             list_requires_token: false,
             list_enabled: true,
             paste_tokens: false,
+            expose_creator_addr: false,
             rate_limit_per_minute: 0,
             http_bearer_token: None,
             mcp_local_root: None,

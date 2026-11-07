@@ -10,7 +10,17 @@ use axum::extract::ConnectInfo;
 use axum::http::Request;
 use common::FakeS3;
 use dayfly::http::AppState;
+use dayfly::store::Store;
 use tower::ServiceExt;
+
+async fn app_with_exposure(fake: &FakeS3, expose: bool) -> axum::Router {
+    let mut config = fake.config();
+    config.expose_creator_addr = expose;
+    let store = Store::from_config(config)
+        .await
+        .expect("test S3 config must build without network access");
+    dayfly::http::app_router(AppState::new(store))
+}
 
 /// A writer that keeps every log line in memory.
 #[derive(Clone, Default)]
@@ -51,7 +61,7 @@ fn a_successful_request_writes_one_access_line() {
 
     let (status, output) = runtime.block_on(async {
         let fake = FakeS3::start().await;
-        let app = dayfly::http::app_router(AppState::new(fake.store().await));
+        let app = app_with_exposure(&fake, true).await;
         let mut request = Request::builder()
             .method("GET")
             .uri("/v1/pastes")
@@ -122,7 +132,7 @@ fn a_json_access_line_has_stable_fields() {
 
     let output = runtime.block_on(async {
         let fake = FakeS3::start().await;
-        let app = dayfly::http::app_router(AppState::new(fake.store().await));
+        let app = app_with_exposure(&fake, true).await;
         let mut request = Request::builder()
             .method("GET")
             .uri("/v1/pastes")
@@ -157,4 +167,53 @@ fn a_json_access_line_has_stable_fields() {
     assert!(value["response_bytes"].is_number(), "line: {line}");
     assert!(value["request_id"].is_string(), "line: {line}");
     assert_eq!(value["client"], "127.0.0.1");
+}
+
+#[test]
+fn the_access_log_omits_the_client_address_when_exposure_is_off() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let buffer = Buffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buffer.clone())
+        .with_env_filter(tracing_subscriber::EnvFilter::new("dayfly=info"))
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let output = runtime.block_on(async {
+        let fake = FakeS3::start().await;
+        let app = app_with_exposure(&fake, false).await;
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/v1/pastes")
+            .body(Body::empty())
+            .expect("request must build");
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                1234,
+            ))));
+        let response = app
+            .oneshot(request)
+            .await
+            .expect("router call must complete");
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body must collect");
+        let output = buffer.0.lock().expect("buffer lock").clone();
+        String::from_utf8(output).expect("log output must be UTF-8")
+    });
+
+    assert!(
+        output.lines().any(|line| line.contains("client=")),
+        "the access line must still carry an empty client field: {output}"
+    );
+    assert!(
+        !output.contains("127.0.0.1"),
+        "the client address must not be logged when exposure is off: {output}"
+    );
 }

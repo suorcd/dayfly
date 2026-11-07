@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use dayfly::config::{Config, ConfigError};
 
-const VARS: [&str; 33] = [
+const VARS: [&str; 34] = [
     "S3_ENDPOINT",
     "S3_BUCKET",
     "S3_REGION",
@@ -34,6 +34,7 @@ const VARS: [&str; 33] = [
     "DAYFLY_TRUSTED_PROXIES",
     "DAYFLY_LIST_REQUIRES_TOKEN",
     "DAYFLY_PASTE_TOKENS",
+    "DAYFLY_EXPOSE_CREATOR_ADDR",
     "DAYFLY_RATE_LIMIT_PER_MINUTE",
     "DAYFLY_SHOW_WORDS",
     "DAYFLY_SHOW_INTERNAL_PATHS",

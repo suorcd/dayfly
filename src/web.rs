@@ -39,7 +39,7 @@ use std::collections::HashMap;
 
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 
-use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Extension, Multipart, Path, Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN, REFERER};
 use axum::http::uri::{Authority, Uri};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -50,6 +50,7 @@ use axum::{Form, Router};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
+use crate::client_addr::ClientAddr;
 use crate::config::{Config, LISTING_DISABLED_MESSAGE};
 use crate::http::{
     check_auth, check_list_access, check_paste_control, public_base, read_metadata_field,
@@ -739,6 +740,7 @@ struct TextForm {
 async fn text_submit_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
+    client: Option<Extension<ClientAddr>>,
     Form(form): Form<TextForm>,
 ) -> Response {
     if let Err(resp) = check_auth(&state, &headers) {
@@ -747,6 +749,7 @@ async fn text_submit_handler(
     if !same_origin_allowed(&headers) {
         return forbidden_page();
     }
+    let created_by = client.map(|Extension(address)| address.0.to_string());
     let filename = form.filename.filter(|f| !f.trim().is_empty());
     let store = state.store();
     let footer = Footer::from_config(&store.config);
@@ -762,6 +765,7 @@ async fn text_submit_handler(
         content_type: None,
         title: form.title,
         tags: form.tags.as_deref().map(split_tags).unwrap_or_default(),
+        created_by,
     };
     match store
         .store_text_with_fields(form.text.as_bytes(), &fields, ttl)
@@ -888,6 +892,7 @@ async fn store_file_field(
         content_type: field_content_type.or_else(|| fields.content_type.clone()),
         title: fields.title.clone(),
         tags: fields.tags.clone(),
+        created_by: fields.created_by.clone(),
     };
     store
         .store_stream_with_fields(Box::pin(stream), &fields, ttl, None, max_bytes)
@@ -917,6 +922,7 @@ async fn read_text_field(
 async fn upload_submit_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
+    client: Option<Extension<ClientAddr>>,
     mut multipart: Multipart,
 ) -> Response {
     if let Err(resp) = check_auth(&state, &headers) {
@@ -925,6 +931,7 @@ async fn upload_submit_handler(
     if !same_origin_allowed(&headers) {
         return forbidden_page();
     }
+    let created_by = client.map(|Extension(address)| address.0.to_string());
     let store = state.store();
     let footer = Footer::from_config(&store.config);
     if !multipart_length_allows(&store, &headers) {
@@ -936,7 +943,10 @@ async fn upload_submit_handler(
         );
     }
     let mut ttl: Option<Ttl> = None;
-    let mut fields = PasteFields::default();
+    let mut fields = PasteFields {
+        created_by,
+        ..PasteFields::default()
+    };
     // Stream the file field inside the loop, not moved out of it: an
     // axum Field borrows its Multipart, so holding it across a
     // next_field call does not compile (see http.rs for the same note).
@@ -1055,6 +1065,7 @@ async fn upload_submit_handler(
 async fn create_submit_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
+    client: Option<Extension<ClientAddr>>,
     mut multipart: Multipart,
 ) -> Response {
     if let Err(resp) = check_auth(&state, &headers) {
@@ -1063,6 +1074,7 @@ async fn create_submit_handler(
     if !same_origin_allowed(&headers) {
         return forbidden_page();
     }
+    let created_by = client.map(|Extension(address)| address.0.to_string());
     let store = state.store();
     let footer = Footer::from_config(&store.config);
     if !multipart_length_allows(&store, &headers) {
@@ -1194,6 +1206,7 @@ async fn create_submit_handler(
                     content_type: None,
                     title: title.clone(),
                     tags: tags.clone(),
+                    created_by: created_by.clone(),
                 };
                 return match store_file_field(&store, field, &fields, ttl).await {
                     Ok(stored) => {
@@ -1218,6 +1231,7 @@ async fn create_submit_handler(
         content_type: None,
         title,
         tags,
+        created_by,
     };
     match store.store_text_with_fields(&bytes, &fields, ttl).await {
         Ok(stored) => {
@@ -1874,6 +1888,7 @@ mod tests {
             list_requires_token: false,
             list_enabled: true,
             paste_tokens: false,
+            expose_creator_addr: false,
             rate_limit_per_minute: 0,
             http_bearer_token: None,
             mcp_local_root: None,
