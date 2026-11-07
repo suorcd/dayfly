@@ -14,8 +14,10 @@
 use std::collections::HashMap;
 use std::env;
 use std::fmt::Write as _;
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use rmcp::transport::stdio;
@@ -23,13 +25,16 @@ use rmcp::ServiceExt;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
+use dayfly::client_addr::Cidr;
 use dayfly::config::{
     bind_is_loopback, credential_warnings, ensure_bind_is_safe, environment_file_warnings,
-    load_env_file, parse_bool_flag, Config, CONFIG_FIELDS, MAX_TTL_DAYS,
+    load_env_file, log_format_from_env_file, parse_bool_flag, Config, LogFormat, CONFIG_FIELDS,
+    MAX_TTL_DAYS,
 };
 use dayfly::http;
 use dayfly::http::AppState;
 use dayfly::mcp;
+use dayfly::metrics::Metrics;
 use dayfly::reload;
 use dayfly::store::Store;
 
@@ -210,6 +215,22 @@ fn check_config_file(path: Option<PathBuf>, explicit: bool, strict: bool) -> any
             }
             "DAYFLY_SHOW_WORDS" | "DAYFLY_INLINE_PDF" if parse_bool_flag(&value).is_none() => {
                 faults.push(format!("{}: expected true or false", field.name));
+            }
+            "DAYFLY_LOG_FORMAT" if LogFormat::parse(&value).is_none() => {
+                faults.push("DAYFLY_LOG_FORMAT: expected text or json".to_string());
+            }
+            "DAYFLY_METRICS_BIND" if value.parse::<SocketAddr>().is_err() => {
+                faults
+                    .push("DAYFLY_METRICS_BIND: expected an IP address and port".to_string());
+            }
+            "DAYFLY_METRICS_ALLOWED_NETWORKS" => {
+                if let Err(error) = value
+                    .split(',')
+                    .map(|part| part.trim().parse::<Cidr>())
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    faults.push(format!("DAYFLY_METRICS_ALLOWED_NETWORKS: {error}"));
+                }
             }
             "DAYFLY_HTTP_BEARER_TOKEN"
                 if value.contains(|character: char| character.is_ascii_whitespace()) =>
@@ -400,13 +421,13 @@ fn default_config_path() -> Option<PathBuf> {
     Some(base.join("dayfly").join("dayfly.env"))
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    // Stderr only: stdout belongs to MCP JSON-RPC in MCP mode.
-    // The default level is WARN, so an unsafe credential file permission
-    // warning is visible without RUST_LOG. RUST_LOG still sets the filter.
-    let default_level = if cli.verbose {
+/// Build the stderr subscriber.
+///
+/// Stderr only: stdout belongs to MCP JSON-RPC in MCP mode. The default
+/// level is WARN, so an unsafe credential file permission warning is
+/// visible without RUST_LOG. RUST_LOG still sets the filter.
+fn init_logging(format: LogFormat, verbose: bool) {
+    let default_level = if verbose {
         LevelFilter::INFO
     } else {
         LevelFilter::WARN
@@ -414,12 +435,33 @@ async fn main() -> anyhow::Result<()> {
     let filter = EnvFilter::builder()
         .with_default_directive(default_level.into())
         .from_env_lossy();
-    tracing_subscriber::fmt()
+    let builder = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(filter)
-        .init();
+        .with_env_filter(filter);
+    match format {
+        LogFormat::Text => builder.init(),
+        LogFormat::Json => builder
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_timer(tracing_subscriber::fmt::time::ChronoUtc::rfc_3339())
+            .init(),
+    }
+}
 
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
     let (config_path, explicit) = resolve_config_path(cli.config);
+    let log_format = match log_format_from_env_file(config_path.as_deref()) {
+        Ok(format) => format,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    };
+    init_logging(log_format, cli.verbose);
     if let Some(Command::Config { action }) = &cli.command {
         return match action {
             ConfigAction::Init { out, force } => {
@@ -462,7 +504,14 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
-    let store = Store::from_config(config.clone()).await?;
+    // The metrics registry exists only when serve mode starts a private
+    // listener. A stdio process has no HTTP request to measure.
+    let metrics = if serve_bind.is_some() && config.metrics_bind.is_some() {
+        Some(Arc::new(Metrics::new()))
+    } else {
+        None
+    };
+    let store = Store::from_config_with_metrics(config.clone(), metrics.clone()).await?;
     // The watcher follows the same file that startup used and the secret
     // files that it names. A process with only process-environment
     // settings has nothing to watch.
@@ -478,7 +527,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Serve { bind }) => {
             let bind_addr = serve_bind.unwrap_or(bind.unwrap_or_else(|| config.http_bind.clone()));
-            let state = AppState::new(store);
+            let state = match metrics {
+                Some(metrics) => AppState::with_metrics(store, metrics),
+                None => AppState::new(store),
+            };
             // Report the bucket lifecycle rules once. The check is best
             // effort and does not delay the listener.
             let lifecycle_state = state.clone();
@@ -488,12 +540,40 @@ async fn main() -> anyhow::Result<()> {
             let app = http::app_router(state.clone());
             let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
             tracing::info!("HTTP listening on {bind_addr}");
-            reload::spawn_file_watcher(reload_paths, state, bind_addr.clone());
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await?;
+            let metrics_listener = match config.metrics_bind {
+                Some(bind) => {
+                    let listener = tokio::net::TcpListener::bind(bind).await.map_err(|error| {
+                        anyhow::anyhow!("cannot bind the metrics listener on {bind}: {error}")
+                    })?;
+                    tracing::info!("metrics listening on {bind}");
+                    Some(listener)
+                }
+                None => None,
+            };
+            reload::spawn_file_watcher(reload_paths, state.clone(), bind_addr.clone());
+            match metrics_listener {
+                Some(metrics_listener) => {
+                    let http_server = axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .into_future();
+                    let metrics_app = http::metrics_router(state);
+                    let metrics_server = axum::serve(
+                        metrics_listener,
+                        metrics_app.into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .into_future();
+                    tokio::try_join!(http_server, metrics_server)?;
+                }
+                None => {
+                    axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .await?;
+                }
+            }
         }
         Some(Command::Lifecycle { action }) => {
             let LifecycleAction::Apply {

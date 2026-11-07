@@ -14,11 +14,13 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{
-    ConnectInfo, DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State,
+    ConnectInfo, DefaultBodyLimit, FromRequest, MatchedPath, Multipart, Path, Query, Request, State,
 };
 use axum::http::header::{
     ACCEPT, ALLOW, AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE,
@@ -39,6 +41,7 @@ use subtle::ConstantTimeEq;
 use crate::client_addr::{self, ClientAddr};
 use crate::config::TextAsset;
 use crate::content_type::content_disposition;
+use crate::metrics::Metrics;
 use crate::rate_limit::RateLimiter;
 use crate::store::{
     parse_list_window_request, parse_range_header, ListCursor, ListWindowRequest, PasteFields,
@@ -88,6 +91,7 @@ pub(crate) async fn read_metadata_field(
 pub struct AppState {
     store: StoreHandle,
     rate_limiter: Arc<RateLimiter>,
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl AppState {
@@ -95,7 +99,22 @@ impl AppState {
         Self {
             store: StoreHandle::new(store),
             rate_limiter: Arc::new(RateLimiter::new()),
+            metrics: None,
         }
+    }
+
+    /// Build a state that records Prometheus metrics.
+    pub fn with_metrics(store: Store, metrics: Arc<Metrics>) -> Self {
+        Self {
+            store: StoreHandle::new(store),
+            rate_limiter: Arc::new(RateLimiter::new()),
+            metrics: Some(metrics),
+        }
+    }
+
+    /// The metrics registry, when the metrics listener is enabled.
+    pub fn metrics(&self) -> Option<&Metrics> {
+        self.metrics.as_deref()
     }
 
     /// The process-wide request limiter.
@@ -1436,6 +1455,170 @@ async fn client_context(
     response
 }
 
+/// The next access log request ID.
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_request_id() -> String {
+    format!("{:016x}", REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// The matched route template, or a stable name for an unmatched path.
+fn route_template(request: &Request) -> String {
+    request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|path| path.as_str().to_string())
+        .unwrap_or_else(|| "<unmatched>".to_string())
+}
+
+/// The paste ID or alias in an API path, when the path has one.
+///
+/// The value is a name, not a credential. It is safe to log. The query
+/// string is never read.
+fn paste_id_from_path(path: &str) -> Option<&str> {
+    let rest = path
+        .strip_prefix("/v1/pastes/")
+        .or_else(|| path.strip_prefix("/raw/"))
+        .or_else(|| path.strip_prefix("/view/"))?;
+    let mut parts = rest.split('/');
+    let first = parts.next()?;
+    if first.is_empty() {
+        return None;
+    }
+    let id = if is_date_component(first) {
+        parts.next()?
+    } else {
+        first
+    };
+    if id.is_empty() || matches!(id, "meta" | "search" | "append") {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+fn is_date_component(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10 && bytes[4] == b'-' && bytes[7] == b'-'
+}
+
+/// The paste API operation that a route performs.
+fn operation_for_route(method: &str, route: &str) -> Option<&'static str> {
+    match (method, route) {
+        ("POST", "/upload") | ("POST", "/v1/pastes") => Some("store"),
+        ("GET", "/v1/pastes") => Some("list"),
+        ("GET", "/v1/pastes/{date}/{random}")
+        | ("GET", "/v1/pastes/{random}")
+        | ("GET", "/raw/{date}/{random}")
+        | ("GET", "/raw/{random}") => Some("fetch"),
+        ("HEAD", "/v1/pastes/{date}/{random}") | ("HEAD", "/v1/pastes/{random}") => {
+            Some("metadata")
+        }
+        ("GET", "/v1/pastes/{date}/{random}/meta") | ("GET", "/v1/pastes/{random}/meta") => {
+            Some("metadata")
+        }
+        ("GET", "/v1/pastes/{date}/{random}/search") | ("GET", "/v1/pastes/{random}/search") => {
+            Some("search")
+        }
+        ("POST", "/v1/pastes/{date}/{random}/append") | ("POST", "/v1/pastes/{random}/append") => {
+            Some("append")
+        }
+        ("PATCH", "/v1/pastes/{date}/{random}") | ("PATCH", "/v1/pastes/{random}") => {
+            Some("set_ttl")
+        }
+        ("DELETE", "/v1/pastes/{date}/{random}") | ("DELETE", "/v1/pastes/{random}") => {
+            Some("delete")
+        }
+        _ => None,
+    }
+}
+
+fn outcome_for_status(status: u16) -> &'static str {
+    match status {
+        200..=399 => "ok",
+        401 | 403 => "forbidden",
+        404 => "not_found",
+        410 => "expired",
+        413 => "too_large",
+        429 => "rate_limited",
+        400..=499 => "client_error",
+        _ => "server_error",
+    }
+}
+
+/// Log one line per HTTP request and record the request metrics.
+///
+/// This layer runs inside [`client_context`], so the client address is
+/// already resolved. It runs outside the rate limiter, so a refused
+/// request is logged too.
+///
+/// The latency stops when the response starts. A streamed body can take
+/// longer. The response byte count comes from `Content-Length`, so a
+/// chunked response reports zero.
+async fn access_log(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let started = Instant::now();
+    let method = request.method().as_str().to_string();
+    let route = route_template(&request);
+    let paste_id = paste_id_from_path(request.uri().path())
+        .unwrap_or("")
+        .to_string();
+    let client = request
+        .extensions()
+        .get::<ClientAddr>()
+        .map(|address| address.0.to_string())
+        .unwrap_or_default();
+    let request_bytes = request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let request_id = next_request_id();
+    let metrics = state.metrics.clone();
+    let in_flight = metrics.as_ref().map(|metrics| metrics.start_request());
+
+    let mut response = next.run(request).await;
+    let elapsed = started.elapsed();
+    let status = response.status().as_u16();
+    let response_bytes = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    if let Some(metrics) = metrics.as_ref() {
+        metrics.observe_request(
+            &method,
+            &route,
+            status,
+            elapsed,
+            request_bytes,
+            response_bytes,
+        );
+        if let Some(operation) = operation_for_route(&method, &route) {
+            metrics.observe_paste_operation(operation, outcome_for_status(status));
+        }
+    }
+    drop(in_flight);
+
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    tracing::info!(
+        request_id = %request_id,
+        method = %method,
+        route = %route,
+        status,
+        latency_ms = elapsed.as_secs_f64() * 1000.0,
+        response_bytes,
+        client = %client,
+        paste_id = %paste_id,
+        "http request"
+    );
+    response
+}
+
 /// Refuse a client over its request budget.
 ///
 /// This runs inside [`client_context`], so the key is the same resolved
@@ -1447,6 +1630,9 @@ async fn rate_limit(State(state): State<AppState>, request: Request, next: Next)
     if limit > 0 {
         if let Some(ClientAddr(client)) = request.extensions().get::<ClientAddr>().copied() {
             if let Err(error) = state.rate_limiter().check(client, limit) {
+                if let Some(metrics) = state.metrics() {
+                    metrics.count_rate_limited();
+                }
                 // `Retry-After` is whole seconds, and truncation would tell
                 // a client to retry just before a token exists.
                 let retry_after = error.retry_after.as_secs_f64().ceil().max(1.0) as u64;
@@ -1485,7 +1671,8 @@ async fn rate_limit(State(state): State<AppState>, request: Request, next: Next)
 /// same store and configuration. Do not build a second store here.
 ///
 /// `client_context` is added last, so it runs first and attaches the
-/// address that `rate_limit` reads.
+/// address that `access_log` and `rate_limit` read. `access_log` wraps the
+/// rate limiter, so a refused request still writes one access line.
 pub fn app_router(state: AppState) -> Router {
     api_router()
         .merge(mcp_router(state.clone()))
@@ -1496,6 +1683,7 @@ pub fn app_router(state: AppState) -> Router {
             map_method_not_allowed,
         ))
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
+        .layer(middleware::from_fn_with_state(state.clone(), access_log))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             client_context,
@@ -1617,6 +1805,72 @@ pub fn mcp_router(state: AppState) -> Router<AppState> {
         .nest_service("/mcp", service)
         .layer(middleware::from_fn_with_state(state, require_bearer))
         .layer(middleware::from_fn(require_same_origin))
+}
+
+/// The private metrics listener.
+///
+/// The router serves only `GET /metrics`. The public [`app_router`] does
+/// not contain this route, so an ingress that forwards every path to the
+/// public listener cannot reach the registry.
+pub fn metrics_router(state: AppState) -> Router {
+    Router::new()
+        .route("/metrics", get(metrics_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            metrics_source_check,
+        ))
+        .with_state(state)
+}
+
+async fn metrics_handler(State(state): State<AppState>) -> Response {
+    let Some(metrics) = state.metrics() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let body = match metrics.render() {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::error!(%error, "cannot render Prometheus metrics");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    (headers, body).into_response()
+}
+
+/// Allow only a source inside `DAYFLY_METRICS_ALLOWED_NETWORKS`.
+///
+/// The check uses the socket peer. It never reads `X-Forwarded-For`. An
+/// empty list allows only a loopback source, which is the only case where
+/// the configuration permits an empty list.
+async fn metrics_source_check(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(ConnectInfo(peer)) = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .copied()
+    else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let allowed = state.store().config.metrics_allowed_networks.clone();
+    let permitted = if allowed.is_empty() {
+        peer.ip().is_loopback()
+    } else {
+        allowed.iter().any(|network| network.contains(peer.ip()))
+    };
+    if permitted {
+        next.run(request).await
+    } else {
+        tracing::warn!(client = %peer, "metrics scrape refused");
+        StatusCode::FORBIDDEN.into_response()
+    }
 }
 
 async fn append_inner(state: &AppState, headers: &HeaderMap, id: &str, req: Request) -> Response {
@@ -1986,6 +2240,9 @@ mod tests {
             retention_min_days: 30,
             retention_max_days: 365,
             http_bind: "127.0.0.1:0".to_string(),
+            log_format: crate::config::LogFormat::Text,
+            metrics_bind: None,
+            metrics_allowed_networks: Vec::new(),
             trusted_proxies: Vec::new(),
             show_words: false,
             show_internal_paths: false,
@@ -2835,6 +3092,26 @@ mod tests {
         assert!(TtlSelection::default().set("ttl", "0").is_err());
         assert!(TtlSelection::default().set("ttl_days", "soon").is_err());
         assert!(TtlSelection::default().set("ttl_days", "0").is_err());
+    }
+
+    #[test]
+    fn paste_id_is_read_from_api_and_view_paths() {
+        assert_eq!(
+            paste_id_from_path("/v1/pastes/2026-10-28/AbC123"),
+            Some("AbC123")
+        );
+        assert_eq!(paste_id_from_path("/v1/pastes/AbC123/meta"), Some("AbC123"));
+        assert_eq!(paste_id_from_path("/raw/AbC123"), Some("AbC123"));
+        assert_eq!(
+            paste_id_from_path("/view/2026-10-28/abacus-abdomen-zoology"),
+            Some("abacus-abdomen-zoology")
+        );
+        assert_eq!(
+            paste_id_from_path("/view/abacus-abdomen-zoology"),
+            Some("abacus-abdomen-zoology")
+        );
+        assert_eq!(paste_id_from_path("/v1/pastes"), None);
+        assert_eq!(paste_id_from_path("/v1/pastes/"), None);
     }
 
     #[test]

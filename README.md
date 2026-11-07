@@ -379,6 +379,9 @@ permissions and the lower total cap.
 | `DAYFLY_RETENTION_MIN_DAYS` | no | 30 | Minimum retention in whole days at `DAYFLY_MAX_PASTE_BYTES`. Must be at least 1 and at most 3650, and must not exceed `DAYFLY_RETENTION_MAX_DAYS` |
 | `DAYFLY_RETENTION_MAX_DAYS` | no | 365 | Maximum retention in whole days at zero bytes. Must be at least 1 and at most 3650, and must be at least `DAYFLY_RETENTION_MIN_DAYS` |
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
+| `DAYFLY_LOG_FORMAT` | no | `text` | Log format. `text` keeps the existing output. `json` writes one JSON object per line to stderr. A change needs a restart |
+| `DAYFLY_METRICS_BIND` | no | (unset) | Private bind address for the Prometheus metrics listener. Unset starts no metrics listener. The public listener never serves `/metrics` |
+| `DAYFLY_METRICS_ALLOWED_NETWORKS` | no | (empty) | Comma-separated CIDR blocks allowed to scrape the metrics listener. A loopback bind needs no list. A non-loopback bind is refused at startup without a list. The check uses the socket peer, not `X-Forwarded-For` |
 | `DAYFLY_TRUSTED_PROXIES` | no | (empty) | Comma-separated CIDR blocks (bare addresses are single hosts) of reverse proxies whose `X-Forwarded-For` header is believed. Empty keeps the socket peer as the client and ignores forwarding headers. The chain is walked from the right; a malformed or over-long chain falls back to the peer with one warning. Set this before any per-client limit behind an ingress |
 | `DAYFLY_RATE_LIMIT_PER_MINUTE` | no | 0 | Maximum requests per client per minute. 0 disables the limiter and allocates no counters. The burst is this value, and the bucket refills at this rate. Over the limit → 429 with `Retry-After`. Keyed on the resolved client address, so set `DAYFLY_TRUSTED_PROXIES` behind an ingress. Per process; resets on restart |
 | `DAYFLY_ALLOW_UNAUTHENTICATED` | no | `false` | Accept a non-loopback bind with no bearer token. Startup refuses that bind without this value, and with it the service writes one warning. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
@@ -479,6 +482,7 @@ first, then the file. These settings take effect on the next request:
 - `DAYFLY_INLINE_PDF`
 - `DAYFLY_ROBOTS_TXT_PATH` and `DAYFLY_SECURITY_TXT_PATH`
 - `DAYFLY_TRUSTED_PROXIES`
+- `DAYFLY_METRICS_ALLOWED_NETWORKS`
 - `DAYFLY_LIST_ENABLED`
 - `DAYFLY_LIST_REQUIRES_TOKEN`
 - `DAYFLY_PASTE_TOKENS`
@@ -489,6 +493,8 @@ first, then the file. These settings take effect on the next request:
 These settings need a restart:
 
 - `DAYFLY_HTTP_BIND`: the listener is already bound.
+- `DAYFLY_LOG_FORMAT`: the subscriber is built at startup.
+- `DAYFLY_METRICS_BIND`: the metrics listener is already bound.
 - `DAYFLY_ALLOW_UNAUTHENTICATED`: startup guard only.
 - `DAYFLY_MCP_LOCAL_ROOT`: an MCP handler resolves it at startup.
 
@@ -505,6 +511,45 @@ current snapshot for each tool call.
 `mcp` (stdio) reads the environment at startup and does not watch the
 file. If the process has no environment file, `serve` writes one line
 and starts no watch.
+
+## Access logs and metrics
+
+HTTP mode writes one access log line for each request at `INFO`. The line
+carries `request_id`, `method`, `route`, `status`, `latency_ms`,
+`response_bytes`, `client`, and `paste_id`. The route is the template, for
+example `/v1/pastes/{random}`. The line never carries a credential, a
+paste token, or a query string. The latency stops when the response
+starts, so a streamed body can take longer. Set `--verbose` or
+`RUST_LOG=dayfly=info` to see the lines.
+
+Set `DAYFLY_LOG_FORMAT=json` to write one JSON object per line on stderr.
+A collector such as Alloy or Promtail can read the container stderr and
+send the lines to Loki.
+
+The metrics listener is separate. Set `DAYFLY_METRICS_BIND` to a private
+address, for example `127.0.0.1:9091` or `10.0.0.5:9091`. The listener
+serves only `GET /metrics` in the Prometheus text format. The public
+listener returns 404 for `/metrics` in every configuration. Set
+`DAYFLY_METRICS_ALLOWED_NETWORKS` when the bind is not loopback. The
+listener checks the socket peer and never reads `X-Forwarded-For`.
+
+The registry has `dayfly_build_info`, `dayfly_http_requests_total`,
+`dayfly_http_request_duration_seconds`, `dayfly_http_requests_in_flight`,
+`dayfly_http_request_bytes_total`, `dayfly_http_response_bytes_total`,
+`dayfly_paste_operations_total`, `dayfly_s3_requests_total`,
+`dayfly_rate_limited_total`, and the process metrics. Labels use the route template, not a paste ID or a
+client address. Metrics are per process and reset on restart.
+
+```yaml
+scrape_configs:
+  - job_name: dayfly
+    static_configs:
+      - targets: ["10.0.0.5:9091"]
+```
+
+Do not give Prometheus the bearer token. The metrics listener does not
+check it. Use the private bind, the allowlist, and the network policy. If
+the metrics listener needs authentication, put a proxy in front of it.
 
 ## Running the MCP server
 

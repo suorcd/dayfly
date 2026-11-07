@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::io::Read;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -35,6 +36,35 @@ pub const MAX_ALIAS_WORDS: u8 = 6;
 
 /// Default number of words in a generated alias.
 pub const DEFAULT_ALIAS_WORDS: u8 = 3;
+
+/// The log output format.
+///
+/// `Text` is the default and keeps the existing output. `Json` writes one
+/// JSON object per line, for a log collector such as Loki.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogFormat {
+    Text,
+    Json,
+}
+
+impl LogFormat {
+    /// Parse the `DAYFLY_LOG_FORMAT` value.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "text" => Some(Self::Text),
+            "json" => Some(Self::Json),
+            _ => None,
+        }
+    }
+
+    /// The value used in the configuration summary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+}
 
 /// Configuration loaded from the environment.
 ///
@@ -116,6 +146,26 @@ pub struct Config {
     pub retention_max_days: u32,
     /// Default bind address for HTTP mode.
     pub http_bind: String,
+    /// Log output format.
+    ///
+    /// Default: [`LogFormat::Text`]. A JSON value writes one object per
+    /// line to stderr. A change needs a restart, because the subscriber
+    /// is built at startup.
+    pub log_format: LogFormat,
+    /// Optional bind address for the private Prometheus metrics listener.
+    ///
+    /// Default: unset, so no metrics listener exists. When set, the
+    /// listener serves only `GET /metrics`. The public HTTP listener
+    /// never serves that route. The address must be an IP address and a
+    /// port, for example `127.0.0.1:9091` or `10.0.0.5:9091`.
+    pub metrics_bind: Option<SocketAddr>,
+    /// CIDR blocks allowed to scrape the metrics listener.
+    ///
+    /// Default: empty. A loopback [`Self::metrics_bind`] needs no list.
+    /// A non-loopback bind is refused at startup when this list is
+    /// empty. The listener checks the socket peer and never reads
+    /// `X-Forwarded-For`.
+    pub metrics_allowed_networks: Vec<Cidr>,
     /// CIDR blocks of reverse proxies whose `X-Forwarded-For` header is
     /// believed.
     ///
@@ -389,6 +439,24 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("127.0.0.1:8080"),
         required: false,
         help: "HTTP bind address",
+    },
+    ConfigField {
+        name: "DAYFLY_LOG_FORMAT",
+        value: Some("text"),
+        required: false,
+        help: "Log format: text or json",
+    },
+    ConfigField {
+        name: "DAYFLY_METRICS_BIND",
+        value: None,
+        required: false,
+        help: "Optional private bind address for the Prometheus metrics listener, for example 127.0.0.1:9091",
+    },
+    ConfigField {
+        name: "DAYFLY_METRICS_ALLOWED_NETWORKS",
+        value: None,
+        required: false,
+        help: "Comma-separated CIDRs allowed to scrape the metrics listener; required for a non-loopback bind",
     },
     ConfigField {
         name: "DAYFLY_TRUSTED_PROXIES",
@@ -734,31 +802,96 @@ fn trusted_proxies<F>(lookup: &F) -> Result<Vec<Cidr>, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
-    let Some(value) = lookup("DAYFLY_TRUSTED_PROXIES") else {
+    cidr_list(lookup, "DAYFLY_TRUSTED_PROXIES")
+}
+
+/// Parse a comma-separated CIDR list.
+///
+/// An unset or empty value means an empty list. Each entry is one CIDR
+/// block or one bare address.
+fn cidr_list<F>(lookup: &F, name: &str) -> Result<Vec<Cidr>, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(value) = lookup(name) else {
         return Ok(Vec::new());
     };
     let value = value.trim();
     if value.is_empty() {
         return Ok(Vec::new());
     }
-    let mut proxies = Vec::new();
+    let mut networks = Vec::new();
     for part in value.split(',') {
         let part = part.trim();
         if part.is_empty() {
             return Err(ConfigError::Invalid(
-                "DAYFLY_TRUSTED_PROXIES".to_string(),
+                name.to_string(),
                 "expected a comma-separated list of CIDR blocks".to_string(),
             ));
         }
         let cidr = part.parse::<Cidr>().map_err(|error| {
-            ConfigError::Invalid(
-                "DAYFLY_TRUSTED_PROXIES".to_string(),
-                format!("`{part}`: {error}"),
-            )
+            ConfigError::Invalid(name.to_string(), format!("`{part}`: {error}"))
         })?;
-        proxies.push(cidr);
+        networks.push(cidr);
     }
-    Ok(proxies)
+    Ok(networks)
+}
+
+/// Parse `DAYFLY_LOG_FORMAT`.
+fn log_format<F>(lookup: &F) -> Result<LogFormat, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match lookup("DAYFLY_LOG_FORMAT") {
+        Some(value) if !value.trim().is_empty() => LogFormat::parse(&value).ok_or_else(|| {
+            ConfigError::Invalid(
+                "DAYFLY_LOG_FORMAT".to_string(),
+                "expected text or json".to_string(),
+            )
+        }),
+        _ => Ok(LogFormat::Text),
+    }
+}
+
+/// Read the log format before the subscriber starts.
+///
+/// The value comes from the process environment or the environment file.
+/// The full configuration is loaded after the subscriber exists, so the
+/// format can be applied to the first log line.
+pub fn log_format_from_env_file(path: Option<&Path>) -> Result<LogFormat, ConfigError> {
+    let file_values = match path {
+        Some(path) if path.exists() => Some(read_env_file(path)?),
+        _ => None,
+    };
+    let lookup = |name: &str| {
+        env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                file_values
+                    .as_ref()
+                    .and_then(|values| values.get(name).cloned())
+            })
+    };
+    log_format(&lookup)
+}
+
+/// Parse an optional IP address and port.
+fn optional_socket_addr<F>(lookup: &F, name: &str) -> Result<Option<SocketAddr>, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match lookup(name) {
+        Some(value) if !value.trim().is_empty() => {
+            value.trim().parse::<SocketAddr>().map(Some).map_err(|_| {
+                ConfigError::Invalid(
+                    name.to_string(),
+                    "expected an IP address and port, for example 127.0.0.1:9091".to_string(),
+                )
+            })
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Read an S3 credential from a direct variable or from a file.
@@ -1323,6 +1456,17 @@ impl Config {
         if bucket.is_empty() {
             return Err(ConfigError::EmptyBucket);
         }
+        let log_format = log_format(&lookup)?;
+        let metrics_bind = optional_socket_addr(&lookup, "DAYFLY_METRICS_BIND")?;
+        let metrics_allowed_networks = cidr_list(&lookup, "DAYFLY_METRICS_ALLOWED_NETWORKS")?;
+        if let Some(bind) = metrics_bind {
+            if !bind.ip().is_loopback() && metrics_allowed_networks.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "DAYFLY_METRICS_ALLOWED_NETWORKS".to_string(),
+                    format!("required when DAYFLY_METRICS_BIND ({bind}) is not a loopback address"),
+                ));
+            }
+        }
         let min_ttl_days = optional_u32(&lookup, "DAYFLY_MIN_TTL_DAYS", 0)?;
         let max_ttl_days = optional_u32(&lookup, "DAYFLY_MAX_TTL_DAYS", MAX_TTL_DAYS)?;
         if max_ttl_days == 0 || max_ttl_days > MAX_TTL_DAYS {
@@ -1478,6 +1622,9 @@ impl Config {
                 "DAYFLY_HTTP_BIND",
                 field_default("DAYFLY_HTTP_BIND").unwrap_or("127.0.0.1:8080"),
             ),
+            log_format,
+            metrics_bind,
+            metrics_allowed_networks,
             trusted_proxies: trusted_proxies(&lookup)?,
             show_words: optional_bool(
                 &lookup,
@@ -1599,7 +1746,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} search_max_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} list_requires_token={} paste_tokens={} rate_limit_per_minute={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
+            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} search_max_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} list_requires_token={} paste_tokens={} rate_limit_per_minute={} log_format={} metrics_bind={} metrics_allowed_networks={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -1625,6 +1772,12 @@ impl Config {
             self.list_requires_token,
             self.paste_tokens,
             self.rate_limit_per_minute,
+            self.log_format.as_str(),
+            self.metrics_bind
+                .as_ref()
+                .map(|bind| bind.to_string())
+                .unwrap_or_else(|| "unset".to_string()),
+            self.metrics_allowed_networks.len(),
             if self.mcp_local_root.is_some() {
                 "set"
             } else {
@@ -1974,6 +2127,9 @@ mod tests {
             retention_min_days: 30,
             retention_max_days: 365,
             http_bind: "127.0.0.1:0".to_string(),
+            log_format: LogFormat::Text,
+            metrics_bind: None,
+            metrics_allowed_networks: Vec::new(),
             trusted_proxies: Vec::new(),
             show_words: true,
             show_internal_paths: false,
@@ -2101,6 +2257,91 @@ mod tests {
         ));
         let config = Config::from_lookup(lookup_from(&pairs)).expect("rate limit config");
         assert_eq!(config.rate_limit_per_minute, 120);
+    }
+
+    #[test]
+    fn log_format_defaults_to_text_and_accepts_json() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert_eq!(config.log_format, LogFormat::Text);
+
+        let mut pairs = base_env();
+        pairs.push(("DAYFLY_LOG_FORMAT".to_string(), "json".to_string()));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("JSON log config");
+        assert_eq!(config.log_format, LogFormat::Json);
+    }
+
+    #[test]
+    fn log_format_rejects_an_unknown_value() {
+        let mut pairs = base_env();
+        pairs.push(("DAYFLY_LOG_FORMAT".to_string(), "xml".to_string()));
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        match error {
+            ConfigError::Invalid(name, message) => {
+                assert_eq!(name, "DAYFLY_LOG_FORMAT");
+                assert!(message.contains("text or json"), "message: {message}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn metrics_listener_defaults_to_off() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert_eq!(config.metrics_bind, None);
+        assert!(config.metrics_allowed_networks.is_empty());
+    }
+
+    #[test]
+    fn a_loopback_metrics_bind_needs_no_allowlist() {
+        let mut pairs = base_env();
+        pairs.push((
+            "DAYFLY_METRICS_BIND".to_string(),
+            "127.0.0.1:9091".to_string(),
+        ));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("loopback metrics config");
+        assert_eq!(
+            config.metrics_bind,
+            Some("127.0.0.1:9091".parse().expect("socket address"))
+        );
+    }
+
+    #[test]
+    fn a_non_loopback_metrics_bind_requires_an_allowlist() {
+        let mut pairs = base_env();
+        pairs.push((
+            "DAYFLY_METRICS_BIND".to_string(),
+            "0.0.0.0:9091".to_string(),
+        ));
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        match error {
+            ConfigError::Invalid(name, message) => {
+                assert_eq!(name, "DAYFLY_METRICS_ALLOWED_NETWORKS");
+                assert!(
+                    message.contains("0.0.0.0:9091"),
+                    "message must name the bind: {message}"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn metrics_allowlist_accepts_cidrs() {
+        let mut pairs = base_env();
+        pairs.push((
+            "DAYFLY_METRICS_BIND".to_string(),
+            "0.0.0.0:9091".to_string(),
+        ));
+        pairs.push((
+            "DAYFLY_METRICS_ALLOWED_NETWORKS".to_string(),
+            "10.0.0.0/8, 2001:db8::/32".to_string(),
+        ));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("metrics allowlist config");
+        let expected: Vec<Cidr> = vec![
+            "10.0.0.0/8".parse().expect("IPv4 CIDR"),
+            "2001:db8::/32".parse().expect("IPv6 CIDR"),
+        ];
+        assert_eq!(config.metrics_allowed_networks, expected);
     }
 
     #[test]

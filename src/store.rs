@@ -49,6 +49,18 @@ use crate::config::{
     Config, DEFAULT_ALIAS_WORDS, MAX_ALIAS_WORDS, MAX_TTL_DAYS, MAX_TTL_SECONDS, MIN_ALIAS_WORDS,
 };
 use crate::content_type::{detect_content_type, detect_content_type_sample, Detection, PEEK_BYTES};
+use crate::metrics::Metrics;
+
+/// Await one S3 request and record its operation and outcome.
+macro_rules! s3_call {
+    ($metrics:expr, $operation:literal, $call:expr) => {{
+        let result = $call.await;
+        if let Some(metrics) = $metrics.as_ref() {
+            metrics.observe_s3($operation, if result.is_ok() { "ok" } else { "error" });
+        }
+        result
+    }};
+}
 
 pub const MULTIPART_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 pub const LIST_SCAN_MAX_PAGES: usize = 10;
@@ -1526,6 +1538,7 @@ pub struct Store {
     pub config: Config,
     alias_lock: Arc<AsyncMutex<()>>,
     alias_candidates: Option<Arc<Vec<String>>>,
+    metrics: Option<Arc<Metrics>>,
 }
 
 /// A shared handle to the current [`Store`].
@@ -1572,6 +1585,7 @@ struct AwsUploadSink {
     key: String,
     content_type: String,
     metadata: HashMap<String, String>,
+    metrics: Option<Arc<Metrics>>,
 }
 
 #[async_trait::async_trait]
@@ -1580,30 +1594,35 @@ impl crate::stream::UploadSink for AwsUploadSink {
         let mut meta = self.metadata.clone();
         meta.insert("sha256".to_string(), sha256.to_string());
         meta.insert("size".to_string(), bytes.len().to_string());
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&self.key)
-            .body(ByteStream::from(bytes))
-            .content_type(self.content_type.clone())
-            .set_metadata(Some(meta))
-            .send()
-            .await
-            .map_err(|e| map_sdk_error(e, &self.key))?;
+        s3_call!(
+            self.metrics,
+            "put_object",
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .body(ByteStream::from(bytes))
+                .content_type(self.content_type.clone())
+                .set_metadata(Some(meta))
+                .send()
+        )
+        .map_err(|e| map_sdk_error(e, &self.key))?;
         Ok(())
     }
 
     async fn create_multipart(&mut self) -> Result<String, StoreError> {
-        let out = self
-            .client
-            .create_multipart_upload()
-            .bucket(&self.bucket)
-            .key(&self.key)
-            .content_type(self.content_type.clone())
-            .set_metadata(Some(self.metadata.clone()))
-            .send()
-            .await
-            .map_err(|e| map_sdk_error(e, &self.key))?;
+        let out = s3_call!(
+            self.metrics,
+            "create_multipart_upload",
+            self.client
+                .create_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .content_type(self.content_type.clone())
+                .set_metadata(Some(self.metadata.clone()))
+                .send()
+        )
+        .map_err(|e| map_sdk_error(e, &self.key))?;
         let id = out.upload_id().unwrap_or("").to_string();
         if id.is_empty() {
             return Err(StoreError::S3(
@@ -1619,17 +1638,19 @@ impl crate::stream::UploadSink for AwsUploadSink {
         part_number: i32,
         bytes: Vec<u8>,
     ) -> Result<String, StoreError> {
-        let out = self
-            .client
-            .upload_part()
-            .bucket(&self.bucket)
-            .key(&self.key)
-            .upload_id(upload_id)
-            .part_number(part_number)
-            .body(ByteStream::from(bytes))
-            .send()
-            .await
-            .map_err(|e| map_sdk_error(e, &self.key))?;
+        let out = s3_call!(
+            self.metrics,
+            "upload_part",
+            self.client
+                .upload_part()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .body(ByteStream::from(bytes))
+                .send()
+        )
+        .map_err(|e| map_sdk_error(e, &self.key))?;
         Ok(out.e_tag().unwrap_or("").to_string())
     }
 
@@ -1646,32 +1667,45 @@ impl crate::stream::UploadSink for AwsUploadSink {
                     .collect(),
             ))
             .build();
-        self.client
-            .complete_multipart_upload()
-            .bucket(&self.bucket)
-            .key(&self.key)
-            .upload_id(upload_id)
-            .multipart_upload(completed)
-            .send()
-            .await
-            .map_err(|e| map_sdk_error(e, &self.key))?;
+        s3_call!(
+            self.metrics,
+            "complete_multipart_upload",
+            self.client
+                .complete_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .upload_id(upload_id)
+                .multipart_upload(completed)
+                .send()
+        )
+        .map_err(|e| map_sdk_error(e, &self.key))?;
         Ok(())
     }
 
     async fn abort(&mut self, upload_id: &str) {
-        let _ = self
-            .client
-            .abort_multipart_upload()
-            .bucket(&self.bucket)
-            .key(&self.key)
-            .upload_id(upload_id)
-            .send()
-            .await;
+        let _ = s3_call!(
+            self.metrics,
+            "abort_multipart_upload",
+            self.client
+                .abort_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .upload_id(upload_id)
+                .send()
+        );
     }
 }
 
 impl Store {
     pub async fn from_config(config: Config) -> Result<Self, StoreError> {
+        Self::from_config_with_metrics(config, None).await
+    }
+
+    /// Build a store that records S3 metrics in the given registry.
+    pub async fn from_config_with_metrics(
+        config: Config,
+        metrics: Option<Arc<Metrics>>,
+    ) -> Result<Self, StoreError> {
         // Credentials come from the environment or the credential files
         // named in Config only. The AWS default chain is not used, so a
         // stray AWS profile or instance role can never supply credentials.
@@ -1697,19 +1731,27 @@ impl Store {
             config,
             alias_lock: Arc::new(AsyncMutex::new(())),
             alias_candidates: None,
+            metrics,
         })
+    }
+
+    /// The metrics registry that this store snapshot records to.
+    pub fn metrics_handle(&self) -> Option<Arc<Metrics>> {
+        self.metrics.clone()
     }
 
     /// The bucket lifecycle rules, or an empty set when none is set.
     ///
     /// The call needs read permission on the bucket.
     pub async fn lifecycle_rules(&self) -> Result<Vec<LifecycleRule>, StoreError> {
-        let result = self
-            .client
-            .get_bucket_lifecycle_configuration()
-            .bucket(self.bucket.clone())
-            .send()
-            .await;
+        let result = s3_call!(
+            self.metrics,
+            "get_bucket_lifecycle_configuration",
+            self.client
+                .get_bucket_lifecycle_configuration()
+                .bucket(self.bucket.clone())
+                .send()
+        );
         match result {
             Ok(output) => Ok(output.rules().to_vec()),
             Err(error) => {
@@ -1736,13 +1778,16 @@ impl Store {
     pub async fn put_lifecycle_rules(&self, rules: Vec<LifecycleRule>) -> Result<(), StoreError> {
         let configuration = crate::lifecycle::configuration(rules)
             .map_err(|error| StoreError::InvalidLifecycle(error.to_string()))?;
-        self.client
-            .put_bucket_lifecycle_configuration()
-            .bucket(self.bucket.clone())
-            .lifecycle_configuration(configuration)
-            .send()
-            .await
-            .map_err(|error| map_sdk_error(error, &self.bucket))?;
+        s3_call!(
+            self.metrics,
+            "put_bucket_lifecycle_configuration",
+            self.client
+                .put_bucket_lifecycle_configuration()
+                .bucket(self.bucket.clone())
+                .lifecycle_configuration(configuration)
+                .send()
+        )
+        .map_err(|error| map_sdk_error(error, &self.bucket))?;
         Ok(())
     }
 
@@ -1798,14 +1843,16 @@ impl Store {
     /// True when an alias object already holds this phrase.
     async fn alias_object_exists(&self, phrase: &str) -> Result<bool, StoreError> {
         let key = alias_key(phrase);
-        match self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .send()
-            .await
-            .map_err(|e| map_sdk_error(e, &key))
+        match s3_call!(
+            self.metrics,
+            "head_object",
+            self.client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+        )
+        .map_err(|e| map_sdk_error(e, &key))
         {
             Ok(_) => Ok(true),
             Err(StoreError::NotFound(_)) => Ok(false),
@@ -1862,16 +1909,19 @@ impl Store {
         meta.insert("target".to_string(), target_key.to_string());
         meta.insert("expires-at".to_string(), expires_at.to_rfc3339());
         meta.insert("kind".to_string(), "alias".to_string());
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .body(ByteStream::from(target_key.as_bytes().to_vec()))
-            .content_type("text/plain")
-            .set_metadata(Some(meta))
-            .send()
-            .await
-            .map_err(|e| map_sdk_error(e, &key))?;
+        s3_call!(
+            self.metrics,
+            "put_object",
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .body(ByteStream::from(target_key.as_bytes().to_vec()))
+                .content_type("text/plain")
+                .set_metadata(Some(meta))
+                .send()
+        )
+        .map_err(|e| map_sdk_error(e, &key))?;
         Ok(())
     }
 
@@ -1900,13 +1950,16 @@ impl Store {
 
     async fn delete_alias_object(&self, phrase: &str) -> Result<(), StoreError> {
         let key = alias_key(phrase);
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .send()
-            .await
-            .map_err(|e| map_sdk_error(e, &key))?;
+        s3_call!(
+            self.metrics,
+            "delete_object",
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+        )
+        .map_err(|e| map_sdk_error(e, &key))?;
         Ok(())
     }
 
@@ -1922,17 +1975,19 @@ impl Store {
     /// must be a valid paste key. A stale or corrupt alias is not trusted.
     async fn read_alias(&self, phrase: &str) -> Result<String, StoreError> {
         let key = alias_key(phrase);
-        let out = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .send()
-            .await
-            .map_err(|e| match map_sdk_error(e, &key) {
-                StoreError::NotFound(_) => StoreError::NotFound(phrase.to_string()),
-                other => other,
-            })?;
+        let out = s3_call!(
+            self.metrics,
+            "get_object",
+            self.client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+        )
+        .map_err(|e| match map_sdk_error(e, &key) {
+            StoreError::NotFound(_) => StoreError::NotFound(phrase.to_string()),
+            other => other,
+        })?;
         let meta = out.metadata().cloned().unwrap_or_default();
         let bytes = out
             .body
@@ -2005,14 +2060,16 @@ impl Store {
 
     /// Read the `words` value from a base object, when it has one.
     async fn base_words(&self, key: &str) -> Result<Option<String>, StoreError> {
-        let out = match self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| map_sdk_error(e, key))
+        let out = match s3_call!(
+            self.metrics,
+            "head_object",
+            self.client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+        )
+        .map_err(|e| map_sdk_error(e, key))
         {
             Ok(out) => out,
             Err(StoreError::NotFound(_)) => return Ok(None),
@@ -2027,13 +2084,16 @@ impl Store {
     /// Delete one object. DeleteObject is idempotent, so a missing key is
     /// not an error.
     async fn delete_object_key(&self, key: &str) -> Result<(), StoreError> {
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| map_sdk_error(e, key))?;
+        s3_call!(
+            self.metrics,
+            "delete_object",
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+        )
+        .map_err(|e| map_sdk_error(e, key))?;
         Ok(())
     }
 
@@ -2122,7 +2182,8 @@ impl Store {
             if let Some(t) = token {
                 req = req.continuation_token(t);
             }
-            let out = req.send().await.map_err(|e| map_sdk_error(e, id))?;
+            let out = s3_call!(self.metrics, "list_objects_v2", req.send())
+                .map_err(|e| map_sdk_error(e, id))?;
             for obj in out.contents() {
                 if let Some(key) = obj.key() {
                     if !is_paste_key(key) {
@@ -2241,17 +2302,18 @@ impl Store {
             title.as_deref(),
             &tags,
         );
-        if let Err(e) = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .body(ByteStream::from(text.to_vec()))
-            .content_type(ct.clone())
-            .set_metadata(Some(meta))
-            .send()
-            .await
-        {
+        if let Err(e) = s3_call!(
+            self.metrics,
+            "put_object",
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .body(ByteStream::from(text.to_vec()))
+                .content_type(ct.clone())
+                .set_metadata(Some(meta))
+                .send()
+        ) {
             self.cleanup_failed_store(&key, &words).await;
             return Err(map_sdk_error(e, &key));
         }
@@ -2391,17 +2453,18 @@ impl Store {
                     title.as_deref(),
                     &tags,
                 );
-                if let Err(e) = self
-                    .client
-                    .put_object()
-                    .bucket(&self.bucket)
-                    .key(&key)
-                    .body(ByteStream::from(bytes))
-                    .content_type(ct.clone())
-                    .set_metadata(Some(meta))
-                    .send()
-                    .await
-                {
+                if let Err(e) = s3_call!(
+                    self.metrics,
+                    "put_object",
+                    self.client
+                        .put_object()
+                        .bucket(&self.bucket)
+                        .key(&key)
+                        .body(ByteStream::from(bytes))
+                        .content_type(ct.clone())
+                        .set_metadata(Some(meta))
+                        .send()
+                ) {
                     self.cleanup_failed_store(&key, &claimed).await;
                     return Err(map_sdk_error(e, &key));
                 }
@@ -2525,6 +2588,7 @@ impl Store {
             key: key.clone(),
             content_type: ct.clone(),
             metadata: meta,
+            metrics: self.metrics.clone(),
         };
         let outcome = match crate::stream::run_streaming_upload(
             Box::pin(file_stream(file)),
@@ -2704,6 +2768,7 @@ impl Store {
             key: key.clone(),
             content_type: ct.clone(),
             metadata: initial_meta,
+            metrics: self.metrics.clone(),
         };
         let outcome =
             match crate::stream::run_streaming_upload(wrapped, &mut sink, known_length, max_bytes)
@@ -2759,7 +2824,8 @@ impl Store {
             if let Some(t) = token.take() {
                 req = req.continuation_token(t);
             }
-            let out = req.send().await.map_err(|e| map_sdk_error(e, base_key))?;
+            let out = s3_call!(self.metrics, "list_objects_v2", req.send())
+                .map_err(|e| map_sdk_error(e, base_key))?;
             for obj in out.contents() {
                 if let Some(key) = obj.key() {
                     entries.push((
@@ -2887,17 +2953,18 @@ impl Store {
                 return Err(error);
             }
         }
-        if let Err(error) = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .body(ByteStream::from(text.to_vec()))
-            .content_type(meta.content_type.clone())
-            .set_metadata(Some(object_meta))
-            .send()
-            .await
-        {
+        if let Err(error) = s3_call!(
+            self.metrics,
+            "put_object",
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .body(ByteStream::from(text.to_vec()))
+                .content_type(meta.content_type.clone())
+                .set_metadata(Some(object_meta))
+                .send()
+        ) {
             tracing::warn!(key = %key, error = ?error, "append segment write failed");
             return Err(StoreError::PartialUpdate {
                 step: "new segment",
@@ -2915,14 +2982,15 @@ impl Store {
         // A delete can remove the base after the first head and before
         // this segment write. Check the base again. If it is gone, remove
         // the segment, so an in-flight delete does not leave an orphan.
-        if let Err(error) = self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(&meta.key)
-            .send()
-            .await
-        {
+        if let Err(error) = s3_call!(
+            self.metrics,
+            "head_object",
+            self.client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(&meta.key)
+                .send()
+        ) {
             let mapped = map_sdk_error(error, &meta.key);
             let mut removed = false;
             for _ in 0..MULTI_STEP_ATTEMPTS {
@@ -2974,14 +3042,15 @@ impl Store {
         let Ok(key) = self.resolve_key(id).await else {
             return false;
         };
-        let Ok(out) = self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .send()
-            .await
-        else {
+        let Ok(out) = s3_call!(
+            self.metrics,
+            "head_object",
+            self.client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+        ) else {
             return false;
         };
         let Some(expected) = out
@@ -2996,14 +3065,16 @@ impl Store {
 
     /// Read metadata for a canonical key without another alias lookup.
     async fn head_metadata_by_key(&self, key: &str, id: &str) -> Result<PasteMetadata, StoreError> {
-        let out = self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| map_sdk_error(e, id))?;
+        let out = s3_call!(
+            self.metrics,
+            "head_object",
+            self.client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+        )
+        .map_err(|e| map_sdk_error(e, id))?;
         let meta = out.metadata().cloned().unwrap_or_default();
         let created_at = meta.get("created-at").and_then(|s| parse_rfc3339(s));
         let expires_at = meta.get("expires-at").and_then(|s| parse_rfc3339(s));
@@ -3063,14 +3134,16 @@ impl Store {
         expires_at: DateTime<Utc>,
         ttl: Ttl,
     ) -> Result<(), StoreError> {
-        let out = self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| map_sdk_error(e, key))?;
+        let out = s3_call!(
+            self.metrics,
+            "head_object",
+            self.client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+        )
+        .map_err(|e| map_sdk_error(e, key))?;
         let mut meta = out.metadata().cloned().unwrap_or_default();
         meta.insert("expires-at".to_string(), expires_at.to_rfc3339());
         meta.insert("ttl-seconds".to_string(), ttl.num_seconds().to_string());
@@ -3083,17 +3156,20 @@ impl Store {
             .content_type()
             .unwrap_or("application/octet-stream")
             .to_string();
-        self.client
-            .copy_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .copy_source(format!("{}/{}", self.bucket, key))
-            .metadata_directive(MetadataDirective::Replace)
-            .content_type(content_type)
-            .set_metadata(Some(meta))
-            .send()
-            .await
-            .map_err(|e| map_sdk_error(e, key))?;
+        s3_call!(
+            self.metrics,
+            "copy_object",
+            self.client
+                .copy_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .copy_source(format!("{}/{}", self.bucket, key))
+                .metadata_directive(MetadataDirective::Replace)
+                .content_type(content_type)
+                .set_metadata(Some(meta))
+                .send()
+        )
+        .map_err(|e| map_sdk_error(e, key))?;
         Ok(())
     }
 
@@ -3218,7 +3294,8 @@ impl Store {
         if let Some((start, end)) = range {
             req = req.range(format!("bytes={start}-{end}"));
         }
-        let out = req.send().await.map_err(|e| map_sdk_error(e, key))?;
+        let out =
+            s3_call!(self.metrics, "get_object", req.send()).map_err(|e| map_sdk_error(e, key))?;
         let bytes = out
             .body
             .collect()
@@ -3269,14 +3346,16 @@ impl Store {
         key: &str,
         range: Option<(u64, u64)>,
     ) -> Result<Vec<u8>, StoreError> {
-        let out = self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| map_sdk_error(e, key))?;
+        let out = s3_call!(
+            self.metrics,
+            "head_object",
+            self.client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+        )
+        .map_err(|e| map_sdk_error(e, key))?;
         let base_size = u64::try_from(out.content_length().unwrap_or(0)).unwrap_or(0);
         let plan = self.load_plan(key, base_size).await?;
         match range {
@@ -3680,7 +3759,8 @@ impl Store {
                 } else if let Some(key) = start_after.take() {
                     req = req.start_after(key);
                 }
-                let out = req.send().await.map_err(|e| map_sdk_error(e, &date_str))?;
+                let out = s3_call!(self.metrics, "list_objects_v2", req.send())
+                    .map_err(|e| map_sdk_error(e, &date_str))?;
                 for obj in out.contents() {
                     if summaries.len() >= limit {
                         break;

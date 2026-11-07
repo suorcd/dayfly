@@ -77,6 +77,14 @@ pub async fn reload_with_config(
         warnings.push("DAYFLY_MCP_LOCAL_ROOT changed. A restart is necessary.".to_string());
         new_config.mcp_local_root = old.config.mcp_local_root.clone();
     }
+    if new_config.log_format != old.config.log_format {
+        warnings.push("DAYFLY_LOG_FORMAT changed. A restart is necessary.".to_string());
+        new_config.log_format = old.config.log_format;
+    }
+    if new_config.metrics_bind != old.config.metrics_bind {
+        warnings.push("DAYFLY_METRICS_BIND changed. A restart is necessary.".to_string());
+        new_config.metrics_bind = old.config.metrics_bind;
+    }
 
     // A token removal on a reachable listener needs the same guard as
     // startup. The new store is not built when this check fails.
@@ -94,7 +102,7 @@ pub async fn reload_with_config(
     }
 
     let changed = changed_fields(&old.config, &new_config);
-    let new_store = Store::from_config(new_config)
+    let new_store = Store::from_config_with_metrics(new_config, old.metrics_handle())
         .await
         .map_err(|error| error.to_string())?;
     state.replace_store(new_store);
@@ -250,6 +258,9 @@ fn changed_fields(old: &Config, new: &Config) -> Vec<&'static str> {
     }
     if old.trusted_proxies != new.trusted_proxies {
         changed.push("DAYFLY_TRUSTED_PROXIES");
+    }
+    if old.metrics_allowed_networks != new.metrics_allowed_networks {
+        changed.push("DAYFLY_METRICS_ALLOWED_NETWORKS");
     }
     if old.favicon != new.favicon {
         changed.push("DAYFLY_FAVICON_PATH");
