@@ -33,6 +33,7 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use futures::Stream;
 use futures::StreamExt;
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 
 use crate::store::StoreError;
 
@@ -271,7 +272,14 @@ pub fn content_disposition(content_type: &str, filename: Option<&str>, inline_pd
                     }
                 })
                 .collect();
-            format!("{disposition}; filename=\"{safe}\"")
+            let mut header = format!("{disposition}; filename=\"{safe}\"");
+            // RFC 5987 carries the real name when the ASCII fallback loses
+            // characters. A browser that supports it uses filename*.
+            if safe != f {
+                let encoded = utf8_percent_encode(f, NON_ALPHANUMERIC).to_string();
+                header.push_str(&format!("; filename*=UTF-8''{encoded}"));
+            }
+            header
         }
         _ => disposition.to_string(),
     }
@@ -630,6 +638,31 @@ mod tests {
         assert!(
             content_disposition("image/svg+xml", Some("x.svg"), false).starts_with("attachment")
         );
+    }
+
+    #[test]
+    fn content_disposition_uses_rfc5987_for_a_non_ascii_filename() {
+        let header = content_disposition("application/octet-stream", Some("日本語-😀.txt"), false);
+        assert!(header.starts_with("attachment"));
+        assert!(
+            header.contains("filename=\"___-_.txt\""),
+            "the ASCII fallback must stay: {header}"
+        );
+        assert!(
+            header.contains("filename*=UTF-8''"),
+            "the UTF-8 name must use RFC 5987: {header}"
+        );
+        assert!(
+            !header.contains('日'),
+            "the header must stay ASCII: {header}"
+        );
+    }
+
+    #[test]
+    fn content_disposition_keeps_an_ascii_filename_short() {
+        let header = content_disposition("text/plain", Some("notes.txt"), true);
+        assert_eq!(header, "inline; filename=\"notes.txt\"");
+        assert!(!header.contains("filename*="));
     }
 
     #[tokio::test]

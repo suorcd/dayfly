@@ -1251,6 +1251,109 @@ async fn list_route_pages_with_a_cursor_and_reports_truncation() {
 }
 
 #[tokio::test]
+async fn text_downloads_declare_utf8_and_non_ascii_filenames_use_rfc5987() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+
+    let request = common::request(
+        "POST",
+        "/upload",
+        &[("content-type", "text/plain; charset=utf-8".to_string())],
+        "emoji 😀 日本語".as_bytes().to_vec(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = id_from_plain_url(&body);
+    let request = common::request("GET", &format!("/v1/pastes/{id}"), &[], Vec::new());
+    let (status, headers, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "emoji 😀 日本語".as_bytes());
+    let content_type = headers[header::CONTENT_TYPE]
+        .to_str()
+        .expect("content type must be ASCII");
+    assert!(
+        content_type.contains("charset=utf-8"),
+        "a text response must declare UTF-8: {content_type}"
+    );
+
+    let boundary = "i18n-filename";
+    let body = common::multipart_body(
+        boundary,
+        Some("日本語-😀.txt"),
+        Some("application/octet-stream"),
+        b"file body",
+        &[],
+    );
+    let request = common::request(
+        "POST",
+        "/upload",
+        &[
+            (
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            ),
+            ("accept", "application/json".to_string()),
+        ],
+        body,
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let json = common::json_body(&body);
+    assert_eq!(json["filename"], "日本語-😀.txt");
+    let id = json["id"].as_str().expect("id").to_string();
+    let request = common::request("GET", &format!("/v1/pastes/{id}"), &[], Vec::new());
+    let (status, headers, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let disposition = headers[header::CONTENT_DISPOSITION]
+        .to_str()
+        .expect("content disposition must be ASCII");
+    assert!(
+        disposition.contains("filename*=UTF-8''"),
+        "the real non-ASCII name must use RFC 5987: {disposition}"
+    );
+    assert!(
+        disposition.contains("filename=\"___-_.txt\""),
+        "the ASCII fallback must stay: {disposition}"
+    );
+}
+
+#[tokio::test]
+async fn utf8_metadata_headers_are_accepted() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let mut request = common::request(
+        "POST",
+        "/upload",
+        &[
+            ("content-type", "text/plain".to_string()),
+            ("accept", "application/json".to_string()),
+        ],
+        b"body".to_vec(),
+    );
+    request.headers_mut().insert(
+        "x-title",
+        axum::http::HeaderValue::from_bytes("日本語タイトル 😀".as_bytes())
+            .expect("UTF-8 title bytes must form a header value"),
+    );
+    request.headers_mut().insert(
+        "x-tags",
+        axum::http::HeaderValue::from_bytes("日本語,emoji😀".as_bytes())
+            .expect("UTF-8 tag bytes must form a header value"),
+    );
+    request.headers_mut().insert(
+        "x-filename",
+        axum::http::HeaderValue::from_bytes("日本語-😀.txt".as_bytes())
+            .expect("UTF-8 filename bytes must form a header value"),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let json = common::json_body(&body);
+    assert_eq!(json["title"], "日本語タイトル 😀");
+    assert_eq!(json["tags"], json!(["日本語", "emoji😀"]));
+    assert_eq!(json["filename"], "日本語-😀.txt");
+}
+
+#[tokio::test]
 async fn search_route_returns_hits_and_rejects_binary_and_bad_patterns() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
