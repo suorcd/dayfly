@@ -211,6 +211,7 @@ fn get_info_reports_live_limits_and_domain_errors_have_a_stable_code() {
     assert_eq!(info["name"], "dayfly");
     assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(info["auth"], "none");
+    assert_eq!(info["expose_creator_addr"], false);
     assert_eq!(info["listing_enabled"], true);
     assert_eq!(info["mcp_local_files"], "open");
     assert!(info["limits"]["max_text_bytes"].as_u64().is_some());
@@ -232,6 +233,23 @@ fn get_info_reports_live_limits_and_domain_errors_have_a_stable_code() {
         }
         other => panic!("expected a tool error result, got {other:?}"),
     }
+}
+
+#[test]
+fn stdio_store_text_writes_no_creator_address() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let mut client = McpClient::spawn(&fake, &[]);
+
+    let stored = client
+        .call_tool("store_text", json!({"text": "hello stdio"}))
+        .expect("store_text must succeed");
+    let key = stored["key"].as_str().expect("stored key");
+    let object = fake.object(key).expect("the stored object must exist");
+    assert!(
+        !object.metadata.contains_key("created-by"),
+        "the stdio transport must not write a creator address"
+    );
 }
 
 #[test]

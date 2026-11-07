@@ -28,12 +28,16 @@ is needed. See "No database in v1" below.
 - Each new paste also gets a word alias, three words by default, for
   example `abacus-abdomen-zoology`. The alias is a second name for the
   same paste, not a second paste.
-- Filename, title, tags, content-type, created date, and TTL are stored
-  in object metadata. The S3 `Content-Length` gives the size. A `sha256` value is
+- Filename, title, tags, content-type, created date, TTL, and the
+  resolved creator address are stored in object metadata. The S3
+  `Content-Length` gives the size. A `sha256` value is
   stored when the hash is known before the object is created. A
   multipart stream cannot know the hash in advance, so it omits the
   value. The TTL is stored as exact seconds and as whole days when the
-  duration has no smaller part. No separate metadata sidecar in v1.
+  duration has no smaller part. The base object stores the client
+  address as `created-by` when the transport has one. The address is
+  hidden unless `DAYFLY_EXPOSE_CREATOR_ADDR` is set. No separate
+  metadata sidecar in v1.
 - Expiry uses a read-time TTL. The TTL accepts seconds or a duration
   such as `90m` or `1h30m`. A bare integer is always seconds: `7` is
   seven seconds, and `7d` is seven days. `ttl_days` remains as a
@@ -270,8 +274,8 @@ both forms; the plain-text HTTP response returns only the URL. See
 
 The running service publishes `GET /.well-known/dayfly.json` without
 authentication. The document reports the crate version, the auth mode,
-the content policy (`inline_pdf`), the limits in force, and every API
-route. The frontend links to it. The MCP tool `get_info` returns the
+the content policy (`inline_pdf`), the creator-address exposure setting
+(`expose_creator_addr`), the limits in force, and every API route. The frontend links to it. The MCP tool `get_info` returns the
 same document, plus the local-path tool mode for the transport. Both
 read one function, so they cannot drift.
 
@@ -282,7 +286,9 @@ The reference deployment serves it at
 
 Listing/search/sorting beyond a date window, view counters,
 burn-after-read, per-paste permissions/ownership, audit history, and
-deduplication. These are the future SQLite triggers: they are the
+deduplication. A `created-by` address is not an owner, an account, or an
+audit trail. It is hidden by default, and no query lists pastes by
+address. These are the future SQLite triggers: they are the
 reasons a database would be added later. No database schema is
 invented in v1. A paste token is a per-paste delete and expiry
 credential, not an ownership model.
@@ -388,6 +394,7 @@ permissions and the lower total cap.
 | `DAYFLY_LIST_ENABLED` | no | `true` | Allow listing on every transport. `false` makes `/pastes`, `GET /v1/pastes`, and the MCP `list_recent` tool return 403 with "Listing is turned off on this instance." It wins over `DAYFLY_LIST_REQUIRES_TOKEN`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_LIST_REQUIRES_TOKEN` | no | `false` | Require the bearer token for `GET /v1/pastes` and the human `/pastes` page even when reads are anonymous. With this on and no token configured, both routes refuse with 401: there is nothing to check. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_PASTE_TOKENS` | no | `false` | Return a 128-bit management token at creation. The JSON store response carries `paste_token`; the plain response carries `X-Paste-Token`. The token authorizes `DELETE` and `PATCH` for that paste. Only its SHA-256 is stored. The bearer token remains universal. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
+| `DAYFLY_EXPOSE_CREATOR_ADDR` | no | `false` | Return the stored `created-by` address in the meta route, the `X-Created-By` header on `HEAD`, and the MCP `fetch_metadata` tool. The access log includes the client address only when this is on. An address is personal data, so the default hides it. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_SHOW_WORDS` | no | `true` | Show the generated word alias in the human UI: create redirects, the view page, and the paste list. Display only; the JSON/MCP responses still include `words`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_SHOW_INTERNAL_PATHS` | no | `false` | Show the canonical date and ID under the alias in the human paste list. Off labels the column "Link" and shows only the alias. Display only; view URLs and API responses still accept the canonical ID. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_INLINE_PDF` | no | `true` | Serve a PDF download inline. Set this to `false` on a public instance so a PDF is an attachment. HTML and SVG are always attachments. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
@@ -486,6 +493,7 @@ first, then the file. These settings take effect on the next request:
 - `DAYFLY_LIST_ENABLED`
 - `DAYFLY_LIST_REQUIRES_TOKEN`
 - `DAYFLY_PASTE_TOKENS`
+- `DAYFLY_EXPOSE_CREATOR_ADDR`
 - `DAYFLY_RATE_LIMIT_PER_MINUTE`
 - `DAYFLY_HTTP_BEARER_TOKEN` or `DAYFLY_HTTP_BEARER_TOKEN_FILE`
 - `DAYFLY_SITE_NAME`, `DAYFLY_CONTACT`, and `DAYFLY_AUP_URL`
@@ -516,11 +524,12 @@ and starts no watch.
 
 HTTP mode writes one access log line for each request at `INFO`. The line
 carries `request_id`, `method`, `route`, `status`, `latency_ms`,
-`response_bytes`, `client`, and `paste_id`. The route is the template, for
-example `/v1/pastes/{random}`. The line never carries a credential, a
-paste token, or a query string. The latency stops when the response
-starts, so a streamed body can take longer. Set `--verbose` or
-`RUST_LOG=dayfly=info` to see the lines.
+`response_bytes`, and `paste_id`. It carries `client` only when
+`DAYFLY_EXPOSE_CREATOR_ADDR` is on; otherwise the field is empty. The
+route is the template, for example `/v1/pastes/{random}`. The line never
+carries a credential, a paste token, or a query string. The latency stops
+when the response starts, so a streamed body can take longer. Set
+`--verbose` or `RUST_LOG=dayfly=info` to see the lines.
 
 Set `DAYFLY_LOG_FORMAT=json` to write one JSON object per line on stderr.
 A collector such as Alloy or Promtail can read the container stderr and
@@ -904,6 +913,13 @@ curl 'http://127.0.0.1:8080/v1/pastes?tag=ops'
 curl 'http://127.0.0.1:8080/v1/pastes?date=2026-10-28&limit=100&after_date=2026-10-28&after_key=pastes%2F2026-10-28%2FAbC123...'
 ```
 
+The base object records the resolved creator address as `created-by` when
+the transport has a client address. `GET .../meta` returns it as
+`created_by`, and `HEAD` returns it as `X-Created-By`, only when
+`DAYFLY_EXPOSE_CREATOR_ADDR` is on. The MCP `fetch_metadata` tool uses the
+same gate. The stdio MCP transport has no client address, so it stores no
+key.
+
 `date` takes precedence over `start` and `end`. Supply both `start` and
 `end` for a range; a one-sided range returns 400. Results are in date
 order, then in S3 key order within each date. The limit applies to the
@@ -1212,8 +1228,10 @@ applies.
 
 Stored in S3 object metadata: the final `content-type`, the
 detection source (`client` | `sniffed` | `extension` | `text` |
-`fallback`), and the original filename if supplied. `fetch_metadata`
-and the upload JSON response return `content_type`,
+`fallback`), and the original filename if supplied. The base object also
+records `created-by` when the transport has a client address.
+`DAYFLY_EXPOSE_CREATOR_ADDR` controls whether a response returns it.
+`fetch_metadata` and the upload JSON response return `content_type`,
 `detection_source`, and `detection_conflict`.
 
 ### Serving behaviour and the HTML/SVG safety note
@@ -1653,6 +1671,10 @@ recorded here so readers can plan around them.
 - **A title and tags use S3 user metadata.** Keep them small: 200 bytes
   for the title and 512 bytes for tags. AWS-compatible stores cap user
   metadata at 2 KB per object; verify the limit on your Garage build.
+- **The creator address is metadata, not ownership.** The base object
+  stores `created-by` when the transport has a client address. The
+  address is hidden unless `DAYFLY_EXPOSE_CREATOR_ADDR` is on. It is not
+  an account, an audit trail, or a query key.
 - **The HTTP endpoint is intended for a private network.** The
   bearer token comparison is constant time for equal-length tokens.
   A length difference still leaks through timing. The write-route origin

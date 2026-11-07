@@ -60,6 +60,7 @@ fn test_config() -> Config {
         list_requires_token: false,
         list_enabled: true,
         paste_tokens: false,
+        expose_creator_addr: false,
         rate_limit_per_minute: 0,
         http_bearer_token: None,
         mcp_local_root: None,

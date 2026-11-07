@@ -544,12 +544,29 @@ fn partial_update_error(step: &'static str, key: &str, error: StoreError) -> Sto
 ///
 /// The store normalizes the title and tags. A caller can pass raw values
 /// from a header, a form, or an MCP argument.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct PasteFields {
     pub filename: Option<String>,
     pub content_type: Option<String>,
     pub title: Option<String>,
     pub tags: Vec<String>,
+    /// Canonical text form of the resolved client address.
+    ///
+    /// The HTTP and HTTP MCP transports set this. The stdio transport
+    /// leaves it `None`, so no `created-by` key is written.
+    pub created_by: Option<String>,
+}
+
+impl std::fmt::Debug for PasteFields {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasteFields")
+            .field("filename", &self.filename)
+            .field("content_type", &self.content_type)
+            .field("title", &self.title)
+            .field("tags", &self.tags)
+            .field("created_by", &self.created_by.as_ref().map(|_| "<set>"))
+            .finish()
+    }
 }
 
 /// Maximum title length in bytes.
@@ -586,7 +603,7 @@ pub struct StoredPaste {
     pub paste_token: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PasteMetadata {
     pub id: String,
     pub key: String,
@@ -612,7 +629,36 @@ pub struct PasteMetadata {
     pub sha256: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
+    /// Resolved creator address, when the base object records one.
+    ///
+    /// The API layer returns this only when `DAYFLY_EXPOSE_CREATOR_ADDR`
+    /// is on.
+    pub created_by: Option<String>,
     pub expired: bool,
+}
+
+impl std::fmt::Debug for PasteMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasteMetadata")
+            .field("id", &self.id)
+            .field("key", &self.key)
+            .field("words", &self.words)
+            .field("filename", &self.filename)
+            .field("title", &self.title)
+            .field("tags", &self.tags)
+            .field("content_type", &self.content_type)
+            .field("detection_source", &self.detection_source)
+            .field("detection_conflict", &self.detection_conflict)
+            .field("size", &self.size)
+            .field("base_size", &self.base_size)
+            .field("segments", &self.segments)
+            .field("sha256", &self.sha256)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("created_by", &self.created_by.as_ref().map(|_| "<set>"))
+            .field("expired", &self.expired)
+            .finish()
+    }
 }
 
 impl PasteMetadata {
@@ -1468,6 +1514,7 @@ fn metadata_for(
     paste_token_hash: Option<&str>,
     ttl: Ttl,
     created_at: DateTime<Utc>,
+    created_by: Option<&str>,
     detection: &Detection,
     title: Option<&str>,
     tags: &[String],
@@ -1508,6 +1555,9 @@ fn metadata_for(
         meta.insert("ttl-days".to_string(), days.to_string());
     }
     meta.insert("created-at".to_string(), created_at.to_rfc3339());
+    if let Some(address) = created_by {
+        meta.insert("created-by".to_string(), address.to_string());
+    }
     meta.insert("expires-at".to_string(), expires_at.to_rfc3339());
     // Final Content-Type is also stored in metadata (not just the S3
     // Content-Type header) so HeadObject alone recovers the full record.
@@ -2298,6 +2348,7 @@ impl Store {
             paste_token_hash.as_deref(),
             ttl,
             created_at,
+            fields.created_by.as_deref(),
             &detection,
             title.as_deref(),
             &tags,
@@ -2449,6 +2500,7 @@ impl Store {
                     paste_token_hash.as_deref(),
                     ttl,
                     created_at,
+                    fields.created_by.as_deref(),
                     &detection,
                     title.as_deref(),
                     &tags,
@@ -2578,6 +2630,7 @@ impl Store {
             paste_token_hash.as_deref(),
             ttl,
             created_at,
+            fields.created_by.as_deref(),
             &detection,
             title.as_deref(),
             &tags,
@@ -2721,6 +2774,7 @@ impl Store {
                 content_type: fields.content_type.clone(),
                 title: fields.title.clone(),
                 tags: fields.tags.clone(),
+                created_by: fields.created_by.clone(),
             };
             return self
                 .store_text_with_fields(&body, &text_fields, Some(ttl))
@@ -2758,6 +2812,7 @@ impl Store {
             paste_token_hash.as_deref(),
             ttl,
             created_at,
+            fields.created_by.as_deref(),
             &detection,
             title.as_deref(),
             &tags,
@@ -3115,6 +3170,7 @@ impl Store {
             },
             created_at,
             expires_at,
+            created_by: meta.get("created-by").cloned(),
             expired,
         })
     }
@@ -4335,6 +4391,7 @@ mod tests {
             None,
             Ttl::days(7),
             created,
+            None,
             &detection,
             None,
             &[],
@@ -4429,6 +4486,7 @@ mod tests {
             None,
             Ttl::parse("1h").unwrap(),
             created,
+            None,
             &detection,
             None,
             &[],
@@ -4459,6 +4517,7 @@ mod tests {
             None,
             Ttl::parse("1h").unwrap(),
             created,
+            None,
             &detection,
             None,
             &[],
@@ -4479,6 +4538,7 @@ mod tests {
             sha256: Some("deadbeef".to_string()),
             created_at: Some(created),
             expires_at: Some(expires),
+            created_by: None,
             expired: is_expired_at(Some(expires), now),
         };
         assert!(
@@ -4510,6 +4570,7 @@ mod tests {
             None,
             Ttl::days(3),
             created,
+            None,
             &detection,
             None,
             &[],
@@ -4524,6 +4585,48 @@ mod tests {
         assert_eq!(meta.get("sha256").unwrap(), "abc123");
         assert_eq!(meta.get("size").unwrap(), "42");
         assert_eq!(expires, created + chrono::Duration::days(3));
+    }
+
+    #[test]
+    fn metadata_map_records_the_creator_address_when_present() {
+        let created = Utc.with_ymd_and_hms(2026, 10, 28, 0, 0, 0).unwrap();
+        let detection = Detection {
+            content_type: "text/plain".to_string(),
+            source: "text",
+            conflict: None,
+        };
+        let (meta, _) = metadata_for(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Ttl::days(1),
+            created,
+            Some("203.0.113.7"),
+            &detection,
+            None,
+            &[],
+        );
+        assert_eq!(meta.get("created-by").unwrap(), "203.0.113.7");
+
+        let (meta, _) = metadata_for(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Ttl::days(1),
+            created,
+            None,
+            &detection,
+            None,
+            &[],
+        );
+        assert!(
+            !meta.contains_key("created-by"),
+            "an absent address must not write the key"
+        );
     }
 
     #[test]
@@ -4545,6 +4648,7 @@ mod tests {
             None,
             Ttl::days(7),
             created,
+            None,
             &detection,
             None,
             &[],
@@ -4587,6 +4691,7 @@ mod token_tests {
             Some("abc123"),
             Ttl::days(1),
             created,
+            None,
             &detection,
             None,
             &[],
@@ -4601,6 +4706,7 @@ mod token_tests {
             None,
             Ttl::days(1),
             created,
+            None,
             &detection,
             None,
             &[],

@@ -213,7 +213,11 @@ fn check_config_file(path: Option<PathBuf>, explicit: bool, strict: bool) -> any
                     )),
                 }
             }
-            "DAYFLY_SHOW_WORDS" | "DAYFLY_INLINE_PDF" if parse_bool_flag(&value).is_none() => {
+            "DAYFLY_SHOW_WORDS"
+            | "DAYFLY_INLINE_PDF"
+            | "DAYFLY_EXPOSE_CREATOR_ADDR"
+                if parse_bool_flag(&value).is_none() =>
+            {
                 faults.push(format!("{}: expected true or false", field.name));
             }
             "DAYFLY_LOG_FORMAT" if LogFormat::parse(&value).is_none() => {

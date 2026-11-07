@@ -25,7 +25,8 @@ use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
-use rmcp::{tool, tool_handler, tool_router};
+use rmcp::service::RequestContext;
+use rmcp::{tool, tool_handler, tool_router, RoleServer};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -160,9 +161,25 @@ fn tool_error(code: &str, message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(value.to_string())])
 }
 
+/// The resolved client address from the HTTP transport, when present.
+///
+/// The stdio transport has no HTTP request parts, so it stores no
+/// creator address.
+fn creator_addr(ctx: &RequestContext<RoleServer>) -> Option<String> {
+    ctx.extensions
+        .get::<axum::http::request::Parts>()
+        .and_then(|parts| parts.extensions.get::<crate::client_addr::ClientAddr>())
+        .map(|address| address.0.to_string())
+}
+
 /// The metadata shape shared by `fetch_metadata` and `set_ttl`.
-fn metadata_json(meta: PasteMetadata) -> serde_json::Value {
-    serde_json::json!({
+fn metadata_json(meta: PasteMetadata, expose_creator_addr: bool) -> serde_json::Value {
+    let created_by = if expose_creator_addr {
+        meta.created_by
+    } else {
+        None
+    };
+    let mut value = serde_json::json!({
         "id": meta.id,
         "key": meta.key,
         "words": meta.words,
@@ -177,7 +194,11 @@ fn metadata_json(meta: PasteMetadata) -> serde_json::Value {
         "created_at": meta.created_at.map(|d| d.to_rfc3339()),
         "expires_at": meta.expires_at.map(|d| d.to_rfc3339()),
         "expired": meta.expired,
-    })
+    });
+    if let Some(created_by) = created_by {
+        value["created_by"] = serde_json::Value::String(created_by);
+    }
+    value
 }
 
 /// Check the paste token for an MCP delete or set_ttl call.
@@ -466,6 +487,7 @@ impl Pastebin {
     )]
     async fn store_text(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(params): Parameters<StoreTextParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let ttl = resolve_ttl(params.ttl.as_deref(), params.ttl_days)?;
@@ -474,6 +496,7 @@ impl Pastebin {
             content_type: params.content_type,
             title: params.title,
             tags: params.tags.unwrap_or_default(),
+            created_by: creator_addr(&ctx),
         };
         let stored = try_store!(
             self.current_store()
@@ -505,6 +528,7 @@ impl Pastebin {
     )]
     async fn store_file(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(params): Parameters<StoreFileParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let ttl = resolve_ttl(params.ttl.as_deref(), params.ttl_days)?;
@@ -517,6 +541,7 @@ impl Pastebin {
             content_type: params.content_type,
             title: params.title,
             tags: params.tags.unwrap_or_default(),
+            created_by: creator_addr(&ctx),
         };
         let stored = try_store!(
             self.current_store()
@@ -591,7 +616,7 @@ impl Pastebin {
             return Ok(result);
         }
         let meta = try_store!(store.set_ttl(&params.id, ttl).await);
-        result_json(metadata_json(meta))
+        result_json(metadata_json(meta, store.config.expose_creator_addr))
     }
 
     #[tool(
@@ -723,8 +748,9 @@ impl Pastebin {
         &self,
         Parameters(params): Parameters<IdParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let meta = try_store!(self.current_store().head_metadata_live(&params.id).await);
-        result_json(metadata_json(meta))
+        let store = self.current_store();
+        let meta = try_store!(store.head_metadata_live(&params.id).await);
+        result_json(metadata_json(meta, store.config.expose_creator_addr))
     }
 
     #[tool(
