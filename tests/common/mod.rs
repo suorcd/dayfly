@@ -232,6 +232,7 @@ impl FakeS3 {
             inline_pdf: true,
             view_line_numbers: false,
             allow_unauthenticated: false,
+            write_requires_token: false,
             list_requires_token: false,
             list_enabled: true,
             paste_tokens: false,
@@ -1224,6 +1225,13 @@ pub fn multipart_fields_only(boundary: &str, fields: &[(&str, &str)]) -> Vec<u8>
 /// Make a store config with a custom bearer token.
 pub fn config_with_token(mut config: Config, token: &str) -> Config {
     config.http_bearer_token = Some(token.to_string());
+    config
+}
+
+/// Make a store config that requires the bearer token for writes only.
+pub fn config_with_write_token(mut config: Config, token: &str) -> Config {
+    config.http_bearer_token = Some(token.to_string());
+    config.write_requires_token = true;
     config
 }
 

@@ -592,6 +592,483 @@ async fn bearer_auth_is_required_and_accepted_on_api_and_ui() {
     assert_eq!(status, StatusCode::OK);
 }
 
+#[tokio::test]
+async fn write_auth_allows_anonymous_reads() {
+    let fake = FakeS3::start().await;
+    let config = common::config_with_write_token(fake.config(), "secret-token");
+    let store = Store::from_config(config)
+        .await
+        .expect("the write-only store must build");
+    let stored = store
+        .store_text(b"public read text", None, None, Some(Ttl::days(1)))
+        .await
+        .expect("the read target must store");
+    let app = common::full_app(store);
+
+    let reads = [
+        ("GET", format!("/v1/pastes/{}", stored.id)),
+        ("HEAD", format!("/v1/pastes/{}", stored.id)),
+        ("GET", format!("/v1/pastes/{}/meta", stored.id)),
+        ("GET", format!("/v1/pastes/{}/search?q=public", stored.id)),
+        ("GET", format!("/raw/{}", stored.id)),
+        ("GET", format!("/view/{}", stored.id)),
+        ("GET", "/".to_string()),
+        ("GET", "/pastes".to_string()),
+        ("GET", "/v1/pastes".to_string()),
+    ];
+    for (method, uri) in reads {
+        let request = common::request(method, &uri, &[], Vec::new());
+        let (status, _, body) = common::send(&app, request).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{method} {uri} must stay anonymous: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}
+
+#[tokio::test]
+async fn write_auth_gates_writes_with_the_bearer_token() {
+    let fake = FakeS3::start().await;
+    let config = common::config_with_write_token(fake.config(), "secret-token");
+    let store = Store::from_config(config)
+        .await
+        .expect("the write-only store must build");
+    let stored = store
+        .store_text(b"public read text", None, None, Some(Ttl::days(1)))
+        .await
+        .expect("the write target must store");
+    let stored_key = stored.key.clone();
+    let app = common::full_app(store);
+    let requests_before = fake.requests().len();
+
+    let body = b"blocked".to_vec();
+    let request = common::request(
+        "POST",
+        "/upload",
+        &[content_length(body.len())],
+        body.clone(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        fake.requests().len(),
+        requests_before,
+        "an anonymous upload must not reach S3"
+    );
+
+    let request = common::request(
+        "POST",
+        &format!("/v1/pastes/{}/append", stored.id),
+        &[("content-length", "1".to_string())],
+        b"x".to_vec(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let request = common::request(
+        "PATCH",
+        &format!("/v1/pastes/{}", stored.id),
+        &[("x-ttl", "1h".to_string())],
+        Vec::new(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let request = common::request(
+        "DELETE",
+        &format!("/v1/pastes/{}", stored.id),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(
+        fake.object(&stored_key).is_some(),
+        "an anonymous delete must keep the paste"
+    );
+
+    let form = b"text=blocked".to_vec();
+    let request = common::request(
+        "POST",
+        "/ui/text",
+        &[
+            ("host", "localhost".to_string()),
+            ("origin", "http://localhost".to_string()),
+            (
+                "content-type",
+                "application/x-www-form-urlencoded".to_string(),
+            ),
+            ("content-length", form.len().to_string()),
+        ],
+        form,
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let form = format!("id={}", stored.id).into_bytes();
+    let request = common::request(
+        "POST",
+        "/ui/delete",
+        &[
+            ("host", "localhost".to_string()),
+            ("origin", "http://localhost".to_string()),
+            (
+                "content-type",
+                "application/x-www-form-urlencoded".to_string(),
+            ),
+            ("content-length", form.len().to_string()),
+        ],
+        form,
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(
+        fake.object(&stored_key).is_some(),
+        "an anonymous human delete must keep the paste"
+    );
+
+    let boundary = "write-auth-create";
+    let body = common::multipart_fields_only(boundary, &[("text", "blocked")]);
+    let request = common::request(
+        "POST",
+        "/ui/create",
+        &multipart_headers(boundary)
+            .into_iter()
+            .chain([("content-length", body.len().to_string())])
+            .collect::<Vec<_>>(),
+        body,
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let boundary = "write-auth-upload";
+    let body = common::multipart_body(
+        boundary,
+        Some("blocked.txt"),
+        Some("text/plain"),
+        b"blocked",
+        &[],
+    );
+    let request = common::request(
+        "POST",
+        "/ui/upload",
+        &multipart_headers(boundary)
+            .into_iter()
+            .chain([("content-length", body.len().to_string())])
+            .collect::<Vec<_>>(),
+        body,
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _, _) = mcp_post_with_auth(&app, &initialize_body(), None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let request = common::request(
+        "POST",
+        "/upload",
+        &[
+            ("authorization", "Bearer secret-token".to_string()),
+            content_length("allowed".len()),
+        ],
+        b"allowed".to_vec(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let request = common::request(
+        "POST",
+        &format!("/v1/pastes/{}/append", stored.id),
+        &[
+            ("authorization", "Bearer secret-token".to_string()),
+            ("content-length", "1".to_string()),
+        ],
+        b"y".to_vec(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let request = common::request(
+        "PATCH",
+        &format!("/v1/pastes/{}", stored.id),
+        &[
+            ("authorization", "Bearer secret-token".to_string()),
+            ("x-ttl", "1h".to_string()),
+        ],
+        Vec::new(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let form = b"text=allowed".to_vec();
+    let request = common::request(
+        "POST",
+        "/ui/text",
+        &[
+            ("host", "localhost".to_string()),
+            ("origin", "http://localhost".to_string()),
+            ("authorization", "Bearer secret-token".to_string()),
+            (
+                "content-type",
+                "application/x-www-form-urlencoded".to_string(),
+            ),
+            ("content-length", form.len().to_string()),
+        ],
+        form,
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let form = format!("id={}", stored.id).into_bytes();
+    let request = common::request(
+        "POST",
+        "/ui/delete",
+        &[
+            ("host", "localhost".to_string()),
+            ("origin", "http://localhost".to_string()),
+            ("authorization", "Bearer secret-token".to_string()),
+            (
+                "content-type",
+                "application/x-www-form-urlencoded".to_string(),
+            ),
+            ("content-length", form.len().to_string()),
+        ],
+        form,
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(
+        fake.object(&stored_key).is_none(),
+        "the bearer token must allow the human delete"
+    );
+
+    initialize_mcp_session_with_auth(&app, Some("Bearer secret-token")).await;
+}
+
+#[tokio::test]
+async fn write_auth_keeps_the_list_gate_independent() {
+    let fake = FakeS3::start().await;
+    let mut config = common::config_with_write_token(fake.config(), "secret-token");
+    config.list_requires_token = true;
+    let store = Store::from_config(config)
+        .await
+        .expect("the write-only list store must build");
+    let stored = store
+        .store_text(b"public read text", None, None, Some(Ttl::days(1)))
+        .await
+        .expect("the read target must store");
+    let app = common::full_app(store);
+
+    for uri in ["/v1/pastes", "/pastes"] {
+        let request = common::request("GET", uri, &[], Vec::new());
+        let (status, _, _) = common::send(&app, request).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the list gate must still require the token on {uri}"
+        );
+    }
+
+    let request = common::request("GET", &format!("/v1/pastes/{}", stored.id), &[], Vec::new());
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the list gate must not gate a single download"
+    );
+
+    for uri in ["/v1/pastes", "/pastes"] {
+        let request = common::request(
+            "GET",
+            uri,
+            &[("authorization", "Bearer secret-token".to_string())],
+            Vec::new(),
+        );
+        let (status, _, _) = common::send(&app, request).await;
+        assert_eq!(status, StatusCode::OK, "the token must open {uri}");
+    }
+}
+
+#[tokio::test]
+async fn write_auth_reports_write_bearer_and_gated_routes() {
+    let fake = FakeS3::start().await;
+    let config = common::config_with_write_token(fake.config(), "secret-token");
+    let store = Store::from_config(config)
+        .await
+        .expect("the write-only store must build");
+    let app = common::app(store);
+
+    let request = common::request("GET", "/.well-known/dayfly.json", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let info = common::json_body(&body);
+    assert_eq!(info["auth"], "write-bearer");
+    assert_eq!(info["write_requires_token"], true);
+    let routes: Vec<&str> = info["write_routes"]
+        .as_array()
+        .expect("write_routes must be an array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for expected in [
+        "POST /upload",
+        "POST /v1/pastes",
+        "POST /v1/pastes/{random}/append",
+        "DELETE /v1/pastes/{random}",
+        "PATCH /v1/pastes/{random}",
+        "POST /ui/create",
+        "POST /ui/text",
+        "POST /ui/upload",
+        "POST /ui/delete",
+        "/mcp",
+    ] {
+        assert!(
+            routes.contains(&expected),
+            "the service document must name {expected}: {info}"
+        );
+    }
+    assert!(
+        routes.iter().all(|route| !route.starts_with("GET ")),
+        "the service document must not name a read route as gated: {info}"
+    );
+}
+
+#[tokio::test]
+async fn write_auth_off_reports_bearer_auth_without_gated_routes() {
+    let fake = FakeS3::start().await;
+    let config = common::config_with_token(fake.config(), "secret-token");
+    let store = Store::from_config(config)
+        .await
+        .expect("the bearer store must build");
+    let app = common::app(store);
+
+    let request = common::request("GET", "/.well-known/dayfly.json", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let info = common::json_body(&body);
+    assert_eq!(info["auth"], "bearer");
+    assert_eq!(info["write_requires_token"], false);
+    assert_eq!(info["write_routes"], json!([]));
+}
+
+#[tokio::test]
+async fn write_auth_off_keeps_reads_gated_by_the_bearer_token() {
+    let fake = FakeS3::start().await;
+    let config = common::config_with_token(fake.config(), "secret-token");
+    let store = Store::from_config(config)
+        .await
+        .expect("the bearer store must build");
+    let stored = store
+        .store_text(b"private read", None, None, Some(Ttl::days(1)))
+        .await
+        .expect("the read target must store");
+    let app = common::full_app(store);
+
+    for uri in [
+        format!("/v1/pastes/{}", stored.id),
+        format!("/v1/pastes/{}/meta", stored.id),
+        format!("/view/{}", stored.id),
+    ] {
+        let request = common::request("GET", &uri, &[], Vec::new());
+        let (status, _, _) = common::send(&app, request).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{uri} must require a token"
+        );
+    }
+
+    for uri in [
+        format!("/v1/pastes/{}", stored.id),
+        format!("/v1/pastes/{}/meta", stored.id),
+        format!("/view/{}", stored.id),
+    ] {
+        let request = common::request(
+            "GET",
+            &uri,
+            &[("authorization", "Bearer secret-token".to_string())],
+            Vec::new(),
+        );
+        let (status, _, _) = common::send(&app, request).await;
+        assert_eq!(status, StatusCode::OK, "{uri} must accept the token");
+    }
+}
+
+#[tokio::test]
+async fn write_auth_keeps_paste_tokens_authorized() {
+    let fake = FakeS3::start().await;
+    let mut config = common::config_with_write_token(fake.config(), "secret-token");
+    config.paste_tokens = true;
+    let store = Store::from_config(config)
+        .await
+        .expect("the write-only token store must build");
+    let deleted = store
+        .store_text(b"delete me", None, None, Some(Ttl::days(1)))
+        .await
+        .expect("the delete target must store");
+    let patched = store
+        .store_text(b"patch me", None, None, Some(Ttl::days(1)))
+        .await
+        .expect("the patch target must store");
+    let appended = store
+        .store_text(b"append me", None, None, Some(Ttl::days(1)))
+        .await
+        .expect("the append target must store");
+    let deleted_token = deleted.paste_token.clone().expect("the delete token");
+    let patched_token = patched.paste_token.clone().expect("the patch token");
+    let appended_token = appended.paste_token.clone().expect("the append token");
+    let deleted_key = deleted.key.clone();
+    let app = common::full_app(store);
+
+    let request = common::request(
+        "DELETE",
+        &format!("/v1/pastes/{}", deleted.id),
+        &[("x-paste-token", deleted_token)],
+        Vec::new(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "a paste token must still authorize its own delete"
+    );
+    assert!(fake.object(&deleted_key).is_none());
+
+    let request = common::request(
+        "PATCH",
+        &format!("/v1/pastes/{}", patched.id),
+        &[
+            ("x-ttl", "1h".to_string()),
+            ("x-paste-token", patched_token),
+        ],
+        Vec::new(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a paste token must still authorize its own expiry change"
+    );
+
+    let request = common::request(
+        "POST",
+        &format!("/v1/pastes/{}/append", appended.id),
+        &[
+            ("x-paste-token", appended_token),
+            ("content-length", "1".to_string()),
+        ],
+        b"z".to_vec(),
+    );
+    let (status, _, _) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a paste token must still authorize its own append"
+    );
+}
+
 async fn upload_named(app: &Router, content_type: &str, filename: &str, body: Vec<u8>) -> String {
     let request = common::request(
         "POST",

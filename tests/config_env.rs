@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use dayfly::config::{Config, ConfigError};
 
-const VARS: [&str; 34] = [
+const VARS: [&str; 35] = [
     "S3_ENDPOINT",
     "S3_BUCKET",
     "S3_REGION",
@@ -33,6 +33,7 @@ const VARS: [&str; 34] = [
     "DAYFLY_METRICS_ALLOWED_NETWORKS",
     "DAYFLY_TRUSTED_PROXIES",
     "DAYFLY_LIST_REQUIRES_TOKEN",
+    "DAYFLY_WRITE_REQUIRES_TOKEN",
     "DAYFLY_PASTE_TOKENS",
     "DAYFLY_EXPOSE_CREATOR_ADDR",
     "DAYFLY_RATE_LIMIT_PER_MINUTE",
@@ -621,6 +622,48 @@ fn bearer_token_with_whitespace_is_rejected() {
         error,
         ConfigError::Invalid(ref name, _) if name == "DAYFLY_HTTP_BEARER_TOKEN"
     ));
+}
+
+#[test]
+fn write_requires_token_needs_a_bearer_token() {
+    let _guard = lock_env();
+    clear_env();
+    set_required();
+    env::set_var("DAYFLY_WRITE_REQUIRES_TOKEN", "true");
+    let error = Config::from_env()
+        .err()
+        .expect("write auth without a bearer token must fail");
+    match error {
+        ConfigError::Invalid(name, message) => {
+            assert_eq!(name, "DAYFLY_WRITE_REQUIRES_TOKEN");
+            assert!(
+                message.contains("DAYFLY_HTTP_BEARER_TOKEN"),
+                "message: {message}"
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn write_requires_token_accepts_a_bearer_token() {
+    let _guard = lock_env();
+    clear_env();
+    set_required();
+    env::set_var("DAYFLY_WRITE_REQUIRES_TOKEN", "true");
+    env::set_var("DAYFLY_HTTP_BEARER_TOKEN", "secret-token");
+    let config = Config::from_env().expect("write auth config must parse");
+    assert!(config.write_requires_token);
+    assert_eq!(config.http_bearer_token.as_deref(), Some("secret-token"));
+}
+
+#[test]
+fn write_requires_token_defaults_to_false() {
+    let _guard = lock_env();
+    clear_env();
+    set_required();
+    let config = Config::from_env().expect("default config must parse");
+    assert!(!config.write_requires_token);
 }
 
 #[test]

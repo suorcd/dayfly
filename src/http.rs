@@ -8,9 +8,11 @@
 //! Deployment note (see README): the intended deployment is
 //! private-network / localhost. When `DAYFLY_HTTP_BEARER_TOKEN` is
 //! set, every HTTP route requires `Authorization: Bearer <token>`.
-//! That token is a simple option for the binary's own endpoint; it is
-//! not the Garage credential and bucket privacy is not a substitute
-//! for securing this endpoint.
+//! With `DAYFLY_WRITE_REQUIRES_TOKEN` on, reads stay anonymous and
+//! only the mutating routes require the token. That token is a simple
+//! option for the binary's own endpoint; it is not the Garage
+//! credential and bucket privacy is not a substitute for securing
+//! this endpoint.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -170,6 +172,22 @@ pub(crate) fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Re
     }
 }
 
+/// Check whether a read may proceed.
+///
+/// With `DAYFLY_WRITE_REQUIRES_TOKEN` on, reads are anonymous and the
+/// bearer token gates only the mutating routes. With it off, this is the
+/// same check as [`check_auth`], so an existing deployment keeps its
+/// current behavior.
+// Axum handlers return `Response` directly; boxing it here would only add
+// indirection at every call site.
+#[allow(clippy::result_large_err)]
+pub(crate) fn check_read_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    if state.store().config.write_requires_token {
+        return Ok(());
+    }
+    check_auth(state, headers)
+}
+
 fn unauthorized_response() -> Response {
     (
         StatusCode::UNAUTHORIZED,
@@ -227,11 +245,12 @@ pub(crate) enum ListAccessError {
 
 /// Check whether a request may list pastes.
 ///
-/// With `DAYFLY_LIST_REQUIRES_TOKEN` off this is exactly [`check_auth`], so
-/// listing keeps today's behaviour in both the token and no-token cases.
-/// With it on, the bearer token is required even when reads are anonymous.
-/// When no token is configured, the request is refused: there is nothing to
-/// check against. The missing-token decision is shared with MCP.
+/// With `DAYFLY_LIST_REQUIRES_TOKEN` off, listing follows the read rule.
+/// It is gated by [`check_auth`] when write mode is off, and anonymous when
+/// write mode is on. With the gate on, the bearer token is required even
+/// when reads are anonymous. When no token is configured, the request is
+/// refused: there is nothing to check against. The missing-token decision
+/// is shared with MCP.
 // The error carries the shared auth response unchanged. Boxing it here
 // would only add an allocation at every refused listing request.
 #[allow(clippy::result_large_err)]
@@ -241,7 +260,7 @@ pub(crate) fn check_list_access(
 ) -> Result<(), ListAccessError> {
     let store = state.store();
     if !store.config.list_requires_token {
-        return check_auth(state, headers).map_err(ListAccessError::Unauthorized);
+        return check_read_auth(state, headers).map_err(ListAccessError::Unauthorized);
     }
     if store.config.list_token_gate_denied() {
         return Err(ListAccessError::MissingToken);
@@ -839,7 +858,7 @@ async fn multipart_inner(
 }
 
 async fn meta_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response {
-    if let Err(resp) = check_auth(state, headers) {
+    if let Err(resp) = check_read_auth(state, headers) {
         return resp;
     }
     let store = state.store();
@@ -866,7 +885,7 @@ async fn search_inner(
     id: &str,
     query: &HashMap<String, String>,
 ) -> Response {
-    if let Err(resp) = check_auth(state, headers) {
+    if let Err(resp) = check_read_auth(state, headers) {
         return resp;
     }
     let Some(text) = query.get("q").filter(|value| !value.is_empty()) else {
@@ -959,7 +978,7 @@ async fn download_response(
     is_head: bool,
     raw_fallback: bool,
 ) -> Response {
-    if let Err(resp) = check_auth(state, headers) {
+    if let Err(resp) = check_read_auth(state, headers) {
         return resp;
     }
     let store = state.store();
@@ -2125,15 +2144,38 @@ pub fn service_info(store: &Store) -> serde_json::Value {
             })
         })
         .collect();
+    let write_routes: Vec<&str> = if config.write_requires_token {
+        vec![
+            "POST /upload",
+            "POST /v1/pastes",
+            "POST /v1/pastes/{date}/{random}/append",
+            "POST /v1/pastes/{random}/append",
+            "DELETE /v1/pastes/{date}/{random}",
+            "DELETE /v1/pastes/{random}",
+            "PATCH /v1/pastes/{date}/{random}",
+            "PATCH /v1/pastes/{random}",
+            "POST /ui/create",
+            "POST /ui/text",
+            "POST /ui/upload",
+            "POST /ui/delete",
+            "/mcp",
+        ]
+    } else {
+        Vec::new()
+    };
     serde_json::json!({
         "name": "dayfly",
         "version": env!("CARGO_PKG_VERSION"),
         "mcp_endpoint": "/mcp",
-        "auth": if config.http_bearer_token.is_some() {
+        "auth": if config.write_requires_token {
+            "write-bearer"
+        } else if config.http_bearer_token.is_some() {
             "bearer"
         } else {
             "none"
         },
+        "write_requires_token": config.write_requires_token,
+        "write_routes": write_routes,
         "paste_tokens": config.paste_tokens,
         "expose_creator_addr": config.expose_creator_addr,
         "listing_enabled": config.list_enabled,
@@ -2291,6 +2333,7 @@ mod tests {
             inline_pdf: true,
             view_line_numbers: false,
             allow_unauthenticated: false,
+            write_requires_token: false,
             list_requires_token: false,
             list_enabled: true,
             paste_tokens: false,

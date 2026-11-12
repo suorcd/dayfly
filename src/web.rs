@@ -53,8 +53,8 @@ use serde::Deserialize;
 use crate::client_addr::ClientAddr;
 use crate::config::{Config, LISTING_DISABLED_MESSAGE};
 use crate::http::{
-    check_auth, check_list_access, check_paste_control, public_base, read_metadata_field,
-    split_tags, status_for, AppState, ListAccessError, MultipartFieldError,
+    check_auth, check_list_access, check_paste_control, check_read_auth, public_base,
+    read_metadata_field, split_tags, status_for, AppState, ListAccessError, MultipartFieldError,
     MULTIPART_METADATA_MAX_BYTES,
 };
 use crate::store::{
@@ -684,7 +684,7 @@ fn forbidden_page() -> Response {
 }
 
 async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(resp) = check_auth(&state, &headers) {
+    if let Err(resp) = check_read_auth(&state, &headers) {
         return resp;
     }
     let store = state.store();
@@ -1666,7 +1666,7 @@ fn text_pre_view(text: &str, line_numbers: bool) -> String {
 }
 
 async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response {
-    if let Err(resp) = check_auth(state, headers) {
+    if let Err(resp) = check_read_auth(state, headers) {
         return resp;
     }
     let store = state.store();
@@ -1906,6 +1906,7 @@ mod tests {
             inline_pdf: true,
             view_line_numbers: false,
             allow_unauthenticated: false,
+            write_requires_token: false,
             list_requires_token: false,
             list_enabled: true,
             paste_tokens: false,

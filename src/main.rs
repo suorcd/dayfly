@@ -216,6 +216,7 @@ fn check_config_file(path: Option<PathBuf>, explicit: bool, strict: bool) -> any
             "DAYFLY_SHOW_WORDS"
             | "DAYFLY_INLINE_PDF"
             | "DAYFLY_EXPOSE_CREATOR_ADDR"
+            | "DAYFLY_WRITE_REQUIRES_TOKEN"
                 if parse_bool_flag(&value).is_none() =>
             {
                 faults.push(format!("{}: expected true or false", field.name));
@@ -243,6 +244,13 @@ fn check_config_file(path: Option<PathBuf>, explicit: bool, strict: bool) -> any
             }
             _ => {}
         }
+    }
+
+    if lookup("DAYFLY_WRITE_REQUIRES_TOKEN").and_then(|value| parse_bool_flag(&value)) == Some(true)
+        && lookup("DAYFLY_HTTP_BEARER_TOKEN").is_none()
+        && lookup("DAYFLY_HTTP_BEARER_TOKEN_FILE").is_none()
+    {
+        faults.push("DAYFLY_WRITE_REQUIRES_TOKEN requires DAYFLY_HTTP_BEARER_TOKEN".to_string());
     }
 
     for (direct, file) in [
