@@ -359,10 +359,10 @@ missing default file is ignored. A named file must exist.
 The file holds one `NAME=VALUE` pair per line. Blank lines and lines
 that start with `#` are ignored. A leading `export` and one pair of
 matching single or double quotes are accepted. A relative secret-file
-path in the file resolves against the directory of the file. An
-exported relative secret-file path resolves against the working
-directory. Never commit a real `.env`; copy `.env.example` to a path
-you choose and pass it with `--config`. The `.env` name is in
+or asset path in the file resolves against the directory of the file.
+An exported relative secret-file or asset path resolves against the
+working directory. Never commit a real `.env`; copy `.env.example` to
+a path you choose and pass it with `--config`. The `.env` name is in
 `.gitignore`.
 
 ```sh
@@ -492,10 +492,10 @@ supervise it. There is no daemon mode.
 
 ### Reload
 
-`serve` watches the environment file and the credential files that it
-names. It reloads when one of them changes. The watch checks the
-modification time every 2 seconds. A container cannot send a signal to
-itself, so the files are the trigger.
+`serve` watches the environment file, the credential files, and the
+asset files that it names. It reloads when one of them changes. The
+watch checks the modification time every 2 seconds. A container cannot
+send a signal to itself, so the files are the trigger.
 
 A reload reads the same sources as startup: the process environment
 first, then the file. These settings take effect on the next request:
@@ -511,7 +511,8 @@ first, then the file. These settings take effect on the next request:
   `DAYFLY_RETENTION_MAX_DAYS`
 - `DAYFLY_SHOW_WORDS`
 - `DAYFLY_INLINE_PDF`
-- `DAYFLY_ROBOTS_TXT_PATH` and `DAYFLY_SECURITY_TXT_PATH`
+- `DAYFLY_FAVICON_PATH`, `DAYFLY_ROBOTS_TXT_PATH`, and
+  `DAYFLY_SECURITY_TXT_PATH`
 - `DAYFLY_TRUSTED_PROXIES`
 - `DAYFLY_METRICS_ALLOWED_NETWORKS`
 - `DAYFLY_WRITE_REQUIRES_TOKEN`

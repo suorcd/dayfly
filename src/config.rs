@@ -1011,8 +1011,21 @@ fn read_credential_file(file_variable: &str, path: &str) -> Result<String, Confi
     Ok(value.to_string())
 }
 
-/// Resolve relative secret-file paths against the env file directory.
-fn resolve_secret_paths(values: &mut HashMap<String, String>, base: Option<&Path>) {
+/// Variables that name a local file that the configuration reads.
+const CONFIG_FILE_VARIABLES: &[&str] = &[
+    "S3_ACCESS_KEY_ID_FILE",
+    "S3_SECRET_ACCESS_KEY_FILE",
+    "DAYFLY_HTTP_BEARER_TOKEN_FILE",
+    "DAYFLY_FAVICON_PATH",
+    "DAYFLY_ROBOTS_TXT_PATH",
+    "DAYFLY_SECURITY_TXT_PATH",
+];
+
+/// Resolve relative file paths against the env file directory.
+///
+/// The secret files and the asset files follow the same rule at startup
+/// and during a reload watch.
+fn resolve_file_paths(values: &mut HashMap<String, String>, base: Option<&Path>) {
     let Some(base) = base else {
         return;
     };
@@ -1021,11 +1034,7 @@ fn resolve_secret_paths(values: &mut HashMap<String, String>, base: Option<&Path
     } else {
         base
     };
-    for name in [
-        "S3_ACCESS_KEY_ID_FILE",
-        "S3_SECRET_ACCESS_KEY_FILE",
-        "DAYFLY_HTTP_BEARER_TOKEN_FILE",
-    ] {
+    for &name in CONFIG_FILE_VARIABLES {
         if let Some(value) = values.get_mut(name) {
             let trimmed = value.trim();
             if !trimmed.is_empty() && Path::new(trimmed).is_relative() {
@@ -1425,8 +1434,8 @@ fn credential_directory_warning_parts(
 /// The merged process environment and an optional environment file.
 ///
 /// A process environment value wins over the same name in the file. A
-/// relative secret-file path in the file resolves against the file
-/// directory.
+/// relative secret-file or asset path in the file resolves against the
+/// file directory.
 pub struct ConfigSource {
     file_values: HashMap<String, String>,
 }
@@ -1437,7 +1446,7 @@ impl ConfigSource {
         let file_values = match path {
             Some(path) => {
                 let mut values = read_env_file(path)?;
-                resolve_secret_paths(&mut values, path.parent());
+                resolve_file_paths(&mut values, path.parent());
                 values
             }
             None => HashMap::new(),
@@ -1520,7 +1529,8 @@ impl Config {
     /// The file format is one `NAME=VALUE` pair per line. Blank lines and
     /// lines that start with `#` are ignored. A leading `export` and one
     /// pair of matching single or double quotes are accepted. A relative
-    /// secret-file path in the file resolves against the file directory.
+    /// secret-file or asset path in the file resolves against the file
+    /// directory.
     pub fn from_env_file(path: Option<&Path>) -> Result<Self, ConfigError> {
         Self::validate_from_env_file(path)?.into_result()
     }
@@ -1546,27 +1556,23 @@ impl Config {
 
     /// Files that a reload watch must follow.
     ///
-    /// The result starts with `env_file`. It adds each secret file that
-    /// the process environment or the file selects. A relative secret
-    /// path in the file resolves against the file directory, as at
-    /// startup.
+    /// The result starts with `env_file`. It adds each secret file and
+    /// each asset file that the process environment or the file selects.
+    /// A relative path in the file resolves against the file directory,
+    /// as at startup.
     pub fn watch_paths(env_file: &Path) -> Vec<PathBuf> {
         let mut paths = vec![env_file.to_path_buf()];
         let Ok(mut values) = read_env_file(env_file) else {
             return paths;
         };
-        resolve_secret_paths(&mut values, env_file.parent());
+        resolve_file_paths(&mut values, env_file.parent());
         let lookup = |name: &str| {
             env::var(name)
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .or_else(|| values.get(name).cloned())
         };
-        for name in [
-            "S3_ACCESS_KEY_ID_FILE",
-            "S3_SECRET_ACCESS_KEY_FILE",
-            "DAYFLY_HTTP_BEARER_TOKEN_FILE",
-        ] {
+        for &name in CONFIG_FILE_VARIABLES {
             if let Some(path) = lookup(name) {
                 let path = PathBuf::from(path.trim());
                 if !path.as_os_str().is_empty() && !paths.contains(&path) {
