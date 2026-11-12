@@ -242,6 +242,7 @@ fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> 
         | StoreError::TooManySegments { .. }
         | StoreError::NotText(_)
         | StoreError::RangeNotSatisfiable
+        | StoreError::CopyLimit { .. }
         | StoreError::QuotaExceeded => Ok(tool_error(e.code(), e.to_string())),
         StoreError::InvalidId(_)
         | StoreError::InvalidDate(_)

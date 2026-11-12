@@ -79,10 +79,12 @@ pub struct FakeState {
     pub fail_head_errors: Vec<(String, StatusCode, String)>,
     pub fail_list_prefixes: Vec<(String, StatusCode, String)>,
     pub fail_put_prefixes: Vec<String>,
+    pub fail_put_errors: Vec<(String, StatusCode, String, String)>,
     pub fail_get_prefixes: Vec<String>,
     pub fail_copy_keys: Vec<String>,
     pub fail_copy_once_keys: Vec<String>,
     pub fail_delete_keys: Vec<String>,
+    pub reported_sizes: BTreeMap<String, u64>,
     pub missing_bucket: bool,
 }
 
@@ -448,6 +450,32 @@ impl FakeS3 {
             .push(prefix.to_string());
     }
 
+    /// Make PutObject whose key starts with `prefix` fail with one S3 error.
+    pub fn fail_put_with(&self, prefix: &str, status: StatusCode, code: &str, message: &str) {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .fail_put_errors
+            .push((
+                prefix.to_string(),
+                status,
+                code.to_string(),
+                message.to_string(),
+            ));
+    }
+
+    /// Report a different Content-Length for one object on HEAD.
+    ///
+    /// A test uses this to cross the 5 GB copy limit without allocating
+    /// a 5 GB body.
+    pub fn set_reported_size(&self, key: &str, size: u64) {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .reported_sizes
+            .insert(key.to_string(), size);
+    }
+
     /// Make every GetObject whose key starts with `prefix` fail.
     pub fn fail_get_prefix(&self, prefix: &str) {
         self.state
@@ -493,6 +521,7 @@ impl FakeS3 {
         state.fail_head_errors.clear();
         state.fail_list_prefixes.clear();
         state.fail_put_prefixes.clear();
+        state.fail_put_errors.clear();
         state.fail_get_prefixes.clear();
         state.fail_copy_keys.clear();
         state.fail_copy_once_keys.clear();
@@ -586,7 +615,7 @@ fn split_path(uri: &Uri, bucket: &str) -> Option<String> {
     Some(key.to_string())
 }
 
-fn object_headers(object: &S3Object) -> HeaderMap {
+fn object_headers(object: &S3Object, size: u64) -> HeaderMap {
     let mut headers = HeaderMap::new();
     if !object.content_type.is_empty() {
         headers.insert(
@@ -606,10 +635,7 @@ fn object_headers(object: &S3Object) -> HeaderMap {
     );
     headers.insert(
         header::CONTENT_LENGTH,
-        object
-            .body
-            .len()
-            .to_string()
+        size.to_string()
             .parse()
             .expect("length must be a valid header"),
     );
@@ -743,6 +769,13 @@ fn put_object(
             "injected PutObject failure",
         );
     }
+    if let Some((_, status, code, message)) = state
+        .fail_put_errors
+        .iter()
+        .find(|(prefix, _, _, _)| key.starts_with(prefix))
+    {
+        return s3_error(*status, code, message);
+    }
     let object = S3Object {
         body: body.to_vec(),
         content_type: content_type_from_headers(headers),
@@ -814,7 +847,16 @@ fn get_object(
             return s3_error(*status, code, "injected HeadObject failure");
         }
     }
-    let mut resp_headers = object_headers(object);
+    let reported_size = if is_head {
+        state
+            .reported_sizes
+            .get(&key)
+            .copied()
+            .unwrap_or(object.body.len() as u64)
+    } else {
+        object.body.len() as u64
+    };
+    let mut resp_headers = object_headers(object, reported_size);
     if is_head {
         return (StatusCode::OK, resp_headers, Body::empty()).into_response();
     }
