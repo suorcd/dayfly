@@ -7,7 +7,7 @@
         "Prefix": "pastes/"
       },
       "Expiration": {
-        "Days": 90
+        "Days": 3651
       },
       "AbortIncompleteMultipartUpload": {
         "DaysAfterInitiation": 7
