@@ -178,15 +178,20 @@ filter a list by author.
 `DAYFLY_LIST_REQUIRES_TOKEN` separates "public downloads" from "private
 listing" when listing is on. With the default `false`, listing follows
 the global token rule: gated when `DAYFLY_HTTP_BEARER_TOKEN` is set,
-open when it is not. When `true`, `GET /v1/pastes` and the human
-`/pastes` page require the bearer token even if reads are otherwise
-anonymous. If the setting is on and no token is configured, both routes
-refuse with 401 and a message naming the missing variable: there is
-nothing to check against, and an open list is what the setting prevents.
-The human page renders a 401 page rather than an empty table. A browser
-cannot send an `Authorization` header, so put an authenticating proxy in
-front of `/pastes`, or use the API with the token. `DAYFLY_LIST_ENABLED`
-wins over this setting.
+open when it is not. When `true`, `GET /v1/pastes`, the human `/pastes`
+page, and the MCP `list_recent` tool require the bearer token even if
+reads are otherwise anonymous. If the setting is on and no token is
+configured, all three refuse and the message names the missing variable:
+there is nothing to check against, and an open list is what the setting
+prevents. The human page renders a 401 page rather than an empty table. A
+browser cannot send an `Authorization` header, so put an authenticating
+proxy in front of `/pastes`, or use the API with the token.
+`DAYFLY_LIST_ENABLED` wins over this setting.
+
+The HTTP `/mcp` endpoint requires the bearer token when one is
+configured. The stdio transport is the local trust boundary and accepts
+`list_recent` when a token is configured. With no token configured, both
+transports refuse `list_recent`.
 
 `DAYFLY_RATE_LIMIT_PER_MINUTE` caps requests per client per minute. It
 is a token bucket keyed on the resolved client address: the burst is the
@@ -392,7 +397,7 @@ permissions and the lower total cap.
 | `DAYFLY_RATE_LIMIT_PER_MINUTE` | no | 0 | Maximum requests per client per minute. 0 disables the limiter and allocates no counters. The burst is this value, and the bucket refills at this rate. Over the limit → 429 with `Retry-After`. Keyed on the resolved client address, so set `DAYFLY_TRUSTED_PROXIES` behind an ingress. Per process; resets on restart |
 | `DAYFLY_ALLOW_UNAUTHENTICATED` | no | `false` | Accept a non-loopback bind with no bearer token. Startup refuses that bind without this value, and with it the service writes one warning. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_LIST_ENABLED` | no | `true` | Allow listing on every transport. `false` makes `/pastes`, `GET /v1/pastes`, and the MCP `list_recent` tool return 403 with "Listing is turned off on this instance." It wins over `DAYFLY_LIST_REQUIRES_TOKEN`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
-| `DAYFLY_LIST_REQUIRES_TOKEN` | no | `false` | Require the bearer token for `GET /v1/pastes` and the human `/pastes` page even when reads are anonymous. With this on and no token configured, both routes refuse with 401: there is nothing to check. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
+| `DAYFLY_LIST_REQUIRES_TOKEN` | no | `false` | Require the bearer token for `GET /v1/pastes`, the human `/pastes` page, and the MCP `list_recent` tool even when reads are anonymous. With this on and no token configured, all three refuse: there is nothing to check. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_PASTE_TOKENS` | no | `false` | Return a 128-bit management token at creation. The JSON store response carries `paste_token`; the plain response carries `X-Paste-Token`. The token authorizes `DELETE` and `PATCH` for that paste. Only its SHA-256 is stored. The bearer token remains universal. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_EXPOSE_CREATOR_ADDR` | no | `false` | Return the stored `created-by` address in the meta route, the `X-Created-By` header on `HEAD`, and the MCP `fetch_metadata` tool. The access log includes the client address only when this is on. An address is personal data, so the default hides it. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_SHOW_WORDS` | no | `true` | Show the generated word alias in the human UI: create redirects, the view page, and the paste list. Display only; the JSON/MCP responses still include `words`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |

@@ -225,20 +225,13 @@ pub(crate) enum ListAccessError {
     MissingToken,
 }
 
-impl ListAccessError {
-    /// A message safe to show a client. It names the setting and the
-    /// missing variable, never a credential value.
-    pub(crate) const MISSING_TOKEN_MESSAGE: &'static str =
-        "DAYFLY_LIST_REQUIRES_TOKEN is set, but DAYFLY_HTTP_BEARER_TOKEN is not";
-}
-
 /// Check whether a request may list pastes.
 ///
 /// With `DAYFLY_LIST_REQUIRES_TOKEN` off this is exactly [`check_auth`], so
 /// listing keeps today's behaviour in both the token and no-token cases.
 /// With it on, the bearer token is required even when reads are anonymous.
 /// When no token is configured, the request is refused: there is nothing to
-/// check against.
+/// check against. The missing-token decision is shared with MCP.
 // The error carries the shared auth response unchanged. Boxing it here
 // would only add an allocation at every refused listing request.
 #[allow(clippy::result_large_err)]
@@ -250,7 +243,7 @@ pub(crate) fn check_list_access(
     if !store.config.list_requires_token {
         return check_auth(state, headers).map_err(ListAccessError::Unauthorized);
     }
-    if store.config.http_bearer_token.is_none() {
+    if store.config.list_token_gate_denied() {
         return Err(ListAccessError::MissingToken);
     }
     check_auth(state, headers).map_err(ListAccessError::Unauthorized)
@@ -277,7 +270,7 @@ fn list_access_response(error: ListAccessError) -> Response {
             Json(serde_json::json!({
                 "error": "unauthorized",
                 "code": "unauthorized",
-                "detail": ListAccessError::MISSING_TOKEN_MESSAGE,
+                "detail": crate::config::LIST_MISSING_TOKEN_MESSAGE,
             })),
         )
             .into_response(),

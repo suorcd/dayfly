@@ -28,6 +28,10 @@ pub const MAX_TTL_SECONDS: i64 = MAX_TTL_DAYS as i64 * 86_400;
 /// Message returned by every listing route when listing is off.
 pub const LISTING_DISABLED_MESSAGE: &str = "Listing is turned off on this instance.";
 
+/// Message returned when the list gate is on and no bearer token exists.
+pub const LIST_MISSING_TOKEN_MESSAGE: &str =
+    "DAYFLY_LIST_REQUIRES_TOKEN is set, but DAYFLY_HTTP_BEARER_TOKEN is not";
+
 /// Minimum number of words in a generated alias.
 pub const MIN_ALIAS_WORDS: u8 = 3;
 
@@ -1760,6 +1764,14 @@ impl Config {
         let fraction = (size.min(self.max_paste_bytes) as f64) / (self.max_paste_bytes as f64);
         let days = min_days as f64 + span_days as f64 * (1.0 - fraction).powi(3);
         (days * 86_400.0).floor() as i64
+    }
+
+    /// True when the list gate is on but no bearer token can satisfy it.
+    ///
+    /// Both HTTP and MCP use this decision. With the gate on and no token,
+    /// there is nothing to check against, so listing must refuse.
+    pub fn list_token_gate_denied(&self) -> bool {
+        self.list_requires_token && self.http_bearer_token.is_none()
     }
 
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.

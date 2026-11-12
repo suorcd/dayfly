@@ -2227,10 +2227,20 @@ fn store_text_body(id: u64, text: &str) -> Value {
     })
 }
 
-async fn mcp_post(
+fn list_recent_body(id: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {"name": "list_recent", "arguments": {}}
+    })
+}
+
+async fn mcp_post_with_auth(
     app: &Router,
     body: &Value,
     session_id: Option<&str>,
+    authorization: Option<&str>,
 ) -> (StatusCode, HeaderMap, Vec<u8>) {
     let mut headers = vec![
         ("host", "localhost".to_string()),
@@ -2241,11 +2251,22 @@ async fn mcp_post(
     if let Some(session_id) = session_id {
         headers.push(("mcp-session-id", session_id.to_string()));
     }
+    if let Some(authorization) = authorization {
+        headers.push(("authorization", authorization.to_string()));
+    }
     let mut request = common::request("POST", "/mcp", &headers, body.to_string().into_bytes());
     request.extensions_mut().insert(ConnectInfo(
         "127.0.0.1:1234".parse::<SocketAddr>().expect("test peer"),
     ));
     common::send(app, request).await
+}
+
+async fn mcp_post(
+    app: &Router,
+    body: &Value,
+    session_id: Option<&str>,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    mcp_post_with_auth(app, body, session_id, None).await
 }
 
 fn sse_json(body: &[u8]) -> Value {
@@ -2284,8 +2305,9 @@ async fn mcp_rejects_a_foreign_origin() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
-async fn initialize_mcp_session(app: &Router) -> String {
-    let (status, headers, body) = mcp_post(app, &initialize_body(), None).await;
+async fn initialize_mcp_session_with_auth(app: &Router, authorization: Option<&str>) -> String {
+    let (status, headers, body) =
+        mcp_post_with_auth(app, &initialize_body(), None, authorization).await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -2299,7 +2321,8 @@ async fn initialize_mcp_session(app: &Router) -> String {
         .expect("session id must be ASCII")
         .to_string();
 
-    let (status, _, body) = mcp_post(app, &initialized_body(), Some(&session)).await;
+    let (status, _, body) =
+        mcp_post_with_auth(app, &initialized_body(), Some(&session), authorization).await;
     assert_eq!(
         status,
         StatusCode::ACCEPTED,
@@ -2307,6 +2330,85 @@ async fn initialize_mcp_session(app: &Router) -> String {
         String::from_utf8_lossy(&body)
     );
     session
+}
+
+async fn initialize_mcp_session(app: &Router) -> String {
+    initialize_mcp_session_with_auth(app, None).await
+}
+
+#[tokio::test]
+async fn mcp_http_list_gate_refuses_without_a_configured_token() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.list_requires_token = true;
+    let store = Store::from_config(config)
+        .await
+        .expect("the gated store must build");
+    let app = common::full_app(store);
+    let session = initialize_mcp_session(&app).await;
+
+    let (status, _, body) = mcp_post(&app, &list_recent_body(2), Some(&session)).await;
+    assert_eq!(status, StatusCode::OK);
+    let payload = sse_json(&body);
+    assert_eq!(
+        payload["result"]["isError"], true,
+        "the gate must refuse the tool call: {payload}"
+    );
+    let error = stored_paste(&payload);
+    assert_eq!(error["code"], "unauthorized");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("DAYFLY_LIST_REQUIRES_TOKEN")),
+        "the error must name the setting: {error}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_http_list_gate_allows_an_authorized_session() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.list_requires_token = true;
+    config.http_bearer_token = Some("list-secret".to_string());
+    let store = Store::from_config(config)
+        .await
+        .expect("the gated store must build");
+    let app = common::full_app(store);
+    let session = initialize_mcp_session_with_auth(&app, Some("Bearer list-secret")).await;
+
+    let (status, _, body) = mcp_post_with_auth(
+        &app,
+        &list_recent_body(2),
+        Some(&session),
+        Some("Bearer list-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let payload = sse_json(&body);
+    assert_eq!(
+        payload["result"]["isError"], false,
+        "an authorized list must succeed: {payload}"
+    );
+    let listed = stored_paste(&payload);
+    assert!(
+        listed["items"].is_array(),
+        "the list result must carry items: {listed}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_http_listing_works_when_the_gate_is_off() {
+    let fake = FakeS3::start().await;
+    let app = common::full_app(fake.store().await);
+    let session = initialize_mcp_session(&app).await;
+
+    let (status, _, body) = mcp_post(&app, &list_recent_body(2), Some(&session)).await;
+    assert_eq!(status, StatusCode::OK);
+    let payload = sse_json(&body);
+    assert_eq!(
+        payload["result"]["isError"], false,
+        "the default listing mode must stay open: {payload}"
+    );
 }
 
 #[tokio::test]
