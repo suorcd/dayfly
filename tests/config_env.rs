@@ -200,6 +200,83 @@ fn watch_paths_follows_the_env_file_and_its_secret_files() {
 }
 
 #[test]
+fn watch_paths_include_configured_asset_files_relative_to_the_env_file() {
+    let _guard = lock_env();
+    clear_env();
+    let dir = temp_env_dir("watch-assets");
+    for (name, bytes) in [
+        ("favicon.png", &b"png-bytes"[..]),
+        ("robots.txt", &b"User-agent: *\nDisallow: /\n"[..]),
+        ("security.txt", &b"Contact: https://example.invalid/\n"[..]),
+    ] {
+        std::fs::write(dir.join(name), bytes).expect("the asset must be writable");
+    }
+    let env_file = dir.join("dayfly.env");
+    std::fs::write(
+        &env_file,
+        "S3_ENDPOINT=https://s3.example.invalid\n\
+         S3_BUCKET=bucket\n\
+         S3_ACCESS_KEY_ID=key\n\
+         S3_SECRET_ACCESS_KEY=secret\n\
+         DAYFLY_FAVICON_PATH=favicon.png\n\
+         DAYFLY_ROBOTS_TXT_PATH=robots.txt\n\
+         DAYFLY_SECURITY_TXT_PATH=security.txt\n",
+    )
+    .expect("the env file must be writable");
+
+    let paths = Config::watch_paths(&env_file);
+    assert_eq!(paths.first(), Some(&env_file));
+    for name in ["favicon.png", "robots.txt", "security.txt"] {
+        let expected = dir.join(name);
+        assert!(paths.contains(&expected), "missing {name} in {paths:?}");
+    }
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn watch_paths_keep_missing_asset_files() {
+    let _guard = lock_env();
+    clear_env();
+    let dir = temp_env_dir("watch-missing-assets");
+    let env_file = dir.join("dayfly.env");
+    std::fs::write(
+        &env_file,
+        "DAYFLY_FAVICON_PATH=missing-favicon.ico\n\
+         DAYFLY_ROBOTS_TXT_PATH=missing-robots.txt\n\
+         DAYFLY_SECURITY_TXT_PATH=missing-security.txt\n",
+    )
+    .expect("the env file must be writable");
+
+    let names = [
+        "missing-favicon.ico",
+        "missing-robots.txt",
+        "missing-security.txt",
+    ];
+    let paths = Config::watch_paths(&env_file);
+    for name in names {
+        let expected = dir.join(name);
+        assert!(
+            paths.contains(&expected),
+            "a missing asset path must stay watched: {paths:?}"
+        );
+    }
+
+    // A missing path must not stop the watch when the file appears.
+    std::fs::write(dir.join(names[0]), b"icon").expect("the asset must be writable");
+    let paths = Config::watch_paths(&env_file);
+    for name in names {
+        let expected = dir.join(name);
+        assert!(
+            paths.contains(&expected),
+            "the asset path must stay watched after creation: {paths:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn env_file_supplies_values_and_the_process_environment_wins() {
     let _guard = lock_env();
     clear_env();
@@ -751,6 +828,52 @@ fn env_file_relative_secret_path_resolves_against_the_file_directory() {
 
     let config = Config::from_env_file(Some(&path)).expect("the relative secret path must resolve");
     assert_eq!(config.access_key_id, "relative-access-key");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn env_file_relative_asset_paths_resolve_against_the_file_directory() {
+    let _guard = lock_env();
+    clear_env();
+    let dir = temp_env_dir("relative-assets");
+    std::fs::write(dir.join("favicon.png"), b"png-bytes").expect("the favicon must be writable");
+    std::fs::write(dir.join("robots.txt"), b"User-agent: *\nDisallow: /\n")
+        .expect("the robots file must be writable");
+    std::fs::write(
+        dir.join("security.txt"),
+        b"Contact: https://example.invalid/\n",
+    )
+    .expect("the security file must be writable");
+    let path = dir.join("dayfly.env");
+    std::fs::write(
+        &path,
+        "S3_ENDPOINT=https://s3.example.invalid\n\
+         S3_BUCKET=bucket\n\
+         S3_ACCESS_KEY_ID=key\n\
+         S3_SECRET_ACCESS_KEY=secret\n\
+         DAYFLY_FAVICON_PATH=favicon.png\n\
+         DAYFLY_ROBOTS_TXT_PATH=robots.txt\n\
+         DAYFLY_SECURITY_TXT_PATH=security.txt\n",
+    )
+    .expect("the env file must be writable");
+
+    let config = Config::from_env_file(Some(&path)).expect("relative asset paths must resolve");
+    assert_eq!(
+        &*config.favicon.expect("the favicon must load").bytes,
+        b"png-bytes"
+    );
+    assert_eq!(
+        &*config.robots_txt.expect("the robots file must load").bytes,
+        b"User-agent: *\nDisallow: /\n"
+    );
+    assert_eq!(
+        &*config
+            .security_txt
+            .expect("the security file must load")
+            .bytes,
+        b"Contact: https://example.invalid/\n"
+    );
+
     let _ = std::fs::remove_dir_all(dir);
 }
 

@@ -201,6 +201,107 @@ async fn reload_swaps_credentials_token_caps_ttl_and_show_words() {
 }
 
 #[tokio::test]
+async fn reload_from_file_applies_asset_changes_and_names_them() {
+    let fake = FakeS3::start().await;
+    let state = state_with_token(&fake, Some(OLD_TOKEN)).await;
+    let app = app_router(state.clone());
+
+    let dir = common::temp_path("reload-assets");
+    std::fs::create_dir_all(&dir).expect("the asset directory must be creatable");
+    std::fs::write(dir.join("favicon.ico"), b"old-icon").expect("the favicon must write");
+    std::fs::write(dir.join("robots.txt"), b"User-agent: *\nDisallow: /\n")
+        .expect("the robots file must write");
+    std::fs::write(dir.join("security.txt"), b"Contact: old@example.invalid\n")
+        .expect("the security file must write");
+    let env_file = dir.join("dayfly.env");
+    std::fs::write(
+        &env_file,
+        format!(
+            "S3_ENDPOINT={}\n\
+             S3_BUCKET={}\n\
+             S3_REGION=us-east-1\n\
+             S3_ACCESS_KEY_ID=test-access-key\n\
+             S3_SECRET_ACCESS_KEY=test-secret-key\n\
+             DAYFLY_HTTP_BIND=127.0.0.1:0\n\
+             DAYFLY_HTTP_BEARER_TOKEN={OLD_TOKEN}\n\
+             DAYFLY_FAVICON_PATH=favicon.ico\n\
+             DAYFLY_ROBOTS_TXT_PATH=robots.txt\n\
+             DAYFLY_SECURITY_TXT_PATH=security.txt\n",
+            fake.endpoint, fake.bucket
+        ),
+    )
+    .expect("the env file must write");
+
+    // The first reload proves that the relative asset paths resolve against
+    // the env file directory, as they do at startup.
+    reload_from_file(&env_file, &state, "127.0.0.1:8080")
+        .await
+        .expect("the relative asset paths must reload");
+
+    async fn get(app: &axum::Router, uri: &str) -> Vec<u8> {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request must build"),
+            )
+            .await
+            .expect("router call must complete");
+        assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body must read")
+            .to_vec()
+    }
+
+    assert_eq!(get(&app, "/favicon.ico").await.as_slice(), b"old-icon");
+    assert_eq!(
+        get(&app, "/robots.txt").await.as_slice(),
+        b"User-agent: *\nDisallow: /\n"
+    );
+    assert_eq!(
+        get(&app, "/.well-known/security.txt").await.as_slice(),
+        b"Contact: old@example.invalid\n"
+    );
+
+    std::fs::write(dir.join("favicon.ico"), b"new-icon").expect("the favicon must write");
+    std::fs::write(dir.join("robots.txt"), b"User-agent: *\nDisallow: /new\n")
+        .expect("the robots file must write");
+    std::fs::write(dir.join("security.txt"), b"Contact: new@example.invalid\n")
+        .expect("the security file must write");
+
+    let report = reload_from_file(&env_file, &state, "127.0.0.1:8080")
+        .await
+        .expect("a changed asset must reload");
+    for field in [
+        "DAYFLY_FAVICON_PATH",
+        "DAYFLY_ROBOTS_TXT_PATH",
+        "DAYFLY_SECURITY_TXT_PATH",
+    ] {
+        assert!(
+            report.changed.contains(&field),
+            "the report must name {field}: {:?}",
+            report.changed
+        );
+    }
+
+    assert_eq!(get(&app, "/favicon.ico").await.as_slice(), b"new-icon");
+    assert_eq!(
+        get(&app, "/robots.txt").await.as_slice(),
+        b"User-agent: *\nDisallow: /new\n"
+    );
+    assert_eq!(
+        get(&app, "/.well-known/security.txt").await.as_slice(),
+        b"Contact: new@example.invalid\n"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn reload_applies_write_auth_and_reports_the_setting() {
     let fake = FakeS3::start().await;
     let state = state_with_token(&fake, Some("secret")).await;
