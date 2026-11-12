@@ -339,6 +339,28 @@ mod tests {
     }
 
     #[test]
+    fn the_example_document_passes_the_default_max_ttl_guard() {
+        let document = Document::parse(include_str!("../docs/lifecycle-example.json"))
+            .expect("the example must parse");
+        let rules = document
+            .rules(crate::config::MAX_TTL_DAYS, false)
+            .expect("the example must pass the default max-TTL guard");
+        let rule = rules
+            .iter()
+            .find(|rule| rule.filter().and_then(|filter| filter.prefix()) == Some("pastes/"))
+            .expect("the example must keep the pastes/ rule");
+        assert_eq!(
+            rule.expiration().and_then(|expiration| expiration.days()),
+            Some(3651)
+        );
+        assert_eq!(
+            rule.abort_incomplete_multipart_upload()
+                .and_then(|abort| abort.days_after_initiation()),
+            Some(7)
+        );
+    }
+
+    #[test]
     fn rejects_an_expiration_at_or_below_the_max_ttl() {
         let mut document = Document::parse(EXAMPLE).expect("example must parse");
         document.rules[0].expiration = Some(DocumentExpiration { days: Some(3) });

@@ -1657,11 +1657,13 @@ production use.
 
 An `Expiration.Days` value at or below `DAYFLY_MAX_TTL_DAYS` is
 rejected, because the sweeper could delete an object before its
-read-time expiry. Use `--allow-short-expiration` only when you accept
-that risk. Without the override, keep the rule longer than the longest
-TTL in use. Deletion is day-rounded and asynchronous, and it can run
-after the TTL. Objects are already unreadable through the API when
-`expires-at` passes, regardless of when the sweeper runs.
+read-time expiry. The example uses 3651 days, one day above the default
+maximum, so it applies without the override. Use
+`--allow-short-expiration` only when you accept that risk. Without the
+override, keep the rule longer than the longest TTL in use. Deletion is
+day-rounded and asynchronous, and it can run after the TTL. Objects are
+already unreadable through the API when `expires-at` passes, regardless
+of when the sweeper runs.
 
 The example rule covers `pastes/` only. An alias object lives under
 `words/`. Add a second rule with the `words/` prefix to sweep expired
