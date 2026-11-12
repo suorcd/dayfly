@@ -358,6 +358,15 @@ mod tests {
                 .and_then(|abort| abort.days_after_initiation()),
             Some(7)
         );
+        let words = rules
+            .iter()
+            .find(|rule| rule.filter().and_then(|filter| filter.prefix()) == Some("words/"))
+            .expect("the example must have a words/ rule");
+        assert_eq!(
+            words.expiration().and_then(|expiration| expiration.days()),
+            Some(3651)
+        );
+        assert_eq!(words.status(), &ExpirationStatus::Enabled);
     }
 
     #[test]
