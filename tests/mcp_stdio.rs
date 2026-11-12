@@ -37,6 +37,13 @@ impl Drop for McpClient {
 
 impl McpClient {
     fn spawn(fake: &FakeS3, extra_env: &[(&str, &str)]) -> Self {
+        let mut client = Self::spawn_process(fake, extra_env);
+        client.initialize();
+        client
+    }
+
+    /// Start the binary without the MCP handshake.
+    fn spawn_process(fake: &FakeS3, extra_env: &[(&str, &str)]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_dayfly"));
         command
             .arg("mcp")
@@ -55,17 +62,16 @@ impl McpClient {
         let mut child = command.spawn().expect("dayfly MCP process must start");
         let stdin = child.stdin.take().expect("MCP stdin must be piped");
         let stdout = child.stdout.take().expect("MCP stdout must be piped");
-        let mut client = Self {
+        Self {
             child,
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 0,
-        };
-        client.initialize();
-        client
+        }
     }
 
-    fn initialize(&mut self) {
+    /// Send the initialize request and return its result object.
+    fn initialize(&mut self) -> Value {
         let response = self.request(
             "initialize",
             json!({
@@ -76,10 +82,12 @@ impl McpClient {
         );
         let result = response
             .get("result")
+            .cloned()
             .unwrap_or_else(|| panic!("initialize must succeed: {response}"));
         assert_eq!(result["serverInfo"]["name"], "dayfly");
         assert!(result["capabilities"]["tools"].is_object());
         self.notify("notifications/initialized", json!({}));
+        result
     }
 
     fn notify(&mut self, method: &str, params: Value) {
@@ -163,6 +171,20 @@ fn runtime() -> tokio::runtime::Runtime {
         .enable_all()
         .build()
         .expect("test runtime must build")
+}
+
+#[test]
+fn mcp_initialize_reports_the_crate_version() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let mut client = McpClient::spawn_process(&fake, &[]);
+
+    let initialized = client.initialize();
+    assert_eq!(
+        initialized["serverInfo"]["version"],
+        env!("CARGO_PKG_VERSION"),
+        "the MCP initialize response must report the version from Cargo.toml"
+    );
 }
 
 #[test]

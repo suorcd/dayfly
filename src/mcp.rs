@@ -899,7 +899,7 @@ impl Pastebin {
 impl rmcp::handler::server::ServerHandler for Pastebin {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("dayfly", "0.1.0"))
+            .with_server_info(Implementation::new("dayfly", env!("CARGO_PKG_VERSION")))
             .with_instructions(self.instructions())
     }
 }
