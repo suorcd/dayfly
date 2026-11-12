@@ -1184,7 +1184,9 @@ and delete.
   guarantee.
 - Expiry: the alias inherits the paste `expires-at`. It does not
   extend the TTL. An expired or missing paste does not resolve through
-  its alias.
+  its alias. An expired alias object is free to reuse, and a new paste
+  writes over it. An alias object without a valid `expires-at` value
+  stays taken.
 - Delete: delete by ID or by alias. Either form removes the base
   object, every segment, and the alias object when the alias still
   points to that paste. A phrase that another store has rebound is left
@@ -1201,9 +1203,9 @@ and delete.
   guessing. Treat the alias as a name, not a secret. The bearer token
   and the private bucket remain the access control.
 - The alias object is small. It has the same expiry as the paste.
-  A lifecycle rule for `pastes/` does not cover `words/`. Add a
-  `words/` rule if you want the storage sweeper to remove expired
-  alias objects. Lookup still rejects an expired target.
+  `docs/lifecycle-example.json` includes a `words/` rule. Add one if you
+  write your own lifecycle document. Lookup still rejects an expired
+  target.
 
 ## Content-Type detection
 
@@ -1658,18 +1660,18 @@ production use.
 
 An `Expiration.Days` value at or below `DAYFLY_MAX_TTL_DAYS` is
 rejected, because the sweeper could delete an object before its
-read-time expiry. The example uses 3651 days, one day above the default
-maximum, so it applies without the override. Use
+read-time expiry. The example rules use 3651 days, one day above the
+default maximum, so they apply without the override. Use
 `--allow-short-expiration` only when you accept that risk. Without the
 override, keep the rule longer than the longest TTL in use. Deletion is
 day-rounded and asynchronous, and it can run after the TTL. Objects are
 already unreadable through the API when `expires-at` passes, regardless
 of when the sweeper runs.
 
-The example rule covers `pastes/` only. An alias object lives under
-`words/`. Add a second rule with the `words/` prefix to sweep expired
-alias objects. Lookup rejects an expired target even when the alias
-object remains.
+The example has a rule for `pastes/` and a rule for `words/`. Keep
+both when you write your own document. The `words/` rule lets the
+sweeper remove expired alias objects. Lookup rejects an expired target
+even when the alias object remains.
 
 ## Known limitations (v1)
 

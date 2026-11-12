@@ -402,6 +402,140 @@ async fn alias_collision_retries_until_a_new_phrase_is_chosen() {
 }
 
 #[tokio::test]
+async fn expired_alias_is_reused_and_resolves_to_the_new_paste() {
+    let fake = FakeS3::start().await;
+    let candidate = "abacus-abdomen-zoology".to_string();
+    let store = fake
+        .store()
+        .await
+        .with_alias_candidates(vec![candidate.clone()]);
+    let old_target = "pastes/2026-10-28/expiredalias";
+    let old_expiry = (Utc::now() - Duration::days(1)).to_rfc3339();
+    fake.seed(
+        &format!("words/{candidate}"),
+        old_target.as_bytes(),
+        "text/plain",
+        &[
+            ("kind", "alias"),
+            ("target", old_target),
+            ("expires-at", old_expiry.as_str()),
+        ],
+    );
+
+    let stored = store
+        .store_text(b"new alias body", None, None, Some(Ttl::days(1)))
+        .await
+        .expect("an expired alias must be free to reuse");
+    assert_eq!(stored.words.as_deref(), Some(candidate.as_str()));
+
+    let alias = fake
+        .object(&format!("words/{candidate}"))
+        .expect("the reused alias must exist");
+    assert_eq!(
+        alias.body,
+        stored.key.as_bytes(),
+        "the reused alias must point to the new paste"
+    );
+    assert_eq!(
+        alias.metadata.get("target").map(String::as_str),
+        Some(stored.key.as_str())
+    );
+    assert_eq!(
+        alias.metadata.get("expires-at").map(String::as_str),
+        Some(stored.expires_at.to_rfc3339().as_str())
+    );
+
+    let fetched = store
+        .fetch_text(&candidate, 0, None)
+        .await
+        .expect("the reused alias must resolve to the new paste");
+    assert_eq!(fetched.text, "new alias body");
+}
+
+#[tokio::test]
+async fn unexpired_alias_blocks_reuse() {
+    let fake = FakeS3::start().await;
+    let candidate = "abacus-abdomen-zoology".to_string();
+    let store = fake
+        .store()
+        .await
+        .with_alias_candidates(vec![candidate.clone()]);
+    let old_target = "pastes/2026-10-28/livealias";
+    let future_expiry = (Utc::now() + Duration::days(1)).to_rfc3339();
+    fake.seed(
+        &format!("words/{candidate}"),
+        old_target.as_bytes(),
+        "text/plain",
+        &[
+            ("kind", "alias"),
+            ("target", old_target),
+            ("expires-at", future_expiry.as_str()),
+        ],
+    );
+
+    let error = store
+        .store_text(b"new alias body", None, None, Some(Ttl::days(1)))
+        .await
+        .expect_err("an unexpired alias must block reuse");
+    assert!(
+        matches!(error, StoreError::AliasUnavailable { attempts: 1 }),
+        "got {error:?}"
+    );
+    assert_eq!(
+        fake.object(&format!("words/{candidate}"))
+            .expect("the live alias must remain")
+            .body,
+        old_target.as_bytes(),
+        "a failed reuse must not overwrite the alias"
+    );
+    let bases: Vec<String> = fake
+        .keys()
+        .into_iter()
+        .filter(|key| key.starts_with("pastes/"))
+        .collect();
+    assert!(
+        bases.is_empty(),
+        "a failed reuse must write no paste: {bases:?}"
+    );
+}
+
+#[tokio::test]
+async fn alias_without_a_valid_expiry_stays_taken() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let missing = "abacus-abdomen-zoology";
+    let malformed = "abacus-abdomen-abdominal";
+    let target = "pastes/2026-10-28/taken";
+    fake.seed(
+        &format!("words/{missing}"),
+        target.as_bytes(),
+        "text/plain",
+        &[("kind", "alias"), ("target", target)],
+    );
+    fake.seed(
+        &format!("words/{malformed}"),
+        target.as_bytes(),
+        "text/plain",
+        &[
+            ("kind", "alias"),
+            ("target", target),
+            ("expires-at", "not-a-timestamp"),
+        ],
+    );
+
+    for phrase in [missing, malformed] {
+        let error = store
+            .choose_alias_from(vec![phrase.to_string()])
+            .await
+            .expect_err("an alias without a valid expiry must stay taken");
+        assert!(
+            matches!(error, StoreError::AliasUnavailable { attempts: 1 }),
+            "{phrase}: got {error:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn alias_allocation_fails_when_every_candidate_collides() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;

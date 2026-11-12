@@ -12,6 +12,16 @@
       "AbortIncompleteMultipartUpload": {
         "DaysAfterInitiation": 7
       }
+    },
+    {
+      "ID": "dayfly-expire-words",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "words/"
+      },
+      "Expiration": {
+        "Days": 3651
+      }
     }
   ]
 }

@@ -1891,6 +1891,9 @@ impl Store {
     }
 
     /// True when an alias object already holds this phrase.
+    ///
+    /// An alias object with a valid past `expires-at` value is free to
+    /// reuse. A missing or malformed value keeps the alias taken.
     async fn alias_object_exists(&self, phrase: &str) -> Result<bool, StoreError> {
         let key = alias_key(phrase);
         match s3_call!(
@@ -1904,7 +1907,13 @@ impl Store {
         )
         .map_err(|e| map_sdk_error(e, &key))
         {
-            Ok(_) => Ok(true),
+            Ok(out) => {
+                let expires_at = out
+                    .metadata()
+                    .and_then(|meta| meta.get("expires-at"))
+                    .and_then(|value| parse_rfc3339(value));
+                Ok(!expires_at.is_some_and(|expires| Utc::now() > expires))
+            }
             Err(StoreError::NotFound(_)) => Ok(false),
             Err(e) => Err(e),
         }
