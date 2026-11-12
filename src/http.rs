@@ -627,9 +627,21 @@ fn upload_response(
         )
             .into_response()
     } else {
-        // Plain-text URL only, so `url=$(curl ...)` works. The token is
-        // a header, so the body stays a single URL.
+        // Plain-text URL only, so `url=$(curl ...)` works. The token,
+        // canonical ID, and alias are headers, so the body stays a
+        // single URL. Omit the alias header when the store wrote no
+        // alias.
         let mut response = (StatusCode::CREATED, format!("{url}\n")).into_response();
+        response.headers_mut().insert(
+            HeaderName::from_static("x-paste-id"),
+            HeaderValue::from_str(&stored.id).expect("a paste id is a valid header value"),
+        );
+        if let Some(words) = &stored.words {
+            response.headers_mut().insert(
+                HeaderName::from_static("x-words"),
+                HeaderValue::from_str(words).expect("a word alias is a valid header value"),
+            );
+        }
         if let Some(token) = &stored.paste_token {
             response.headers_mut().insert(
                 HeaderName::from_static("x-paste-token"),
