@@ -212,17 +212,20 @@ should set it, because a request limit does not bound the bytes that one
 client can store. See "Retention by size".
 
 `DAYFLY_PASTE_TOKENS` gives each new paste a management token. Creation
-returns the token once: `paste_token` in the JSON response and
-`X-Paste-Token` in the plain response. Send that header on `DELETE`,
-`PATCH`, and `append` to act on the paste without the bearer token. The
+returns the token once: `paste_token` in the JSON response,
+`X-Paste-Token` in the plain response, and the token on the human
+create result page. Send that header on `DELETE`, `PATCH`, and
+`append` to act on the paste without the bearer token. The
 bearer token remains a universal key. The
 base object stores only the SHA-256 of the token. The meta route and the
 MCP metadata tool do not return it. Treat the token as a credential and
 do not put it in a URL. A lost token means lost control of that paste;
 there is no recovery. A paste created before the setting has
 no token; only a bearer token can change it. A token for one paste
-cannot change another paste. The human delete form cannot send the
-token, so it needs the bearer token or a proxy that authenticates.
+cannot change another paste. The human create result page includes the
+token in its delete form. The view page has a token field in its delete
+form. The delete form on each list row has no token field, so it needs
+the bearer token or a proxy that authenticates.
 
 The MCP stdio transport does not use the bearer token: spawning the
 binary locally is the trust boundary there. The MCP transport over
@@ -398,9 +401,9 @@ permissions and the lower total cap.
 | `DAYFLY_ALLOW_UNAUTHENTICATED` | no | `false` | Accept a non-loopback bind with no bearer token. Startup refuses that bind without this value, and with it the service writes one warning. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_LIST_ENABLED` | no | `true` | Allow listing on every transport. `false` makes `/pastes`, `GET /v1/pastes`, and the MCP `list_recent` tool return 403 with "Listing is turned off on this instance." It wins over `DAYFLY_LIST_REQUIRES_TOKEN`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_LIST_REQUIRES_TOKEN` | no | `false` | Require the bearer token for `GET /v1/pastes`, the human `/pastes` page, and the MCP `list_recent` tool even when reads are anonymous. With this on and no token configured, all three refuse: there is nothing to check. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
-| `DAYFLY_PASTE_TOKENS` | no | `false` | Return a 128-bit management token at creation. The JSON store response carries `paste_token`; the plain response carries `X-Paste-Token`. The token authorizes `DELETE` and `PATCH` for that paste. Only its SHA-256 is stored. The bearer token remains universal. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
+| `DAYFLY_PASTE_TOKENS` | no | `false` | Return a 128-bit management token at creation. The JSON store response carries `paste_token`; the plain response carries `X-Paste-Token`; the human create result page shows the token once. The token authorizes `DELETE` and `PATCH` for that paste. Only its SHA-256 is stored. The bearer token remains universal. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_EXPOSE_CREATOR_ADDR` | no | `false` | Return the stored `created-by` address in the meta route, the `X-Created-By` header on `HEAD`, and the MCP `fetch_metadata` tool. The access log includes the client address only when this is on. An address is personal data, so the default hides it. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
-| `DAYFLY_SHOW_WORDS` | no | `true` | Show the generated word alias in the human UI: create redirects, the view page, and the paste list. Display only; the JSON/MCP responses still include `words`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
+| `DAYFLY_SHOW_WORDS` | no | `true` | Show the generated word alias in the human UI: create responses, the view page, and the paste list. Display only; the JSON/MCP responses still include `words`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_SHOW_INTERNAL_PATHS` | no | `false` | Show the canonical date and ID under the alias in the human paste list. Off labels the column "Link" and shows only the alias. Display only; view URLs and API responses still accept the canonical ID. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_INLINE_PDF` | no | `true` | Serve a PDF download inline. Set this to `false` on a public instance so a PDF is an attachment. HTML and SVG are always attachments. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_VIEW_LINE_NUMBERS` | no | `false` | Number the lines of a text paste on the view page. The numbers are presentation only: a CSS counter renders them, they are not selectable, and the Copy button does not include them. Pastes above 5,000 lines render unnumbered. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
@@ -1168,7 +1171,7 @@ and delete.
   in place.
 - Legacy objects have no alias. They keep working by ID, and `words`
   is absent or null.
-- Display: the human UI uses the alias for create redirects, the view
+- Display: the human UI uses the alias in create responses, the view
   page, and the paste list by default. Set `DAYFLY_SHOW_WORDS=false`
   to use and show the canonical ID instead. The setting is display-only:
   the alias is still generated and the JSON/MCP responses still return
@@ -1295,9 +1298,14 @@ instance.
   the page shows curl examples for a text paste, a file paste, and a
   JSON response. The examples use the request scheme and host. When a
   token is configured, the examples add a bearer header placeholder. On
-  success the browser is redirected to the new paste: the word alias
-  when `DAYFLY_SHOW_WORDS` is true (the default), otherwise the
-  canonical ID.
+  success, with `DAYFLY_PASTE_TOKENS` off, the browser is redirected to
+  the new paste: the word alias when `DAYFLY_SHOW_WORDS` is true (the
+  default), otherwise the canonical ID. With `DAYFLY_PASTE_TOKENS` on,
+  the browser gets a one-time result page. The page shows the paste
+  token, the view URL, and a delete form. It states that the token is
+  shown once and cannot be recovered. The response carries
+  `Cache-Control: no-store`, and the token never appears in a URL or a
+  log line.
 - `GET /pastes` — current pastes, built from the bucket scan (no
   database): alias when enabled (with the canonical ID as secondary
   text when `DAYFLY_SHOW_INTERNAL_PATHS` is true), title, filename if

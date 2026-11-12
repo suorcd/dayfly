@@ -1596,6 +1596,228 @@ async fn view_page_offers_a_paste_token_field_when_enabled() {
     );
 }
 
+async fn assert_token_result_page(
+    app: &axum::Router,
+    fake: &FakeS3,
+    route: &str,
+    headers: Vec<(&'static str, String)>,
+    body: Vec<u8>,
+) {
+    let request = common::request("POST", route, &headers, body);
+    let (status, response_headers, body) = common::send(app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{route} must show the token result page: {}",
+        html_text(&body)
+    );
+    assert_eq!(
+        response_headers
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store"),
+        "{route} must not cache the token page"
+    );
+    assert!(
+        response_headers.get(header::LOCATION).is_none(),
+        "{route} must not redirect and lose the token"
+    );
+
+    let page = html_text(&body);
+    assert!(
+        page.contains("shown once") && page.contains("cannot be recovered"),
+        "{route} must warn that the token is not recoverable: {page}"
+    );
+    let token = page
+        .split("<code id=\"paste-token\">")
+        .nth(1)
+        .and_then(|rest| rest.split("</code>").next())
+        .expect("the page must show the token")
+        .to_string();
+    let id = page
+        .split("name=\"id\" value=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the page must carry the paste id")
+        .to_string();
+    assert!(!token.is_empty(), "{route} must show a token");
+    assert!(
+        page.contains(&format!(
+            "<input type=\"hidden\" name=\"paste_token\" value=\"{token}\">"
+        )),
+        "{route} must put the token in the delete form: {page}"
+    );
+    assert!(
+        page.contains(&format!("href=\"/view/{id}\"")),
+        "{route} must show the view URL: {page}"
+    );
+    assert!(
+        !page.contains(&format!("/view/{token}")) && !page.contains("paste_token="),
+        "{route} must not put the token in a URL: {page}"
+    );
+    for (name, value) in &response_headers {
+        assert!(
+            !value.to_str().unwrap_or("").contains(&token),
+            "{route} must not put the token in the {} header",
+            name.as_str()
+        );
+    }
+
+    let request = common::request("GET", &format!("/view/{id}"), &[], Vec::new());
+    let (status, _, body) = common::send(app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !html_text(&body).contains(&token),
+        "{route} must not show the token on the view page"
+    );
+
+    let request = common::request("GET", "/pastes", &[], Vec::new());
+    let (status, _, body) = common::send(app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !html_text(&body).contains(&token),
+        "{route} must not show the token on the list page"
+    );
+
+    let body = format!("id={id}&paste_token={token}").into_bytes();
+    let request = common::request("POST", "/ui/delete", &form_headers(body.len()), body);
+    let (status, _, _) = common::send(app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "{route} must let the shown token delete the paste"
+    );
+    assert!(
+        fake.object(&format!("pastes/{id}")).is_none(),
+        "{route} must delete the paste through /ui/delete"
+    );
+}
+
+#[tokio::test]
+async fn text_submit_shows_the_paste_token_once() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store_with_paste_tokens().await);
+    let form = b"text=hello+token&ttl_days=1".to_vec();
+    assert_token_result_page(&app, &fake, "/ui/text", form_headers(form.len()), form).await;
+}
+
+#[tokio::test]
+async fn create_submit_shows_the_paste_token_once() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store_with_paste_tokens().await);
+    let boundary = "web-create-token-text";
+    let body =
+        common::multipart_fields_only(boundary, &[("ttl_days", "1"), ("text", "secret body")]);
+    let headers = multipart_headers(boundary, body.len());
+    assert_token_result_page(&app, &fake, "/ui/create", headers, body).await;
+}
+
+#[tokio::test]
+async fn create_submit_file_shows_the_paste_token_once() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store_with_paste_tokens().await);
+    let boundary = "web-create-token-file";
+    let body = common::multipart_body(
+        boundary,
+        Some("secret.txt"),
+        Some("text/plain"),
+        b"secret file",
+        &[("ttl_days", "1")],
+    );
+    let headers = multipart_headers(boundary, body.len());
+    assert_token_result_page(&app, &fake, "/ui/create", headers, body).await;
+}
+
+#[tokio::test]
+async fn upload_submit_shows_the_paste_token_once() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store_with_paste_tokens().await);
+    let boundary = "web-upload-token";
+    let body = common::multipart_body(
+        boundary,
+        Some("secret.bin"),
+        Some("application/octet-stream"),
+        b"secret upload",
+        &[("ttl_days", "1")],
+    );
+    let headers = multipart_headers(boundary, body.len());
+    assert_token_result_page(&app, &fake, "/ui/upload", headers, body).await;
+}
+
+#[tokio::test]
+async fn browser_create_redirects_when_paste_tokens_are_off() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+
+    let form = b"text=off".to_vec();
+    let request = common::request("POST", "/ui/text", &form_headers(form.len()), form);
+    let (status, headers, body) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "/ui/text must keep the redirect when tokens are off: {}",
+        html_text(&body)
+    );
+    let location = headers[header::LOCATION].to_str().unwrap();
+    assert!(
+        location.starts_with("/view/"),
+        "unexpected target: {location}"
+    );
+    assert!(
+        !location.contains("paste_token"),
+        "token leaked: {location}"
+    );
+
+    let boundary = "web-create-off";
+    let body =
+        common::multipart_fields_only(boundary, &[("ttl_days", "1"), ("text", "off create")]);
+    let headers = multipart_headers(boundary, body.len());
+    let request = common::request("POST", "/ui/create", &headers, body);
+    let (status, headers, body) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "/ui/create must keep the redirect when tokens are off: {}",
+        html_text(&body)
+    );
+    let location = headers[header::LOCATION].to_str().unwrap();
+    assert!(
+        location.starts_with("/view/"),
+        "unexpected target: {location}"
+    );
+    assert!(
+        !location.contains("paste_token"),
+        "token leaked: {location}"
+    );
+
+    let boundary = "web-upload-off";
+    let body = common::multipart_body(
+        boundary,
+        Some("off.txt"),
+        Some("text/plain"),
+        b"off upload",
+        &[("ttl_days", "1")],
+    );
+    let headers = multipart_headers(boundary, body.len());
+    let request = common::request("POST", "/ui/upload", &headers, body);
+    let (status, headers, body) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "/ui/upload must keep the redirect when tokens are off: {}",
+        html_text(&body)
+    );
+    let location = headers[header::LOCATION].to_str().unwrap();
+    assert!(
+        location.starts_with("/view/"),
+        "unexpected target: {location}"
+    );
+    assert!(
+        !location.contains("paste_token"),
+        "token leaked: {location}"
+    );
+}
+
 #[tokio::test]
 async fn view_page_numbers_lines_without_changing_the_text() {
     let fake = FakeS3::start().await;

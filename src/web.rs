@@ -771,9 +771,7 @@ async fn text_submit_handler(
         .store_text_with_fields(form.text.as_bytes(), &fields, ttl)
         .await
     {
-        Ok(stored) => {
-            Redirect::to(&stored_view_target(&stored, store.config.show_words)).into_response()
-        }
+        Ok(stored) => created_response(&stored, &store, &footer),
         Err(e) => error_page(&footer, e),
     }
 }
@@ -845,6 +843,35 @@ fn stored_view_target(stored: &StoredPaste, show_words: bool) -> String {
         &stored.id
     };
     format!("/view/{name}")
+}
+
+/// Show the one-time paste token after a browser create.
+///
+/// A redirect would lose the token, and the store keeps only its SHA-256.
+/// When `paste_tokens` is off, or the store returned no token, the caller
+/// gets the usual redirect.
+fn created_response(stored: &StoredPaste, store: &Store, footer: &Footer) -> Response {
+    let target = stored_view_target(stored, store.config.show_words);
+    let Some(token) = stored.paste_token.as_deref() else {
+        return Redirect::to(&target).into_response();
+    };
+    let id = html_escape(&stored.id);
+    let token = html_escape(token);
+    let target = html_escape(&target);
+    let body = format!(
+        "<p>The paste token is shown once. Store it now. It cannot be recovered.</p>\
+         <p>Paste token: <code id=\"paste-token\">{token}</code></p>\
+         <p>View URL: <a href=\"{target}\">{target}</a></p>\
+         <form method=\"post\" action=\"/ui/delete\">\
+         <input type=\"hidden\" name=\"id\" value=\"{id}\">\
+         <input type=\"hidden\" name=\"paste_token\" value=\"{token}\">\
+         <button type=\"submit\">Delete this paste</button></form>"
+    );
+    let mut response = page(footer, "Paste created", None, true, &body).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// Reject an obviously oversized multipart request from its Content-Length
@@ -959,8 +986,7 @@ async fn upload_submit_handler(
         let name = field.name().unwrap_or("").to_string();
         if name == "file" {
             return match store_file_field(&store, field, &fields, ttl).await {
-                Ok(stored) => Redirect::to(&stored_view_target(&stored, store.config.show_words))
-                    .into_response(),
+                Ok(stored) => created_response(&stored, &store, &footer),
                 Err(e) => error_page(&footer, e),
             };
         }
@@ -1209,10 +1235,7 @@ async fn create_submit_handler(
                     created_by: created_by.clone(),
                 };
                 return match store_file_field(&store, field, &fields, ttl).await {
-                    Ok(stored) => {
-                        Redirect::to(&stored_view_target(&stored, store.config.show_words))
-                            .into_response()
-                    }
+                    Ok(stored) => created_response(&stored, &store, &footer),
                     Err(e) => error_page(&footer, e),
                 };
             }
@@ -1234,9 +1257,7 @@ async fn create_submit_handler(
         created_by,
     };
     match store.store_text_with_fields(&bytes, &fields, ttl).await {
-        Ok(stored) => {
-            Redirect::to(&stored_view_target(&stored, store.config.show_words)).into_response()
-        }
+        Ok(stored) => created_response(&stored, &store, &footer),
         Err(e) => error_page(&footer, e),
     }
 }
