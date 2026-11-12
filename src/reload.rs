@@ -238,6 +238,9 @@ fn changed_fields(old: &Config, new: &Config) -> Vec<&'static str> {
     if old.list_default_days != new.list_default_days {
         changed.push("DAYFLY_LIST_DEFAULT_DAYS");
     }
+    if old.write_requires_token != new.write_requires_token {
+        changed.push("DAYFLY_WRITE_REQUIRES_TOKEN");
+    }
     if old.list_requires_token != new.list_requires_token {
         changed.push("DAYFLY_LIST_REQUIRES_TOKEN");
     }

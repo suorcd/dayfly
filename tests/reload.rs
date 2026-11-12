@@ -201,6 +201,42 @@ async fn reload_swaps_credentials_token_caps_ttl_and_show_words() {
 }
 
 #[tokio::test]
+async fn reload_applies_write_auth_and_reports_the_setting() {
+    let fake = FakeS3::start().await;
+    let state = state_with_token(&fake, Some("secret")).await;
+
+    let mut new_config = fake.config();
+    new_config.http_bearer_token = Some("secret".to_string());
+    new_config.write_requires_token = true;
+    let report = reload_with_config(&state, new_config, "127.0.0.1:8080")
+        .await
+        .expect("a write auth config must reload");
+    assert!(
+        report.changed.contains(&"DAYFLY_WRITE_REQUIRES_TOKEN"),
+        "the report must name the setting: {:?}",
+        report.changed
+    );
+    assert!(state.store().config.write_requires_token);
+
+    let app = app_router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/pastes")
+                .body(Body::empty())
+                .expect("request must build"),
+        )
+        .await
+        .expect("router call must complete");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the reloaded write mode must leave the list anonymous"
+    );
+}
+
+#[tokio::test]
 async fn reload_rejects_a_malformed_file_and_keeps_the_running_config() {
     let fake = FakeS3::start().await;
     let state = state_with_token(&fake, Some(OLD_TOKEN)).await;

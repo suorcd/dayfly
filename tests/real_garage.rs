@@ -57,6 +57,7 @@ fn test_config() -> Config {
         inline_pdf: true,
         view_line_numbers: false,
         allow_unauthenticated: false,
+        write_requires_token: false,
         list_requires_token: false,
         list_enabled: true,
         paste_tokens: false,

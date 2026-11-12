@@ -187,12 +187,23 @@ pub struct Config {
     /// proxy that authenticates. The service then logs one warning at
     /// startup. See "Access model" in the README.
     pub allow_unauthenticated: bool,
+    /// Whether mutating HTTP routes require the bearer token while reads
+    /// stay anonymous.
+    ///
+    /// Default: `false`. When this is `true`,
+    /// [`Self::http_bearer_token`] must be set. Uploads, appends, deletes,
+    /// expiry changes, the human write routes, and `/mcp` require the
+    /// token. Downloads, metadata, search, `/raw`, the human index and
+    /// view pages, and listing stay anonymous unless
+    /// [`Self::list_requires_token`] also gates the list.
+    pub write_requires_token: bool,
     /// Whether listing requires the bearer token.
     ///
-    /// Default: `false`. With the default, listing follows the global
-    /// bearer setting: gated when a token is set, open when none is. When
-    /// this is `true`, `GET /v1/pastes` and the human `/pastes` page
-    /// require the bearer token even if reads are otherwise anonymous.
+    /// Default: `false`. With the default, listing follows the read rule:
+    /// gated when the bearer token gates reads, open when reads are
+    /// anonymous. When this is `true`, `GET /v1/pastes` and the human
+    /// `/pastes` page require the bearer token even if reads are otherwise
+    /// anonymous.
     /// With no token configured, both routes refuse: there is nothing to
     /// check against, and an open list is what this setting prevents.
     pub list_requires_token: bool,
@@ -253,10 +264,12 @@ pub struct Config {
     /// it: the Garage key/secret stay in S3_ACCESS_KEY_ID /
     /// S3_SECRET_ACCESS_KEY and are held only by this binary. When this
     /// is set (non-empty), HTTP mode rejects requests without
-    /// `Authorization: Bearer <token>` with 401. When unset, HTTP mode
-    /// relies on private-network / localhost deployment (see README).
-    /// The MCP stdio transport does not use this token: spawning the
-    /// binary locally is the trust boundary there.
+    /// `Authorization: Bearer <token>` with 401. With
+    /// [`Self::write_requires_token`] on, only the mutating routes require
+    /// the token. When unset, HTTP mode relies on private-network /
+    /// localhost deployment (see README). The MCP stdio transport does not
+    /// use this token: spawning the binary locally is the trust boundary
+    /// there.
     pub http_bearer_token: Option<String>,
     /// Optional directory that limits the MCP local-path tools.
     ///
@@ -481,6 +494,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("false"),
         required: false,
         help: "Start a non-loopback bind with no bearer token",
+    },
+    ConfigField {
+        name: "DAYFLY_WRITE_REQUIRES_TOKEN",
+        value: Some("false"),
+        required: false,
+        help: "Require the bearer token for writes while reads stay anonymous",
     },
     ConfigField {
         name: "DAYFLY_LIST_ENABLED",
@@ -1598,6 +1617,15 @@ impl Config {
         }
         // The range check above keeps this conversion in bounds.
         let alias_words = u8::try_from(alias_words).unwrap_or(DEFAULT_ALIAS_WORDS);
+        let http_bearer_token =
+            bearer_token(optional_credential(&lookup, "DAYFLY_HTTP_BEARER_TOKEN")?)?;
+        let write_requires_token = optional_bool(&lookup, "DAYFLY_WRITE_REQUIRES_TOKEN", false)?;
+        if write_requires_token && http_bearer_token.is_none() {
+            return Err(ConfigError::Invalid(
+                "DAYFLY_WRITE_REQUIRES_TOKEN".to_string(),
+                "requires DAYFLY_HTTP_BEARER_TOKEN".to_string(),
+            ));
+        }
         Ok(Self {
             endpoint,
             bucket,
@@ -1669,6 +1697,7 @@ impl Config {
                 "DAYFLY_ALLOW_UNAUTHENTICATED",
                 field_default("DAYFLY_ALLOW_UNAUTHENTICATED") == Some("true"),
             )?,
+            write_requires_token,
             list_requires_token: optional_bool(
                 &lookup,
                 "DAYFLY_LIST_REQUIRES_TOKEN",
@@ -1694,10 +1723,7 @@ impl Config {
                 "DAYFLY_RATE_LIMIT_PER_MINUTE",
                 field_u32("DAYFLY_RATE_LIMIT_PER_MINUTE", 0),
             )?,
-            http_bearer_token: bearer_token(optional_credential(
-                &lookup,
-                "DAYFLY_HTTP_BEARER_TOKEN",
-            )?)?,
+            http_bearer_token,
             mcp_local_root: local_root(lookup("DAYFLY_MCP_LOCAL_ROOT"))?,
             favicon: favicon(lookup("DAYFLY_FAVICON_PATH"))?,
             robots_txt: text_asset(lookup("DAYFLY_ROBOTS_TXT_PATH"), "DAYFLY_ROBOTS_TXT_PATH")?,
@@ -1777,7 +1803,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} search_max_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} list_requires_token={} paste_tokens={} expose_creator_addr={} rate_limit_per_minute={} log_format={} metrics_bind={} metrics_allowed_networks={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
+            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} search_max_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} write_requires_token={} list_requires_token={} paste_tokens={} expose_creator_addr={} rate_limit_per_minute={} log_format={} metrics_bind={} metrics_allowed_networks={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -1800,6 +1826,7 @@ impl Config {
             self.inline_pdf,
             self.view_line_numbers,
             self.trusted_proxies.len(),
+            self.write_requires_token,
             self.list_requires_token,
             self.paste_tokens,
             self.expose_creator_addr,
@@ -2168,6 +2195,7 @@ mod tests {
             inline_pdf: true,
             view_line_numbers: false,
             allow_unauthenticated: false,
+            write_requires_token: false,
             list_requires_token: false,
             list_enabled: true,
             paste_tokens: false,
@@ -2530,6 +2558,48 @@ mod tests {
             message.contains("10.0.0.0/33"),
             "the error must name the entry: {message}"
         );
+    }
+
+    #[test]
+    fn write_requires_token_defaults_to_false() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert!(!config.write_requires_token);
+    }
+
+    #[test]
+    fn write_requires_token_needs_a_bearer_token() {
+        let mut pairs = base_env();
+        pairs.push((
+            "DAYFLY_WRITE_REQUIRES_TOKEN".to_string(),
+            "true".to_string(),
+        ));
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        match error {
+            ConfigError::Invalid(name, message) => {
+                assert_eq!(name, "DAYFLY_WRITE_REQUIRES_TOKEN");
+                assert!(
+                    message.contains("DAYFLY_HTTP_BEARER_TOKEN"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn write_requires_token_accepts_a_bearer_token() {
+        let mut pairs = base_env();
+        pairs.push((
+            "DAYFLY_WRITE_REQUIRES_TOKEN".to_string(),
+            "true".to_string(),
+        ));
+        pairs.push((
+            "DAYFLY_HTTP_BEARER_TOKEN".to_string(),
+            "secret-token".to_string(),
+        ));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("write auth config");
+        assert!(config.write_requires_token);
+        assert_eq!(config.http_bearer_token.as_deref(), Some("secret-token"));
     }
 
     #[test]

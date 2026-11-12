@@ -39,6 +39,7 @@ fn command() -> Command {
         "DAYFLY_METRICS_ALLOWED_NETWORKS",
         "DAYFLY_TRUSTED_PROXIES",
         "DAYFLY_LIST_REQUIRES_TOKEN",
+        "DAYFLY_WRITE_REQUIRES_TOKEN",
         "DAYFLY_PASTE_TOKENS",
         "DAYFLY_EXPOSE_CREATOR_ADDR",
         "DAYFLY_RATE_LIMIT_PER_MINUTE",
@@ -485,6 +486,116 @@ fn config_check_missing_secret_file_names_the_path_and_not_the_secret() {
     assert!(
         !text.contains("top-secret-value"),
         "the secret value must never appear: {text}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn write_auth_without_a_token_file(dir: &std::path::Path) -> PathBuf {
+    std::fs::create_dir_all(dir).expect("the directory must be creatable");
+    let path = dir.join("dayfly.env");
+    std::fs::write(
+        &path,
+        "S3_ENDPOINT=https://s3.example.invalid\n\
+         S3_BUCKET=bucket\n\
+         S3_ACCESS_KEY_ID=key\n\
+         S3_SECRET_ACCESS_KEY=secret\n\
+         DAYFLY_WRITE_REQUIRES_TOKEN=true\n",
+    )
+    .expect("the env file must be writable");
+    path
+}
+
+#[test]
+fn config_check_refuses_write_auth_without_a_bearer_token() {
+    let dir = temp_config_dir("check-write-auth");
+    let path = write_auth_without_a_token_file(&dir);
+
+    let output = command()
+        .arg("--config")
+        .arg(&path)
+        .arg("config")
+        .arg("check")
+        .output()
+        .expect("config check must run");
+    assert!(
+        !output.status.success(),
+        "write auth without a bearer token must fail: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("DAYFLY_WRITE_REQUIRES_TOKEN"),
+        "the error must name the setting: {stderr}"
+    );
+    assert!(
+        stderr.contains("DAYFLY_HTTP_BEARER_TOKEN"),
+        "the error must name the missing variable: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn config_check_accepts_write_auth_with_a_bearer_token() {
+    let dir = temp_config_dir("check-write-auth-token");
+    std::fs::create_dir_all(&dir).expect("the directory must be creatable");
+    let path = dir.join("dayfly.env");
+    std::fs::write(
+        &path,
+        "S3_ENDPOINT=https://s3.example.invalid\n\
+         S3_BUCKET=bucket\n\
+         S3_ACCESS_KEY_ID=key\n\
+         S3_SECRET_ACCESS_KEY=secret\n\
+         DAYFLY_WRITE_REQUIRES_TOKEN=true\n\
+         DAYFLY_HTTP_BEARER_TOKEN=secret-token\n",
+    )
+    .expect("the env file must be writable");
+
+    let output = command()
+        .arg("--config")
+        .arg(&path)
+        .arg("config")
+        .arg("check")
+        .output()
+        .expect("config check must run");
+    assert!(
+        output.status.success(),
+        "write auth with a bearer token must pass: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("DAYFLY_WRITE_REQUIRES_TOKEN: set"),
+        "the check must report the setting: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn startup_refuses_write_auth_without_a_bearer_token() {
+    let dir = temp_config_dir("start-write-auth");
+    let path = write_auth_without_a_token_file(&dir);
+
+    let output = command()
+        .arg("--config")
+        .arg(&path)
+        .arg("mcp")
+        .output()
+        .expect("dayfly must start");
+    assert!(
+        !output.status.success(),
+        "write auth without a bearer token must stop startup: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("DAYFLY_WRITE_REQUIRES_TOKEN"),
+        "the error must name the setting: {stderr}"
+    );
+    assert!(
+        stderr.contains("DAYFLY_HTTP_BEARER_TOKEN"),
+        "the error must name the missing variable: {stderr}"
     );
     let _ = std::fs::remove_dir_all(dir);
 }

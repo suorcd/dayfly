@@ -124,7 +124,8 @@ As a simple, optional extra for the binary's own endpoint (not a
 replacement for the S3 credentials), set
 `DAYFLY_HTTP_BEARER_TOKEN`: HTTP mode then requires
 `Authorization: Bearer <token>` on every HTTP route, including `/mcp`
-and the human pages. The exceptions are `DELETE` and `PATCH`, which
+and the human pages, unless `DAYFLY_WRITE_REQUIRES_TOKEN` is on (see
+below). The exceptions are `DELETE` and `PATCH`, which
 also accept a valid paste token when `DAYFLY_PASTE_TOKENS` is on. The
 token must not contain ASCII whitespace;
 startup fails if it does. Unset the variable to disable the token. A
@@ -138,13 +139,25 @@ set, and use the token for API clients. Do not put the token in a URL
 query
 parameter — it would leak into logs and browser history.
 
+`DAYFLY_WRITE_REQUIRES_TOKEN` adds a write-only auth mode. It needs
+`DAYFLY_HTTP_BEARER_TOKEN`. Reads stay anonymous: downloads, metadata,
+search, `/raw`, the human index and view pages, and listing. Writes
+require the bearer token: uploads, appends, deletes, expiry changes,
+the human write routes, and `/mcp`. A paste token still authorizes its
+own `DELETE`, `PATCH`, and `append` when `DAYFLY_PASTE_TOKENS` is on.
+`DAYFLY_LIST_REQUIRES_TOKEN` still gates the list separately. A browser
+form cannot send the bearer token, so browser writes need an
+authenticating proxy or a paste token. The service document reports
+`auth: "write-bearer"` and names the gated routes.
+
 `serve` refuses a bind address that other hosts can reach when the
 bearer token is unset. Startup stops with a configuration error, and
 the message names the ways out. The rule has three states:
 
 - Loopback bind, no token: start. This is the default.
-- Non-loopback bind with a token: start. The browser front end stays
-  unusable, as the paragraph above says.
+- Non-loopback bind with a token: start. With
+  `DAYFLY_WRITE_REQUIRES_TOKEN`, reads work in a browser and writes need
+  the token or an authenticating proxy.
 - Non-loopback bind, no token: refuse, unless
   `DAYFLY_ALLOW_UNAUTHENTICATED=1` is set. With that value the service
   starts and writes one warning at startup. Set it only on a network
@@ -177,8 +190,8 @@ filter a list by author.
 
 `DAYFLY_LIST_REQUIRES_TOKEN` separates "public downloads" from "private
 listing" when listing is on. With the default `false`, listing follows
-the global token rule: gated when `DAYFLY_HTTP_BEARER_TOKEN` is set,
-open when it is not. When `true`, `GET /v1/pastes`, the human `/pastes`
+the read rule: gated when the bearer token gates reads, open when reads
+are anonymous. When `true`, `GET /v1/pastes`, the human `/pastes`
 page, and the MCP `list_recent` tool require the bearer token even if
 reads are otherwise anonymous. If the setting is on and no token is
 configured, all three refuse and the message names the missing variable:
@@ -281,9 +294,11 @@ both forms; the plain-text HTTP response returns only the URL. See
 ### Service description
 
 The running service publishes `GET /.well-known/dayfly.json` without
-authentication. The document reports the crate version, the auth mode,
-the content policy (`inline_pdf`), the creator-address exposure setting
-(`expose_creator_addr`), the limits in force, and every API route. The frontend links to it. The MCP tool `get_info` returns the
+authentication. The document reports the crate version, the auth mode
+(`none`, `bearer`, or `write-bearer`), the gated write routes when write
+mode is on, the content policy (`inline_pdf`), the creator-address
+exposure setting (`expose_creator_addr`), the limits in force, and every
+API route. The frontend links to it. The MCP tool `get_info` returns the
 same document, plus the local-path tool mode for the transport. Both
 read one function, so they cannot drift.
 
@@ -399,6 +414,7 @@ permissions and the lower total cap.
 | `DAYFLY_TRUSTED_PROXIES` | no | (empty) | Comma-separated CIDR blocks (bare addresses are single hosts) of reverse proxies whose `X-Forwarded-For` header is believed. Empty keeps the socket peer as the client and ignores forwarding headers. The chain is walked from the right; a malformed or over-long chain falls back to the peer with one warning. Set this before any per-client limit behind an ingress |
 | `DAYFLY_RATE_LIMIT_PER_MINUTE` | no | 0 | Maximum requests per client per minute. 0 disables the limiter and allocates no counters. The burst is this value, and the bucket refills at this rate. Over the limit → 429 with `Retry-After`. Keyed on the resolved client address, so set `DAYFLY_TRUSTED_PROXIES` behind an ingress. Per process; resets on restart |
 | `DAYFLY_ALLOW_UNAUTHENTICATED` | no | `false` | Accept a non-loopback bind with no bearer token. Startup refuses that bind without this value, and with it the service writes one warning. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
+| `DAYFLY_WRITE_REQUIRES_TOKEN` | no | `false` | Require the bearer token for writes while reads stay anonymous. It requires `DAYFLY_HTTP_BEARER_TOKEN`. Uploads, appends, deletes, expiry changes, the human write routes, and `/mcp` require the token. Downloads, metadata, search, `/raw`, the human index and view pages, and listing stay anonymous unless `DAYFLY_LIST_REQUIRES_TOKEN` gates the list. A paste token still authorizes its own delete, patch, and append. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_LIST_ENABLED` | no | `true` | Allow listing on every transport. `false` makes `/pastes`, `GET /v1/pastes`, and the MCP `list_recent` tool return 403 with "Listing is turned off on this instance." It wins over `DAYFLY_LIST_REQUIRES_TOKEN`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_LIST_REQUIRES_TOKEN` | no | `false` | Require the bearer token for `GET /v1/pastes`, the human `/pastes` page, and the MCP `list_recent` tool even when reads are anonymous. With this on and no token configured, all three refuse: there is nothing to check. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_PASTE_TOKENS` | no | `false` | Return a 128-bit management token at creation. The JSON store response carries `paste_token`; the plain response carries `X-Paste-Token`; the human create result page shows the token once. The token authorizes `DELETE` and `PATCH` for that paste. Only its SHA-256 is stored. The bearer token remains universal. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
@@ -498,6 +514,7 @@ first, then the file. These settings take effect on the next request:
 - `DAYFLY_ROBOTS_TXT_PATH` and `DAYFLY_SECURITY_TXT_PATH`
 - `DAYFLY_TRUSTED_PROXIES`
 - `DAYFLY_METRICS_ALLOWED_NETWORKS`
+- `DAYFLY_WRITE_REQUIRES_TOKEN`
 - `DAYFLY_LIST_ENABLED`
 - `DAYFLY_LIST_REQUIRES_TOKEN`
 - `DAYFLY_PASTE_TOKENS`
@@ -1021,7 +1038,9 @@ The endpoint uses the same auth rule as the REST routes:
 
 - When `DAYFLY_HTTP_BEARER_TOKEN` is set, every request needs
   `Authorization: Bearer <token>`. A missing or wrong token gets HTTP
-  401 and `{"error":"unauthorized"}`.
+  401 and `{"error":"unauthorized"}`. `DAYFLY_WRITE_REQUIRES_TOKEN`
+  makes reads anonymous, but `/mcp` stays gated because it carries
+  writes.
 - When the token is unset, the endpoint stays open. In that case,
   serve it on a private network or localhost only.
 
@@ -1414,7 +1433,7 @@ credentials. The suite needs no network and no Garage.
 | --- | --- |
 | `tests/common/mod.rs` | The single fake S3 service, request helpers, multipart bodies, temporary files |
 | `tests/store_s3.rs` | `store_text`, `store_file_path`, `store_stream`, multipart abort paths, caps, `head_metadata`, `fetch_text`, `fetch_range_by_key`, `download_file`, `delete`, `list_recent`, error mapping, append and segment reads |
-| `tests/http_routes.rs` | Raw and multipart uploads, bearer auth, download, `HEAD`, `Range`, metadata, delete, list, append, MCP shared store, failed uploads |
+| `tests/http_routes.rs` | Raw and multipart uploads, bearer and write-only auth, download, `HEAD`, `Range`, metadata, delete, list, append, MCP shared store, failed uploads |
 | `tests/web_handlers.rs` | Index, text submit, upload submit, list, view, delete, auth, error pages |
 | `tests/mcp_stdio.rs` | The real binary over MCP stdio: all tools and their error paths |
 | `tests/config_env.rs` | `Config::from_env` defaults, overrides, and error text |
