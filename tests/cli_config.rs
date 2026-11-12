@@ -490,6 +490,118 @@ fn config_check_missing_secret_file_names_the_path_and_not_the_secret() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn config_check_accepts_relative_secret_files() {
+    let dir = temp_config_dir("check-relative-valid");
+    let path = dir.join("dayfly.env");
+    let access_name = format!("access-key-{}", std::process::id());
+    let secret_name = format!("secret-key-{}", std::process::id());
+    let token_name = format!("bearer-token-{}", std::process::id());
+    std::fs::create_dir_all(&dir).expect("the directory must be creatable");
+    std::fs::write(dir.join(&access_name), "relative-access-value\n")
+        .expect("the access key file must be writable");
+    std::fs::write(dir.join(&secret_name), "relative-secret-value\n")
+        .expect("the secret key file must be writable");
+    std::fs::write(dir.join(&token_name), "relative-token-value\n")
+        .expect("the token file must be writable");
+    std::fs::write(
+        &path,
+        format!(
+            "S3_ENDPOINT=https://s3.example.invalid\n\
+             S3_BUCKET=bucket\n\
+             S3_ACCESS_KEY_ID_FILE={access_name}\n\
+             S3_SECRET_ACCESS_KEY_FILE={secret_name}\n\
+             DAYFLY_HTTP_BEARER_TOKEN_FILE={token_name}\n"
+        ),
+    )
+    .expect("the env file must be writable");
+
+    let output = command()
+        .arg("--config")
+        .arg(&path)
+        .arg("config")
+        .arg("check")
+        .output()
+        .expect("config check must run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "a relative secret file must resolve against the env file directory: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("configuration check: ok"),
+        "a valid env file must pass: {stdout}"
+    );
+    for secret in [
+        "relative-access-value",
+        "relative-secret-value",
+        "relative-token-value",
+    ] {
+        assert!(
+            !stdout.contains(secret) && !stderr.contains(secret),
+            "the check must not print a secret value: stdout={stdout} stderr={stderr}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn config_check_reports_relative_secret_files_and_every_fault() {
+    let dir = temp_config_dir("check-relative-faults");
+    let path = dir.join("dayfly.env");
+    let access_name = format!("access-key-{}", std::process::id());
+    let missing_root = format!("missing-directory-{}", std::process::id());
+    std::fs::create_dir_all(&dir).expect("the directory must be creatable");
+    std::fs::write(dir.join(&access_name), "relative-access-value\n")
+        .expect("the access key file must be writable");
+    std::fs::write(
+        &path,
+        format!(
+            "S3_ENDPOINT=https://s3.example.invalid\n\
+             S3_ACCESS_KEY_ID_FILE={access_name}\n\
+             DAYFLY_TTL_CHOICES=0\n\
+             DAYFLY_MCP_LOCAL_ROOT={missing_root}\n"
+        ),
+    )
+    .expect("the env file must be writable");
+
+    let output = command()
+        .arg("--config")
+        .arg(&path)
+        .arg("config")
+        .arg("check")
+        .output()
+        .expect("config check must run");
+    assert!(!output.status.success(), "the faults must fail the check");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("S3_BUCKET"),
+        "the missing bucket must be reported: {stderr}"
+    );
+    assert!(
+        stderr.contains("DAYFLY_TTL_CHOICES"),
+        "the invalid TTL choice must be reported in the same run: {stderr}"
+    );
+    assert!(
+        stderr.contains("DAYFLY_MCP_LOCAL_ROOT"),
+        "the missing local root must be reported in the same run: {stderr}"
+    );
+    assert!(
+        !stderr.contains("cannot read S3_ACCESS_KEY_ID_FILE"),
+        "the relative access key file must resolve against the env file directory: {stderr}"
+    );
+    assert!(
+        !stderr.contains("S3_ACCESS_KEY_ID or S3_ACCESS_KEY_ID_FILE"),
+        "the relative access key file must supply the access key: {stderr}"
+    );
+    assert!(
+        !stderr.contains("relative-access-value"),
+        "the check must not print a secret value: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn write_auth_without_a_token_file(dir: &std::path::Path) -> PathBuf {
     std::fs::create_dir_all(dir).expect("the directory must be creatable");
     let path = dir.join("dayfly.env");

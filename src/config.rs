@@ -754,21 +754,11 @@ where
     }
 }
 
-/// Parse and check `DAYFLY_TTL_CHOICES`.
-///
-/// Every choice must be from `min_ttl_days` (at least 1) to `max_ttl_days`.
-/// The default TTL is added when it is absent. The result is sorted and
-/// has no duplicates.
-fn ttl_choices<F>(
-    lookup: &F,
-    default_ttl_days: u32,
-    min_ttl_days: u32,
-    max_ttl_days: u32,
-) -> Result<Vec<u32>, ConfigError>
+/// Parse the `DAYFLY_TTL_CHOICES` list without a range check.
+fn ttl_choice_values<F>(lookup: &F) -> Result<Vec<u32>, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
-    let min = min_ttl_days.max(1);
     let raw = lookup("DAYFLY_TTL_CHOICES")
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "1,3,7,14,30,90".to_string());
@@ -787,18 +777,40 @@ where
                 "expected a comma-separated list of whole days".to_string(),
             )
         })?;
-        if days < min || days > max_ttl_days {
-            return Err(ConfigError::Invalid(
-                "DAYFLY_TTL_CHOICES".to_string(),
-                format!("each value must be from {min} to {max_ttl_days}"),
-            ));
-        }
         choices.push(days);
     }
     if choices.is_empty() {
         return Err(ConfigError::Invalid(
             "DAYFLY_TTL_CHOICES".to_string(),
             "expected at least one value".to_string(),
+        ));
+    }
+    Ok(choices)
+}
+
+/// Parse and check `DAYFLY_TTL_CHOICES`.
+///
+/// Every choice must be from `min_ttl_days` (at least 1) to `max_ttl_days`.
+/// The default TTL is added when it is absent. The result is sorted and
+/// has no duplicates.
+fn ttl_choices<F>(
+    lookup: &F,
+    default_ttl_days: u32,
+    min_ttl_days: u32,
+    max_ttl_days: u32,
+) -> Result<Vec<u32>, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let min = min_ttl_days.max(1);
+    let mut choices = ttl_choice_values(lookup)?;
+    if choices
+        .iter()
+        .any(|days| *days < min || *days > max_ttl_days)
+    {
+        return Err(ConfigError::Invalid(
+            "DAYFLY_TTL_CHOICES".to_string(),
+            format!("each value must be from {min} to {max_ttl_days}"),
         ));
     }
     if !choices.contains(&default_ttl_days) {
@@ -1410,9 +1422,95 @@ fn credential_directory_warning_parts(
     }
 }
 
+/// The merged process environment and an optional environment file.
+///
+/// A process environment value wins over the same name in the file. A
+/// relative secret-file path in the file resolves against the file
+/// directory.
+pub struct ConfigSource {
+    file_values: HashMap<String, String>,
+}
+
+impl ConfigSource {
+    /// Read the process environment and an optional environment file.
+    pub fn from_env_file(path: Option<&Path>) -> Result<Self, ConfigError> {
+        let file_values = match path {
+            Some(path) => {
+                let mut values = read_env_file(path)?;
+                resolve_secret_paths(&mut values, path.parent());
+                values
+            }
+            None => HashMap::new(),
+        };
+        Ok(Self { file_values })
+    }
+
+    /// Read one value. A blank process value falls back to the file.
+    pub fn get(&self, name: &str) -> Option<String> {
+        env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| self.file_values.get(name).cloned())
+    }
+
+    /// Read one value. A blank value means unset.
+    pub fn get_nonempty(&self, name: &str) -> Option<String> {
+        self.get(name).filter(|value| !value.trim().is_empty())
+    }
+}
+
+/// The result of one configuration validation run.
+///
+/// `config` holds the parsed values. A field with a fault holds its
+/// default. `faults` holds every independent fault from the run.
+pub struct ConfigValidation {
+    pub config: Config,
+    pub faults: Vec<ConfigError>,
+}
+
+impl ConfigValidation {
+    /// Return the configuration, or the first fault.
+    pub fn into_result(self) -> Result<Config, ConfigError> {
+        match self.faults.into_iter().next() {
+            Some(error) => Err(error),
+            None => Ok(self.config),
+        }
+    }
+}
+
+/// Record a parse result, or push its fault and return `fallback`.
+fn record<T>(faults: &mut Vec<ConfigError>, result: Result<T, ConfigError>, fallback: T) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            faults.push(error);
+            fallback
+        }
+    }
+}
+
+/// Record a parse result and keep the value only when it is valid.
+fn record_ok<T>(faults: &mut Vec<ConfigError>, result: Result<T, ConfigError>) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            faults.push(error);
+            None
+        }
+    }
+}
+
+/// Read an optional boolean and record a fault.
+fn record_bool<F>(faults: &mut Vec<ConfigError>, lookup: &F, name: &str, default: bool) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    record(faults, optional_bool(lookup, name, default), default)
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        Self::from_lookup(|name| env::var(name).ok())
+        Self::validate_from_env().into_result()
     }
 
     /// Build a configuration from the process environment and an optional
@@ -1424,24 +1522,26 @@ impl Config {
     /// pair of matching single or double quotes are accepted. A relative
     /// secret-file path in the file resolves against the file directory.
     pub fn from_env_file(path: Option<&Path>) -> Result<Self, ConfigError> {
-        let file_values = match path {
-            Some(path) => {
-                let mut values = read_env_file(path)?;
-                resolve_secret_paths(&mut values, path.parent());
-                Some(values)
-            }
-            None => None,
-        };
-        Self::from_lookup(|name| {
-            env::var(name)
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| {
-                    file_values
-                        .as_ref()
-                        .and_then(|values| values.get(name).cloned())
-                })
-        })
+        Self::validate_from_env_file(path)?.into_result()
+    }
+
+    /// Validate the process environment and return every fault.
+    fn validate_from_env() -> ConfigValidation {
+        Self::validate_lookup(|name| env::var(name).ok())
+    }
+
+    /// Validate the process environment and an optional environment file.
+    ///
+    /// A relative secret-file path in the file resolves against the file
+    /// directory. The result holds every fault, not only the first one.
+    fn validate_from_env_file(path: Option<&Path>) -> Result<ConfigValidation, ConfigError> {
+        let source = ConfigSource::from_env_file(path)?;
+        Ok(Self::validate_source(&source))
+    }
+
+    /// Validate a merged configuration source and return every fault.
+    pub fn validate_source(source: &ConfigSource) -> ConfigValidation {
+        Self::validate_lookup(|name| source.get(name))
     }
 
     /// Files that a reload watch must follow.
@@ -1479,74 +1579,155 @@ impl Config {
 
     /// Build a configuration from a name-to-value lookup.
     ///
-    /// `from_env` passes the process environment. Unit tests pass a plain
-    /// map, so they do not change global process state.
+    /// Unit tests pass a plain map, so they do not change global process
+    /// state. The result holds the first fault.
+    #[cfg(test)]
     fn from_lookup<F>(lookup: F) -> Result<Self, ConfigError>
     where
         F: Fn(&str) -> Option<String>,
     {
-        let endpoint = required(&lookup, "S3_ENDPOINT")?;
-        if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
-            return Err(ConfigError::BadEndpoint);
-        }
-        let bucket = required(&lookup, "S3_BUCKET")?;
-        if bucket.is_empty() {
-            return Err(ConfigError::EmptyBucket);
-        }
-        let log_format = log_format(&lookup)?;
-        let metrics_bind = optional_socket_addr(&lookup, "DAYFLY_METRICS_BIND")?;
-        let metrics_allowed_networks = cidr_list(&lookup, "DAYFLY_METRICS_ALLOWED_NETWORKS")?;
-        if let Some(bind) = metrics_bind {
-            if !bind.ip().is_loopback() && metrics_allowed_networks.is_empty() {
-                return Err(ConfigError::Invalid(
+        Self::validate_lookup(lookup).into_result()
+    }
+
+    /// Build a configuration and collect every independent fault.
+    fn validate_lookup<F>(lookup: F) -> ConfigValidation
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let mut faults = Vec::new();
+
+        let endpoint = match required(&lookup, "S3_ENDPOINT") {
+            Ok(endpoint) => {
+                if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+                    faults.push(ConfigError::BadEndpoint);
+                }
+                endpoint
+            }
+            Err(error) => {
+                faults.push(error);
+                String::new()
+            }
+        };
+        let bucket = match required(&lookup, "S3_BUCKET") {
+            Ok(bucket) => {
+                if bucket.is_empty() {
+                    faults.push(ConfigError::EmptyBucket);
+                }
+                bucket
+            }
+            Err(error) => {
+                faults.push(error);
+                String::new()
+            }
+        };
+        let log_format = record(&mut faults, log_format(&lookup), LogFormat::Text);
+        let metrics_bind = record(
+            &mut faults,
+            optional_socket_addr(&lookup, "DAYFLY_METRICS_BIND"),
+            None,
+        );
+        let metrics_allowed_networks = match cidr_list(&lookup, "DAYFLY_METRICS_ALLOWED_NETWORKS") {
+            Ok(networks) => Some(networks),
+            Err(error) => {
+                faults.push(error);
+                None
+            }
+        };
+        if let (Some(bind), Some(networks)) = (&metrics_bind, &metrics_allowed_networks) {
+            if !bind.ip().is_loopback() && networks.is_empty() {
+                faults.push(ConfigError::Invalid(
                     "DAYFLY_METRICS_ALLOWED_NETWORKS".to_string(),
                     format!("required when DAYFLY_METRICS_BIND ({bind}) is not a loopback address"),
                 ));
             }
         }
-        let min_ttl_days = optional_u32(&lookup, "DAYFLY_MIN_TTL_DAYS", 0)?;
-        let max_ttl_days = optional_u32(&lookup, "DAYFLY_MAX_TTL_DAYS", MAX_TTL_DAYS)?;
-        if max_ttl_days == 0 || max_ttl_days > MAX_TTL_DAYS {
-            return Err(ConfigError::Invalid(
-                "DAYFLY_MAX_TTL_DAYS".to_string(),
-                format!("expected an integer from 1 to {MAX_TTL_DAYS}"),
-            ));
+        let metrics_allowed_networks = metrics_allowed_networks.unwrap_or_default();
+        let min_ttl_days = record_ok(&mut faults, optional_u32(&lookup, "DAYFLY_MIN_TTL_DAYS", 0));
+        let max_ttl_days = record_ok(
+            &mut faults,
+            optional_u32(&lookup, "DAYFLY_MAX_TTL_DAYS", MAX_TTL_DAYS),
+        );
+        let max_ttl_valid = max_ttl_days.is_some_and(|days| (1..=MAX_TTL_DAYS).contains(&days));
+        if let Some(days) = max_ttl_days {
+            if days == 0 || days > MAX_TTL_DAYS {
+                faults.push(ConfigError::Invalid(
+                    "DAYFLY_MAX_TTL_DAYS".to_string(),
+                    format!("expected an integer from 1 to {MAX_TTL_DAYS}"),
+                ));
+            }
         }
-        if min_ttl_days > max_ttl_days {
-            return Err(ConfigError::Invalid(
-                "DAYFLY_MIN_TTL_DAYS".to_string(),
-                "must not exceed DAYFLY_MAX_TTL_DAYS".to_string(),
-            ));
+        if let (Some(min), Some(max)) = (min_ttl_days, max_ttl_days) {
+            if max_ttl_valid && min > max {
+                faults.push(ConfigError::Invalid(
+                    "DAYFLY_MIN_TTL_DAYS".to_string(),
+                    "must not exceed DAYFLY_MAX_TTL_DAYS".to_string(),
+                ));
+            }
         }
-        let default_ttl_days = optional_u32(
-            &lookup,
-            "DAYFLY_DEFAULT_TTL_DAYS",
-            field_u32("DAYFLY_DEFAULT_TTL_DAYS", 7),
-        )?;
-        if default_ttl_days == 0 || default_ttl_days < min_ttl_days.max(1) {
-            return Err(ConfigError::Invalid(
-                "DAYFLY_DEFAULT_TTL_DAYS".to_string(),
-                format!(
-                    "expected an integer from {} to {max_ttl_days}",
-                    min_ttl_days.max(1)
-                ),
-            ));
+        let min_ttl_days = min_ttl_days.unwrap_or(0);
+        let max_ttl_days = max_ttl_days.unwrap_or(MAX_TTL_DAYS);
+        let default_ttl_days = record_ok(
+            &mut faults,
+            optional_u32(
+                &lookup,
+                "DAYFLY_DEFAULT_TTL_DAYS",
+                field_u32("DAYFLY_DEFAULT_TTL_DAYS", 7),
+            ),
+        );
+        if let Some(days) = default_ttl_days {
+            let min = min_ttl_days.max(1);
+            if days == 0 {
+                faults.push(ConfigError::Invalid(
+                    "DAYFLY_DEFAULT_TTL_DAYS".to_string(),
+                    format!("expected an integer from {min} to {max_ttl_days}"),
+                ));
+            } else if min_ttl_days <= max_ttl_days && max_ttl_valid {
+                if days < min {
+                    faults.push(ConfigError::Invalid(
+                        "DAYFLY_DEFAULT_TTL_DAYS".to_string(),
+                        format!("expected an integer from {min} to {max_ttl_days}"),
+                    ));
+                } else if days > max_ttl_days {
+                    faults.push(ConfigError::Invalid(
+                        "DAYFLY_DEFAULT_TTL_DAYS".to_string(),
+                        format!("expected at most {max_ttl_days} days"),
+                    ));
+                }
+            }
         }
-        if default_ttl_days > max_ttl_days {
-            return Err(ConfigError::Invalid(
-                "DAYFLY_DEFAULT_TTL_DAYS".to_string(),
-                format!("expected at most {max_ttl_days} days"),
-            ));
-        }
-        let ttl_choices = ttl_choices(&lookup, default_ttl_days, min_ttl_days, max_ttl_days)?;
-        let list_default_days = optional_u32(
-            &lookup,
-            "DAYFLY_LIST_DEFAULT_DAYS",
-            field_u32("DAYFLY_LIST_DEFAULT_DAYS", 2),
-        )?;
+        let ttl_choices =
+            if min_ttl_days <= max_ttl_days && max_ttl_valid && default_ttl_days.is_some() {
+                record(
+                    &mut faults,
+                    ttl_choices(
+                        &lookup,
+                        default_ttl_days.unwrap_or(7),
+                        min_ttl_days,
+                        max_ttl_days,
+                    ),
+                    vec![1, 3, 7, 14, 30, 90],
+                )
+            } else {
+                match ttl_choice_values(&lookup) {
+                    Ok(_) => vec![1, 3, 7, 14, 30, 90],
+                    Err(error) => {
+                        faults.push(error);
+                        vec![1, 3, 7, 14, 30, 90]
+                    }
+                }
+            };
+        let list_default_days = record(
+            &mut faults,
+            optional_u32(
+                &lookup,
+                "DAYFLY_LIST_DEFAULT_DAYS",
+                field_u32("DAYFLY_LIST_DEFAULT_DAYS", 2),
+            ),
+            2,
+        );
         if list_default_days == 0 || list_default_days as usize > crate::store::LIST_WINDOW_MAX_DAYS
         {
-            return Err(ConfigError::Invalid(
+            faults.push(ConfigError::Invalid(
                 "DAYFLY_LIST_DEFAULT_DAYS".to_string(),
                 format!(
                     "expected an integer from 1 to {}",
@@ -1554,187 +1735,328 @@ impl Config {
                 ),
             ));
         }
-        let retention_min_days = optional_u32(
-            &lookup,
-            "DAYFLY_RETENTION_MIN_DAYS",
-            field_u32("DAYFLY_RETENTION_MIN_DAYS", 30),
-        )?;
-        if retention_min_days == 0 || retention_min_days > MAX_TTL_DAYS {
-            return Err(ConfigError::Invalid(
-                "DAYFLY_RETENTION_MIN_DAYS".to_string(),
-                format!("expected an integer from 1 to {MAX_TTL_DAYS}"),
-            ));
+        let retention_min_days = record_ok(
+            &mut faults,
+            optional_u32(
+                &lookup,
+                "DAYFLY_RETENTION_MIN_DAYS",
+                field_u32("DAYFLY_RETENTION_MIN_DAYS", 30),
+            ),
+        );
+        if let Some(days) = retention_min_days {
+            if days == 0 || days > MAX_TTL_DAYS {
+                faults.push(ConfigError::Invalid(
+                    "DAYFLY_RETENTION_MIN_DAYS".to_string(),
+                    format!("expected an integer from 1 to {MAX_TTL_DAYS}"),
+                ));
+            }
         }
-        let retention_max_days = optional_u32(
-            &lookup,
-            "DAYFLY_RETENTION_MAX_DAYS",
-            field_u32("DAYFLY_RETENTION_MAX_DAYS", 365),
-        )?;
-        if retention_max_days == 0 || retention_max_days > MAX_TTL_DAYS {
-            return Err(ConfigError::Invalid(
-                "DAYFLY_RETENTION_MAX_DAYS".to_string(),
-                format!("expected an integer from 1 to {MAX_TTL_DAYS}"),
-            ));
+        let retention_max_days = record_ok(
+            &mut faults,
+            optional_u32(
+                &lookup,
+                "DAYFLY_RETENTION_MAX_DAYS",
+                field_u32("DAYFLY_RETENTION_MAX_DAYS", 365),
+            ),
+        );
+        if let Some(days) = retention_max_days {
+            if days == 0 || days > MAX_TTL_DAYS {
+                faults.push(ConfigError::Invalid(
+                    "DAYFLY_RETENTION_MAX_DAYS".to_string(),
+                    format!("expected an integer from 1 to {MAX_TTL_DAYS}"),
+                ));
+            }
         }
-        if retention_min_days > retention_max_days {
-            return Err(ConfigError::Invalid(
-                "DAYFLY_RETENTION_MIN_DAYS".to_string(),
-                "must not exceed DAYFLY_RETENTION_MAX_DAYS".to_string(),
-            ));
+        if let (Some(min), Some(max)) = (retention_min_days, retention_max_days) {
+            let min_valid = (1..=MAX_TTL_DAYS).contains(&min);
+            let max_valid = (1..=MAX_TTL_DAYS).contains(&max);
+            if min_valid && max_valid && min > max {
+                faults.push(ConfigError::Invalid(
+                    "DAYFLY_RETENTION_MIN_DAYS".to_string(),
+                    "must not exceed DAYFLY_RETENTION_MAX_DAYS".to_string(),
+                ));
+            }
         }
-        let max_file_bytes = optional_u64(
-            &lookup,
-            "DAYFLY_MAX_FILE_BYTES",
-            field_u64("DAYFLY_MAX_FILE_BYTES", 1024 * 1024 * 1024),
-        )?;
+        let retention_min_days = retention_min_days.unwrap_or(30);
+        let retention_max_days = retention_max_days.unwrap_or(365);
+        let max_file_bytes = record(
+            &mut faults,
+            optional_u64(
+                &lookup,
+                "DAYFLY_MAX_FILE_BYTES",
+                field_u64("DAYFLY_MAX_FILE_BYTES", 1024 * 1024 * 1024),
+            ),
+            1024 * 1024 * 1024,
+        );
         if max_file_bytes > MAX_MULTIPART_BYTES {
-            return Err(ConfigError::Invalid(
+            faults.push(ConfigError::Invalid(
                 "DAYFLY_MAX_FILE_BYTES".to_string(),
                 format!("expected at most {MAX_MULTIPART_BYTES} bytes: 10,000 parts of 5 MiB"),
             ));
         }
-        let search_max_bytes = optional_u64(
-            &lookup,
-            "DAYFLY_SEARCH_MAX_BYTES",
-            field_u64("DAYFLY_SEARCH_MAX_BYTES", 64 * 1024 * 1024),
-        )?;
+        let search_max_bytes = record(
+            &mut faults,
+            optional_u64(
+                &lookup,
+                "DAYFLY_SEARCH_MAX_BYTES",
+                field_u64("DAYFLY_SEARCH_MAX_BYTES", 64 * 1024 * 1024),
+            ),
+            64 * 1024 * 1024,
+        );
         if search_max_bytes == 0 {
-            return Err(ConfigError::Invalid(
+            faults.push(ConfigError::Invalid(
                 "DAYFLY_SEARCH_MAX_BYTES".to_string(),
                 "expected a positive number of bytes".to_string(),
             ));
         }
-        let alias_words = optional_u32(
-            &lookup,
-            "DAYFLY_ALIAS_WORDS",
+        let alias_words = record(
+            &mut faults,
+            optional_u32(
+                &lookup,
+                "DAYFLY_ALIAS_WORDS",
+                u32::from(DEFAULT_ALIAS_WORDS),
+            ),
             u32::from(DEFAULT_ALIAS_WORDS),
-        )?;
+        );
         if !(u32::from(MIN_ALIAS_WORDS)..=u32::from(MAX_ALIAS_WORDS)).contains(&alias_words) {
-            return Err(ConfigError::Invalid(
+            faults.push(ConfigError::Invalid(
                 "DAYFLY_ALIAS_WORDS".to_string(),
                 format!("expected an integer from {MIN_ALIAS_WORDS} to {MAX_ALIAS_WORDS}"),
             ));
         }
         // The range check above keeps this conversion in bounds.
         let alias_words = u8::try_from(alias_words).unwrap_or(DEFAULT_ALIAS_WORDS);
-        let http_bearer_token =
-            bearer_token(optional_credential(&lookup, "DAYFLY_HTTP_BEARER_TOKEN")?)?;
-        let write_requires_token = optional_bool(&lookup, "DAYFLY_WRITE_REQUIRES_TOKEN", false)?;
+        let http_bearer_token = match optional_credential(&lookup, "DAYFLY_HTTP_BEARER_TOKEN") {
+            Ok(value) => match bearer_token(value) {
+                Ok(token) => token,
+                Err(error) => {
+                    faults.push(error);
+                    None
+                }
+            },
+            Err(error) => {
+                faults.push(error);
+                None
+            }
+        };
+        let write_requires_token =
+            record_bool(&mut faults, &lookup, "DAYFLY_WRITE_REQUIRES_TOKEN", false);
         if write_requires_token && http_bearer_token.is_none() {
-            return Err(ConfigError::Invalid(
+            faults.push(ConfigError::Invalid(
                 "DAYFLY_WRITE_REQUIRES_TOKEN".to_string(),
                 "requires DAYFLY_HTTP_BEARER_TOKEN".to_string(),
             ));
         }
-        Ok(Self {
-            endpoint,
-            bucket,
-            // Region is a signing parameter for S3-compatible stores such
-            // as Garage. It is not hardcoded: the operator supplies it.
-            region: optional_string(
-                &lookup,
-                "S3_REGION",
-                field_default("S3_REGION").unwrap_or("us-east-1"),
-            ),
-            access_key_id: credential(&lookup, "S3_ACCESS_KEY_ID")?,
-            secret_access_key: credential(&lookup, "S3_SECRET_ACCESS_KEY")?,
-            max_text_bytes: optional_u64(
+        // Region is a signing parameter for S3-compatible stores such as
+        // Garage. It is not hardcoded: the operator supplies it.
+        let region = optional_string(
+            &lookup,
+            "S3_REGION",
+            field_default("S3_REGION").unwrap_or("us-east-1"),
+        );
+        let access_key_id = record(
+            &mut faults,
+            credential(&lookup, "S3_ACCESS_KEY_ID"),
+            String::new(),
+        );
+        let secret_access_key = record(
+            &mut faults,
+            credential(&lookup, "S3_SECRET_ACCESS_KEY"),
+            String::new(),
+        );
+        let max_text_bytes = record(
+            &mut faults,
+            optional_u64(
                 &lookup,
                 "DAYFLY_MAX_TEXT_BYTES",
                 field_u64("DAYFLY_MAX_TEXT_BYTES", 100 * 1024 * 1024),
-            )?,
-            max_file_bytes,
-            max_paste_bytes: optional_u64(
+            ),
+            100 * 1024 * 1024,
+        );
+        let max_paste_bytes = record(
+            &mut faults,
+            optional_u64(
                 &lookup,
                 "DAYFLY_MAX_PASTE_BYTES",
                 field_u64("DAYFLY_MAX_PASTE_BYTES", 1024 * 1024 * 1024),
-            )?,
-            search_max_bytes,
-            alias_words,
-            default_ttl_days,
-            min_ttl_days,
-            max_ttl_days,
-            ttl_choices,
-            list_default_days,
-            retention_by_size: optional_bool(
-                &lookup,
-                "DAYFLY_RETENTION_BY_SIZE",
-                field_default("DAYFLY_RETENTION_BY_SIZE") == Some("true"),
-            )?,
-            retention_min_days,
-            retention_max_days,
-            http_bind: optional_string(
-                &lookup,
-                "DAYFLY_HTTP_BIND",
-                field_default("DAYFLY_HTTP_BIND").unwrap_or("127.0.0.1:8080"),
             ),
-            log_format,
-            metrics_bind,
-            metrics_allowed_networks,
-            trusted_proxies: trusted_proxies(&lookup)?,
-            show_words: optional_bool(
-                &lookup,
-                "DAYFLY_SHOW_WORDS",
-                field_default("DAYFLY_SHOW_WORDS") == Some("true"),
-            )?,
-            show_internal_paths: optional_bool(
-                &lookup,
-                "DAYFLY_SHOW_INTERNAL_PATHS",
-                field_default("DAYFLY_SHOW_INTERNAL_PATHS") == Some("true"),
-            )?,
-            inline_pdf: optional_bool(
-                &lookup,
-                "DAYFLY_INLINE_PDF",
-                field_default("DAYFLY_INLINE_PDF") == Some("true"),
-            )?,
-            view_line_numbers: optional_bool(
-                &lookup,
-                "DAYFLY_VIEW_LINE_NUMBERS",
-                field_default("DAYFLY_VIEW_LINE_NUMBERS") == Some("true"),
-            )?,
-            allow_unauthenticated: optional_bool(
-                &lookup,
-                "DAYFLY_ALLOW_UNAUTHENTICATED",
-                field_default("DAYFLY_ALLOW_UNAUTHENTICATED") == Some("true"),
-            )?,
-            write_requires_token,
-            list_requires_token: optional_bool(
-                &lookup,
-                "DAYFLY_LIST_REQUIRES_TOKEN",
-                field_default("DAYFLY_LIST_REQUIRES_TOKEN") == Some("true"),
-            )?,
-            list_enabled: optional_bool(
-                &lookup,
-                "DAYFLY_LIST_ENABLED",
-                field_default("DAYFLY_LIST_ENABLED") != Some("false"),
-            )?,
-            paste_tokens: optional_bool(
-                &lookup,
-                "DAYFLY_PASTE_TOKENS",
-                field_default("DAYFLY_PASTE_TOKENS") == Some("true"),
-            )?,
-            expose_creator_addr: optional_bool(
-                &lookup,
-                "DAYFLY_EXPOSE_CREATOR_ADDR",
-                field_default("DAYFLY_EXPOSE_CREATOR_ADDR") == Some("true"),
-            )?,
-            rate_limit_per_minute: optional_u32(
+            1024 * 1024 * 1024,
+        );
+        let retention_by_size = record_bool(
+            &mut faults,
+            &lookup,
+            "DAYFLY_RETENTION_BY_SIZE",
+            field_default("DAYFLY_RETENTION_BY_SIZE") == Some("true"),
+        );
+        let http_bind = optional_string(
+            &lookup,
+            "DAYFLY_HTTP_BIND",
+            field_default("DAYFLY_HTTP_BIND").unwrap_or("127.0.0.1:8080"),
+        );
+        let trusted_proxies = record(&mut faults, trusted_proxies(&lookup), Vec::new());
+        let show_words = record_bool(
+            &mut faults,
+            &lookup,
+            "DAYFLY_SHOW_WORDS",
+            field_default("DAYFLY_SHOW_WORDS") == Some("true"),
+        );
+        let show_internal_paths = record_bool(
+            &mut faults,
+            &lookup,
+            "DAYFLY_SHOW_INTERNAL_PATHS",
+            field_default("DAYFLY_SHOW_INTERNAL_PATHS") == Some("true"),
+        );
+        let inline_pdf = record_bool(
+            &mut faults,
+            &lookup,
+            "DAYFLY_INLINE_PDF",
+            field_default("DAYFLY_INLINE_PDF") == Some("true"),
+        );
+        let view_line_numbers = record_bool(
+            &mut faults,
+            &lookup,
+            "DAYFLY_VIEW_LINE_NUMBERS",
+            field_default("DAYFLY_VIEW_LINE_NUMBERS") == Some("true"),
+        );
+        let allow_unauthenticated = record_bool(
+            &mut faults,
+            &lookup,
+            "DAYFLY_ALLOW_UNAUTHENTICATED",
+            field_default("DAYFLY_ALLOW_UNAUTHENTICATED") == Some("true"),
+        );
+        let list_requires_token = record_bool(
+            &mut faults,
+            &lookup,
+            "DAYFLY_LIST_REQUIRES_TOKEN",
+            field_default("DAYFLY_LIST_REQUIRES_TOKEN") == Some("true"),
+        );
+        let list_enabled = record_bool(
+            &mut faults,
+            &lookup,
+            "DAYFLY_LIST_ENABLED",
+            field_default("DAYFLY_LIST_ENABLED") != Some("false"),
+        );
+        let paste_tokens = record_bool(
+            &mut faults,
+            &lookup,
+            "DAYFLY_PASTE_TOKENS",
+            field_default("DAYFLY_PASTE_TOKENS") == Some("true"),
+        );
+        let expose_creator_addr = record_bool(
+            &mut faults,
+            &lookup,
+            "DAYFLY_EXPOSE_CREATOR_ADDR",
+            field_default("DAYFLY_EXPOSE_CREATOR_ADDR") == Some("true"),
+        );
+        let rate_limit_per_minute = record(
+            &mut faults,
+            optional_u32(
                 &lookup,
                 "DAYFLY_RATE_LIMIT_PER_MINUTE",
                 field_u32("DAYFLY_RATE_LIMIT_PER_MINUTE", 0),
-            )?,
-            http_bearer_token,
-            mcp_local_root: local_root(lookup("DAYFLY_MCP_LOCAL_ROOT"))?,
-            favicon: favicon(lookup("DAYFLY_FAVICON_PATH"))?,
-            robots_txt: text_asset(lookup("DAYFLY_ROBOTS_TXT_PATH"), "DAYFLY_ROBOTS_TXT_PATH")?,
-            security_txt: text_asset(
-                lookup("DAYFLY_SECURITY_TXT_PATH"),
-                "DAYFLY_SECURITY_TXT_PATH",
-            )?,
-            site_name: optional_text(&lookup, "DAYFLY_SITE_NAME", MAX_SITE_NAME_CHARS)?,
-            contact: optional_text(&lookup, "DAYFLY_CONTACT", MAX_CONTACT_CHARS)?,
-            aup_url: optional_url(&lookup, "DAYFLY_AUP_URL", MAX_AUP_URL_CHARS)?,
-        })
+            ),
+            0,
+        );
+        let mcp_local_root = match local_root(lookup("DAYFLY_MCP_LOCAL_ROOT")) {
+            Ok(value) => value,
+            Err(error) => {
+                faults.push(error);
+                None
+            }
+        };
+        let favicon = match favicon(lookup("DAYFLY_FAVICON_PATH")) {
+            Ok(value) => value,
+            Err(error) => {
+                faults.push(error);
+                None
+            }
+        };
+        let robots_txt =
+            match text_asset(lookup("DAYFLY_ROBOTS_TXT_PATH"), "DAYFLY_ROBOTS_TXT_PATH") {
+                Ok(value) => value,
+                Err(error) => {
+                    faults.push(error);
+                    None
+                }
+            };
+        let security_txt = match text_asset(
+            lookup("DAYFLY_SECURITY_TXT_PATH"),
+            "DAYFLY_SECURITY_TXT_PATH",
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                faults.push(error);
+                None
+            }
+        };
+        let site_name = match optional_text(&lookup, "DAYFLY_SITE_NAME", MAX_SITE_NAME_CHARS) {
+            Ok(value) => value,
+            Err(error) => {
+                faults.push(error);
+                None
+            }
+        };
+        let contact = match optional_text(&lookup, "DAYFLY_CONTACT", MAX_CONTACT_CHARS) {
+            Ok(value) => value,
+            Err(error) => {
+                faults.push(error);
+                None
+            }
+        };
+        let aup_url = match optional_url(&lookup, "DAYFLY_AUP_URL", MAX_AUP_URL_CHARS) {
+            Ok(value) => value,
+            Err(error) => {
+                faults.push(error);
+                None
+            }
+        };
+        ConfigValidation {
+            config: Self {
+                endpoint,
+                bucket,
+                region,
+                access_key_id,
+                secret_access_key,
+                max_text_bytes,
+                max_file_bytes,
+                max_paste_bytes,
+                search_max_bytes,
+                alias_words,
+                default_ttl_days: default_ttl_days.unwrap_or(7),
+                min_ttl_days,
+                max_ttl_days,
+                ttl_choices,
+                list_default_days,
+                retention_by_size,
+                retention_min_days,
+                retention_max_days,
+                http_bind,
+                log_format,
+                metrics_bind,
+                metrics_allowed_networks,
+                trusted_proxies,
+                show_words,
+                show_internal_paths,
+                inline_pdf,
+                view_line_numbers,
+                allow_unauthenticated,
+                write_requires_token,
+                list_requires_token,
+                list_enabled,
+                paste_tokens,
+                expose_creator_addr,
+                rate_limit_per_minute,
+                http_bearer_token,
+                mcp_local_root,
+                favicon,
+                robots_txt,
+                security_txt,
+                site_name,
+                contact,
+                aup_url,
+            },
+            faults,
+        }
     }
 
     /// Effective text cap when this config creates a paste.
