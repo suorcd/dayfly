@@ -794,6 +794,12 @@ impl Pastebin {
                 crate::config::LISTING_DISABLED_MESSAGE,
             ));
         }
+        if store.config.list_token_gate_denied() {
+            return Ok(tool_error(
+                "unauthorized",
+                crate::config::LIST_MISSING_TOKEN_MESSAGE,
+            ));
+        }
         let request = try_store!(list_request(&params));
         let cursor = match (&params.after_date, &params.after_key) {
             (None, None) => None,

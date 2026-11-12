@@ -654,6 +654,36 @@ fn list_recent_reports_that_listing_is_off() {
 }
 
 #[test]
+fn list_recent_refuses_the_gate_without_a_bearer_token() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let mut client = McpClient::spawn(&fake, &[("DAYFLY_LIST_REQUIRES_TOKEN", "1")]);
+
+    let error = client
+        .call_tool("list_recent", json!({}))
+        .expect_err("the list gate must refuse a server with no token");
+    assert_tool_error(error, "DAYFLY_LIST_REQUIRES_TOKEN");
+}
+
+#[test]
+fn list_recent_allows_stdio_when_the_gate_has_a_bearer_token() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let mut client = McpClient::spawn(
+        &fake,
+        &[
+            ("DAYFLY_LIST_REQUIRES_TOKEN", "1"),
+            ("DAYFLY_HTTP_BEARER_TOKEN", "list-secret"),
+        ],
+    );
+
+    let listed = client
+        .call_tool("list_recent", json!({}))
+        .expect("stdio is the local trust boundary");
+    assert!(listed["items"].is_array(), "got: {listed}");
+}
+
+#[test]
 fn list_recent_filters_expired_objects_through_mcp() {
     let runtime = runtime();
     let fake = runtime.block_on(FakeS3::start());
