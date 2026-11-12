@@ -11,7 +11,6 @@
 //! stream on stdout is never corrupted. Credentials come from
 //! environment variables or credential files and are never logged.
 
-use std::collections::HashMap;
 use std::env;
 use std::fmt::Write as _;
 use std::future::IntoFuture;
@@ -25,11 +24,9 @@ use rmcp::ServiceExt;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
-use dayfly::client_addr::Cidr;
 use dayfly::config::{
     bind_is_loopback, credential_warnings, ensure_bind_is_safe, environment_file_warnings,
-    load_env_file, log_format_from_env_file, parse_bool_flag, Config, LogFormat, CONFIG_FIELDS,
-    MAX_TTL_DAYS,
+    log_format_from_env_file, Config, ConfigSource, LogFormat, CONFIG_FIELDS,
 };
 use dayfly::http;
 use dayfly::http::AppState;
@@ -130,33 +127,20 @@ fn exposure_state(bind: &str, has_token: bool, allow_unauthenticated: bool) -> &
 
 /// Validate the environment file and print one line per setting.
 fn check_config_file(path: Option<PathBuf>, explicit: bool, strict: bool) -> anyhow::Result<()> {
-    let file_values = match path.as_deref() {
-        Some(path) if path.exists() => {
-            load_env_file(path).map_err(|error| anyhow::anyhow!("{error}"))?
-        }
-        Some(path) if explicit => {
+    let existing_path = path.as_deref().filter(|path| path.exists());
+    if explicit {
+        if let Some(path) = path.as_deref().filter(|path| !path.exists()) {
             anyhow::bail!(
                 "cannot read config file {}: file does not exist",
                 path.display()
-            )
+            );
         }
-        _ => HashMap::new(),
-    };
-    let lookup = |name: &str| {
-        env::var(name)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                file_values
-                    .get(name)
-                    .filter(|value| !value.trim().is_empty())
-                    .cloned()
-            })
-    };
+    }
+    let source =
+        ConfigSource::from_env_file(existing_path).map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    let mut faults = Vec::new();
     let mut warnings = Vec::new();
-    if let Some(path) = path.as_deref().filter(|path| path.exists()) {
+    if let Some(path) = existing_path {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -174,18 +158,17 @@ fn check_config_file(path: Option<PathBuf>, explicit: bool, strict: bool) -> any
     }
     for field in CONFIG_FIELDS {
         let file_value = match field.name {
-            "S3_ACCESS_KEY_ID" => lookup("S3_ACCESS_KEY_ID_FILE"),
-            "S3_SECRET_ACCESS_KEY" => lookup("S3_SECRET_ACCESS_KEY_FILE"),
-            "DAYFLY_HTTP_BEARER_TOKEN" => lookup("DAYFLY_HTTP_BEARER_TOKEN_FILE"),
+            "S3_ACCESS_KEY_ID" => source.get_nonempty("S3_ACCESS_KEY_ID_FILE"),
+            "S3_SECRET_ACCESS_KEY" => source.get_nonempty("S3_SECRET_ACCESS_KEY_FILE"),
+            "DAYFLY_HTTP_BEARER_TOKEN" => source.get_nonempty("DAYFLY_HTTP_BEARER_TOKEN_FILE"),
             _ => None,
         };
-        let value = lookup(field.name).or_else(|| file_value.clone());
+        let value = source
+            .get_nonempty(field.name)
+            .or_else(|| file_value.clone());
         let status = match (&value, field.required, field.value) {
             (Some(_), _, _) => "set",
-            (None, true, _) => {
-                faults.push(format!("{} is missing", field.name));
-                "unset"
-            }
+            (None, true, _) => "unset",
             (None, false, Some(_)) => "default",
             (None, false, None) => "unset",
         };
@@ -194,137 +177,59 @@ fn check_config_file(path: Option<PathBuf>, explicit: bool, strict: bool) -> any
         } else {
             println!("{}: {status}", field.name);
         }
-        let Some(value) = value else { continue };
-        match field.name {
-            "S3_ENDPOINT" if !(value.starts_with("http://") || value.starts_with("https://")) => {
-                faults.push("S3_ENDPOINT is not an http:// or https:// URL".to_string());
-            }
-            "DAYFLY_MAX_TEXT_BYTES" | "DAYFLY_MAX_FILE_BYTES" | "DAYFLY_MAX_PASTE_BYTES"
-            | "DAYFLY_ALIAS_WORDS" | "DAYFLY_RATE_LIMIT_PER_MINUTE" => {
-                if value.parse::<u64>().is_err() {
-                    faults.push(format!("{}: expected a non-negative integer", field.name));
-                }
-            }
-            "DAYFLY_DEFAULT_TTL_DAYS" => {
-                match value.parse::<u32>() {
-                    Ok(days) if days > 0 && days <= MAX_TTL_DAYS => {}
-                    _ => faults.push(format!(
-                        "DAYFLY_DEFAULT_TTL_DAYS: expected a positive integer no greater than {MAX_TTL_DAYS}"
-                    )),
-                }
-            }
-            "DAYFLY_SHOW_WORDS"
-            | "DAYFLY_INLINE_PDF"
-            | "DAYFLY_EXPOSE_CREATOR_ADDR"
-            | "DAYFLY_WRITE_REQUIRES_TOKEN"
-                if parse_bool_flag(&value).is_none() =>
-            {
-                faults.push(format!("{}: expected true or false", field.name));
-            }
-            "DAYFLY_LOG_FORMAT" if LogFormat::parse(&value).is_none() => {
-                faults.push("DAYFLY_LOG_FORMAT: expected text or json".to_string());
-            }
-            "DAYFLY_METRICS_BIND" if value.parse::<SocketAddr>().is_err() => {
-                faults
-                    .push("DAYFLY_METRICS_BIND: expected an IP address and port".to_string());
-            }
-            "DAYFLY_METRICS_ALLOWED_NETWORKS" => {
-                if let Err(error) = value
-                    .split(',')
-                    .map(|part| part.trim().parse::<Cidr>())
-                    .collect::<Result<Vec<_>, _>>()
-                {
-                    faults.push(format!("DAYFLY_METRICS_ALLOWED_NETWORKS: {error}"));
-                }
-            }
-            "DAYFLY_HTTP_BEARER_TOKEN"
-                if value.contains(|character: char| character.is_ascii_whitespace()) =>
-            {
-                faults.push("DAYFLY_HTTP_BEARER_TOKEN: expected no ASCII whitespace".to_string());
-            }
-            _ => {}
-        }
     }
 
-    if lookup("DAYFLY_WRITE_REQUIRES_TOKEN").and_then(|value| parse_bool_flag(&value)) == Some(true)
-        && lookup("DAYFLY_HTTP_BEARER_TOKEN").is_none()
-        && lookup("DAYFLY_HTTP_BEARER_TOKEN_FILE").is_none()
-    {
-        faults.push("DAYFLY_WRITE_REQUIRES_TOKEN requires DAYFLY_HTTP_BEARER_TOKEN".to_string());
-    }
+    let validation = Config::validate_source(&source);
+    let mut faults: Vec<String> = validation.faults.iter().map(ToString::to_string).collect();
 
-    for (direct, file) in [
-        ("S3_ACCESS_KEY_ID", "S3_ACCESS_KEY_ID_FILE"),
-        ("S3_SECRET_ACCESS_KEY", "S3_SECRET_ACCESS_KEY_FILE"),
-        ("DAYFLY_HTTP_BEARER_TOKEN", "DAYFLY_HTTP_BEARER_TOKEN_FILE"),
+    for file in [
+        "S3_ACCESS_KEY_ID_FILE",
+        "S3_SECRET_ACCESS_KEY_FILE",
+        "DAYFLY_HTTP_BEARER_TOKEN_FILE",
     ] {
-        let direct_value = lookup(direct);
-        let file_value = lookup(file);
-        if direct_value.is_some() && file_value.is_some() {
-            faults.push(format!("{direct} and {file} are both set"));
-        }
-        if let Some(file_path) = file_value {
-            match std::fs::read_to_string(&file_path) {
-                Ok(contents) if contents.trim().is_empty() => {
-                    faults.push(format!("{file} file {file_path} is empty"));
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    faults.push(format!("cannot read {file} file {file_path}: {error}"));
-                }
-            }
+        if let Some(file_path) = source.get_nonempty(file) {
             warnings.extend(credential_warnings(&file_path));
         }
     }
 
     if faults.is_empty() {
-        let result = if path.as_ref().is_some_and(|path| path.exists()) {
-            Config::from_env_file(path.as_deref())
-        } else {
-            Config::from_env()
-        };
-        match result {
-            Ok(config) => {
-                let exposure = exposure_state(
-                    &config.http_bind,
-                    config.http_bearer_token.is_some(),
-                    config.allow_unauthenticated,
-                );
-                println!("bind exposure: {exposure}");
-                if config.max_paste_bytes < config.max_text_bytes {
-                    warnings.push(format!(
-                        "DAYFLY_MAX_PASTE_BYTES ({}) is lower than DAYFLY_MAX_TEXT_BYTES ({}). \
-                         The total paste cap wins: a text paste is limited to {} bytes.",
-                        config.max_paste_bytes,
-                        config.max_text_bytes,
-                        config.max_text_paste_bytes()
-                    ));
-                }
-                if config.max_paste_bytes < config.max_file_bytes {
-                    warnings.push(format!(
-                        "DAYFLY_MAX_PASTE_BYTES ({}) is lower than DAYFLY_MAX_FILE_BYTES ({}). \
-                         The total paste cap wins: a file paste is limited to {} bytes.",
-                        config.max_paste_bytes,
-                        config.max_file_bytes,
-                        config.max_file_paste_bytes()
-                    ));
-                }
-                if let Err(error) = ensure_bind_is_safe(
-                    &config.http_bind,
-                    config.http_bearer_token.is_some(),
-                    config.allow_unauthenticated,
-                ) {
-                    faults.push(error.to_string());
-                } else if !bind_is_loopback(&config.http_bind) && config.http_bearer_token.is_none()
-                {
-                    warnings.push(format!(
-                        "{}: unauthenticated service on a non-loopback bind, allowed by \
-                         DAYFLY_ALLOW_UNAUTHENTICATED",
-                        config.http_bind
-                    ));
-                }
-            }
-            Err(error) => faults.push(error.to_string()),
+        let config = &validation.config;
+        let exposure = exposure_state(
+            &config.http_bind,
+            config.http_bearer_token.is_some(),
+            config.allow_unauthenticated,
+        );
+        println!("bind exposure: {exposure}");
+        if config.max_paste_bytes < config.max_text_bytes {
+            warnings.push(format!(
+                "DAYFLY_MAX_PASTE_BYTES ({}) is lower than DAYFLY_MAX_TEXT_BYTES ({}). \
+                 The total paste cap wins: a text paste is limited to {} bytes.",
+                config.max_paste_bytes,
+                config.max_text_bytes,
+                config.max_text_paste_bytes()
+            ));
+        }
+        if config.max_paste_bytes < config.max_file_bytes {
+            warnings.push(format!(
+                "DAYFLY_MAX_PASTE_BYTES ({}) is lower than DAYFLY_MAX_FILE_BYTES ({}). \
+                 The total paste cap wins: a file paste is limited to {} bytes.",
+                config.max_paste_bytes,
+                config.max_file_bytes,
+                config.max_file_paste_bytes()
+            ));
+        }
+        if let Err(error) = ensure_bind_is_safe(
+            &config.http_bind,
+            config.http_bearer_token.is_some(),
+            config.allow_unauthenticated,
+        ) {
+            faults.push(error.to_string());
+        } else if !bind_is_loopback(&config.http_bind) && config.http_bearer_token.is_none() {
+            warnings.push(format!(
+                "{}: unauthenticated service on a non-loopback bind, allowed by \
+                 DAYFLY_ALLOW_UNAUTHENTICATED",
+                config.http_bind
+            ));
         }
     }
 
@@ -466,8 +371,16 @@ fn init_logging(format: LogFormat, verbose: bool) {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let (config_path, explicit) = resolve_config_path(cli.config);
+    let checking = matches!(
+        &cli.command,
+        Some(Command::Config {
+            action: ConfigAction::Check { .. }
+        })
+    );
     let log_format = match log_format_from_env_file(config_path.as_deref()) {
         Ok(format) => format,
+        // The check reports this fault with the other faults.
+        Err(_) if checking => LogFormat::Text,
         Err(error) => {
             eprintln!("error: {error}");
             std::process::exit(1);
