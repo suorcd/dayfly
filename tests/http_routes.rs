@@ -1989,6 +1989,36 @@ async fn failed_uploads_return_an_error_and_never_a_paste_url() {
 }
 
 #[tokio::test]
+async fn quota_exceeded_code_with_another_message_maps_to_507() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let app = common::app(store);
+    fake.fail_put_with(
+        "pastes/",
+        StatusCode::FORBIDDEN,
+        "QuotaExceeded",
+        "the bucket is full",
+    );
+
+    let body = b"quota".to_vec();
+    let request = common::request(
+        "POST",
+        "/upload?format=json",
+        &[content_length(body.len())],
+        body,
+    );
+    let (status, _, response) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "got: {}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(common::json_body(&response)["code"], "quota_exceeded");
+    assert!(fake.keys().is_empty(), "a failed upload must store nothing");
+}
+
+#[tokio::test]
 async fn multipart_part_failure_over_http_aborts_and_returns_no_url() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;

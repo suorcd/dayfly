@@ -87,6 +87,18 @@ const MAX_SEGMENTS_READ: usize = MAX_SEGMENTS_PER_PASTE + SEGMENT_READ_HEADROOM;
 /// the rest.
 pub const MAX_FETCH_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Maximum bytes for one S3 `CopyObject` request.
+///
+/// S3 caps one atomic copy at 5 GB. A larger object needs a multipart copy.
+/// Dayfly does not implement one, so a TTL change on a larger object fails
+/// before any rewrite.
+pub const COPY_OBJECT_MAX_BYTES: u64 = 5_000_000_000;
+
+/// True when one `CopyObject` request cannot carry this object.
+fn copy_object_too_large(size: u64) -> bool {
+    size > COPY_OBJECT_MAX_BYTES
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("paste not found: {0}")]
@@ -137,6 +149,8 @@ pub enum StoreError {
     S3(String),
     #[error("bucket storage quota is reached: try again after a paste expires or is deleted")]
     QuotaExceeded,
+    #[error("object is larger than the {limit} byte copy limit")]
+    CopyLimit { limit: u64 },
     #[error("multi-object update failed at the {step} step for {key}")]
     PartialUpdate { step: &'static str, key: String },
 }
@@ -172,6 +186,7 @@ impl StoreError {
             StoreError::Io(_) => "io_error",
             StoreError::S3(_) => "s3_error",
             StoreError::QuotaExceeded => "quota_exceeded",
+            StoreError::CopyLimit { .. } => "copy_limit",
             StoreError::PartialUpdate { .. } => "partial_update",
         }
     }
@@ -510,12 +525,15 @@ where
 
 /// Whether an S3 error reports a bucket quota limit.
 ///
-/// Garage rejects a write with `403 Forbidden` and a message that contains
+/// The `QuotaExceeded` code is a quota error with any message. Garage
+/// rejects a write with `403 Forbidden` and a message that contains
 /// "Bucket size quota is reached" or "Object quota is reached". The S3
 /// error code is `Forbidden`, so the message is the stable signal.
 fn is_quota_error(code: Option<&str>, message: Option<&str>) -> bool {
-    code.is_some_and(|code| code == "Forbidden" || code == "QuotaExceeded")
-        && message.is_some_and(|message| message.contains("quota is reached"))
+    if code == Some("QuotaExceeded") {
+        return true;
+    }
+    code == Some("Forbidden") && message.is_some_and(|message| message.contains("quota is reached"))
 }
 
 /// Log an object store failure and return a client-safe error.
@@ -3191,6 +3209,22 @@ impl Store {
         Ok(())
     }
 
+    /// Reject a paste that has one object above the `CopyObject` limit.
+    ///
+    /// The check runs before any rewrite, so a failed TTL change changes
+    /// no object.
+    fn check_copy_limit(meta: &PasteMetadata) -> Result<(), StoreError> {
+        let oversized = std::iter::once(meta.base_size)
+            .chain(meta.segments.iter().map(|segment| segment.size))
+            .any(copy_object_too_large);
+        if oversized {
+            return Err(StoreError::CopyLimit {
+                limit: COPY_OBJECT_MAX_BYTES,
+            });
+        }
+        Ok(())
+    }
+
     /// Replace the expiry metadata on one object, preserving its body and
     /// all other metadata. A server-side copy avoids downloading the object.
     async fn rewrite_expiry(
@@ -3209,6 +3243,12 @@ impl Store {
                 .send()
         )
         .map_err(|e| map_sdk_error(e, key))?;
+        let size = u64::try_from(out.content_length().unwrap_or(0)).unwrap_or(0);
+        if copy_object_too_large(size) {
+            return Err(StoreError::CopyLimit {
+                limit: COPY_OBJECT_MAX_BYTES,
+            });
+        }
         let mut meta = out.metadata().cloned().unwrap_or_default();
         meta.insert("expires-at".to_string(), expires_at.to_rfc3339());
         meta.insert("ttl-seconds".to_string(), ttl.num_seconds().to_string());
@@ -3275,6 +3315,7 @@ impl Store {
         let ttl = self.validate_ttl(ttl)?;
         let mut meta = self.head_metadata(id).await?;
         Self::check_not_expired(&meta)?;
+        Self::check_copy_limit(&meta)?;
         let now = Utc::now();
         let mut expires_at = expires_at_for(now, ttl);
         if self.config.retention_by_size {
@@ -3978,6 +4019,21 @@ mod tests {
             Some("The specified key does not exist.")
         ));
         assert!(!is_quota_error(None, None));
+    }
+
+    #[test]
+    fn a_quota_exceeded_code_is_quota_with_any_message() {
+        assert!(is_quota_error(
+            Some("QuotaExceeded"),
+            Some("the bucket is full")
+        ));
+        assert!(is_quota_error(Some("QuotaExceeded"), None));
+    }
+
+    #[test]
+    fn the_copy_object_limit_matches_the_s3_limit() {
+        assert!(!copy_object_too_large(COPY_OBJECT_MAX_BYTES));
+        assert!(copy_object_too_large(COPY_OBJECT_MAX_BYTES + 1));
     }
 
     #[tokio::test]

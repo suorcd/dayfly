@@ -3571,6 +3571,83 @@ async fn set_ttl_moves_base_segments_alias_and_rejects_an_expired_paste() {
     );
 }
 
+/// S3 accepts one `CopyObject` request for an object of this size.
+const COPY_LIMIT_BYTES: u64 = 5_000_000_000;
+
+#[tokio::test]
+async fn set_ttl_at_the_copy_object_limit_succeeds() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"base", None, None, Some(Ttl::days(7)))
+        .await
+        .expect("the base must store");
+    let appended = store
+        .append_text(&stored.id, b"segment")
+        .await
+        .expect("the segment must append");
+    let segment_key = appended.segment_key.expect("the segment key");
+    let alias_key = dayfly::store::alias_key(stored.words.as_deref().expect("the alias"));
+    fake.set_reported_size(&stored.key, COPY_LIMIT_BYTES);
+
+    store
+        .set_ttl(&stored.id, Ttl::parse("30d").expect("thirty days"))
+        .await
+        .expect("a copy at the limit must succeed");
+
+    let base = object_expiry(&fake, &stored.key);
+    assert_eq!(object_expiry(&fake, &segment_key), base);
+    assert_eq!(object_expiry(&fake, &alias_key), base);
+}
+
+#[tokio::test]
+async fn set_ttl_above_the_copy_object_limit_writes_nothing() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"base", None, None, Some(Ttl::days(7)))
+        .await
+        .expect("the base must store");
+    let appended = store
+        .append_text(&stored.id, b"segment")
+        .await
+        .expect("the segment must append");
+    let segment_key = appended.segment_key.expect("the segment key");
+    let alias_key = dayfly::store::alias_key(stored.words.as_deref().expect("the alias"));
+    let keys_before = fake.keys();
+    let base_expiry = object_expiry(&fake, &stored.key);
+    let segment_expiry = object_expiry(&fake, &segment_key);
+    let alias_expiry = object_expiry(&fake, &alias_key);
+    fake.set_reported_size(&stored.key, COPY_LIMIT_BYTES + 1);
+
+    let error = store
+        .set_ttl(&stored.id, Ttl::parse("30d").expect("thirty days"))
+        .await
+        .expect_err("a copy above the limit must fail");
+
+    assert_eq!(error.code(), "copy_limit", "got: {error}");
+    assert!(
+        error.to_string().contains(&COPY_LIMIT_BYTES.to_string()),
+        "the message must name the copy limit: {error}"
+    );
+    assert_eq!(
+        object_expiry(&fake, &stored.key),
+        base_expiry,
+        "the base must keep its expiry"
+    );
+    assert_eq!(
+        object_expiry(&fake, &segment_key),
+        segment_expiry,
+        "the segment must keep its expiry"
+    );
+    assert_eq!(
+        object_expiry(&fake, &alias_key),
+        alias_expiry,
+        "the alias must keep its expiry"
+    );
+    assert_eq!(fake.keys(), keys_before, "no object may be added");
+}
+
 #[tokio::test]
 async fn store_text_clamps_a_long_ttl_to_the_size_curve() {
     let fake = FakeS3::start().await;

@@ -395,7 +395,7 @@ permissions and the lower total cap.
 | `S3_SECRET_ACCESS_KEY_FILE` | one form | — | Path to a file that contains the Garage secret key; set this variable or `S3_SECRET_ACCESS_KEY` |
 | `S3_REGION` | no | `us-east-1` | Signing region for Garage; supply your own, do not rely on the default being "yours" |
 | `DAYFLY_MAX_TEXT_BYTES` | no | 104857600 (100 MiB) | Max text paste size for MCP `store_text`, the human text form, and `POST /upload` without a filename; oversize → 413. A new paste must also fit `DAYFLY_MAX_PASTE_BYTES`, so the lower cap wins. A filename (including a multipart filename) uses `DAYFLY_MAX_FILE_BYTES` instead |
-| `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error. A new paste must also fit `DAYFLY_MAX_PASTE_BYTES`, so the lower cap wins. The maximum is 52428800000 bytes: 10,000 parts of 5 MiB |
+| `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error. A new paste must also fit `DAYFLY_MAX_PASTE_BYTES`, so the lower cap wins. The maximum is 52428800000 bytes: 10,000 parts of 5 MiB. A TTL change on a paste above the 5 GB copy limit fails with `copy_limit`; no object is rewritten |
 | `DAYFLY_MAX_PASTE_BYTES` | no | 1073741824 (1 GiB) | Max total size for one paste, including the base object and every appended segment. A new paste or an append that would exceed the cap fails and writes no object |
 | `DAYFLY_SEARCH_MAX_BYTES` | no | 67108864 (64 MiB) | Max bytes that one text search reads. The search returns `truncated` at the cap and the caller resumes with `next_offset`. Must be a positive number of bytes |
 | `DAYFLY_ALIAS_WORDS` | no | 3 | Number of words in a new alias. Allowed range 3 to 6. Resolution accepts 3 words up to this value |
@@ -1004,8 +1004,8 @@ Every HTTP error carries a stable `code`. The current values are:
 `invalid_lifecycle`,
 `invalid_path`, `path_outside_root`, `local_files_disabled`,
 `alias_unavailable`, `io_error`, `s3_error`, `quota_exceeded`,
-`bucket_unavailable`, `partial_update`, `rate_limited`, and
-`method_not_allowed`. Do not parse the `error` text; branch on the
+`copy_limit`, `bucket_unavailable`, `partial_update`, `rate_limited`,
+and `method_not_allowed`. Do not parse the `error` text; branch on the
 `code`.
 
 The MCP tools use the same codes. A domain error returns a tool result
@@ -1708,6 +1708,10 @@ recorded here so readers can plan around them.
 - **A title and tags use S3 user metadata.** Keep them small: 200 bytes
   for the title and 512 bytes for tags. AWS-compatible stores cap user
   metadata at 2 KB per object; verify the limit on your Garage build.
+- **A TTL change on a paste above 5 GB is rejected.** `PATCH` rewrites
+  metadata with one `CopyObject`, and S3 caps that call at 5 GB. The
+  error code is `copy_limit` and no object is rewritten. Read the paste
+  and store it again to change its expiry.
 - **The creator address is metadata, not ownership.** The base object
   stores `created-by` when the transport has a client address. The
   address is hidden unless `DAYFLY_EXPOSE_CREATOR_ADDR` is on. It is not
