@@ -43,6 +43,7 @@ pub struct Multipart {
     content_type: String,
     metadata: BTreeMap<String, String>,
     parts: BTreeMap<i32, (String, Vec<u8>)>,
+    initiated: String,
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +85,10 @@ pub struct FakeState {
     pub fail_copy_keys: Vec<String>,
     pub fail_copy_once_keys: Vec<String>,
     pub fail_delete_keys: Vec<String>,
+    pub fail_delete_prefixes: Vec<String>,
+    pub fail_abort_once: Vec<String>,
+    pub fail_abort_always: Vec<String>,
+    pub multipart_page_size: Option<usize>,
     pub reported_sizes: BTreeMap<String, u64>,
     pub missing_bucket: bool,
 }
@@ -108,6 +113,8 @@ pub enum Gate {
     HeadObject,
     /// Every plain PutObject, such as a new segment.
     PutObject,
+    /// Every UploadPart.
+    UploadPart,
     /// Every DeleteObject, such as the base object.
     DeleteObject,
     /// CreateMultipartUpload.
@@ -214,6 +221,7 @@ impl FakeS3 {
             max_text_bytes,
             max_file_bytes,
             max_paste_bytes: 1024 * 1024 * 1024,
+            multipart_abort_after_seconds: 3_600,
             search_max_bytes: 64 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,
@@ -512,6 +520,67 @@ impl FakeS3 {
             .push(key.to_string());
     }
 
+    /// Make every DeleteObject whose key starts with `prefix` fail.
+    pub fn fail_delete_prefix(&self, prefix: &str) {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .fail_delete_prefixes
+            .push(prefix.to_string());
+    }
+
+    /// Make one AbortMultipartUpload for `upload_id` fail.
+    pub fn fail_abort_once(&self, upload_id: &str) {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .fail_abort_once
+            .push(upload_id.to_string());
+    }
+
+    /// Make every AbortMultipartUpload for `upload_id` fail.
+    pub fn fail_abort_always(&self, upload_id: &str) {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .fail_abort_always
+            .push(upload_id.to_string());
+    }
+
+    /// Insert an incomplete multipart upload directly, bypassing the store.
+    ///
+    /// `initiated` is an RFC 3339 timestamp. A stale-upload test uses a
+    /// past value. A fresh-upload test uses the current time.
+    pub fn seed_multipart(&self, key: &str, upload_id: &str, initiated: &str) {
+        self.state.lock().expect("fake state lock").uploads.insert(
+            upload_id.to_string(),
+            Multipart {
+                bucket: self.bucket.clone(),
+                key: key.to_string(),
+                content_type: "application/octet-stream".to_string(),
+                metadata: BTreeMap::new(),
+                parts: BTreeMap::new(),
+                initiated: initiated.to_string(),
+            },
+        );
+    }
+
+    /// Limit one ListMultipartUploads response to `size` entries.
+    pub fn set_multipart_page_size(&self, size: usize) {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .multipart_page_size = Some(size);
+    }
+
+    /// The upload IDs that the fake currently holds, sorted.
+    pub fn upload_ids(&self) -> Vec<String> {
+        let state = self.state.lock().expect("fake state lock");
+        let mut ids: Vec<String> = state.uploads.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
     /// Clear every injected failure. Held gates stay held.
     pub fn clear_failures(&self) {
         let mut state = self.state.lock().expect("fake state lock");
@@ -526,6 +595,9 @@ impl FakeS3 {
         state.fail_copy_keys.clear();
         state.fail_copy_once_keys.clear();
         state.fail_delete_keys.clear();
+        state.fail_delete_prefixes.clear();
+        state.fail_abort_once.clear();
+        state.fail_abort_always.clear();
     }
 
     pub fn drop_upload(&self, upload_id: &str) {
@@ -696,6 +768,7 @@ async fn handle_request(State(app): State<FakeApp>, req: Request) -> Response {
     let gate = match method.as_str() {
         "HEAD" => Some(Gate::HeadObject),
         "POST" if has_query_param(&uri, "uploads") => Some(Gate::CreateMultipartUpload),
+        "PUT" if has_query_param(&uri, "uploadId") => Some(Gate::UploadPart),
         "PUT"
             if !headers.contains_key("x-amz-copy-source") && !has_query_param(&uri, "uploadId") =>
         {
@@ -728,6 +801,7 @@ async fn handle_request(State(app): State<FakeApp>, req: Request) -> Response {
         Method::PUT => put_object(&state, key, &headers, body),
         Method::POST if has_query_param(&uri, "uploads") => create_multipart(&state, key, &headers),
         Method::POST if has_query_param(&uri, "uploadId") => complete_multipart(&state, key, &uri),
+        Method::GET if has_query_param(&uri, "uploads") => list_multipart_uploads(&state, &uri),
         Method::GET if query_param(&uri, "list-type").as_deref() == Some("2") => {
             list_objects(&state, &uri)
         }
@@ -920,7 +994,12 @@ fn parse_range(value: &str, size: u64) -> Option<(u64, u64)> {
 fn delete_object(state: &Arc<Mutex<FakeState>>, key: Option<String>) -> Response {
     let mut state = state.lock().expect("fake state lock");
     if let Some(key) = key.as_deref() {
-        if state.fail_delete_keys.iter().any(|failed| failed == key) {
+        if state.fail_delete_keys.iter().any(|failed| failed == key)
+            || state
+                .fail_delete_prefixes
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+        {
             return s3_error(
                 StatusCode::FORBIDDEN,
                 "AccessDenied",
@@ -1040,6 +1119,7 @@ fn create_multipart(
             content_type: content_type_from_headers(headers),
             metadata: metadata_from_headers(headers),
             parts: BTreeMap::new(),
+            initiated: now_iso(),
         },
     );
     xml_response(
@@ -1142,9 +1222,92 @@ fn complete_multipart(state: &Arc<Mutex<FakeState>>, key: Option<String>, uri: &
 fn abort_multipart(state: &Arc<Mutex<FakeState>>, uri: &Uri) -> Response {
     let upload_id = query_param(uri, "uploadId").unwrap_or_default();
     let mut state = state.lock().expect("fake state lock");
+    if state
+        .fail_abort_always
+        .iter()
+        .any(|failed| failed == &upload_id)
+    {
+        return s3_error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "injected AbortMultipartUpload failure",
+        );
+    }
+    if let Some(index) = state
+        .fail_abort_once
+        .iter()
+        .position(|failed| failed == &upload_id)
+    {
+        state.fail_abort_once.remove(index);
+        return s3_error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "injected AbortMultipartUpload failure",
+        );
+    }
     state.uploads.remove(&upload_id);
     state.aborted.push(upload_id);
     (StatusCode::NO_CONTENT, Body::empty()).into_response()
+}
+
+fn list_multipart_uploads(state: &Arc<Mutex<FakeState>>, uri: &Uri) -> Response {
+    let state = state.lock().expect("fake state lock");
+    let prefix = query_param(uri, "prefix").unwrap_or_default();
+    let key_marker = query_param(uri, "key-marker");
+    let upload_id_marker = query_param(uri, "upload-id-marker");
+    let max_uploads = query_param(uri, "max-uploads")
+        .and_then(|value| value.parse::<usize>().ok())
+        .or(state.multipart_page_size)
+        .unwrap_or(1000);
+    let mut entries: Vec<(&String, &Multipart)> = state
+        .uploads
+        .iter()
+        .filter(|(_, upload)| upload.key.starts_with(&prefix))
+        .collect();
+    entries.sort_by(|(a_id, a), (b_id, b)| a.key.cmp(&b.key).then_with(|| a_id.cmp(b_id)));
+    entries.retain(
+        |(upload_id, upload)| match (&key_marker, &upload_id_marker) {
+            (Some(key), None) => upload.key.as_str() > key.as_str(),
+            (Some(key), Some(id)) => {
+                upload.key.as_str() > key.as_str()
+                    || (upload.key.as_str() == key.as_str() && upload_id.as_str() > id.as_str())
+            }
+            _ => true,
+        },
+    );
+    let truncated = entries.len() > max_uploads;
+    entries.truncate(max_uploads);
+    let mut uploads = String::new();
+    for (upload_id, upload) in &entries {
+        uploads.push_str(&format!(
+            "<Upload><Key>{}</Key><UploadId>{}</UploadId><Initiated>{}</Initiated><StorageClass>STANDARD</StorageClass></Upload>",
+            xml_escape(&upload.key),
+            xml_escape(upload_id),
+            xml_escape(&upload.initiated)
+        ));
+    }
+    let (next_key, next_id) = if truncated {
+        entries
+            .last()
+            .map(|(id, upload)| (upload.key.as_str(), id.as_str()))
+            .unwrap_or(("", ""))
+    } else {
+        ("", "")
+    };
+    xml_response(
+        StatusCode::OK,
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListMultipartUploadsResult><Bucket>{}</Bucket><KeyMarker>{}</KeyMarker><UploadIdMarker>{}</UploadIdMarker><NextKeyMarker>{}</NextKeyMarker><NextUploadIdMarker>{}</NextUploadIdMarker><MaxUploads>{}</MaxUploads><IsTruncated>{}</IsTruncated>{}</ListMultipartUploadsResult>",
+            xml_escape(&state.bucket),
+            xml_escape(key_marker.as_deref().unwrap_or("")),
+            xml_escape(upload_id_marker.as_deref().unwrap_or("")),
+            xml_escape(next_key),
+            xml_escape(next_id),
+            max_uploads,
+            truncated,
+            uploads
+        ),
+    )
 }
 
 fn list_objects(state: &Arc<Mutex<FakeState>>, uri: &Uri) -> Response {

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{header, Request, StatusCode};
+use chrono::{Duration, Utc};
 use common::FakeS3;
 use dayfly::http::{metrics_router, AppState};
 use dayfly::metrics::Metrics;
@@ -175,4 +176,37 @@ async fn an_s3_request_is_counted() {
         })
         .unwrap_or_else(|| panic!("no list_objects_v2 S3 counter in: {body}"));
     assert!(!line.ends_with(" 0"), "the S3 call must be counted: {line}");
+}
+
+#[tokio::test]
+async fn multipart_abort_outcomes_are_counted() {
+    let (state, fake) = state_with_metrics(&[]).await;
+    fake.seed_multipart(
+        "pastes/2026-01-01/stale",
+        "upload-stale",
+        &(Utc::now() - Duration::hours(2)).to_rfc3339(),
+    );
+    let aborted = state
+        .store()
+        .abort_stale_multipart_uploads(std::time::Duration::from_secs(3_600))
+        .await
+        .expect("the sweep must succeed");
+    assert_eq!(aborted, 1);
+
+    let metrics = metrics_router(state);
+    let response = metrics
+        .oneshot(scrape("/metrics", "127.0.0.1:1234".parse().unwrap()))
+        .await
+        .expect("router call must complete");
+    let body = body_text(response).await;
+    assert!(
+        body.contains("dayfly_multipart_orphans_aborted_total 1"),
+        "the sweep must count the orphan: {body}"
+    );
+    assert!(
+        body.contains(
+            "dayfly_s3_requests_total{operation=\"abort_multipart_upload\",outcome=\"ok\"} 1"
+        ),
+        "the abort outcome must be counted: {body}"
+    );
 }

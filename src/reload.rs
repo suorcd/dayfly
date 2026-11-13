@@ -102,9 +102,10 @@ pub async fn reload_with_config(
     }
 
     let changed = changed_fields(&old.config, &new_config);
-    let new_store = Store::from_config_with_metrics(new_config, old.metrics_handle())
+    let mut new_store = Store::from_config_with_metrics(new_config, old.metrics_handle())
         .await
         .map_err(|error| error.to_string())?;
+    new_store.adopt_active_uploads(&old);
     state.replace_store(new_store);
     // The new configuration selects the same bucket in most reloads. Log
     // the lifecycle rules again so a rule change made outside dayfly is
@@ -207,6 +208,9 @@ fn changed_fields(old: &Config, new: &Config) -> Vec<&'static str> {
     }
     if old.max_paste_bytes != new.max_paste_bytes {
         changed.push("DAYFLY_MAX_PASTE_BYTES");
+    }
+    if old.multipart_abort_after_seconds != new.multipart_abort_after_seconds {
+        changed.push("DAYFLY_MULTIPART_ABORT_AFTER");
     }
     if old.search_max_bytes != new.search_max_bytes {
         changed.push("DAYFLY_SEARCH_MAX_BYTES");

@@ -41,6 +41,10 @@ pub const MAX_ALIAS_WORDS: u8 = 6;
 /// Default number of words in a generated alias.
 pub const DEFAULT_ALIAS_WORDS: u8 = 3;
 
+/// Default age in seconds before the multipart sweep aborts an
+/// incomplete upload.
+pub const DEFAULT_MULTIPART_ABORT_AFTER_SECONDS: u64 = 3_600;
+
 /// The log output format.
 ///
 /// `Text` is the default and keeps the existing output. `Json` writes one
@@ -97,6 +101,13 @@ pub struct Config {
     /// object and every appended segment. A new paste above this cap
     /// fails with `TooLarge` and writes no object. Default: 1 GiB.
     pub max_paste_bytes: u64,
+    /// Age in seconds after which the startup and periodic sweep aborts an
+    /// incomplete multipart upload under `pastes/`. Default: 3600.
+    ///
+    /// The sweep is a storage guard. A process crash or a failed abort can
+    /// leave multipart parts that no request completes. The sweep aborts
+    /// uploads older than this value. The value must be positive.
+    pub multipart_abort_after_seconds: u64,
     /// Maximum bytes that one text search reads. Default: 64 MiB.
     ///
     /// The search returns `truncated` when it reaches this cap. The
@@ -398,6 +409,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("1073741824"),
         required: false,
         help: "Maximum total paste size in bytes, including appends",
+    },
+    ConfigField {
+        name: "DAYFLY_MULTIPART_ABORT_AFTER",
+        value: Some("3600"),
+        required: false,
+        help: "Age in seconds after which the sweep aborts an incomplete multipart upload",
     },
     ConfigField {
         name: "DAYFLY_SEARCH_MAX_BYTES",
@@ -1888,6 +1905,24 @@ impl Config {
             ),
             1024 * 1024 * 1024,
         );
+        let multipart_abort_after_seconds = record(
+            &mut faults,
+            optional_u64(
+                &lookup,
+                "DAYFLY_MULTIPART_ABORT_AFTER",
+                field_u64(
+                    "DAYFLY_MULTIPART_ABORT_AFTER",
+                    DEFAULT_MULTIPART_ABORT_AFTER_SECONDS,
+                ),
+            ),
+            DEFAULT_MULTIPART_ABORT_AFTER_SECONDS,
+        );
+        if multipart_abort_after_seconds == 0 {
+            faults.push(ConfigError::Invalid(
+                "DAYFLY_MULTIPART_ABORT_AFTER".to_string(),
+                "expected a positive number of seconds".to_string(),
+            ));
+        }
         let retention_by_size = record_bool(
             &mut faults,
             &lookup,
@@ -2026,6 +2061,7 @@ impl Config {
                 max_text_bytes,
                 max_file_bytes,
                 max_paste_bytes,
+                multipart_abort_after_seconds,
                 search_max_bytes,
                 alias_words,
                 default_ttl_days: default_ttl_days.unwrap_or(7),
@@ -2131,7 +2167,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} search_max_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} write_requires_token={} list_requires_token={} paste_tokens={} expose_creator_addr={} rate_limit_per_minute={} log_format={} metrics_bind={} metrics_allowed_networks={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
+            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} multipart_abort_after_seconds={} search_max_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} write_requires_token={} list_requires_token={} paste_tokens={} expose_creator_addr={} rate_limit_per_minute={} log_format={} metrics_bind={} metrics_allowed_networks={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -2142,6 +2178,7 @@ impl Config {
             self.max_text_bytes,
             self.max_file_bytes,
             self.max_paste_bytes,
+            self.multipart_abort_after_seconds,
             self.search_max_bytes,
             self.alias_words,
             self.default_ttl_days,
@@ -2503,6 +2540,7 @@ mod tests {
             max_text_bytes,
             max_file_bytes,
             max_paste_bytes: 1024 * 1024 * 1024,
+            multipart_abort_after_seconds: 3_600,
             search_max_bytes: 64 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,
@@ -2646,6 +2684,34 @@ mod tests {
         ));
         let config = Config::from_lookup(lookup_from(&pairs)).expect("rate limit config");
         assert_eq!(config.rate_limit_per_minute, 120);
+    }
+
+    #[test]
+    fn multipart_abort_after_defaults_to_one_hour() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert_eq!(config.multipart_abort_after_seconds, 3_600);
+    }
+
+    #[test]
+    fn multipart_abort_after_accepts_seconds() {
+        let mut pairs = base_env();
+        pairs.push(("DAYFLY_MULTIPART_ABORT_AFTER".to_string(), "60".to_string()));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("multipart sweep config");
+        assert_eq!(config.multipart_abort_after_seconds, 60);
+    }
+
+    #[test]
+    fn multipart_abort_after_rejects_zero() {
+        let mut pairs = base_env();
+        pairs.push(("DAYFLY_MULTIPART_ABORT_AFTER".to_string(), "0".to_string()));
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        match error {
+            ConfigError::Invalid(name, message) => {
+                assert_eq!(name, "DAYFLY_MULTIPART_ABORT_AFTER");
+                assert!(message.contains("positive"), "message: {message}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]

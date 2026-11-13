@@ -22,7 +22,8 @@
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
 use std::path::Path;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Duration;
 
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
@@ -73,6 +74,10 @@ pub const MAX_SEGMENTS_PER_PASTE: usize = 4096;
 const MULTI_STEP_ATTEMPTS: usize = 3;
 /// Extra segment-prefix passes after a delete removes the base object.
 const DELETE_SEGMENT_PASSES: usize = 2;
+/// Attempts for one multipart abort.
+const ABORT_ATTEMPTS: usize = 3;
+/// Backoff between multipart abort attempts.
+const ABORT_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Extra segments the reader tolerates above the append cap.
 ///
@@ -1607,6 +1612,9 @@ pub struct Store {
     alias_lock: Arc<AsyncMutex<()>>,
     alias_candidates: Option<Arc<Vec<String>>>,
     metrics: Option<Arc<Metrics>>,
+    /// Multipart uploads that this process is still driving. The stale
+    /// sweep skips these, so a slow but live upload is not aborted.
+    active_uploads: Arc<Mutex<HashSet<String>>>,
 }
 
 /// A shared handle to the current [`Store`].
@@ -1644,6 +1652,56 @@ impl StoreHandle {
     }
 }
 
+/// Abort one multipart upload with retries.
+///
+/// The function tries [`ABORT_ATTEMPTS`] times. It logs the key and the
+/// upload ID when every attempt fails, so an orphan is visible in the
+/// server log. A missing upload counts as success. The caller keeps its
+/// original upload error.
+async fn abort_multipart_with_retry(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    metrics: Option<&Arc<Metrics>>,
+) -> Result<(), StoreError> {
+    let mut last_error = None;
+    for attempt in 1..=ABORT_ATTEMPTS {
+        let result = s3_call!(
+            metrics,
+            "abort_multipart_upload",
+            client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .send()
+        );
+        match result {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                if let SdkError::ServiceError(ctx) = &error {
+                    if ctx.err().code() == Some("NoSuchUpload") {
+                        return Ok(());
+                    }
+                }
+                last_error = Some(map_sdk_error(error, key));
+                if attempt < ABORT_ATTEMPTS {
+                    tokio::time::sleep(ABORT_BACKOFF * attempt as u32).await;
+                }
+            }
+        }
+    }
+    let error = last_error.unwrap_or_else(|| StoreError::S3("multipart abort failed".into()));
+    tracing::error!(
+        key = %key,
+        upload_id = %upload_id,
+        error = %error,
+        "cannot abort multipart upload after {ABORT_ATTEMPTS} attempts"
+    );
+    Err(error)
+}
+
 /// The S3 side of a streaming upload (see [`crate::stream::UploadSink`]).
 /// Target backend is Garage (v1); the code stays S3-shaped, but no
 /// AWS/MinIO-specific tuning or multi-backend abstraction is attempted.
@@ -1654,6 +1712,21 @@ struct AwsUploadSink {
     content_type: String,
     metadata: HashMap<String, String>,
     metrics: Option<Arc<Metrics>>,
+    active_uploads: Arc<Mutex<HashSet<String>>>,
+    current_upload: Option<String>,
+}
+
+impl Drop for AwsUploadSink {
+    fn drop(&mut self) {
+        // A cancelled request drops this sink without an abort. Remove the
+        // upload from the live set, so the next sweep can clean it.
+        if let Some(upload_id) = self.current_upload.take() {
+            self.active_uploads
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&upload_id);
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -1697,6 +1770,11 @@ impl crate::stream::UploadSink for AwsUploadSink {
                 "multipart upload returned no upload id".into(),
             ));
         }
+        self.active_uploads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id.clone());
+        self.current_upload = Some(id.clone());
         Ok(id)
     }
 
@@ -1747,20 +1825,28 @@ impl crate::stream::UploadSink for AwsUploadSink {
                 .send()
         )
         .map_err(|e| map_sdk_error(e, &self.key))?;
+        self.current_upload = None;
+        self.active_uploads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(upload_id);
         Ok(())
     }
 
     async fn abort(&mut self, upload_id: &str) {
-        let _ = s3_call!(
-            self.metrics,
-            "abort_multipart_upload",
-            self.client
-                .abort_multipart_upload()
-                .bucket(&self.bucket)
-                .key(&self.key)
-                .upload_id(upload_id)
-                .send()
-        );
+        self.current_upload = None;
+        self.active_uploads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(upload_id);
+        let _ = abort_multipart_with_retry(
+            &self.client,
+            &self.bucket,
+            &self.key,
+            upload_id,
+            self.metrics.as_ref(),
+        )
+        .await;
     }
 }
 
@@ -1800,12 +1886,21 @@ impl Store {
             alias_lock: Arc::new(AsyncMutex::new(())),
             alias_candidates: None,
             metrics,
+            active_uploads: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
     /// The metrics registry that this store snapshot records to.
     pub fn metrics_handle(&self) -> Option<Arc<Metrics>> {
         self.metrics.clone()
+    }
+
+    /// Carry the live upload set across a reload.
+    ///
+    /// A reload builds a new `Store`. The new stale-upload sweep must not
+    /// abort an upload that the old store is still driving.
+    pub(crate) fn adopt_active_uploads(&mut self, other: &Store) {
+        self.active_uploads = Arc::clone(&other.active_uploads);
     }
 
     /// The bucket lifecycle rules, or an empty set when none is set.
@@ -1891,6 +1986,98 @@ impl Store {
                 );
             }
         }
+    }
+
+    /// Abort incomplete multipart uploads older than `older_than`.
+    ///
+    /// The sweep lists the `pastes/` prefix and follows pagination. It
+    /// aborts each stale upload with retries and skips an upload that this
+    /// process still drives. One failed abort logs and the sweep
+    /// continues, so one bad object cannot stop the rest. The return value
+    /// counts the uploads that were aborted.
+    pub async fn abort_stale_multipart_uploads(
+        &self,
+        older_than: Duration,
+    ) -> Result<usize, StoreError> {
+        let cutoff = chrono::Duration::from_std(older_than)
+            .ok()
+            .and_then(|older_than| Utc::now().checked_sub_signed(older_than));
+        let Some(cutoff) = cutoff else {
+            // The age is too large to represent. No upload is that old.
+            return Ok(0);
+        };
+        let mut key_marker: Option<String> = None;
+        let mut upload_id_marker: Option<String> = None;
+        let mut aborted = 0usize;
+        loop {
+            let mut request = self
+                .client
+                .list_multipart_uploads()
+                .bucket(&self.bucket)
+                .prefix("pastes/");
+            if let Some(marker) = &key_marker {
+                request = request.key_marker(marker);
+            }
+            if let Some(marker) = &upload_id_marker {
+                request = request.upload_id_marker(marker);
+            }
+            let output = s3_call!(self.metrics, "list_multipart_uploads", request.send())
+                .map_err(|error| map_sdk_error(error, "pastes/"))?;
+            for upload in output.uploads() {
+                let Some(key) = upload.key() else { continue };
+                let Some(upload_id) = upload.upload_id() else {
+                    continue;
+                };
+                let initiated = upload
+                    .initiated()
+                    .and_then(|date| DateTime::from_timestamp(date.secs(), date.subsec_nanos()));
+                if !initiated.is_some_and(|date| date < cutoff) {
+                    continue;
+                }
+                let is_active = self
+                    .active_uploads
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains(upload_id);
+                if is_active {
+                    continue;
+                }
+                match abort_multipart_with_retry(
+                    &self.client,
+                    &self.bucket,
+                    key,
+                    upload_id,
+                    self.metrics.as_ref(),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        aborted += 1;
+                        if let Some(metrics) = &self.metrics {
+                            metrics.count_multipart_orphan();
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            key = %key,
+                            upload_id = %upload_id,
+                            "cannot abort a stale multipart upload: {error}"
+                        );
+                    }
+                }
+            }
+            if !output.is_truncated().unwrap_or(false) {
+                break;
+            }
+            let next_key = output.next_key_marker().map(str::to_string);
+            let next_upload_id = output.next_upload_id_marker().map(str::to_string);
+            if next_key.is_none() && next_upload_id.is_none() {
+                break;
+            }
+            key_marker = next_key;
+            upload_id_marker = next_upload_id;
+        }
+        Ok(aborted)
     }
 
     /// Normalize an alias with the configured maximum word count.
@@ -2042,7 +2229,13 @@ impl Store {
 
     /// Remove the base object and segments after a failed store.
     async fn cleanup_failed_store(&self, base_key: &str, phrase: &str) {
-        let _ = self.delete_alias_if_target(phrase, base_key).await;
+        if let Err(error) = self.delete_alias_if_target(phrase, base_key).await {
+            tracing::warn!(
+                key = %alias_key(phrase),
+                error = ?error,
+                "cannot delete the alias object of a failed store"
+            );
+        }
         let _ = self.delete_base_and_segments(base_key).await;
     }
 
@@ -2182,16 +2375,33 @@ impl Store {
     /// during the delete. An append that is still in flight removes its
     /// own segment when it sees that the base is gone.
     async fn delete_base_and_segments(&self, base_key: &str) -> Result<(), StoreError> {
-        let segments = self
-            .list_segment_entries(base_key)
-            .await
-            .map_err(|error| partial_update_error("segment list", base_key, error))?;
-        self.delete_object_key(base_key)
-            .await
-            .map_err(|error| partial_update_error("base delete", base_key, error))?;
+        let segments = match self.list_segment_entries(base_key).await {
+            Ok(segments) => segments,
+            Err(error) => {
+                tracing::warn!(
+                    key = %base_key,
+                    error = ?error,
+                    "cannot list segments for delete"
+                );
+                return Err(partial_update_error("segment list", base_key, error));
+            }
+        };
+        if let Err(error) = self.delete_object_key(base_key).await {
+            tracing::warn!(
+                key = %base_key,
+                error = ?error,
+                "cannot delete object"
+            );
+            return Err(partial_update_error("base delete", base_key, error));
+        }
         let mut first_error = None;
         for (key, _) in segments {
             if let Err(error) = self.delete_object_key(&key).await {
+                tracing::warn!(
+                    key = %key,
+                    error = ?error,
+                    "cannot delete object"
+                );
                 first_error.get_or_insert(partial_update_error("segment delete", &key, error));
             }
         }
@@ -2199,6 +2409,11 @@ impl Store {
             let remaining = match self.list_segment_entries(base_key).await {
                 Ok(remaining) => remaining,
                 Err(error) => {
+                    tracing::warn!(
+                        key = %base_key,
+                        error = ?error,
+                        "cannot list segments for delete"
+                    );
                     first_error.get_or_insert(partial_update_error(
                         "segment list",
                         base_key,
@@ -2212,6 +2427,11 @@ impl Store {
             }
             for (key, _) in remaining {
                 if let Err(error) = self.delete_object_key(&key).await {
+                    tracing::warn!(
+                        key = %key,
+                        error = ?error,
+                        "cannot delete object"
+                    );
                     first_error.get_or_insert(partial_update_error("segment delete", &key, error));
                 }
             }
@@ -2669,6 +2889,8 @@ impl Store {
             content_type: ct.clone(),
             metadata: meta,
             metrics: self.metrics.clone(),
+            active_uploads: Arc::clone(&self.active_uploads),
+            current_upload: None,
         };
         let outcome = match crate::stream::run_streaming_upload(
             Box::pin(file_stream(file)),
@@ -2851,6 +3073,8 @@ impl Store {
             content_type: ct.clone(),
             metadata: initial_meta,
             metrics: self.metrics.clone(),
+            active_uploads: Arc::clone(&self.active_uploads),
+            current_upload: None,
         };
         let outcome =
             match crate::stream::run_streaming_upload(wrapped, &mut sink, known_length, max_bytes)
