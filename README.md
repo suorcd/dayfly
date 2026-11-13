@@ -284,7 +284,7 @@ Operations, in both MCP tools and HTTP endpoints:
 | Fetch metadata (HeadObject equivalent) | `fetch_metadata` | `GET /v1/pastes/<id-or-alias>/meta`, or `HEAD /v1/pastes/<id-or-alias>` |
 | Change expiry | `set_ttl` | `PATCH /v1/pastes/<id-or-alias>` with `X-TTL` or `X-TTL-Days` |
 | Delete | `delete_paste` | `DELETE /v1/pastes/<id-or-alias>` |
-| List recent (date or inclusive date window) | `list_recent` | `GET /v1/pastes?date=YYYY-MM-DD&limit=N` or `GET /v1/pastes?start=YYYY-MM-DD&end=YYYY-MM-DD&limit=N` |
+| List recent (date or inclusive date window, optional text and tag filter) | `list_recent` | `GET /v1/pastes?date=YYYY-MM-DD&limit=N` or `GET /v1/pastes?start=YYYY-MM-DD&end=YYYY-MM-DD&limit=N` |
 
 The two file tools work with server-local paths, so the transport
 decides what they may touch. `store_file` and `fetch_file` are
@@ -674,6 +674,8 @@ returns metadata — binary content is never sent over JSON-RPC),
 `store_text` and `store_file` accept `title` and `tags`. The title is
 at most 200 bytes. Tags are at most 8 values and 512 bytes in total.
 `fetch_metadata` and `list_recent` return both fields.
+`list_recent` accepts `q` and `tag` with the same match rules as
+`GET /v1/pastes`.
 
 When `DAYFLY_PASTE_TOKENS` is on, `store_text` and `store_file` return
 `paste_token`. `delete_paste`, `set_ttl`, and `append_text` accept a
@@ -996,9 +998,11 @@ to read the next page; one part alone returns 400 with code
 `invalid_cursor`. The cursor follows scan order (newest date first,
 then S3 key order), not the sorted order of the returned items.
 
-`q` matches the alias, title, filename, or ID. `tag` matches one tag.
-The filter applies to the items in the returned page. Use the cursor to
-read further pages.
+`q` matches the alias, title, filename, or ID. The match ignores
+case. `tag` matches one normalized tag. HTTP and MCP use the same
+filter on the returned page, and the filter does not change
+`truncated` or `next`. A filtered page can be empty while `next` is
+set. Follow the cursor until `next` is null.
 
 ### Search text
 

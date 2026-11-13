@@ -903,6 +903,33 @@ pub struct PasteSummary {
     pub filename: Option<String>,
 }
 
+impl PasteSummary {
+    /// Whether this summary matches the optional text and tag filters.
+    ///
+    /// The caller lowercases `q` and `tag`. `q` matches the ID, alias,
+    /// title, or filename. `tag` matches one normalized tag. The filter
+    /// applies to the returned page. It does not change the cursor.
+    pub fn matches_filter(&self, q: Option<&str>, tag: Option<&str>) -> bool {
+        let text_ok = q.is_none_or(|q| {
+            self.id.to_lowercase().contains(q)
+                || self
+                    .words
+                    .as_deref()
+                    .is_some_and(|words| words.to_lowercase().contains(q))
+                || self
+                    .title
+                    .as_deref()
+                    .is_some_and(|title| title.to_lowercase().contains(q))
+                || self
+                    .filename
+                    .as_deref()
+                    .is_some_and(|filename| filename.to_lowercase().contains(q))
+        });
+        let tag_ok = tag.is_none_or(|tag| self.tags.iter().any(|item_tag| item_tag == tag));
+        text_ok && tag_ok
+    }
+}
+
 /// A stateless cursor for the next listing page.
 ///
 /// `date` is the UTC date prefix to resume. `start_after` is the last
