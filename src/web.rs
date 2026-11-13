@@ -1886,6 +1886,7 @@ mod tests {
             max_text_bytes: 10 * 1024 * 1024,
             max_file_bytes: 1024 * 1024 * 1024,
             max_paste_bytes: 1024 * 1024 * 1024,
+            multipart_abort_after_seconds: 3_600,
             search_max_bytes: 64 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,

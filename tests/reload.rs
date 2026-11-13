@@ -8,13 +8,15 @@ mod common;
 use axum::body::Body;
 use axum::http::header::AUTHORIZATION;
 use axum::http::{Request, StatusCode};
+use bytes::Bytes;
 use chrono::Utc;
 use dayfly::http::{app_router, AppState};
 use dayfly::reload::{reload_from_file, reload_with_config};
-use dayfly::store::Store;
+use dayfly::store::{Store, StoreError};
+use futures::stream;
 use tower::ServiceExt;
 
-use common::FakeS3;
+use common::{FakeS3, Gate};
 
 const OLD_TOKEN: &str = "old-token";
 const NEW_TOKEN: &str = "new-token";
@@ -101,6 +103,7 @@ async fn reload_swaps_credentials_token_caps_ttl_and_show_words() {
     new_config.show_words = true;
     new_config.list_requires_token = true;
     new_config.rate_limit_per_minute = 7;
+    new_config.multipart_abort_after_seconds = 120;
     new_config.show_internal_paths = true;
     new_config.view_line_numbers = true;
     new_config.list_default_days = 5;
@@ -130,6 +133,7 @@ async fn reload_swaps_credentials_token_caps_ttl_and_show_words() {
         "DAYFLY_SHOW_WORDS",
         "DAYFLY_LIST_REQUIRES_TOKEN",
         "DAYFLY_RATE_LIMIT_PER_MINUTE",
+        "DAYFLY_MULTIPART_ABORT_AFTER",
         "DAYFLY_SHOW_INTERNAL_PATHS",
         "DAYFLY_VIEW_LINE_NUMBERS",
         "DAYFLY_LIST_DEFAULT_DAYS",
@@ -459,4 +463,44 @@ async fn reload_refuses_to_remove_the_token_on_a_reachable_bind() {
         state.store().config.http_bearer_token.as_deref(),
         Some(OLD_TOKEN)
     );
+}
+
+#[tokio::test]
+async fn a_reload_keeps_a_live_multipart_upload_active() {
+    let fake = FakeS3::start().await;
+    let state = state_with_token(&fake, Some(OLD_TOKEN)).await;
+    fake.hold(Gate::UploadPart);
+    let upload_store = state.store();
+    let upload = tokio::spawn(async move {
+        let items: Vec<Result<Bytes, StoreError>> =
+            vec![Ok(Bytes::from(common::pattern_bytes(6 * 1024 * 1024)))];
+        upload_store
+            .store_stream(
+                stream::iter(items),
+                Some("large.bin"),
+                None,
+                None,
+                None,
+                u64::MAX,
+            )
+            .await
+    });
+    fake.wait_until_blocked(Gate::UploadPart).await;
+
+    reload_with_config(&state, fake.config(), "127.0.0.1:8080")
+        .await
+        .expect("the reload must succeed");
+    let aborted = state
+        .store()
+        .abort_stale_multipart_uploads(std::time::Duration::from_secs(0))
+        .await
+        .expect("the sweep must succeed");
+    assert_eq!(aborted, 0, "a live upload must stay active after a reload");
+
+    fake.release();
+    let stored = upload
+        .await
+        .expect("the upload task must finish")
+        .expect("the live upload must complete");
+    assert_eq!(stored.size, 6 * 1024 * 1024);
 }

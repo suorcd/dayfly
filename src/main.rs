@@ -17,6 +17,7 @@ use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use rmcp::transport::stdio;
@@ -33,7 +34,7 @@ use dayfly::http::AppState;
 use dayfly::mcp;
 use dayfly::metrics::Metrics;
 use dayfly::reload;
-use dayfly::store::Store;
+use dayfly::store::{Store, StoreHandle};
 
 #[derive(Parser)]
 #[command(
@@ -367,6 +368,32 @@ fn init_logging(format: LogFormat, verbose: bool) {
     }
 }
 
+/// The interval between stale multipart sweeps.
+const MULTIPART_SWEEP_INTERVAL: Duration = Duration::from_secs(3_600);
+
+/// Abort incomplete multipart uploads at startup and on a timer.
+///
+/// The first tick fires at once, so a restart cleans orphans from the
+/// previous process. A failure logs and the next tick tries again.
+fn spawn_multipart_sweeper(handle: StoreHandle) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(MULTIPART_SWEEP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let store = handle.get();
+            let age = Duration::from_secs(store.config.multipart_abort_after_seconds);
+            match store.abort_stale_multipart_uploads(age).await {
+                Ok(0) => {}
+                Ok(count) => tracing::info!(count, "aborted stale multipart uploads"),
+                Err(error) => {
+                    tracing::warn!("cannot sweep stale multipart uploads: {error}");
+                }
+            }
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -447,6 +474,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         None | Some(Command::Mcp) => {
+            spawn_multipart_sweeper(StoreHandle::new(store.clone()));
             let service = mcp::Pastebin::stdio(store).serve(stdio()).await?;
             service.waiting().await?;
         }
@@ -456,6 +484,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(metrics) => AppState::with_metrics(store, metrics),
                 None => AppState::new(store),
             };
+            spawn_multipart_sweeper(state.store_handle());
             // Report the bucket lifecycle rules once. The check is best
             // effort and does not delay the listener.
             let lifecycle_state = state.clone();

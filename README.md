@@ -84,7 +84,7 @@ endpoints use the ordinary permissions:
 | Operation | Permission |
 | --- | --- |
 | `GetObject`, `HeadObject`, `ListObjectsV2`, `ListMultipartUploads` | read |
-| `PutObject`, `DeleteObject`, `CreateMultipartUpload`, `CompleteMultipartUpload` | write |
+| `PutObject`, `DeleteObject`, `CreateMultipartUpload`, `CompleteMultipartUpload`, `AbortMultipartUpload` | write |
 | `GetBucketLifecycleConfiguration` | read |
 | `PutBucketLifecycleConfiguration`, `DeleteBucketLifecycle` | write |
 
@@ -108,6 +108,17 @@ At startup and after a configuration reload, dayfly reads
 ID, status, prefix, expiration days, and abort-incomplete-upload days.
 It logs one warning when the bucket has no rule, or when the call
 fails. The check is best effort and does not delay the listener.
+
+Dayfly also aborts stale multipart uploads in code. It lists the
+`pastes/` prefix at startup and each hour. It aborts an upload older
+than `DAYFLY_MULTIPART_ABORT_AFTER` seconds and skips an upload that
+this process still drives. A failed sweep logs and does not stop the
+listener. A lifecycle rule is a backstop, not a requirement.
+
+The active-upload set is per process. A sweep cannot see an upload
+that a second process drives. Keep `DAYFLY_MULTIPART_ABORT_AFTER`
+above the longest upload time when two writers share the bucket. Add a
+lifecycle rule for the day-rounded second guard.
 
 ## Access model — read this before deploying
 
@@ -397,6 +408,7 @@ permissions and the lower total cap.
 | `DAYFLY_MAX_TEXT_BYTES` | no | 104857600 (100 MiB) | Max text paste size for MCP `store_text`, the human text form, and `POST /upload` without a filename; oversize → 413. A new paste must also fit `DAYFLY_MAX_PASTE_BYTES`, so the lower cap wins. A filename (including a multipart filename) uses `DAYFLY_MAX_FILE_BYTES` instead |
 | `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error. A new paste must also fit `DAYFLY_MAX_PASTE_BYTES`, so the lower cap wins. The maximum is 52428800000 bytes: 10,000 parts of 5 MiB. A TTL change on a paste above the 5 GB copy limit fails with `copy_limit`; no object is rewritten |
 | `DAYFLY_MAX_PASTE_BYTES` | no | 1073741824 (1 GiB) | Max total size for one paste, including the base object and every appended segment. A new paste or an append that would exceed the cap fails and writes no object |
+| `DAYFLY_MULTIPART_ABORT_AFTER` | no | 3600 | Age in seconds after which the startup and hourly sweep aborts an incomplete multipart upload under `pastes/`. Must be positive. The sweep skips an upload that this process still drives. A second process is not visible, so keep this value above the longest upload time when two writers share the bucket |
 | `DAYFLY_SEARCH_MAX_BYTES` | no | 67108864 (64 MiB) | Max bytes that one text search reads. The search returns `truncated` at the cap and the caller resumes with `next_offset`. Must be a positive number of bytes |
 | `DAYFLY_ALIAS_WORDS` | no | 3 | Number of words in a new alias. Allowed range 3 to 6. Resolution accepts 3 words up to this value |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be within `DAYFLY_MIN_TTL_DAYS` (at least 1) and `DAYFLY_MAX_TTL_DAYS` |
@@ -572,8 +584,14 @@ The registry has `dayfly_build_info`, `dayfly_http_requests_total`,
 `dayfly_http_request_duration_seconds`, `dayfly_http_requests_in_flight`,
 `dayfly_http_request_bytes_total`, `dayfly_http_response_bytes_total`,
 `dayfly_paste_operations_total`, `dayfly_s3_requests_total`,
-`dayfly_rate_limited_total`, and the process metrics. Labels use the route template, not a paste ID or a
+`dayfly_rate_limited_total`, `dayfly_multipart_orphans_aborted_total`,
+and the process metrics. Labels use the route template, not a paste ID or a
 client address. Metrics are per process and reset on restart.
+
+`dayfly_s3_requests_total` covers each abort outcome. The operation
+label is `abort_multipart_upload`; the outcome label is `ok` or
+`error`. `dayfly_multipart_orphans_aborted_total` counts the stale
+uploads that the sweep aborts.
 
 ```yaml
 scrape_configs:
@@ -883,7 +901,11 @@ multipart upload is used — parts are buffered to the 5 MiB minimum
 EOF, `AbortMultipartUpload` on client disconnect or any error.
 **A URL is returned only on successful completion. On disconnect or
 any error, no URL is returned and any multipart upload is aborted.**
-An empty upload becomes a single empty PutObject.
+An abort is retried up to three times with a short backoff. If every
+attempt fails, dayfly logs the key and the upload ID and keeps the
+original upload error. The orphan sweep, or a lifecycle rule as a
+backstop, removes a remaining upload. An empty upload becomes a single
+empty PutObject.
 
 The local-file path (`store_file`) reads one open handle for the size,
 the hash, and the uploaded bytes, so the recorded metadata describes the
@@ -1626,8 +1648,8 @@ Run these checks against a real Garage instance:
   confirm the returned URL streams back (Range download), and
   confirm that killing the client mid-upload yields no URL and
   leaves no completed object (an aborted multipart upload may
-  leave an incomplete upload for the lifecycle sweeper — see
-  below).
+  leave an incomplete upload; the startup and hourly sweep abort
+  it, and a lifecycle rule is a backstop — see below).
 - Verify content-type tagging: upload a PNG without an explicit
   Content-Type (curl's default), confirm metadata shows
   `image/png` with source `sniffed`; upload text with
@@ -1650,6 +1672,17 @@ applied automatically. Apply the file with:
 ```sh
 dayfly lifecycle apply --file docs/lifecycle-example.json
 ```
+
+Dayfly cleans orphan multipart uploads in code. It lists the `pastes/`
+prefix at startup and each hour. It aborts an incomplete upload older
+than `DAYFLY_MULTIPART_ABORT_AFTER` seconds. The lifecycle rule in the
+example is a backstop, not a requirement. Keep it when a second process
+writes to the bucket, or when you want a day-rounded second guard.
+
+The sweep cannot see an upload that a second process drives. A short
+threshold can abort a live upload from that process. Keep
+`DAYFLY_MULTIPART_ABORT_AFTER` above the longest expected upload time
+when two writers share the bucket.
 
 The command reads the bucket configuration, replaces a rule with the
 same `ID`, and keeps every other rule. It then writes the merged set.

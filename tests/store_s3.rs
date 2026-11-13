@@ -2,8 +2,9 @@
 
 mod common;
 
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::http::StatusCode;
 use bytes::Bytes;
@@ -26,6 +27,36 @@ fn sha256_hex(data: &[u8]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+/// A log writer that keeps every line in memory.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl Write for CapturedLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log lock").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl CapturedLog {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().expect("log lock").clone())
+            .expect("log output must be UTF-8")
+    }
 }
 
 fn expired_metadata(size: usize) -> Vec<(String, String)> {
@@ -1684,6 +1715,33 @@ async fn store_stream_oversize_aborts() {
     assert!(matches!(error, StoreError::TooLarge { .. }));
     assert_eq!(fake.aborted_uploads().len(), 1);
     assert!(fake.keys().is_empty());
+}
+
+#[tokio::test]
+async fn store_stream_oversize_aborts_after_a_transient_abort_failure() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    fake.fail_abort_once("upload-1");
+    let items: Vec<Result<Bytes, StoreError>> =
+        vec![Ok(Bytes::from(common::pattern_bytes(6 * 1024 * 1024)))];
+
+    let error = store
+        .store_stream(
+            stream::iter(items),
+            Some("large.bin"),
+            None,
+            None,
+            None,
+            5 * 1024 * 1024,
+        )
+        .await
+        .expect_err("an oversize chunked file must fail");
+
+    assert!(matches!(error, StoreError::TooLarge { .. }));
+    assert!(
+        fake.upload_ids().is_empty(),
+        "the immediate abort must be retried until the upload is gone"
+    );
 }
 
 #[tokio::test]
@@ -4567,4 +4625,273 @@ async fn configured_ttl_range_rejects_out_of_range_values() {
         )
         .await
         .expect("a TTL at the maximum must be accepted");
+}
+
+#[tokio::test]
+async fn stale_multipart_upload_is_aborted_and_fresh_is_kept() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    fake.seed_multipart(
+        "pastes/2026-01-01/stale",
+        "upload-stale",
+        &(Utc::now() - Duration::hours(2)).to_rfc3339(),
+    );
+    fake.seed_multipart(
+        "pastes/2026-01-01/fresh",
+        "upload-fresh",
+        &Utc::now().to_rfc3339(),
+    );
+
+    let aborted = store
+        .abort_stale_multipart_uploads(std::time::Duration::from_secs(3_600))
+        .await
+        .expect("the sweep must succeed");
+
+    assert_eq!(aborted, 1, "only the stale upload must be aborted");
+    assert_eq!(fake.upload_ids(), vec!["upload-fresh".to_string()]);
+}
+
+#[tokio::test]
+async fn stale_multipart_sweep_follows_pagination() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    fake.set_multipart_page_size(1);
+    let past = (Utc::now() - Duration::hours(2)).to_rfc3339();
+    fake.seed_multipart("pastes/2026-01-01/a", "upload-a", &past);
+    fake.seed_multipart("pastes/2026-01-01/b", "upload-b", &past);
+
+    let aborted = store
+        .abort_stale_multipart_uploads(std::time::Duration::from_secs(3_600))
+        .await
+        .expect("the paginated sweep must succeed");
+
+    assert_eq!(aborted, 2, "both pages must be visited");
+    assert!(fake.upload_ids().is_empty());
+}
+
+#[tokio::test]
+async fn stale_multipart_sweep_retries_a_failed_abort() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    fake.fail_abort_once("upload-stale");
+    fake.seed_multipart(
+        "pastes/2026-01-01/stale",
+        "upload-stale",
+        &(Utc::now() - Duration::hours(2)).to_rfc3339(),
+    );
+
+    let aborted = store
+        .abort_stale_multipart_uploads(std::time::Duration::from_secs(3_600))
+        .await
+        .expect("the retry must succeed");
+
+    assert_eq!(aborted, 1);
+    assert!(
+        fake.upload_ids().is_empty(),
+        "the failed first abort must be retried"
+    );
+}
+
+#[tokio::test]
+async fn an_active_multipart_upload_is_not_swept() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    fake.hold(Gate::UploadPart);
+    let upload_store = store.clone();
+    let upload = tokio::spawn(async move {
+        let items: Vec<Result<Bytes, StoreError>> =
+            vec![Ok(Bytes::from(common::pattern_bytes(6 * 1024 * 1024)))];
+        upload_store
+            .store_stream(
+                stream::iter(items),
+                Some("large.bin"),
+                None,
+                None,
+                None,
+                u64::MAX,
+            )
+            .await
+    });
+    fake.wait_until_blocked(Gate::UploadPart).await;
+
+    let aborted = store
+        .abort_stale_multipart_uploads(std::time::Duration::from_secs(0))
+        .await
+        .expect("the sweep must succeed");
+    assert_eq!(aborted, 0, "a live upload must not be aborted");
+    assert!(
+        !fake.upload_ids().is_empty(),
+        "the live upload must remain in the bucket"
+    );
+
+    fake.release();
+    let stored = upload
+        .await
+        .expect("the upload task must finish")
+        .expect("the live upload must complete");
+    assert_eq!(stored.size, 6 * 1024 * 1024);
+    assert!(
+        fake.aborted_uploads().is_empty(),
+        "a live upload must not be aborted"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_persistent_abort_failure_logs_the_key_and_upload_id() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    fake.fail_abort_always("upload-1");
+    let captured = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let items: Vec<Result<Bytes, StoreError>> =
+        vec![Ok(Bytes::from(common::pattern_bytes(6 * 1024 * 1024)))];
+
+    let error = store
+        .store_stream(
+            stream::iter(items),
+            Some("large.bin"),
+            None,
+            None,
+            None,
+            5 * 1024 * 1024,
+        )
+        .await
+        .expect_err("an oversize chunked file must fail");
+
+    assert!(matches!(error, StoreError::TooLarge { .. }));
+    assert_eq!(
+        fake.upload_ids(),
+        vec!["upload-1".to_string()],
+        "a failed abort must not remove the upload"
+    );
+    let logs = captured.text();
+    assert!(
+        logs.contains("cannot abort multipart upload after 3 attempts"),
+        "the failed abort must be logged: {logs}"
+    );
+    assert!(
+        logs.contains("key=pastes/"),
+        "the key must be logged: {logs}"
+    );
+    assert!(
+        logs.contains("upload_id=upload-1"),
+        "the upload ID must be logged: {logs}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_cleanup_deletes_log_the_key() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    fake.fail_delete_prefix("pastes/");
+    let captured = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let items: Vec<Result<Bytes, StoreError>> =
+        vec![Ok(Bytes::from(common::pattern_bytes(6 * 1024 * 1024)))];
+
+    let error = store
+        .store_stream(
+            stream::iter(items),
+            Some("large.bin"),
+            None,
+            None,
+            None,
+            5 * 1024 * 1024,
+        )
+        .await
+        .expect_err("an oversize chunked file must fail");
+
+    assert!(
+        matches!(error, StoreError::TooLarge { .. }),
+        "the original upload error must be kept: {error:?}"
+    );
+    let logs = captured.text();
+    assert!(
+        logs.contains("key=pastes/"),
+        "the failed cleanup delete must log the key: {logs}"
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_upload_is_swept() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    fake.hold(Gate::UploadPart);
+    let upload_store = store.clone();
+    let upload = tokio::spawn(async move {
+        let items: Vec<Result<Bytes, StoreError>> =
+            vec![Ok(Bytes::from(common::pattern_bytes(6 * 1024 * 1024)))];
+        upload_store
+            .store_stream(
+                stream::iter(items),
+                Some("large.bin"),
+                None,
+                None,
+                None,
+                u64::MAX,
+            )
+            .await
+    });
+    fake.wait_until_blocked(Gate::UploadPart).await;
+
+    upload.abort();
+    let _ = upload.await;
+    fake.release();
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+    let aborted = store
+        .abort_stale_multipart_uploads(std::time::Duration::from_secs(0))
+        .await
+        .expect("the sweep must succeed");
+    assert_eq!(aborted, 1, "a cancelled upload must not stay active");
+    assert!(fake.upload_ids().is_empty());
+}
+
+#[tokio::test]
+async fn stale_multipart_sweep_follows_the_upload_id_marker() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    fake.set_multipart_page_size(1);
+    let past = (Utc::now() - Duration::hours(2)).to_rfc3339();
+    fake.seed_multipart("pastes/2026-01-01/same-key", "upload-a", &past);
+    fake.seed_multipart("pastes/2026-01-01/same-key", "upload-b", &past);
+
+    let aborted = store
+        .abort_stale_multipart_uploads(std::time::Duration::from_secs(3_600))
+        .await
+        .expect("the paginated sweep must succeed");
+
+    assert_eq!(aborted, 2, "both uploads under one key must be visited");
+    assert!(fake.upload_ids().is_empty());
+}
+
+#[tokio::test]
+async fn an_unrepresentable_sweep_age_aborts_nothing() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    fake.seed_multipart(
+        "pastes/2026-01-01/stale",
+        "upload-stale",
+        &(Utc::now() - Duration::hours(2)).to_rfc3339(),
+    );
+
+    let aborted = store
+        .abort_stale_multipart_uploads(std::time::Duration::from_secs(u64::MAX))
+        .await
+        .expect("an extreme age must not panic");
+
+    assert_eq!(aborted, 0);
+    assert_eq!(fake.upload_ids(), vec!["upload-stale".to_string()]);
 }

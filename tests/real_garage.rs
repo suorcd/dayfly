@@ -15,6 +15,10 @@
 
 use std::path::Path;
 
+use aws_config::BehaviorVersion;
+use aws_credential_types::Credentials;
+use aws_sdk_s3::config::{Builder as S3ConfigBuilder, Region};
+use aws_sdk_s3::Client;
 use chrono::Utc;
 use dayfly::config::Config;
 use dayfly::store::{Store, StoreError, Ttl};
@@ -37,6 +41,7 @@ fn test_config() -> Config {
         max_text_bytes: 10 * 1024 * 1024,
         max_file_bytes: 1024 * 1024 * 1024,
         max_paste_bytes: 1024 * 1024 * 1024,
+        multipart_abort_after_seconds: 3_600,
         search_max_bytes: 64 * 1024 * 1024,
         alias_words: 3,
         default_ttl_days: 1,
@@ -189,4 +194,67 @@ async fn real_multipart_file_round_trip() {
         .expect("real delete must succeed");
     let _ = std::fs::remove_file(source);
     let _ = std::fs::remove_file(dest);
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable real Garage/S3 bucket and explicit opt-in"]
+async fn real_list_and_abort_multipart_upload() {
+    let config = test_config();
+    let store = Store::from_config(config.clone())
+        .await
+        .expect("real S3 configuration must build");
+    let credentials = Credentials::new(
+        config.access_key_id.clone(),
+        config.secret_access_key.clone(),
+        None,
+        None,
+        "dayfly-real-test",
+    );
+    let sdk_config = aws_config::defaults(BehaviorVersion::latest())
+        .endpoint_url(config.endpoint.clone())
+        .region(Region::new(config.region.clone()))
+        .credentials_provider(credentials)
+        .load()
+        .await;
+    let client = Client::from_conf(
+        S3ConfigBuilder::from(&sdk_config)
+            .force_path_style(true)
+            .build(),
+    );
+    let key = format!(
+        "pastes/2020-01-01/dayfly-real-abort-{}",
+        rand::random::<u64>()
+    );
+    let upload = client
+        .create_multipart_upload()
+        .bucket(&config.bucket)
+        .key(&key)
+        .send()
+        .await
+        .expect("the incomplete upload must start");
+    let upload_id = upload
+        .upload_id()
+        .expect("the upload must have an id")
+        .to_string();
+
+    let aborted = store
+        .abort_stale_multipart_uploads(std::time::Duration::from_secs(0))
+        .await
+        .expect("the sweep must reach the real endpoint");
+    assert!(aborted >= 1, "the incomplete upload must be aborted");
+
+    let listed = client
+        .list_multipart_uploads()
+        .bucket(&config.bucket)
+        .prefix(&key)
+        .send()
+        .await
+        .expect("the list must reach the real endpoint");
+    assert!(
+        !listed
+            .uploads()
+            .iter()
+            .any(|upload| upload.upload_id() == Some(upload_id.as_str())),
+        "the aborted upload must not be listed"
+    );
 }

@@ -25,6 +25,7 @@ pub struct Metrics {
     paste_operations: IntCounterVec,
     s3_requests: IntCounterVec,
     rate_limited: IntCounter,
+    multipart_orphans: IntCounter,
 }
 
 impl Metrics {
@@ -113,6 +114,12 @@ impl Metrics {
         )
         .expect("rate limit counter must be valid");
 
+        let multipart_orphans = IntCounter::new(
+            "dayfly_multipart_orphans_aborted_total",
+            "Incomplete multipart uploads aborted by the stale-upload sweep.",
+        )
+        .expect("multipart orphan counter must be valid");
+
         let collectors: Vec<Box<dyn prometheus::core::Collector>> = vec![
             Box::new(build_info),
             Box::new(http_requests.clone()),
@@ -123,6 +130,7 @@ impl Metrics {
             Box::new(paste_operations.clone()),
             Box::new(s3_requests.clone()),
             Box::new(rate_limited.clone()),
+            Box::new(multipart_orphans.clone()),
         ];
         for collector in collectors {
             registry
@@ -145,6 +153,7 @@ impl Metrics {
             paste_operations,
             s3_requests,
             rate_limited,
+            multipart_orphans,
         }
     }
 
@@ -206,6 +215,11 @@ impl Metrics {
     /// Record one request refused by the rate limiter.
     pub fn count_rate_limited(&self) {
         self.rate_limited.inc();
+    }
+
+    /// Record one stale multipart upload that the sweep aborted.
+    pub fn count_multipart_orphan(&self) {
+        self.multipart_orphans.inc();
     }
 }
 
