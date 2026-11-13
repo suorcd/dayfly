@@ -446,6 +446,202 @@ fn list_recent_returns_a_cursor_for_the_next_page() {
 }
 
 #[test]
+fn list_recent_matches_a_title_case_insensitively() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let mut client = McpClient::spawn(&fake, &[]);
+
+    let matching = client
+        .call_tool(
+            "store_text",
+            json!({"text": "one", "title": "Build log", "ttl_days": 1}),
+        )
+        .expect("store_text must succeed");
+    client
+        .call_tool(
+            "store_text",
+            json!({"text": "two", "title": "Release notes", "ttl_days": 1}),
+        )
+        .expect("store_text must succeed");
+    let date = matching["id"]
+        .as_str()
+        .expect("id must be a string")
+        .split_once('/')
+        .expect("id must be dated")
+        .0;
+
+    let listed = client
+        .call_tool("list_recent", json!({"date": date, "q": "BUILD"}))
+        .expect("list_recent must succeed");
+    let items = listed["items"].as_array().expect("items must be an array");
+    assert_eq!(
+        items.len(),
+        1,
+        "q must match the title case-insensitively: {listed}"
+    );
+    assert_eq!(items[0]["id"], matching["id"]);
+}
+
+#[test]
+fn list_recent_matches_a_normalized_tag() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let mut client = McpClient::spawn(&fake, &[]);
+
+    let matching = client
+        .call_tool(
+            "store_text",
+            json!({"text": "one", "tags": ["Ops", "Build"], "ttl_days": 1}),
+        )
+        .expect("store_text must succeed");
+    client
+        .call_tool(
+            "store_text",
+            json!({"text": "two", "tags": ["notes"], "ttl_days": 1}),
+        )
+        .expect("store_text must succeed");
+    let date = matching["id"]
+        .as_str()
+        .expect("id must be a string")
+        .split_once('/')
+        .expect("id must be dated")
+        .0;
+
+    let listed = client
+        .call_tool("list_recent", json!({"date": date, "tag": "OPS"}))
+        .expect("list_recent must succeed");
+    let items = listed["items"].as_array().expect("items must be an array");
+    assert_eq!(
+        items.len(),
+        1,
+        "tag must match one normalized tag: {listed}"
+    );
+    assert_eq!(items[0]["id"], matching["id"]);
+    assert_eq!(items[0]["tags"], json!(["ops", "build"]));
+}
+
+#[test]
+fn list_recent_applies_both_filters() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let mut client = McpClient::spawn(&fake, &[]);
+
+    let matching = client
+        .call_tool(
+            "store_text",
+            json!({
+                "text": "one",
+                "title": "Build log",
+                "tags": ["ops"],
+                "ttl_days": 1,
+            }),
+        )
+        .expect("store_text must succeed");
+    client
+        .call_tool(
+            "store_text",
+            json!({
+                "text": "two",
+                "title": "Build log",
+                "tags": ["notes"],
+                "ttl_days": 1,
+            }),
+        )
+        .expect("store_text must succeed");
+    client
+        .call_tool(
+            "store_text",
+            json!({
+                "text": "three",
+                "title": "Release notes",
+                "tags": ["ops"],
+                "ttl_days": 1,
+            }),
+        )
+        .expect("store_text must succeed");
+    let date = matching["id"]
+        .as_str()
+        .expect("id must be a string")
+        .split_once('/')
+        .expect("id must be dated")
+        .0;
+
+    let listed = client
+        .call_tool(
+            "list_recent",
+            json!({"date": date, "q": "build", "tag": "ops"}),
+        )
+        .expect("list_recent must succeed");
+    let items = listed["items"].as_array().expect("items must be an array");
+    assert_eq!(
+        items.len(),
+        1,
+        "both filters must apply to the returned page: {listed}"
+    );
+    assert_eq!(items[0]["id"], matching["id"]);
+}
+
+#[test]
+fn list_recent_keeps_the_cursor_when_a_filtered_page_is_empty() {
+    let runtime = runtime();
+    let fake = runtime.block_on(FakeS3::start());
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let expires = (Utc::now() + Duration::days(1)).to_rfc3339();
+    let mut first_meta = common::stored_metadata(&expires, "text/plain", 3, "abc");
+    first_meta.push(("title".to_string(), "Haystack".to_string()));
+    let mut second_meta = common::stored_metadata(&expires, "text/plain", 3, "abc");
+    second_meta.push(("title".to_string(), "Needle".to_string()));
+    fake.seed(
+        &format!("pastes/{today}/aaa"),
+        b"abc",
+        "text/plain",
+        &common::metadata_refs(&first_meta),
+    );
+    fake.seed(
+        &format!("pastes/{today}/bbb"),
+        b"abc",
+        "text/plain",
+        &common::metadata_refs(&second_meta),
+    );
+    let mut client = McpClient::spawn(&fake, &[]);
+
+    let first = client
+        .call_tool(
+            "list_recent",
+            json!({"date": today, "limit": 1, "q": "needle"}),
+        )
+        .expect("the filtered page must succeed");
+    assert_eq!(first["truncated"], true);
+    let items = first["items"].as_array().expect("items must be an array");
+    assert!(
+        items.is_empty(),
+        "the filter must apply to the returned page: {first}"
+    );
+    let next = &first["next"];
+    assert!(
+        next.is_object(),
+        "a filtered page must keep the store cursor: {first}"
+    );
+    assert_eq!(next["start_after"], format!("pastes/{today}/aaa"));
+
+    let second = client
+        .call_tool(
+            "list_recent",
+            json!({
+                "date": today,
+                "limit": 1,
+                "q": "needle",
+                "after_date": next["date"],
+                "after_key": next["start_after"],
+            }),
+        )
+        .expect("the next page must succeed");
+    let items = second["items"].as_array().expect("items must be an array");
+    assert_eq!(items.len(), 1, "the cursor must reach the match: {second}");
+    assert_eq!(items[0]["id"], format!("{today}/bbb"));
+}
+
+#[test]
 fn word_alias_round_trip_through_mcp() {
     let runtime = runtime();
     let fake = runtime.block_on(FakeS3::start());

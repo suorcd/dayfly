@@ -1235,27 +1235,8 @@ async fn list_handler(
         .get("tag")
         .map(|value| value.trim().to_lowercase())
         .filter(|value| !value.is_empty());
-    page.items.retain(|item| {
-        let q_ok = q.as_ref().is_none_or(|q| {
-            item.id.to_lowercase().contains(q)
-                || item
-                    .words
-                    .as_deref()
-                    .is_some_and(|words| words.to_lowercase().contains(q))
-                || item
-                    .title
-                    .as_deref()
-                    .is_some_and(|title| title.to_lowercase().contains(q))
-                || item
-                    .filename
-                    .as_deref()
-                    .is_some_and(|filename| filename.to_lowercase().contains(q))
-        });
-        let tag_ok = tag
-            .as_ref()
-            .is_none_or(|tag| item.tags.iter().any(|item_tag| item_tag == tag));
-        q_ok && tag_ok
-    });
+    page.items
+        .retain(|item| item.matches_filter(q.as_deref(), tag.as_deref()));
     Json(serde_json::json!({
         "date": query.get("date"),
         "start": query.get("start"),

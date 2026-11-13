@@ -431,6 +431,11 @@ pub struct ListRecentParams {
     pub start: Option<String>,
     /// Inclusive window end, YYYY-MM-DD. Requires start.
     pub end: Option<String>,
+    /// Keep only items whose ID, alias, title, or filename contains
+    /// this text. The match ignores case.
+    pub q: Option<String>,
+    /// Keep only items that carry this normalized tag.
+    pub tag: Option<String>,
     /// Cursor date from the previous `next` object, YYYY-MM-DD.
     /// Requires after_key.
     pub after_date: Option<String>,
@@ -782,7 +787,7 @@ impl Pastebin {
     }
 
     #[tool(
-        description = "List current pastes for one date or an inclusive date range. date=YYYY-MM-DD takes precedence over start and end. A range needs both start and end (YYYY-MM-DD), and start must be <= end. With no dates, the window is the last DAYFLY_LIST_DEFAULT_DAYS days, ending today in UTC (2 days by default). The result reports truncated and next. Pass next.date as after_date and next.start_after as after_key to read the next page. This scans the bucket directly (ListObjectsV2 + HeadObject per key) and filters expired objects; it is prefix listing, not search or sort, and is O(n) in objects scanned."
+        description = "List current pastes for one date or an inclusive date range. date=YYYY-MM-DD takes precedence over start and end. A range needs both start and end (YYYY-MM-DD), and start must be <= end. With no dates, the window is the last DAYFLY_LIST_DEFAULT_DAYS days, ending today in UTC (2 days by default). Optional q matches the ID, alias, title, or filename, and the match ignores case. Optional tag matches one normalized tag. Both filters apply to the returned page and do not change truncated or next. A filtered page can be empty while next is set, so follow the cursor. The result reports truncated and next. Pass next.date as after_date and next.start_after as after_key to read the next page. This scans the bucket directly (ListObjectsV2 + HeadObject per key) and filters expired objects; it is prefix listing, not search or sort, and is O(n) in objects scanned."
     )]
     async fn list_recent(
         &self,
@@ -816,7 +821,7 @@ impl Pastebin {
             }
         };
         let limit = params.limit.unwrap_or(100);
-        let page = match &request {
+        let mut page = match &request {
             ListWindowRequest::Date(date) => {
                 try_store!(
                     store
@@ -839,6 +844,20 @@ impl Pastebin {
                 )
             }
         };
+        let q = params
+            .q
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_lowercase)
+            .filter(|value| !value.is_empty());
+        let tag = params
+            .tag
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_lowercase)
+            .filter(|value| !value.is_empty());
+        page.items
+            .retain(|item| item.matches_filter(q.as_deref(), tag.as_deref()));
         result_json(serde_json::json!({
             "date": params.date,
             "start": params.start,
@@ -1099,6 +1118,8 @@ mod tests {
             date: date.map(str::to_string),
             start: start.map(str::to_string),
             end: end.map(str::to_string),
+            q: None,
+            tag: None,
             after_date: None,
             after_key: None,
             limit: None,

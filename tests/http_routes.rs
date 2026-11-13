@@ -2055,6 +2055,81 @@ async fn upload_accepts_a_title_and_tags_and_list_filters_on_them() {
 }
 
 #[tokio::test]
+async fn http_list_filter_behavior_stays_unchanged() {
+    let fake = FakeS3::start().await;
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let expires = (Utc::now() + Duration::days(1)).to_rfc3339();
+    let mut build_meta = common::stored_metadata(&expires, "text/plain", 3, "abc");
+    build_meta.push(("title".to_string(), "Build log".to_string()));
+    build_meta.push(("tags".to_string(), r#"["ops","build"]"#.to_string()));
+    let mut release_meta = common::stored_metadata(&expires, "text/plain", 3, "abc");
+    release_meta.push(("title".to_string(), "Release notes".to_string()));
+    release_meta.push(("tags".to_string(), r#"["notes"]"#.to_string()));
+    fake.seed(
+        &format!("pastes/{today}/aaa"),
+        b"abc",
+        "text/plain",
+        &common::metadata_refs(&build_meta),
+    );
+    fake.seed(
+        &format!("pastes/{today}/bbb"),
+        b"abc",
+        "text/plain",
+        &common::metadata_refs(&release_meta),
+    );
+    let app = common::app(fake.store().await);
+
+    for uri in [
+        format!("/v1/pastes?date={today}&q=BUILD"),
+        format!("/v1/pastes?date={today}&tag=OPS"),
+        format!("/v1/pastes?date={today}&q=log&tag=ops"),
+    ] {
+        let request = common::request("GET", &uri, &[], Vec::new());
+        let (status, _, body) = common::send(&app, request).await;
+        assert_eq!(status, StatusCode::OK, "request must succeed: {uri}");
+        let listed = common::json_body(&body);
+        let items = listed["items"].as_array().expect("items must be an array");
+        assert_eq!(
+            items.len(),
+            1,
+            "filter must keep one item for {uri}: {listed}"
+        );
+        assert_eq!(items[0]["id"], format!("{today}/aaa"));
+    }
+
+    let request = common::request(
+        "GET",
+        &format!("/v1/pastes?date={today}&q=build&tag=notes"),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = common::json_body(&body);
+    assert_eq!(
+        listed["items"].as_array().expect("items").len(),
+        0,
+        "both filters must match the same item: {listed}"
+    );
+
+    let request = common::request(
+        "GET",
+        &format!("/v1/pastes?date={today}&limit=1&q=needle"),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = common::json_body(&body);
+    assert!(
+        listed["items"].as_array().expect("items").is_empty(),
+        "the filter must apply to the returned page: {listed}"
+    );
+    assert_eq!(listed["truncated"], true);
+    assert_eq!(listed["next"]["start_after"], format!("pastes/{today}/aaa"));
+}
+
+#[tokio::test]
 async fn list_route_rejects_half_a_cursor() {
     let fake = FakeS3::start().await;
     let app = common::app(fake.store().await);
