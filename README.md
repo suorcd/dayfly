@@ -131,6 +131,9 @@ environment variables or credential files. Agents/clients never get S3
 credentials and never talk to S3 directly; they only talk to the
 binary's MCP/HTTP interface.
 
+See [Public deployment](docs/public-deployment.md) for the full setting
+profile, proxy requirements, and the limits that remain.
+
 Bucket privacy is **not** the same as securing the binary's own HTTP
 endpoint. The intended deployment is **private-network / localhost**.
 As a simple, optional extra for the binary's own endpoint (not a
