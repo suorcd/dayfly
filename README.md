@@ -727,6 +727,16 @@ DAYFLY_BAO_PATH=secret/service/lan/dayfly-local ./scripts/dev.sh
 ./target/release/dayfly serve --bind 127.0.0.1:8080
 ```
 
+`serve` handles `SIGTERM` and `SIGINT`. On a signal, it stops the public
+listener and the metrics listener, then drains in-flight requests. The
+drain has a 30-second timeout. The process exits with status 0 after a
+requested shutdown. A drain that reaches the timeout writes a warning
+and exits with status 0. The log records the signal and the drain result.
+
+An upload that reaches the timeout ends with the process. The existing
+orphan sweep aborts its incomplete multipart upload after the configured
+age.
+
 With a bearer token set, add `-H "Authorization: Bearer $TOKEN"` to
 every curl example below.
 
