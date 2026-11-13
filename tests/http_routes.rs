@@ -134,6 +134,121 @@ async fn raw_text_upload_returns_plain_url_or_json() {
 }
 
 #[tokio::test]
+async fn plain_upload_response_exposes_the_id_and_the_alias_in_headers() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let app = common::app(store);
+
+    let body = b"header paste".to_vec();
+    let request = common::request(
+        "POST",
+        "/upload",
+        &[
+            ("host", "dayfly.test".to_string()),
+            ("content-type", "text/plain".to_string()),
+            content_length(body.len()),
+        ],
+        body,
+    );
+    let (status, headers, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let text = String::from_utf8(body).expect("plain response must be UTF-8");
+    let id = headers
+        .get("x-paste-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("the plain response must carry the paste ID header")
+        .to_string();
+    let words = headers
+        .get("x-words")
+        .and_then(|value| value.to_str().ok())
+        .expect("the plain response must carry the alias header")
+        .to_string();
+
+    assert_eq!(
+        text,
+        format!("http://dayfly.test/v1/pastes/{id}\n"),
+        "the body must stay one URL and one newline"
+    );
+    let stored = fake
+        .object(&format!("pastes/{id}"))
+        .expect("the ID header must name the stored object");
+    assert_eq!(
+        stored.metadata.get("words"),
+        Some(&words),
+        "the alias header must hold the stored alias"
+    );
+
+    let request = common::request("GET", &format!("/v1/pastes/{words}"), &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "the alias header must resolve");
+    assert_eq!(body, b"header paste");
+}
+
+#[tokio::test]
+async fn json_upload_response_keeps_its_fields_and_has_no_plain_headers() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let app = common::app(store);
+
+    let body = b"json fields".to_vec();
+    let request = common::request(
+        "POST",
+        "/upload?format=json",
+        &[
+            ("host", "dayfly.test".to_string()),
+            ("content-type", "text/plain".to_string()),
+            content_length(body.len()),
+        ],
+        body,
+    );
+    let (status, headers, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(
+        !headers.contains_key("x-paste-id"),
+        "the JSON response must not carry the plain paste ID header"
+    );
+    assert!(
+        !headers.contains_key("x-words"),
+        "the JSON response must not carry the plain alias header"
+    );
+
+    let json = common::json_body(&body);
+    let mut keys: Vec<&str> = json
+        .as_object()
+        .expect("the JSON response must be an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "content_type",
+            "detection_conflict",
+            "detection_source",
+            "expires_at",
+            "filename",
+            "id",
+            "sha256",
+            "size",
+            "tags",
+            "title",
+            "url",
+            "words",
+        ],
+        "the JSON response fields must stay unchanged"
+    );
+    assert_eq!(
+        json["url"],
+        format!(
+            "http://dayfly.test/v1/pastes/{}",
+            json["id"].as_str().unwrap()
+        )
+    );
+}
+
+#[tokio::test]
 async fn ttl_days_zero_is_rejected() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;

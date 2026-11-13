@@ -729,7 +729,10 @@ curl --data-binary @- -H 'Accept: application/json' \
 ```
 
 When `DAYFLY_PASTE_TOKENS` is on, the JSON response adds `paste_token`
-and the plain response adds an `X-Paste-Token` header.
+and the plain response adds an `X-Paste-Token` header. The plain
+response also carries `X-Paste-Id` with the canonical paste ID. It
+carries `X-Words` with the word alias when the store wrote one. The
+body stays one URL and one newline, so `url=$(curl ...)` keeps working.
 
 Send `X-Title` and `X-Tags` to name and group a paste. `X-Tags` is a
 comma-separated list. The metadata headers accept UTF-8 values, so
