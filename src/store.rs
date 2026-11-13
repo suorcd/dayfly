@@ -65,6 +65,8 @@ macro_rules! s3_call {
 
 pub const MULTIPART_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 pub const LIST_SCAN_MAX_PAGES: usize = 10;
+/// Maximum number of concurrent `HeadObject` requests during a listing.
+const LIST_HEAD_CONCURRENCY: usize = 16;
 /// Longest accepted listing window, in days. This cap bounds the number of
 /// date prefixes that one request can scan.
 pub const LIST_WINDOW_MAX_DAYS: usize = 366;
@@ -3625,6 +3627,21 @@ impl Store {
 
     /// Read metadata for a canonical key without another alias lookup.
     async fn head_metadata_by_key(&self, key: &str, id: &str) -> Result<PasteMetadata, StoreError> {
+        self.head_metadata_by_key_with_segments(key, id, None).await
+    }
+
+    /// Read metadata for a canonical key with segment entries supplied by
+    /// the caller.
+    ///
+    /// `None` loads the segment prefix. `Some` uses the given entries, so a
+    /// listing can reuse the keys it already scanned instead of issuing one
+    /// prefix listing per paste.
+    async fn head_metadata_by_key_with_segments(
+        &self,
+        key: &str,
+        id: &str,
+        segments: Option<&[(String, u64)]>,
+    ) -> Result<PasteMetadata, StoreError> {
         let out = s3_call!(
             self.metrics,
             "head_object",
@@ -3646,7 +3663,21 @@ impl Store {
             .or_else(|| meta.get("content-type").cloned())
             .unwrap_or_else(|| "application/octet-stream".to_string());
         let base_size = u64::try_from(out.content_length().unwrap_or(0)).unwrap_or(0);
-        let plan = self.load_plan(key, base_size).await?;
+        let plan = match segments {
+            Some(entries) => {
+                if entries.len() > MAX_SEGMENTS_READ {
+                    return Err(StoreError::TooManySegments {
+                        limit: MAX_SEGMENTS_READ,
+                    });
+                }
+                SegmentPlan::new(
+                    key.to_string(),
+                    base_size,
+                    segments_from_listing(key, entries),
+                )
+            }
+            None => self.load_plan(key, base_size).await?,
+        };
         let has_segments = !plan.segments.is_empty();
         Ok(PasteMetadata {
             id: key.strip_prefix("pastes/").unwrap_or(key).to_string(),
@@ -4267,18 +4298,22 @@ impl Store {
     /// reached. The returned summaries are sorted by date ascending, then
     /// by key.
     ///
-    /// The function scans the bucket directly: `ListObjectsV2` for each
-    /// `pastes/<date>/` prefix, then one `HeadObject` and a segment-prefix
-    /// listing per paste to recover expiry, content-type, filename, and
-    /// total size, and to filter expired objects. Segment keys are skipped,
-    /// so a segment never appears as a paste. Each prefix follows
-    /// continuation tokens for up to [`LIST_SCAN_MAX_PAGES`] pages. A
-    /// window can span at most [`LIST_WINDOW_MAX_DAYS`] dates. The listing
-    /// is O(n) in the objects scanned (plus a head and a list per paste):
-    /// it is fast for a small internal bucket and gets slower as the bucket
-    /// grows. That slowdown is exactly the trigger for adding a database
-    /// later — it is documented in README, not hidden, and no database
-    /// schema is invented in v1. This is not search.
+    /// The function scans the bucket directly: one `ListObjectsV2` for each
+    /// `pastes/<date>/` prefix. That scan returns base keys and segment
+    /// keys, so the function groups segments by base key without another
+    /// prefix listing. One `HeadObject` per paste recovers expiry,
+    /// content-type, filename, and metadata. The head calls use bounded
+    /// concurrency, and the result keeps key order. A date scan stops when
+    /// the page holds enough base keys and all their segments. Segment
+    /// keys are skipped, so a segment never appears as a paste. Each
+    /// prefix follows continuation tokens for up to
+    /// [`LIST_SCAN_MAX_PAGES`] pages. A window can span at most
+    /// [`LIST_WINDOW_MAX_DAYS`] dates. The listing is O(n) in the objects
+    /// scanned (plus one head per paste): it is fast for a small internal
+    /// bucket and gets slower as the bucket grows. That slowdown is
+    /// exactly the trigger for adding a database later — it is documented
+    /// in README, not hidden, and no database schema is invented in v1.
+    /// This is not search.
     ///
     /// A cursor resumes after the last key of the previous page. The
     /// cursor is stateless: `date` names the prefix, and `start_after`
@@ -4331,72 +4366,164 @@ impl Store {
             let mut start_after = cursor
                 .filter(|cursor| cursor.date == date_str)
                 .map(|cursor| cursor.start_after.clone());
-            for _ in 0..LIST_SCAN_MAX_PAGES {
-                let mut req = self
-                    .client
-                    .list_objects_v2()
-                    .bucket(&self.bucket)
-                    .prefix(&prefix)
-                    .max_keys(1000);
-                if let Some(t) = token.as_deref() {
-                    req = req.continuation_token(t);
-                } else if let Some(key) = start_after.take() {
-                    req = req.start_after(key);
-                }
-                let out = s3_call!(self.metrics, "list_objects_v2", req.send())
-                    .map_err(|e| map_sdk_error(e, &date_str))?;
-                for obj in out.contents() {
-                    if summaries.len() >= limit {
+            let mut bases: Vec<(String, Option<DateTime<Utc>>)> = Vec::new();
+            let mut segment_map: HashMap<String, Vec<(String, u64)>> = HashMap::new();
+            let mut hydrated = 0usize;
+            let mut open_base: Option<String> = None;
+            let mut incomplete_base: Option<String> = None;
+            let mut pages = 0usize;
+            let mut listing_done = false;
+            loop {
+                let needed = limit - summaries.len();
+                // Collect base keys and their segment keys. A later base
+                // closes the segment group of the previous base. The scan
+                // stops as soon as the page has enough closed groups.
+                while !listing_done {
+                    let needed_end = hydrated + needed;
+                    if bases.len() > needed_end
+                        || (bases.len() == needed_end && open_base.is_none())
+                    {
                         break;
                     }
-                    let Some(key) = obj.key() else { continue };
-                    // A segment key has a third component after `pastes/`.
-                    // It is part of a paste, not a paste.
-                    if !is_paste_key(key) {
-                        continue;
+                    if pages >= LIST_SCAN_MAX_PAGES {
+                        listing_done = true;
+                        // A prefix cap can cut a segment group in the middle.
+                        // Let the head fall back to a segment-prefix listing.
+                        incomplete_base = open_base.clone();
+                        break;
                     }
-                    let id = key.strip_prefix("pastes/").unwrap_or(key).to_string();
-                    // HeadObject per key: ListObjectsV2 returns no user
-                    // metadata. An object deleted between list and head
-                    // is skipped. Any other error fails the listing, so
-                    // an S3 outage does not look like an empty bucket.
-                    let meta = match self.head_metadata(&id).await {
-                        Ok(meta) => meta,
-                        Err(StoreError::NotFound(_)) => continue,
-                        Err(e) => return Err(e),
+                    let mut req = self
+                        .client
+                        .list_objects_v2()
+                        .bucket(&self.bucket)
+                        .prefix(&prefix)
+                        .max_keys(1000);
+                    if let Some(t) = token.as_deref() {
+                        req = req.continuation_token(t);
+                    } else if let Some(key) = start_after.take() {
+                        req = req.start_after(key);
+                    }
+                    let out = s3_call!(self.metrics, "list_objects_v2", req.send())
+                        .map_err(|e| map_sdk_error(e, &date_str))?;
+                    pages += 1;
+                    for obj in out.contents() {
+                        let Some(key) = obj.key() else { continue };
+                        if is_paste_key(key) {
+                            let last_modified = obj.last_modified().and_then(|dt| {
+                                DateTime::from_timestamp(dt.secs(), dt.subsec_nanos())
+                            });
+                            open_base = Some(key.to_string());
+                            bases.push((key.to_string(), last_modified));
+                            continue;
+                        }
+                        if !key.starts_with("pastes/") {
+                            continue;
+                        }
+                        if let Some((base, _)) = key.rsplit_once('/') {
+                            let entries = segment_map.entry(base.to_string()).or_default();
+                            entries.push((
+                                key.to_string(),
+                                u64::try_from(obj.size().unwrap_or(0)).unwrap_or(0),
+                            ));
+                            if entries.len() > MAX_SEGMENTS_READ {
+                                return Err(StoreError::TooManySegments {
+                                    limit: MAX_SEGMENTS_READ,
+                                });
+                            }
+                        }
+                        let closes_open_base = open_base.as_deref().is_some_and(|base| {
+                            !key.starts_with(base) || key.as_bytes().get(base.len()) != Some(&b'/')
+                        });
+                        if closes_open_base {
+                            open_base = None;
+                        }
+                    }
+                    let page_truncated = out.is_truncated().unwrap_or(false);
+                    token = match (page_truncated, out.next_continuation_token()) {
+                        (true, Some(t)) => Some(t.to_string()),
+                        _ => None,
                     };
-                    if meta.expired {
-                        continue;
+                    if token.is_none() {
+                        listing_done = true;
                     }
-                    summaries.push(PasteSummary {
-                        id,
-                        key: key.to_string(),
-                        words: meta.words,
-                        title: meta.title,
-                        tags: meta.tags,
-                        size: meta.size,
-                        last_modified: obj
-                            .last_modified()
-                            .and_then(|dt| DateTime::from_timestamp(dt.secs(), dt.subsec_nanos())),
-                        expires_at: meta.expires_at,
-                        created_at: meta.created_at,
-                        content_type: Some(meta.content_type),
-                        filename: meta.filename,
-                    });
-                    last_included = Some(ListCursor {
-                        date: date_str.clone(),
-                        start_after: key.to_string(),
-                    });
+                }
+                // Read the next batch of base metadata. `buffered` keeps
+                // the key order while it runs up to the concurrency limit.
+                let chunk_end = (hydrated + needed).min(bases.len());
+                if chunk_end > hydrated {
+                    let chunk = bases[hydrated..chunk_end].to_vec();
+                    hydrated = chunk_end;
+                    let incomplete_base = incomplete_base.as_deref();
+                    let hydrated: Vec<Result<(String, Option<PasteSummary>), StoreError>> =
+                        futures::stream::iter(chunk)
+                            .map(|(key, last_modified)| {
+                                let segment_map = &segment_map;
+                                async move {
+                                    let id =
+                                        key.strip_prefix("pastes/").unwrap_or(&key).to_string();
+                                    let entries = if incomplete_base == Some(key.as_str()) {
+                                        None
+                                    } else {
+                                        Some(
+                                            segment_map.get(&key).map(Vec::as_slice).unwrap_or(&[]),
+                                        )
+                                    };
+                                    // HeadObject per key: ListObjectsV2 returns
+                                    // no user metadata. An object deleted
+                                    // between list and head is skipped. Any
+                                    // other error fails the listing, so an S3
+                                    // outage does not look like an empty bucket.
+                                    let meta = match self
+                                        .head_metadata_by_key_with_segments(&key, &id, entries)
+                                        .await
+                                    {
+                                        Ok(meta) => meta,
+                                        Err(StoreError::NotFound(_)) => {
+                                            return Ok((key, None));
+                                        }
+                                        Err(e) => return Err(e),
+                                    };
+                                    if meta.expired {
+                                        return Ok((key, None));
+                                    }
+                                    Ok((
+                                        key,
+                                        Some(PasteSummary {
+                                            id,
+                                            key: meta.key,
+                                            words: meta.words,
+                                            title: meta.title,
+                                            tags: meta.tags,
+                                            size: meta.size,
+                                            last_modified,
+                                            expires_at: meta.expires_at,
+                                            created_at: meta.created_at,
+                                            content_type: Some(meta.content_type),
+                                            filename: meta.filename,
+                                        }),
+                                    ))
+                                }
+                            })
+                            .buffered(LIST_HEAD_CONCURRENCY)
+                            .collect()
+                            .await;
+                    for result in hydrated {
+                        let (key, summary) = result?;
+                        let Some(summary) = summary else { continue };
+                        summaries.push(summary);
+                        last_included = Some(ListCursor {
+                            date: date_str.clone(),
+                            start_after: key,
+                        });
+                        if summaries.len() >= limit {
+                            break;
+                        }
+                    }
                 }
                 if summaries.len() >= limit {
                     break;
                 }
-                let page_truncated = out.is_truncated().unwrap_or(false);
-                token = match (page_truncated, out.next_continuation_token()) {
-                    (true, Some(t)) => Some(t.to_string()),
-                    _ => None,
-                };
-                if token.is_none() {
+                if listing_done && hydrated >= bases.len() {
                     break;
                 }
             }

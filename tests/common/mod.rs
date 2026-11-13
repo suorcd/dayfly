@@ -79,6 +79,7 @@ pub struct FakeState {
     pub fail_head_keys: Vec<String>,
     pub fail_head_errors: Vec<(String, StatusCode, String)>,
     pub fail_list_prefixes: Vec<(String, StatusCode, String)>,
+    pub head_delays: BTreeMap<String, std::time::Duration>,
     pub fail_put_prefixes: Vec<String>,
     pub fail_put_errors: Vec<(String, StatusCode, String, String)>,
     pub fail_get_prefixes: Vec<String>,
@@ -484,6 +485,18 @@ impl FakeS3 {
             .insert(key.to_string(), size);
     }
 
+    /// Set a delay before the fake answers HeadObject for `key`.
+    ///
+    /// A test uses this delay to make a later key finish before an earlier
+    /// key. The listing must keep key order anyway.
+    pub fn delay_head(&self, key: &str, delay: std::time::Duration) {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .head_delays
+            .insert(key.to_string(), delay);
+    }
+
     /// Make every GetObject whose key starts with `prefix` fail.
     pub fn fail_get_prefix(&self, prefix: &str) {
         self.state
@@ -791,6 +804,19 @@ async fn handle_request(State(app): State<FakeApp>, req: Request) -> Response {
         );
     }
     let key = split_path(&uri, &configured_bucket);
+    if method == Method::HEAD {
+        let delay = key.as_ref().and_then(|key| {
+            state
+                .lock()
+                .expect("fake state lock")
+                .head_delays
+                .get(key)
+                .copied()
+        });
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+    }
     match method {
         Method::PUT if headers.contains_key("x-amz-copy-source") => {
             copy_object(&state, key, &headers)

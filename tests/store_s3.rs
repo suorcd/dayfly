@@ -2669,20 +2669,19 @@ async fn list_recent_propagates_a_head_access_denied_error() {
 }
 
 #[tokio::test]
-async fn list_recent_propagates_a_segment_list_error() {
+async fn list_recent_propagates_a_date_prefix_list_error() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
     let today = Utc::now().format("%Y-%m-%d").to_string();
     let metadata = future_metadata(5);
-    let key = format!("pastes/{today}/segments");
     fake.seed(
-        &key,
+        &format!("pastes/{today}/segments"),
         b"abcde",
         "text/plain",
         &common::metadata_refs(&metadata),
     );
     fake.fail_list_prefix(
-        &format!("{key}/"),
+        &format!("pastes/{today}/"),
         StatusCode::INTERNAL_SERVER_ERROR,
         "InternalError",
     );
@@ -2690,10 +2689,322 @@ async fn list_recent_propagates_a_segment_list_error() {
     let error = store
         .list_recent(Some(&today), 10)
         .await
-        .expect_err("a segment-list error must fail the listing");
+        .expect_err("a date-prefix list error must fail the listing");
     assert!(
         matches!(error, StoreError::S3(_)),
-        "a segment-list error must reach the caller, got {error:?}"
+        "a date-prefix list error must reach the caller, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_window_uses_one_date_prefix_scan_for_many_pastes() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let valid = future_metadata(5);
+    for index in 0..24 {
+        fake.seed(
+            &format!("pastes/{today}/paste-{index:03}"),
+            b"abcde",
+            "text/plain",
+            &common::metadata_refs(&valid),
+        );
+    }
+
+    let before = fake.requests().len();
+    let items = store
+        .list_recent(Some(&today), 100)
+        .await
+        .expect("listing must succeed");
+    let requests = fake.requests();
+    let new_requests = &requests[before..];
+    let list_calls = new_requests
+        .iter()
+        .filter(|request| request.query.contains("list-type=2"))
+        .count();
+    let head_calls = new_requests
+        .iter()
+        .filter(|request| request.method == "HEAD")
+        .count();
+    assert_eq!(
+        list_calls, 1,
+        "one date-prefix scan must serve every paste, including segments"
+    );
+    assert_eq!(head_calls, 24, "each paste needs exactly one HeadObject");
+    assert_eq!(items.len(), 24);
+}
+
+#[tokio::test]
+async fn list_window_stops_a_date_scan_after_the_page_is_full() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let valid = future_metadata(5);
+    for index in 0..1200 {
+        fake.seed(
+            &format!("pastes/{today}/paste-{index:04}"),
+            b"abcde",
+            "text/plain",
+            &common::metadata_refs(&valid),
+        );
+    }
+
+    let before = fake.requests().len();
+    let items = store
+        .list_recent(Some(&today), 10)
+        .await
+        .expect("listing must succeed");
+    let requests = fake.requests();
+    let new_requests = &requests[before..];
+    let list_calls = new_requests
+        .iter()
+        .filter(|request| request.query.contains("list-type=2"))
+        .count();
+    let head_calls = new_requests
+        .iter()
+        .filter(|request| request.method == "HEAD")
+        .count();
+    assert_eq!(
+        list_calls, 1,
+        "a full page must stop the date scan after one list page"
+    );
+    assert_eq!(head_calls, 10, "only the page entries need a HeadObject");
+    assert_eq!(items.len(), 10);
+}
+
+#[tokio::test]
+async fn list_window_heads_run_with_bounded_concurrency() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let valid = future_metadata(5);
+    for index in 0..32 {
+        fake.seed(
+            &format!("pastes/{today}/paste-{index:03}"),
+            b"abcde",
+            "text/plain",
+            &common::metadata_refs(&valid),
+        );
+    }
+
+    fake.hold(Gate::HeadObject);
+    let date = today.clone();
+    let task = tokio::spawn(async move { store.list_recent(Some(&date), 100).await });
+    fake.wait_until_blocked(Gate::HeadObject).await;
+    let mut heads_in_flight = 0;
+    for _ in 0..400 {
+        heads_in_flight = fake
+            .requests()
+            .iter()
+            .filter(|request| request.method == "HEAD")
+            .count();
+        if heads_in_flight >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    fake.release();
+    let items = task
+        .await
+        .expect("the listing task must finish")
+        .expect("listing must succeed");
+    assert!(
+        heads_in_flight >= 2,
+        "HeadObject calls must overlap, saw {heads_in_flight} in flight"
+    );
+    assert!(
+        heads_in_flight <= 16,
+        "HeadObject concurrency must stay bounded, saw {heads_in_flight} in flight"
+    );
+    assert_eq!(items.len(), 32);
+    let keys: Vec<&str> = items.iter().map(|item| item.key.as_str()).collect();
+    let mut sorted = keys.clone();
+    sorted.sort_unstable();
+    assert_eq!(keys, sorted, "the page must stay in key order");
+}
+
+#[tokio::test]
+async fn list_window_cursor_keeps_key_order_when_heads_finish_out_of_order() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let valid = future_metadata(5);
+    for key in ["aaa", "bbb", "ccc"] {
+        fake.seed(
+            &format!("pastes/{today}/{key}"),
+            b"abcde",
+            "text/plain",
+            &common::metadata_refs(&valid),
+        );
+    }
+    fake.delay_head(
+        &format!("pastes/{today}/aaa"),
+        std::time::Duration::from_millis(150),
+    );
+
+    let page = store
+        .list_window_page(Some(&today), Some(&today), 2, None)
+        .await
+        .expect("the first page must succeed");
+    let ids: Vec<&str> = page.items.iter().map(|item| item.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![format!("{today}/aaa"), format!("{today}/bbb")],
+        "a later key must not overtake an earlier key"
+    );
+    let next = page.next.expect("the full page needs a cursor");
+    assert_eq!(
+        next.start_after,
+        format!("pastes/{today}/bbb"),
+        "the cursor must name the last included key, not the last finished head"
+    );
+}
+
+#[tokio::test]
+async fn list_window_reports_segment_total_size_and_base_expiry() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_caps(1024, 1024 * 1024).await;
+    let stored = store
+        .store_text(b"base", None, Some("text/plain"), Some(Ttl::days(7)))
+        .await
+        .expect("the base must store");
+    store
+        .append_text(&stored.id, b"+one")
+        .await
+        .expect("the first segment must store");
+    store
+        .append_text(&stored.id, b"+two")
+        .await
+        .expect("the second segment must store");
+    let expected = store
+        .head_metadata(&stored.id)
+        .await
+        .expect("the metadata read must succeed");
+    let date = stored
+        .id
+        .split_once('/')
+        .map(|(date, _)| date)
+        .expect("the id must contain a date");
+
+    let items = store
+        .list_recent(Some(date), 100)
+        .await
+        .expect("listing must succeed");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, stored.id);
+    assert_eq!(items[0].size, 12, "the size must include both segments");
+    assert_eq!(items[0].size, expected.size);
+    assert_eq!(items[0].expires_at, expected.expires_at);
+}
+
+#[tokio::test]
+async fn list_window_pagination_is_unchanged_with_segments() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let valid = future_metadata(5);
+    for key in ["aaa", "bbb", "ccc", "ddd", "eee"] {
+        fake.seed(
+            &format!("pastes/{today}/{key}"),
+            b"abcde",
+            "text/plain",
+            &common::metadata_refs(&valid),
+        );
+    }
+    for key in ["aaa", "ccc"] {
+        let base = format!("pastes/{today}/{key}");
+        for index in 0..2 {
+            let segment = segment_key(&base, index, &format!("suffix{index:06}"));
+            fake.seed(&segment, b"xy", "text/plain", &[]);
+        }
+    }
+
+    let first = store
+        .list_window_page(Some(&today), Some(&today), 2, None)
+        .await
+        .expect("the first page must succeed");
+    let first_ids: Vec<&str> = first.items.iter().map(|item| item.id.as_str()).collect();
+    assert_eq!(
+        first_ids,
+        vec![format!("{today}/aaa"), format!("{today}/bbb")]
+    );
+    assert_eq!(first.items[0].size, 9);
+    let next = first.next.clone().expect("the first page needs a cursor");
+    assert_eq!(next.start_after, format!("pastes/{today}/bbb"));
+
+    let second = store
+        .list_window_page(Some(&today), Some(&today), 2, Some(&next))
+        .await
+        .expect("the second page must succeed");
+    let second_ids: Vec<&str> = second.items.iter().map(|item| item.id.as_str()).collect();
+    assert_eq!(
+        second_ids,
+        vec![format!("{today}/ccc"), format!("{today}/ddd")]
+    );
+    assert_eq!(second.items[0].size, 9);
+    let next = second.next.expect("the second page needs a cursor");
+    assert_eq!(next.start_after, format!("pastes/{today}/ddd"));
+
+    let third = store
+        .list_window_page(Some(&today), Some(&today), 2, Some(&next))
+        .await
+        .expect("the third page must succeed");
+    assert_eq!(third.items.len(), 1);
+    assert_eq!(third.items[0].id, format!("{today}/eee"));
+    assert!(!third.truncated);
+    assert!(third.next.is_none());
+}
+
+#[tokio::test]
+async fn list_window_skips_expired_and_segment_only_keys() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let valid = future_metadata(5);
+    let expired = expired_metadata(5);
+    fake.seed(
+        &format!("pastes/{today}/aaa"),
+        b"abcde",
+        "text/plain",
+        &common::metadata_refs(&valid),
+    );
+    fake.seed(
+        &format!("pastes/{today}/bbb"),
+        b"abcde",
+        "text/plain",
+        &common::metadata_refs(&expired),
+    );
+    let ghost_segment = segment_key(&format!("pastes/{today}/ccc"), 0, "ghost0000000");
+    fake.seed(&ghost_segment, b"xyz", "text/plain", &[]);
+    fake.seed(
+        &format!("pastes/{today}/ddd"),
+        b"abcde",
+        "text/plain",
+        &common::metadata_refs(&valid),
+    );
+
+    let before = fake.requests().len();
+    let items = store
+        .list_recent(Some(&today), 100)
+        .await
+        .expect("listing must succeed");
+    let ids: Vec<&str> = items.iter().map(|item| item.id.as_str()).collect();
+    assert_eq!(ids, vec![format!("{today}/aaa"), format!("{today}/ddd")]);
+
+    let requests = fake.requests();
+    let new_requests = &requests[before..];
+    let list_calls = new_requests
+        .iter()
+        .filter(|request| request.query.contains("list-type=2"))
+        .count();
+    let head_calls = new_requests
+        .iter()
+        .filter(|request| request.method == "HEAD")
+        .count();
+    assert_eq!(list_calls, 1, "the date scan must also carry segment keys");
+    assert_eq!(
+        head_calls, 3,
+        "the segment-only base must get no HeadObject"
     );
 }
 
