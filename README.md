@@ -331,10 +331,11 @@ credential, not an ownership model.
 
 ### No database in v1 — the performance tradeoff
 
-Listing is O(n) in objects scanned, plus one HeadObject and one
-segment-prefix listing per paste (needed to recover expiry,
-content-type, filename, and the total size, which ListObjectsV2 does
-not return, and to filter expired objects out).
+Listing is O(n) in objects scanned, plus one HeadObject per paste
+(needed to recover expiry, content-type, filename, and the total size,
+which ListObjectsV2 does not return, and to filter expired objects
+out). The same date-prefix scan returns the segment keys, so a paste
+with no segments costs no extra prefix listing.
 For a small internal bucket that is fine. As the bucket grows,
 listing gets slower — that slowdown, not a guessed threshold, is
 exactly the trigger for adding a database later. The date prefix
