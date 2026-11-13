@@ -371,6 +371,47 @@ fn init_logging(format: LogFormat, verbose: bool) {
 /// The interval between stale multipart sweeps.
 const MULTIPART_SWEEP_INTERVAL: Duration = Duration::from_secs(3_600);
 
+/// The maximum time that a shutdown waits for in-flight requests.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Wait until the shutdown flag is true.
+async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow() {
+            break;
+        }
+        if rx.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Wait for SIGINT or SIGTERM and return its name.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => "SIGINT",
+                    _ = terminate.recv() => "SIGTERM",
+                }
+            }
+            Err(error) => {
+                tracing::warn!("cannot listen for SIGTERM: {error}");
+                let _ = tokio::signal::ctrl_c().await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "interrupt"
+    }
+}
+
 /// Abort incomplete multipart uploads at startup and on a timer.
 ///
 /// The first tick fires at once, so a restart cleans orphans from the
@@ -505,27 +546,62 @@ async fn main() -> anyhow::Result<()> {
                 None => None,
             };
             reload::spawn_file_watcher(reload_paths, state.clone(), bind_addr.clone());
-            match metrics_listener {
-                Some(metrics_listener) => {
-                    let http_server = axum::serve(
-                        listener,
-                        app.into_make_service_with_connect_info::<SocketAddr>(),
-                    )
-                    .into_future();
-                    let metrics_app = http::metrics_router(state);
-                    let metrics_server = axum::serve(
-                        metrics_listener,
-                        metrics_app.into_make_service_with_connect_info::<SocketAddr>(),
-                    )
-                    .into_future();
-                    tokio::try_join!(http_server, metrics_server)?;
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let shutdown_wait = shutdown_rx.clone();
+            tokio::spawn(async move {
+                let reason = shutdown_signal().await;
+                tracing::info!("shutdown requested by {reason}");
+                if shutdown_tx.send(true).is_err() {
+                    tracing::warn!("shutdown flag has no receivers");
                 }
-                None => {
-                    axum::serve(
-                        listener,
-                        app.into_make_service_with_connect_info::<SocketAddr>(),
-                    )
-                    .await?;
+            });
+            let servers = async move {
+                match metrics_listener {
+                    Some(metrics_listener) => {
+                        let http_server = axum::serve(
+                            listener,
+                            app.into_make_service_with_connect_info::<SocketAddr>(),
+                        )
+                        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()))
+                        .into_future();
+                        let metrics_app = http::metrics_router(state);
+                        let metrics_server = axum::serve(
+                            metrics_listener,
+                            metrics_app.into_make_service_with_connect_info::<SocketAddr>(),
+                        )
+                        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
+                        .into_future();
+                        tokio::try_join!(http_server, metrics_server)?;
+                    }
+                    None => {
+                        axum::serve(
+                            listener,
+                            app.into_make_service_with_connect_info::<SocketAddr>(),
+                        )
+                        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
+                        .await?;
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            };
+            tokio::pin!(servers);
+            tokio::select! {
+                result = &mut servers => result?,
+                _ = wait_for_shutdown(shutdown_wait) => {
+                    tracing::info!(
+                        "shutdown: draining in-flight requests (timeout {} seconds)",
+                        SHUTDOWN_TIMEOUT.as_secs()
+                    );
+                    match tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut servers).await {
+                        Ok(Ok(())) => tracing::info!("shutdown: drain complete"),
+                        Ok(Err(error)) => tracing::warn!(
+                            "shutdown: listener stopped with an error during the drain: {error}"
+                        ),
+                        Err(_) => tracing::warn!(
+                            "shutdown: drain timed out after {} seconds",
+                            SHUTDOWN_TIMEOUT.as_secs()
+                        ),
+                    }
                 }
             }
         }
