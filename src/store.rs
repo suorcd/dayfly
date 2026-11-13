@@ -1604,6 +1604,71 @@ fn is_expired_at(expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool 
     expires_at.map(|expires| now > expires).unwrap_or(false)
 }
 
+/// One incomplete multipart upload, named by key and upload ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartUploadRef {
+    pub key: String,
+    pub upload_id: String,
+}
+
+/// One multipart upload whose abort failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartAbortFailure {
+    pub key: String,
+    pub upload_id: String,
+    pub message: String,
+}
+
+/// The result of one stale multipart upload sweep.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MultipartAbortReport {
+    /// Uploads that the sweep aborted in live mode.
+    pub aborted: Vec<MultipartUploadRef>,
+    /// Uploads that a dry run would abort.
+    pub would_abort: Vec<MultipartUploadRef>,
+    /// Uploads whose abort failed.
+    pub failed: Vec<MultipartAbortFailure>,
+}
+
+/// One failed cleanup item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupFailure {
+    pub key: String,
+    pub message: String,
+}
+
+/// Options for one manual cleanup pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupOptions {
+    /// Report the items without changing the bucket.
+    pub dry_run: bool,
+    /// Abort multipart uploads older than this duration.
+    pub multipart_older_than: Duration,
+}
+
+/// The result of one manual cleanup pass.
+///
+/// Each list holds the named items that the pass changed, would change,
+/// or failed to change. The command uses the lengths as machine-readable
+/// counts.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CleanupReport {
+    pub multipart: MultipartAbortReport,
+    pub pastes_deleted: Vec<String>,
+    pub pastes_would_delete: Vec<String>,
+    pub pastes_failed: Vec<CleanupFailure>,
+    pub aliases_deleted: Vec<String>,
+    pub aliases_would_delete: Vec<String>,
+    pub aliases_failed: Vec<CleanupFailure>,
+}
+
+impl CleanupReport {
+    /// The number of items that the pass failed to change.
+    pub fn failed(&self) -> usize {
+        self.multipart.failed.len() + self.pastes_failed.len() + self.aliases_failed.len()
+    }
+}
+
 #[derive(Clone)]
 pub struct Store {
     client: Client,
@@ -1990,25 +2055,43 @@ impl Store {
 
     /// Abort incomplete multipart uploads older than `older_than`.
     ///
-    /// The sweep lists the `pastes/` prefix and follows pagination. It
-    /// aborts each stale upload with retries and skips an upload that this
-    /// process still drives. One failed abort logs and the sweep
-    /// continues, so one bad object cannot stop the rest. The return value
-    /// counts the uploads that were aborted.
+    /// The automatic sweep uses this wrapper. It returns the count of
+    /// aborted uploads and logs each failed abort. A manual cleanup calls
+    /// [`Self::abort_stale_multipart_uploads_with_report`] instead.
     pub async fn abort_stale_multipart_uploads(
         &self,
         older_than: Duration,
     ) -> Result<usize, StoreError> {
+        Ok(self
+            .abort_stale_multipart_uploads_with_report(older_than, false)
+            .await?
+            .aborted
+            .len())
+    }
+
+    /// Abort incomplete multipart uploads older than `older_than`.
+    ///
+    /// The sweep lists the `pastes/` prefix and follows pagination. It
+    /// aborts each stale upload with retries and skips an upload that this
+    /// process still drives. One failed abort logs and the sweep
+    /// continues, so one bad object cannot stop the rest. With `dry_run`,
+    /// the report lists each upload that the sweep would abort and changes
+    /// nothing.
+    pub async fn abort_stale_multipart_uploads_with_report(
+        &self,
+        older_than: Duration,
+        dry_run: bool,
+    ) -> Result<MultipartAbortReport, StoreError> {
         let cutoff = chrono::Duration::from_std(older_than)
             .ok()
             .and_then(|older_than| Utc::now().checked_sub_signed(older_than));
         let Some(cutoff) = cutoff else {
             // The age is too large to represent. No upload is that old.
-            return Ok(0);
+            return Ok(MultipartAbortReport::default());
         };
         let mut key_marker: Option<String> = None;
         let mut upload_id_marker: Option<String> = None;
-        let mut aborted = 0usize;
+        let mut report = MultipartAbortReport::default();
         loop {
             let mut request = self
                 .client
@@ -2042,6 +2125,14 @@ impl Store {
                 if is_active {
                     continue;
                 }
+                let named = MultipartUploadRef {
+                    key: key.to_string(),
+                    upload_id: upload_id.to_string(),
+                };
+                if dry_run {
+                    report.would_abort.push(named);
+                    continue;
+                }
                 match abort_multipart_with_retry(
                     &self.client,
                     &self.bucket,
@@ -2052,7 +2143,7 @@ impl Store {
                 .await
                 {
                     Ok(()) => {
-                        aborted += 1;
+                        report.aborted.push(named);
                         if let Some(metrics) = &self.metrics {
                             metrics.count_multipart_orphan();
                         }
@@ -2063,6 +2154,11 @@ impl Store {
                             upload_id = %upload_id,
                             "cannot abort a stale multipart upload: {error}"
                         );
+                        report.failed.push(MultipartAbortFailure {
+                            key: key.to_string(),
+                            upload_id: upload_id.to_string(),
+                            message: error.to_string(),
+                        });
                     }
                 }
             }
@@ -2077,7 +2173,165 @@ impl Store {
             key_marker = next_key;
             upload_id_marker = next_upload_id;
         }
-        Ok(aborted)
+        Ok(report)
+    }
+
+    /// Run one manual cleanup pass.
+    ///
+    /// The pass aborts stale multipart uploads, deletes expired paste
+    /// objects through [`Self::delete`], then deletes expired alias
+    /// objects under `words/`. A per-item failure is collected and the
+    /// pass continues. With `dry_run`, the pass collects the items that it
+    /// would delete and changes nothing. The pass does not read the bucket
+    /// lifecycle configuration.
+    pub async fn cleanup(&self, options: CleanupOptions) -> Result<CleanupReport, StoreError> {
+        let mut report = CleanupReport {
+            multipart: self
+                .abort_stale_multipart_uploads_with_report(
+                    options.multipart_older_than,
+                    options.dry_run,
+                )
+                .await?,
+            ..CleanupReport::default()
+        };
+        let now = Utc::now();
+        let paste_keys = match self.list_prefix_keys("pastes/").await {
+            Ok(keys) => keys,
+            Err(error) => {
+                report.pastes_failed.push(CleanupFailure {
+                    key: "pastes/".to_string(),
+                    message: error.to_string(),
+                });
+                Vec::new()
+            }
+        };
+        for key in paste_keys {
+            if !is_paste_key(&key) {
+                continue;
+            }
+            let expires_at = match self.head_expiry(&key).await {
+                Ok(expires_at) => expires_at,
+                Err(error) => {
+                    report.pastes_failed.push(CleanupFailure {
+                        key: key.clone(),
+                        message: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if !is_expired_at(expires_at, now) {
+                continue;
+            }
+            if options.dry_run {
+                report.pastes_would_delete.push(key);
+                continue;
+            }
+            match self.delete(&key).await {
+                Ok(()) => report.pastes_deleted.push(key),
+                Err(error) => report.pastes_failed.push(CleanupFailure {
+                    key: key.clone(),
+                    message: error.to_string(),
+                }),
+            }
+        }
+        let alias_keys = match self.list_prefix_keys(ALIAS_PREFIX).await {
+            Ok(keys) => keys,
+            Err(error) => {
+                report.aliases_failed.push(CleanupFailure {
+                    key: ALIAS_PREFIX.to_string(),
+                    message: error.to_string(),
+                });
+                Vec::new()
+            }
+        };
+        for key in alias_keys {
+            let expires_at = match self.head_expiry(&key).await {
+                Ok(expires_at) => expires_at,
+                Err(error) => {
+                    report.aliases_failed.push(CleanupFailure {
+                        key: key.clone(),
+                        message: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if !is_expired_at(expires_at, now) {
+                continue;
+            }
+            if options.dry_run {
+                report.aliases_would_delete.push(key);
+                continue;
+            }
+            match self.delete_object_key(&key).await {
+                Ok(()) => report.aliases_deleted.push(key),
+                Err(error) => report.aliases_failed.push(CleanupFailure {
+                    key: key.clone(),
+                    message: error.to_string(),
+                }),
+            }
+        }
+        Ok(report)
+    }
+
+    /// List every object key under `prefix`, across all pages.
+    ///
+    /// The cleanup command scans the full bucket, so the listing follows
+    /// continuation tokens until S3 reports the last page. The bucket is
+    /// small in v1. The scan is O(n) in stored objects.
+    async fn list_prefix_keys(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        let mut keys = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix)
+                .max_keys(1000);
+            if let Some(token) = token.as_deref() {
+                request = request.continuation_token(token);
+            }
+            let output = s3_call!(self.metrics, "list_objects_v2", request.send())
+                .map_err(|error| map_sdk_error(error, prefix))?;
+            keys.extend(
+                output
+                    .contents()
+                    .iter()
+                    .filter_map(|object| object.key().map(str::to_string)),
+            );
+            match (
+                output.is_truncated().unwrap_or(false),
+                output.next_continuation_token(),
+            ) {
+                (true, Some(next)) => token = Some(next.to_string()),
+                _ => return Ok(keys),
+            }
+        }
+    }
+
+    /// Read the `expires-at` metadata value from one object.
+    ///
+    /// A missing object returns `Ok(None)`. The cleanup scan treats a
+    /// missing object or a missing expiry value as an object to keep.
+    async fn head_expiry(&self, key: &str) -> Result<Option<DateTime<Utc>>, StoreError> {
+        match s3_call!(
+            self.metrics,
+            "head_object",
+            self.client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+        )
+        .map_err(|error| map_sdk_error(error, key))
+        {
+            Ok(output) => Ok(output
+                .metadata()
+                .and_then(|meta| meta.get("expires-at"))
+                .and_then(|value| parse_rfc3339(value))),
+            Err(StoreError::NotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Normalize an alias with the configured maximum word count.
