@@ -34,7 +34,7 @@ use dayfly::http::AppState;
 use dayfly::mcp;
 use dayfly::metrics::Metrics;
 use dayfly::reload;
-use dayfly::store::{Store, StoreHandle};
+use dayfly::store::{CleanupOptions, CleanupReport, Store, StoreHandle};
 
 #[derive(Parser)]
 #[command(
@@ -73,6 +73,12 @@ enum Command {
     Lifecycle {
         #[command(subcommand)]
         action: LifecycleAction,
+    },
+    /// Delete expired objects and abort stale multipart uploads.
+    Cleanup {
+        /// Report the items without changing the bucket.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -435,6 +441,58 @@ fn spawn_multipart_sweeper(handle: StoreHandle) {
     });
 }
 
+/// Print one line per cleanup item and a final count line.
+fn print_cleanup_report(report: &CleanupReport, dry_run: bool) {
+    for item in &report.multipart.aborted {
+        println!(
+            "multipart upload_id={} key={} aborted",
+            item.upload_id, item.key
+        );
+    }
+    for item in &report.multipart.would_abort {
+        println!(
+            "multipart upload_id={} key={} would-abort",
+            item.upload_id, item.key
+        );
+    }
+    for failure in &report.multipart.failed {
+        println!(
+            "multipart upload_id={} key={} failed: {}",
+            failure.upload_id, failure.key, failure.message
+        );
+    }
+    for key in &report.pastes_deleted {
+        println!("paste key={key} deleted");
+    }
+    for key in &report.pastes_would_delete {
+        println!("paste key={key} would-delete");
+    }
+    for failure in &report.pastes_failed {
+        println!("paste key={} failed: {}", failure.key, failure.message);
+    }
+    for key in &report.aliases_deleted {
+        println!("alias key={key} deleted");
+    }
+    for key in &report.aliases_would_delete {
+        println!("alias key={key} would-delete");
+    }
+    for failure in &report.aliases_failed {
+        println!("alias key={} failed: {}", failure.key, failure.message);
+    }
+    println!(
+        "cleanup: dry_run={dry_run} aborted={} would_abort={} \
+         pastes_deleted={} pastes_would_delete={} aliases_deleted={} \
+         aliases_would_delete={} failed={}",
+        report.multipart.aborted.len(),
+        report.multipart.would_abort.len(),
+        report.pastes_deleted.len(),
+        report.pastes_would_delete.len(),
+        report.aliases_deleted.len(),
+        report.aliases_would_delete.len(),
+        report.failed()
+    );
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -603,6 +661,17 @@ async fn main() -> anyhow::Result<()> {
                         ),
                     }
                 }
+            }
+        }
+        Some(Command::Cleanup { dry_run }) => {
+            let options = CleanupOptions {
+                dry_run,
+                multipart_older_than: Duration::from_secs(config.multipart_abort_after_seconds),
+            };
+            let report = store.cleanup(options).await?;
+            print_cleanup_report(&report, dry_run);
+            if report.failed() > 0 {
+                anyhow::bail!("cleanup failed: {} item(s) failed", report.failed());
             }
         }
         Some(Command::Lifecycle { action }) => {

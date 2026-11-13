@@ -11,9 +11,9 @@ use bytes::Bytes;
 use chrono::{Duration, Utc};
 use common::{FailOp, FakeS3, Gate};
 use dayfly::store::{
-    normalize_words, normalize_words_up_to, parse_segment_key, segment_key, PasteFields,
-    SearchOptions, Store, StoreError, Ttl, MAX_FETCH_TEXT_BYTES, MAX_SEGMENTS_PER_PASTE,
-    MULTIPART_CHUNK_BYTES, SEGMENT_SUFFIX_LEN,
+    normalize_words, normalize_words_up_to, parse_segment_key, segment_key, CleanupOptions,
+    PasteFields, SearchOptions, Store, StoreError, Ttl, MAX_FETCH_TEXT_BYTES,
+    MAX_SEGMENTS_PER_PASTE, MULTIPART_CHUNK_BYTES, SEGMENT_SUFFIX_LEN,
 };
 use futures::stream;
 use sha2::{Digest, Sha256};
@@ -4894,4 +4894,167 @@ async fn an_unrepresentable_sweep_age_aborts_nothing() {
 
     assert_eq!(aborted, 0);
     assert_eq!(fake.upload_ids(), vec!["upload-stale".to_string()]);
+}
+
+#[tokio::test]
+async fn multipart_abort_report_keeps_a_failed_upload() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let past = (Utc::now() - Duration::hours(2)).to_rfc3339();
+    fake.seed_multipart("pastes/2026-01-01/bad", "upload-bad", &past);
+    fake.seed_multipart("pastes/2026-01-01/good", "upload-good", &past);
+    fake.fail_abort_always("upload-bad");
+
+    let report = store
+        .abort_stale_multipart_uploads_with_report(std::time::Duration::from_secs(3_600), false)
+        .await
+        .expect("the reporting sweep must succeed");
+
+    assert_eq!(report.aborted.len(), 1);
+    assert_eq!(report.aborted[0].upload_id, "upload-good");
+    assert_eq!(report.would_abort.len(), 0);
+    assert_eq!(report.failed.len(), 1);
+    assert_eq!(report.failed[0].key, "pastes/2026-01-01/bad");
+    assert_eq!(report.failed[0].upload_id, "upload-bad");
+    assert!(
+        !report.failed[0].message.is_empty(),
+        "the failure must keep its reason"
+    );
+    assert_eq!(fake.upload_ids(), vec!["upload-bad".to_string()]);
+}
+
+#[tokio::test]
+async fn cleanup_dry_run_reports_expired_objects_without_changes() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let past = (Utc::now() - Duration::hours(2)).to_rfc3339();
+    let key = "pastes/2020-01-01/expired";
+    let segment = "pastes/2020-01-01/expired/00000000000000000000-expired00001";
+    let alias = "words/abacus-abdomen-zoology";
+    fake.seed(
+        key,
+        b"expired",
+        "text/plain",
+        &[
+            ("expires-at", past.as_str()),
+            ("words", "abacus-abdomen-zoology"),
+        ],
+    );
+    fake.seed(segment, b"segment", "text/plain", &[]);
+    fake.seed(
+        alias,
+        key.as_bytes(),
+        "text/plain",
+        &[
+            ("expires-at", past.as_str()),
+            ("kind", "alias"),
+            ("target", key),
+        ],
+    );
+    fake.seed_multipart("pastes/2026-01-01/stale", "upload-stale", &past);
+
+    let report = store
+        .cleanup(CleanupOptions {
+            dry_run: true,
+            multipart_older_than: std::time::Duration::from_secs(3_600),
+        })
+        .await
+        .expect("the dry-run cleanup must succeed");
+
+    assert_eq!(report.pastes_would_delete, vec![key.to_string()]);
+    assert_eq!(report.aliases_would_delete, vec![alias.to_string()]);
+    assert_eq!(report.multipart.would_abort.len(), 1);
+    assert_eq!(report.multipart.would_abort[0].upload_id, "upload-stale");
+    assert_eq!(report.failed(), 0);
+    assert!(fake.object(key).is_some());
+    assert!(fake.object(segment).is_some());
+    assert!(fake.object(alias).is_some());
+    assert_eq!(fake.upload_ids(), vec!["upload-stale".to_string()]);
+    assert!(
+        fake.requests()
+            .iter()
+            .all(|request| !request.query.contains("lifecycle")),
+        "cleanup must not read the lifecycle configuration"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_deletes_expired_paste_with_segments_and_alias() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let past = (Utc::now() - Duration::hours(2)).to_rfc3339();
+    let future = (Utc::now() + Duration::hours(2)).to_rfc3339();
+    let expired = "pastes/2020-01-01/expired";
+    let expired_segment = "pastes/2020-01-01/expired/00000000000000000000-expired00001";
+    let expired_alias = "words/abacus-abdomen-zoology";
+    let fresh = "pastes/2999-01-01/fresh";
+    let fresh_segment = "pastes/2999-01-01/fresh/00000000000000000000-fresh0000001";
+    let fresh_alias = "words/abacus-abdomen-abdominal";
+    fake.seed(
+        expired,
+        b"expired",
+        "text/plain",
+        &[
+            ("expires-at", past.as_str()),
+            ("words", "abacus-abdomen-zoology"),
+        ],
+    );
+    fake.seed(expired_segment, b"segment", "text/plain", &[]);
+    fake.seed(
+        expired_alias,
+        expired.as_bytes(),
+        "text/plain",
+        &[
+            ("expires-at", past.as_str()),
+            ("kind", "alias"),
+            ("target", expired),
+        ],
+    );
+    fake.seed(
+        fresh,
+        b"fresh",
+        "text/plain",
+        &[
+            ("expires-at", future.as_str()),
+            ("words", "abacus-abdomen-abdominal"),
+        ],
+    );
+    fake.seed(fresh_segment, b"fresh segment", "text/plain", &[]);
+    fake.seed(
+        fresh_alias,
+        fresh.as_bytes(),
+        "text/plain",
+        &[
+            ("expires-at", future.as_str()),
+            ("kind", "alias"),
+            ("target", fresh),
+        ],
+    );
+
+    let report = store
+        .cleanup(CleanupOptions {
+            dry_run: false,
+            multipart_older_than: std::time::Duration::from_secs(3_600),
+        })
+        .await
+        .expect("the live cleanup must succeed");
+
+    assert_eq!(report.pastes_deleted, vec![expired.to_string()]);
+    assert!(
+        report.aliases_deleted.is_empty(),
+        "the paste delete path must remove the matching alias before the alias scan"
+    );
+    assert_eq!(report.failed(), 0);
+    assert!(fake.object(expired).is_none());
+    assert!(
+        fake.object(expired_segment).is_none(),
+        "the paste delete path must remove its segments"
+    );
+    assert!(
+        fake.object(expired_alias).is_none(),
+        "the paste delete path must remove its alias"
+    );
+    assert!(fake.object(fresh).is_some());
+    assert!(fake.object(fresh_segment).is_some());
+    assert!(fake.object(fresh_alias).is_some());
 }

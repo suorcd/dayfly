@@ -258,3 +258,53 @@ async fn real_list_and_abort_multipart_upload() {
         "the aborted upload must not be listed"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable real Garage/S3 bucket and explicit opt-in"]
+async fn real_cleanup_deletes_expired_paste_and_alias() {
+    let store = Store::from_config(test_config())
+        .await
+        .expect("real S3 configuration must build");
+    let stored = store
+        .store_text(
+            b"real cleanup",
+            None,
+            Some("text/plain"),
+            Some(Ttl::parse("5s").expect("5s must parse")),
+        )
+        .await
+        .expect("real store_text must succeed");
+    let words = stored
+        .words
+        .clone()
+        .expect("a new paste must have a word alias");
+    store
+        .append_text(&stored.id, b" tail")
+        .await
+        .expect("real append must succeed");
+    tokio::time::sleep(std::time::Duration::from_millis(5_500)).await;
+
+    let report = store
+        .cleanup(dayfly::store::CleanupOptions {
+            dry_run: false,
+            multipart_older_than: std::time::Duration::from_secs(3_600),
+        })
+        .await
+        .expect("real cleanup must succeed");
+
+    assert!(
+        report.pastes_deleted.contains(&stored.key),
+        "the expired paste must be deleted: {report:?}"
+    );
+    assert_eq!(report.failed(), 0, "the real cleanup must not fail");
+    let error = store
+        .head_metadata(&stored.id)
+        .await
+        .expect_err("the expired paste must be gone");
+    assert!(matches!(error, StoreError::NotFound(_)));
+    let alias_error = store
+        .head_metadata(&words)
+        .await
+        .expect_err("the alias must be gone");
+    assert!(matches!(alias_error, StoreError::NotFound(_)));
+}

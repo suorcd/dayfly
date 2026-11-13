@@ -113,7 +113,9 @@ Dayfly also aborts stale multipart uploads in code. It lists the
 `pastes/` prefix at startup and each hour. It aborts an upload older
 than `DAYFLY_MULTIPART_ABORT_AFTER` seconds and skips an upload that
 this process still drives. A failed sweep logs and does not stop the
-listener. A lifecycle rule is a backstop, not a requirement.
+listener. A lifecycle rule is a backstop, not a requirement. Run
+`dayfly cleanup` for one manual pass. The command uses the same
+threshold and needs no lifecycle rule.
 
 The active-upload set is per process. A sweep cannot see an upload
 that a second process drives. Keep `DAYFLY_MULTIPART_ABORT_AFTER`
@@ -408,7 +410,7 @@ permissions and the lower total cap.
 | `DAYFLY_MAX_TEXT_BYTES` | no | 104857600 (100 MiB) | Max text paste size for MCP `store_text`, the human text form, and `POST /upload` without a filename; oversize → 413. A new paste must also fit `DAYFLY_MAX_PASTE_BYTES`, so the lower cap wins. A filename (including a multipart filename) uses `DAYFLY_MAX_FILE_BYTES` instead |
 | `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error. A new paste must also fit `DAYFLY_MAX_PASTE_BYTES`, so the lower cap wins. The maximum is 52428800000 bytes: 10,000 parts of 5 MiB. A TTL change on a paste above the 5 GB copy limit fails with `copy_limit`; no object is rewritten |
 | `DAYFLY_MAX_PASTE_BYTES` | no | 1073741824 (1 GiB) | Max total size for one paste, including the base object and every appended segment. A new paste or an append that would exceed the cap fails and writes no object |
-| `DAYFLY_MULTIPART_ABORT_AFTER` | no | 3600 | Age in seconds after which the startup and hourly sweep aborts an incomplete multipart upload under `pastes/`. Must be positive. The sweep skips an upload that this process still drives. A second process is not visible, so keep this value above the longest upload time when two writers share the bucket |
+| `DAYFLY_MULTIPART_ABORT_AFTER` | no | 3600 | Age in seconds after which the startup and hourly sweep aborts an incomplete multipart upload under `pastes/`. The manual `cleanup` command uses the same value. Must be positive. The sweep skips an upload that this process still drives. A second process is not visible, so keep this value above the longest upload time when two writers share the bucket |
 | `DAYFLY_SEARCH_MAX_BYTES` | no | 67108864 (64 MiB) | Max bytes that one text search reads. The search returns `truncated` at the cap and the caller resumes with `next_offset`. Must be a positive number of bytes |
 | `DAYFLY_ALIAS_WORDS` | no | 3 | Number of words in a new alias. Allowed range 3 to 6. Resolution accepts 3 words up to this value |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be within `DAYFLY_MIN_TTL_DAYS` (at least 1) and `DAYFLY_MAX_TTL_DAYS` |
@@ -1473,6 +1475,7 @@ credentials. The suite needs no network and no Garage.
 | `tests/store_s3.rs` | `store_text`, `store_file_path`, `store_stream`, multipart abort paths, caps, `head_metadata`, `fetch_text`, `fetch_range_by_key`, `download_file`, `delete`, `list_recent`, error mapping, append and segment reads |
 | `tests/http_routes.rs` | Raw and multipart uploads, bearer and write-only auth, download, `HEAD`, `Range`, metadata, delete, list, append, MCP shared store, failed uploads |
 | `tests/web_handlers.rs` | Index, text submit, upload submit, list, view, delete, auth, error pages |
+| `tests/cleanup_cli.rs` | `dayfly cleanup` dry-run and live passes against the fake S3 service, no lifecycle rule, per-item failure and exit code |
 | `tests/mcp_stdio.rs` | The real binary over MCP stdio: all tools and their error paths |
 | `tests/config_env.rs` | `Config::from_env` defaults, overrides, and error text |
 | `tests/real_garage.rs` | Ignored tests for a disposable real Garage/S3 bucket |
@@ -1576,7 +1579,8 @@ What a pass looks like, on a machine with Nix: `nix flake check`
 exits 0 with no errors; `nix build` exits 0 and creates a
 `./result` symlink pointing into the Nix store, and
 `./result/bin/dayfly --help` prints the CLI usage
-(subcommands `mcp` and `serve`); `nix develop` drops into a shell
+(subcommands `mcp`, `serve`, `config`, `lifecycle`, and `cleanup`);
+`nix develop` drops into a shell
 where `cargo --version`, `rustc --version`, and
 `rust-analyzer --version` all succeed.
 
@@ -1673,6 +1677,43 @@ Run these checks against a real Garage instance:
   **not** applied automatically), and confirm it only ever
   deletes objects past their TTL, plus aborts incomplete
   multipart uploads.
+
+## Manual cleanup
+
+`dayfly cleanup` runs one cleanup pass and exits. The pass does this
+work in order:
+
+1. It aborts incomplete multipart uploads under `pastes/` that are older
+   than `DAYFLY_MULTIPART_ABORT_AFTER` seconds.
+2. It lists the `pastes/` prefix and reads the `expires-at` value of each
+   base object. It deletes each expired paste through the normal delete
+   path. That path removes the base object, its segments, and a matching
+   alias.
+3. It lists the `words/` prefix. It deletes each alias object with a past
+   `expires-at` value.
+
+The command does not read or need a bucket lifecycle rule. The command
+scans the bucket directly, so its cost is O(n) in stored objects.
+
+```sh
+dayfly cleanup --dry-run
+dayfly cleanup
+```
+
+`--dry-run` prints the same item lines and counts, but changes nothing.
+Live output prints one line per item and a final `cleanup:` line. The
+final line holds these counts: `aborted`, `would_abort`,
+`pastes_deleted`, `pastes_would_delete`, `aliases_deleted`,
+`aliases_would_delete`, and `failed`. The command continues after a
+failed item. It names the key or upload ID of the failed item. It exits
+1 when any item failed.
+
+**Concurrency risk.** The active-upload set is per process. A cleanup
+process cannot see an upload that a server process still drives. A short
+threshold can abort a live upload. Stop the service during cleanup, or
+keep `DAYFLY_MULTIPART_ABORT_AFTER` above the longest upload time. A
+concurrent writer can also add an object during a scan. The next pass
+removes a skipped object.
 
 ## Lifecycle configuration
 
