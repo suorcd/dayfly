@@ -99,6 +99,11 @@ above your new maximum and apply it again:
 dayfly lifecycle apply --file docs/lifecycle-example.json
 ```
 
+The lifecycle endpoints need an **owner** key. Garage 2.5 rejects a
+read/write key with `403 Forbidden: Operation is not allowed for this
+key`. Keep the runtime key read/write and use a separate owner key for
+this command, or grant owner to the shared key.
+
 The example includes a `words/` rule and an
 `AbortIncompleteMultipartUpload` rule. The code also runs its own
 multipart sweep at startup and every hour.

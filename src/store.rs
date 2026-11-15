@@ -1999,7 +1999,9 @@ impl Store {
 
     /// The bucket lifecycle rules, or an empty set when none is set.
     ///
-    /// The call needs read permission on the bucket.
+    /// The call needs owner permission on the bucket. Garage 2.5
+    /// rejects a read/write key with `403 Forbidden: Operation is not
+    /// allowed for this key`.
     pub async fn lifecycle_rules(&self) -> Result<Vec<LifecycleRule>, StoreError> {
         let result = s3_call!(
             self.metrics,
@@ -2030,8 +2032,8 @@ impl Store {
 
     /// Replace the bucket lifecycle rules.
     ///
-    /// The call needs write permission on the bucket. Garage does not
-    /// require owner permission for this endpoint.
+    /// The call needs owner permission on the bucket. Garage 2.5 does
+    /// not accept a read/write key for this endpoint.
     pub async fn put_lifecycle_rules(&self, rules: Vec<LifecycleRule>) -> Result<(), StoreError> {
         let configuration = crate::lifecycle::configuration(rules)
             .map_err(|error| StoreError::InvalidLifecycle(error.to_string()))?;
@@ -2050,8 +2052,9 @@ impl Store {
 
     /// Log the bucket lifecycle rules, best effort.
     ///
-    /// The call needs read permission on the bucket. A missing rule or an
-    /// S3 error logs one warning. Startup and serving continue.
+    /// The call needs owner permission on the bucket. A read/write key
+    /// gets `403 Forbidden` here. A missing rule or an S3 error logs one
+    /// warning. Startup and serving continue.
     pub async fn log_lifecycle_rules(&self) {
         match self.lifecycle_rules().await {
             Ok(rules) if rules.is_empty() => {
