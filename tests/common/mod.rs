@@ -92,6 +92,9 @@ pub struct FakeState {
     pub multipart_page_size: Option<usize>,
     pub reported_sizes: BTreeMap<String, u64>,
     pub missing_bucket: bool,
+    pub lifecycle: Option<String>,
+    pub fail_get_lifecycle: bool,
+    pub lifecycle_puts: Vec<String>,
 }
 
 impl FakeState {
@@ -418,6 +421,29 @@ impl FakeS3 {
             .expect("fake state lock")
             .fail_ops
             .push(op);
+    }
+
+    /// Seed the bucket lifecycle XML returned by GetBucketLifecycleConfiguration.
+    pub fn set_lifecycle_xml(&self, xml: &str) {
+        self.state.lock().expect("fake state lock").lifecycle = Some(xml.to_string());
+    }
+
+    /// Make GetBucketLifecycleConfiguration fail the way Garage does for a
+    /// key that lacks owner permission.
+    pub fn fail_get_lifecycle(&self) {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .fail_get_lifecycle = true;
+    }
+
+    /// Every PutBucketLifecycleConfiguration XML body, in request order.
+    pub fn lifecycle_puts(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .lifecycle_puts
+            .clone()
     }
 
     pub fn fail_part(&self, part_number: i32) {
@@ -783,11 +809,13 @@ async fn handle_request(State(app): State<FakeApp>, req: Request) -> Response {
         "POST" if has_query_param(&uri, "uploads") => Some(Gate::CreateMultipartUpload),
         "PUT" if has_query_param(&uri, "uploadId") => Some(Gate::UploadPart),
         "PUT"
-            if !headers.contains_key("x-amz-copy-source") && !has_query_param(&uri, "uploadId") =>
+            if !headers.contains_key("x-amz-copy-source")
+                && !has_query_param(&uri, "uploadId")
+                && !has_query_param(&uri, "lifecycle") =>
         {
             Some(Gate::PutObject)
         }
-        "DELETE" => Some(Gate::DeleteObject),
+        "DELETE" if !has_query_param(&uri, "lifecycle") => Some(Gate::DeleteObject),
         _ => None,
     };
     if let Some(gate) = gate {
@@ -804,6 +832,44 @@ async fn handle_request(State(app): State<FakeApp>, req: Request) -> Response {
         );
     }
     let key = split_path(&uri, &configured_bucket);
+    if key.as_deref().is_none_or(str::is_empty) && has_query_param(&uri, "lifecycle") {
+        return match method {
+            Method::GET => {
+                let state = state.lock().expect("fake state lock");
+                if state.fail_get_lifecycle {
+                    s3_error(
+                        StatusCode::FORBIDDEN,
+                        "AccessDenied",
+                        "Operation is not allowed for this key.",
+                    )
+                } else if let Some(xml) = &state.lifecycle {
+                    xml_response(StatusCode::OK, xml.clone())
+                } else {
+                    s3_error(
+                        StatusCode::NOT_FOUND,
+                        "NoSuchLifecycleConfiguration",
+                        "The lifecycle configuration does not exist",
+                    )
+                }
+            }
+            Method::PUT => {
+                let xml = String::from_utf8_lossy(&body).to_string();
+                let mut state = state.lock().expect("fake state lock");
+                state.lifecycle = Some(xml.clone());
+                state.lifecycle_puts.push(xml);
+                (StatusCode::OK, Body::empty()).into_response()
+            }
+            Method::DELETE => {
+                state.lock().expect("fake state lock").lifecycle = None;
+                (StatusCode::NO_CONTENT, Body::empty()).into_response()
+            }
+            _ => s3_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "MethodNotAllowed",
+                "unsupported lifecycle method",
+            ),
+        };
+    }
     if method == Method::HEAD {
         let delay = key.as_ref().and_then(|key| {
             state

@@ -76,17 +76,20 @@ by guessing:
 
 ### Garage permissions
 
-The binary needs only **read** and **write** permission on the bucket.
-It does not need **owner**. In Garage, owner is for `DeleteBucket`, the
-website configuration, and the CORS configuration. The lifecycle
-endpoints use the ordinary permissions:
+The serve path needs only **read** and **write** permission on the
+bucket. It does not need **owner** at run time. The lifecycle commands
+do: Garage 2.5 requires **owner** for both reading and writing the
+bucket lifecycle configuration. A read/write key gets `403 Forbidden:
+Operation is not allowed for this key` from `dayfly lifecycle apply`
+and from the startup lifecycle status log. Keep the runtime key
+read/write and give the lifecycle job a separate owner key, or grant
+owner to the shared key if the wider permission is acceptable.
 
 | Operation | Permission |
 | --- | --- |
 | `GetObject`, `HeadObject`, `ListObjectsV2`, `ListMultipartUploads` | read |
 | `PutObject`, `DeleteObject`, `CreateMultipartUpload`, `CompleteMultipartUpload`, `AbortMultipartUpload` | write |
-| `GetBucketLifecycleConfiguration` | read |
-| `PutBucketLifecycleConfiguration`, `DeleteBucketLifecycle` | write |
+| `GetBucketLifecycleConfiguration`, `PutBucketLifecycleConfiguration`, `DeleteBucketLifecycle` | owner |
 
 The Garage **admin API** is a separate service with separate bearer
 tokens. Its scopes name endpoints, not buckets. An S3 access key does
@@ -1747,9 +1750,12 @@ The command reads the bucket configuration, replaces a rule with the
 same `ID`, and keeps every other rule. It then writes the merged set.
 `--dry-run` prints the plan without a write.
 
-The call needs read and write permission on the bucket. Garage does not
-require owner permission for a lifecycle write. Garage lifecycle support
-depends on the Garage version. Verify `Expiration` and
+The call needs **owner** permission on the bucket. Garage 2.5 requires
+owner for both reading and writing the lifecycle configuration; a
+read/write key gets `403 Forbidden: Operation is not allowed for this
+key`. Keep the runtime key read/write and give the lifecycle job a
+separate owner key, or grant owner to the shared key. Garage lifecycle
+support depends on the Garage version. Verify `Expiration` and
 `AbortIncompleteMultipartUpload` on the exact Garage build before
 production use.
 
