@@ -1,11 +1,11 @@
 //! Simple human web frontend, served by the same binary in HTTP mode.
 //!
-//! Server-rendered HTML with a small vanilla-JS drag-and-drop
-//! enhancement; no JavaScript framework and no frontend build step.
-//! Two pages, plus a view page that falls out naturally:
+//! Server-rendered HTML with a small vanilla-JS drag-and-drop and
+//! clipboard-paste enhancement; no JavaScript framework and no frontend
+//! build step. Two pages, plus a view page that falls out naturally:
 //!
-//! * `GET /` — combined new-paste form: drop/choose a file or paste
-//!   text, with a TTL selector.
+//! * `GET /` — combined new-paste form: drop, choose, or paste a file,
+//!   or paste text, with a TTL selector.
 //! * `GET /pastes` — current pastes for a date, from the bucket scan
 //!   (no database), with a delete action per row.
 //! * `GET /view/<id>` — one paste: text in `<pre>`, image inline,
@@ -183,8 +183,9 @@ footer{text-align:center;font-size:.85rem;margin-top:2rem;padding-top:1rem;borde
 "#;
 
 /// Progressive enhancement for the combined new-paste form. Without JS the
-/// file input and the textarea both work; with JS, dropping a file fills the
-/// input and disables the text fields so the file is what gets submitted.
+/// file input and the textarea both work; with JS, dropping or pasting a file
+/// fills the input and disables the text fields so the file is what gets
+/// submitted. A plain text paste keeps the browser default.
 const DROPZONE_SCRIPT: &str = r#"<script>
 (() => {
   const zone = document.getElementById('dropzone');
@@ -207,6 +208,33 @@ const DROPZONE_SCRIPT: &str = r#"<script>
       unit += 1;
     }
     return (unit === 0 ? value : value.toFixed(1)) + ' ' + units[unit];
+  };
+
+  const clipboardFile = (data) => {
+    if (!data) return null;
+    if (data.files && data.files.length > 0) return data.files[0];
+    const items = data.items || [];
+    for (let index = 0; index < items.length; index += 1) {
+      if (items[index].kind === 'file') {
+        const file = items[index].getAsFile();
+        if (file) return file;
+      }
+    }
+    return null;
+  };
+
+  // The server needs a non-empty filename to accept a file part. A clipboard
+  // image or blob can arrive without a name, so give it one.
+  const namedFile = (file) => {
+    if (file.name) return file;
+    try {
+      return new File([file], 'clipboard.bin', {
+        type: file.type,
+        lastModified: file.lastModified,
+      });
+    } catch (error) {
+      return file;
+    }
   };
 
   const show = () => {
@@ -234,6 +262,20 @@ const DROPZONE_SCRIPT: &str = r#"<script>
       precedence.hidden = true;
       text.disabled = false;
       filename.disabled = false;
+    }
+  };
+
+  const select = (file) => {
+    try {
+      const transfer = new DataTransfer();
+      transfer.items.add(namedFile(file));
+      input.files = transfer.files;
+      show();
+      return true;
+    } catch (error) {
+      status.textContent = 'This browser cannot select that file; use the file picker.';
+      status.classList.add('error');
+      return false;
     }
   };
 
@@ -274,14 +316,14 @@ const DROPZONE_SCRIPT: &str = r#"<script>
     zone.classList.remove('dragover');
     const files = event.dataTransfer && event.dataTransfer.files;
     if (!files || files.length === 0) return;
-    try {
-      const transfer = new DataTransfer();
-      transfer.items.add(files[0]);
-      input.files = transfer.files;
-      show();
-    } catch (error) {
-      status.textContent = 'Drop is not supported here; use the file picker.';
-    }
+    select(files[0]);
+  });
+
+  document.addEventListener('paste', (event) => {
+    const file = clipboardFile(event.clipboardData);
+    if (!file) return;
+    event.preventDefault();
+    select(file);
   });
 
   show();
@@ -711,7 +753,7 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
 <div class="form-actions">
 <label class="dropzone compact" id="dropzone">
 <input type="file" name="file" id="file" aria-label="Choose a file">
-<span class="dropzone-line"><span class="dropzone-title">Drop a file</span><span class="muted">or click to choose one</span></span>
+<span class="dropzone-line"><span class="dropzone-title">Drop or paste a file</span><span class="muted">or click to choose one</span></span>
 <span class="badge" id="file-status" aria-live="polite" aria-atomic="true">No file selected</span>
 <span class="muted dropzone-limit">Max file size: {max_file_human}.</span>
 </label>
