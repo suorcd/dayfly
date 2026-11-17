@@ -163,6 +163,41 @@ async fn index_page_renders_the_combined_form_and_the_default_ttl() {
 }
 
 #[tokio::test]
+async fn index_page_paste_selects_a_clipboard_file_for_upload() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store().await);
+    let request = common::request("GET", "/", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+
+    assert!(
+        page.contains("Drop or paste a file"),
+        "the drop zone must offer a clipboard paste: {page}"
+    );
+    assert!(
+        page.contains("document.addEventListener('paste'"),
+        "the page must listen for a clipboard paste: {page}"
+    );
+    assert!(
+        page.contains("event.clipboardData"),
+        "the paste handler must read the clipboard: {page}"
+    );
+    assert!(
+        page.contains("kind === 'file'"),
+        "the paste handler must take a clipboard file: {page}"
+    );
+    assert!(
+        page.contains("event.preventDefault()"),
+        "a clipboard file must not also paste as text: {page}"
+    );
+    assert!(
+        page.contains("if (!file) return;"),
+        "a text-only clipboard must keep the default paste: {page}"
+    );
+}
+
+#[tokio::test]
 async fn disabled_listing_renders_the_turned_off_page() {
     let fake = FakeS3::start().await;
     let mut config = fake.config();

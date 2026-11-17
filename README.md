@@ -1342,9 +1342,10 @@ flip HTML/SVG to inline.
 
 ## Human frontend
 
-Server-rendered HTML with a small vanilla-JS drag-and-drop
-enhancement and copy buttons for the body and the view link; no
-JavaScript framework, no build step. Plain forms and links otherwise.
+Server-rendered HTML with a small vanilla-JS drag-and-drop and
+clipboard-paste enhancement, plus copy buttons for the body and the
+view link; no JavaScript framework, no build step. Plain forms and
+links otherwise.
 Internal use by default — same private-network / binary-auth model as
 the API, no accounts or comments.
 
@@ -1355,10 +1356,12 @@ adds an acceptable-use link. The values are HTML-escaped. A public
 instance sets the site name and leaves the default for a private
 instance.
 
-- `GET /` — combined new-paste form: paste text or drop and choose a
+- `GET /` — combined new-paste form: type or paste text, or add a
   file, with a TTL selector in whole days (1, 3, 7, 14, 30, 90 days;
-  the API also accepts sub-day TTLs). Optional title and tags fields
-  name and group the paste. One "Create paste" button posts
+  the API also accepts sub-day TTLs). Add a file by drag-and-drop, by
+  the file picker, or, with JavaScript on, by a clipboard paste. A
+  clipboard paste can be an image or any binary file. Optional title and
+  tags fields name and group the paste. One "Create paste" button posts
   multipart data to `POST /ui/create`; a selected file takes
   precedence over the text fields. Without JavaScript, the native file
   picker and textarea still work. The page shows the configured file
