@@ -16,4 +16,5 @@ pub mod rate_limit;
 pub mod reload;
 pub mod store;
 pub mod stream;
+mod syntax;
 pub mod web;

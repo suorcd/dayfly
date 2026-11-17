@@ -53,6 +53,33 @@ fn html_text(body: &[u8]) -> String {
     String::from_utf8_lossy(body).into_owned()
 }
 
+/// Return the text content of the first `<pre>` element in a page.
+///
+/// The helper strips tags and decodes the entities that the page writes.
+/// It lets a test assert the copy and `textContent` invariant directly.
+fn pre_text(page: &str) -> String {
+    let open = page
+        .find("<pre")
+        .expect("the page must render a pre element");
+    let start = open + page[open..].find('>').expect("the pre tag must close") + 1;
+    let end = start + page[start..].find("</pre>").expect("the pre must close");
+    let mut text = String::new();
+    let mut in_tag = false;
+    for ch in page[start..end].chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => text.push(ch),
+            _ => {}
+        }
+    }
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
 fn id_from_redirect(headers: &axum::http::HeaderMap) -> String {
     let location = headers[header::LOCATION]
         .to_str()
@@ -1906,6 +1933,236 @@ async fn view_page_numbers_lines_without_changing_the_text() {
     assert!(
         !page.contains("class=\"numbered\""),
         "a paste over the line cap must render unnumbered"
+    );
+}
+
+#[tokio::test]
+async fn view_query_line_numbers_overrides_the_config_default() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let text = "first\nsecond\n";
+    let stored = store
+        .store_text(text.as_bytes(), None, None, None)
+        .await
+        .expect("text must store");
+    let app = common::app(store);
+
+    let request = common::request(
+        "GET",
+        &format!("/view/{}?line_numbers=on", stored.id),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        page.contains("<pre class=\"numbered\">"),
+        "the query must turn line numbers on: {page}"
+    );
+    assert_eq!(pre_text(&page), text, "the numbers must not enter the text");
+
+    let request = common::request("GET", &format!("/view/{}", stored.id), &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !html_text(&body).contains("class=\"numbered\""),
+        "the configured default must stay off"
+    );
+
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.view_line_numbers = true;
+    let store = Store::from_config(config)
+        .await
+        .expect("the store must build");
+    let stored = store
+        .store_text(text.as_bytes(), None, None, None)
+        .await
+        .expect("text must store");
+    let app = common::app(store);
+    let request = common::request(
+        "GET",
+        &format!("/view/{}?line_numbers=off", stored.id),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        !page.contains("class=\"numbered\""),
+        "the query must turn line numbers off: {page}"
+    );
+    assert_eq!(pre_text(&page), text);
+}
+
+#[tokio::test]
+async fn view_query_syntax_highlights_a_text_paste() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let code = "fn main() {\n    println!(\"a < b & c\");\n}\n";
+    let stored = store
+        .store_text(code.as_bytes(), Some("main.rs"), Some("text/plain"), None)
+        .await
+        .expect("code must store");
+    let app = common::app(store);
+
+    let request = common::request(
+        "GET",
+        &format!("/view/{}?syntax=rust", stored.id),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        page.contains("style=\"color:"),
+        "the paste must have highlighted spans: {page}"
+    );
+    assert_eq!(
+        pre_text(&page),
+        code,
+        "the highlighted text must equal the paste text"
+    );
+
+    let request = common::request(
+        "GET",
+        &format!("/view/{}?syntax=auto", stored.id),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html_text(&body).contains("style=\"color:"),
+        "auto must use the .rs filename"
+    );
+
+    let request = common::request(
+        "GET",
+        &format!("/view/{}?syntax=none", stored.id),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        !page.contains("style=\"color:"),
+        "syntax=none must not highlight: {page}"
+    );
+    assert_eq!(pre_text(&page), code);
+}
+
+#[tokio::test]
+async fn view_query_rejects_invalid_display_values() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"plain", None, None, None)
+        .await
+        .expect("text must store");
+    let app = common::app(store);
+
+    for (query, parameter) in [
+        ("line_numbers=sometimes", "line_numbers"),
+        ("syntax=", "syntax"),
+        ("syntax=definitely-not-a-language", "syntax"),
+    ] {
+        let request = common::request(
+            "GET",
+            &format!("/view/{}?{query}", stored.id),
+            &[],
+            Vec::new(),
+        );
+        let (status, _, body) = common::send(&app, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        let page = html_text(&body);
+        assert!(
+            page.contains(parameter),
+            "{query} must name the parameter: {page}"
+        );
+        assert!(
+            page.contains("expected"),
+            "{query} must name the accepted values: {page}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn view_query_links_keep_display_parameters() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"fn main() {}\n", Some("main.rs"), Some("text/plain"), None)
+        .await
+        .expect("code must store");
+    let app = common::app(store);
+
+    let request = common::request(
+        "GET",
+        &format!("/view/{}?line_numbers=1&syntax=rust&unused=1", stored.id),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    let raw = format!(
+        "href=\"/raw/{}?line_numbers=on&amp;syntax=rust\"",
+        stored.id
+    );
+    assert!(
+        page.contains(&raw),
+        "the raw link must keep the display parameters: {page}"
+    );
+    let copy = format!(
+        "data-copy=\"/view/{}?line_numbers=on&amp;syntax=rust\"",
+        stored.id
+    );
+    assert!(
+        page.contains(&copy),
+        "the copy link must keep the display parameters: {page}"
+    );
+}
+
+#[tokio::test]
+async fn view_query_text_options_do_not_change_a_binary_view() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let png = store
+        .store_text(
+            b"\x89PNG\r\n\x1a\nfake-body",
+            Some("pic.png"),
+            Some("image/png"),
+            None,
+        )
+        .await
+        .expect("png must store");
+    let app = common::app(store);
+
+    let request = common::request(
+        "GET",
+        &format!("/view/{}?line_numbers=on&syntax=rust", png.id),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        page.contains("<img src="),
+        "the image must stay inline: {page}"
+    );
+    assert!(
+        !page.contains("class=\"numbered\""),
+        "a binary view must not be numbered: {page}"
+    );
+    assert!(
+        !page.contains("style=\"color:"),
+        "a binary view must not be highlighted: {page}"
     );
 }
 
