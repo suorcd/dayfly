@@ -9,7 +9,8 @@
 //! * `GET /pastes` — current pastes for a date, from the bucket scan
 //!   (no database), with a delete action per row.
 //! * `GET /view/<id>` — one paste: text in `<pre>`, image inline,
-//!   everything else as a download link.
+//!   everything else as a download link. The `line_numbers` and `syntax`
+//!   query parameters override the display options for one request.
 //!
 //! Theme: adapted base look from the user's own site stylesheet,
 //! https://suorcd.us/style.css (verified live as the site's single
@@ -51,7 +52,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::client_addr::ClientAddr;
-use crate::config::{Config, LISTING_DISABLED_MESSAGE};
+use crate::config::{parse_bool_flag, Config, LISTING_DISABLED_MESSAGE};
 use crate::http::{
     check_auth, check_list_access, check_paste_control, check_read_auth, public_base,
     read_metadata_field, split_tags, status_for, AppState, ListAccessError, MultipartFieldError,
@@ -61,6 +62,7 @@ use crate::store::{
     default_list_window, parse_list_window_request, ListWindowRequest, PasteFields, PasteSummary,
     Store, StoreError, StoredPaste, Ttl,
 };
+use crate::syntax;
 
 /// Adapted base look from suorcd.us/style.css, palette cyberpunkNeon
 /// (background #091833, text #e3e8fc, accent #ea00d9, code background
@@ -117,6 +119,7 @@ th:nth-child(4){text-align:center}
 .content-box pre{margin:0;padding-right:6rem}
 .copy-content{position:absolute;top:.5rem;right:.5rem}
 pre.numbered{counter-reset:line;white-space:pre;overflow-x:auto}
+pre.syntax{white-space:pre;overflow-x:auto}
 pre.numbered .line{counter-increment:line}
 pre.numbered .ln{user-select:none}
 pre.numbered .ln::before{content:counter(line);display:inline-block;min-width:3ch;margin-right:1ch;text-align:right;opacity:.5}
@@ -1643,6 +1646,77 @@ fn text_preview_type(main: &str) -> bool {
 /// Maximum lines that the view page numbers.
 const MAX_NUMBERED_LINES: usize = 5_000;
 
+/// Typed display options for one view request.
+///
+/// A missing parameter uses its default. A valid parameter overrides the
+/// default for one response. An unknown parameter is ignored, and an
+/// invalid value returns a 400 page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ViewOptions {
+    line_numbers: bool,
+    syntax: syntax::Choice,
+    /// The normalized display query for the Copy link and Raw link.
+    link_query: String,
+}
+
+/// Add one validated display parameter to the link query.
+fn push_view_query(query: &mut String, name: &str, value: &str) {
+    query.push(if query.is_empty() { '?' } else { '&' });
+    query.push_str(name);
+    query.push('=');
+    query.push_str(&utf8_percent_encode(value, NON_ALPHANUMERIC).to_string());
+}
+
+fn parse_view_options(
+    query: &HashMap<String, String>,
+    default_line_numbers: bool,
+) -> Result<ViewOptions, String> {
+    let mut link_query = String::new();
+
+    let line_numbers = match query.get("line_numbers") {
+        Some(value) => {
+            let parsed = parse_bool_flag(value).ok_or_else(|| {
+                "invalid line_numbers: expected on, off, 1, 0, true, false, yes, or no".to_string()
+            })?;
+            push_view_query(
+                &mut link_query,
+                "line_numbers",
+                if parsed { "on" } else { "off" },
+            );
+            parsed
+        }
+        None => default_line_numbers,
+    };
+
+    let syntax =
+        match query.get("syntax").map(|value| value.trim()) {
+            None => syntax::Choice::None,
+            Some(value) if value.eq_ignore_ascii_case("auto") => {
+                push_view_query(&mut link_query, "syntax", "auto");
+                syntax::Choice::Auto
+            }
+            Some(value) if value.eq_ignore_ascii_case("none") => {
+                push_view_query(&mut link_query, "syntax", "none");
+                syntax::Choice::None
+            }
+            Some(value) if !value.is_empty() => {
+                push_view_query(&mut link_query, "syntax", value);
+                syntax::Choice::Language(value.to_string())
+            }
+            Some(_) => return Err(
+                "invalid syntax: expected auto, none, or a language name such as rust, python, \
+                 or json"
+                    .to_string(),
+            ),
+        };
+
+    Ok(ViewOptions {
+        line_numbers,
+        syntax,
+        link_query,
+    })
+}
+
 /// Render the text preview, optionally with presentation-only line numbers.
 ///
 /// The generated numbers never enter the DOM text: they come from a CSS
@@ -1665,12 +1739,21 @@ fn text_pre_view(text: &str, line_numbers: bool) -> String {
     out
 }
 
-async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response {
+async fn view_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    query: &HashMap<String, String>,
+) -> Response {
     if let Err(resp) = check_read_auth(state, headers) {
         return resp;
     }
     let store = state.store();
     let footer = Footer::from_config(&store.config);
+    let options = match parse_view_options(query, store.config.view_line_numbers) {
+        Ok(options) => options,
+        Err(message) => return bad_request_page(&footer, &message),
+    };
     let meta = match store.head_metadata(id).await {
         Ok(m) => m,
         Err(e) => return error_page(&footer, e),
@@ -1678,6 +1761,10 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
     if meta.expired {
         return error_page(&footer, StoreError::Expired(meta.id));
     }
+    let highlight_syntax = match syntax::resolve(&options.syntax, meta.filename.as_deref()) {
+        Ok(syntax) => syntax,
+        Err(message) => return bad_request_page(&footer, &message),
+    };
     let id_esc = html_escape(&meta.id);
     let main = meta.content_type.split(';').next().unwrap_or("").trim();
     let target_name = if store.config.show_words {
@@ -1703,12 +1790,14 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
     } else {
         ""
     };
+    let raw_href = html_escape(&format!("/raw/{target_name}{}", options.link_query));
+    let copy_href = html_escape(&format!("/view/{target_name}{}", options.link_query));
     let mut body = format!(
         "<div class=\"view-bar\">\
          <div class=\"view-actions\">\
          <a class=\"button\" href=\"/v1/pastes/{target_esc}\" download=\"{download_name}\">Download</a>\
-         <a class=\"button\" href=\"/raw/{target_esc}\">Raw</a>\
-         <button type=\"button\" class=\"copy-link\" data-copy=\"/view/{target_esc}\" hidden>Copy link</button>\
+         <a class=\"button\" href=\"{raw_href}\">Raw</a>\
+         <button type=\"button\" class=\"copy-link\" data-copy=\"{copy_href}\" hidden>Copy link</button>\
          </div>\
          <input type=\"checkbox\" id=\"metadata-toggle\" class=\"metadata-toggle\">\
          <label for=\"metadata-toggle\" class=\"metadata-label\">Metadata &amp; delete</label>\
@@ -1732,7 +1821,11 @@ async fn view_inner(state: &AppState, headers: &HeaderMap, id: &str) -> Response
         let slice = store.fetch_text(&meta.id, 0, Some(1_000_000)).await;
         match slice {
             Ok(s) => {
-                let pre = text_pre_view(&s.text, store.config.view_line_numbers);
+                let pre = match highlight_syntax {
+                    Some(syntax) => syntax::highlight_pre(&s.text, syntax, options.line_numbers)
+                        .unwrap_or_else(|| text_pre_view(&s.text, options.line_numbers)),
+                    None => text_pre_view(&s.text, options.line_numbers),
+                };
                 body.push_str(&format!(
                     "<hr>\
                      <div class=\"content-box\"><button type=\"button\" class=\"copy-content\" \
@@ -1775,16 +1868,18 @@ async fn view_dated(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((date, random)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    view_inner(&state, &headers, &format!("{date}/{random}")).await
+    view_inner(&state, &headers, &format!("{date}/{random}"), &query).await
 }
 
 async fn view_bare(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(random): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    view_inner(&state, &headers, &random).await
+    view_inner(&state, &headers, &random, &query).await
 }
 
 /// Deny framing and block MIME sniffing for every UI response.
@@ -2501,5 +2596,70 @@ mod tests {
             StatusCode::FORBIDDEN,
             "a cross-site delete post must be rejected"
         );
+    }
+
+    #[test]
+    fn view_options_default_to_the_configured_line_numbers() {
+        let query = HashMap::new();
+        let options = parse_view_options(&query, true).expect("defaults must parse");
+        assert!(options.line_numbers);
+        assert_eq!(options.syntax, crate::syntax::Choice::None);
+        assert_eq!(options.link_query, "");
+
+        let mut query = HashMap::new();
+        query.insert("line_numbers".to_string(), "0".to_string());
+        let options = parse_view_options(&query, true).expect("the override must parse");
+        assert!(!options.line_numbers);
+        assert_eq!(options.link_query, "?line_numbers=off");
+    }
+
+    #[test]
+    fn view_options_parse_and_normalize_syntax() {
+        let mut query = HashMap::new();
+        query.insert("syntax".to_string(), "Rust".to_string());
+        let options = parse_view_options(&query, false).expect("Rust must parse");
+        assert_eq!(
+            options.syntax,
+            crate::syntax::Choice::Language("Rust".to_string())
+        );
+        assert_eq!(options.link_query, "?syntax=Rust");
+
+        query.insert("syntax".to_string(), "auto".to_string());
+        let options = parse_view_options(&query, false).expect("auto must parse");
+        assert_eq!(options.syntax, crate::syntax::Choice::Auto);
+        assert_eq!(options.link_query, "?syntax=auto");
+
+        query.insert("syntax".to_string(), "none".to_string());
+        let options = parse_view_options(&query, false).expect("none must parse");
+        assert_eq!(options.syntax, crate::syntax::Choice::None);
+        assert_eq!(options.link_query, "?syntax=none");
+    }
+
+    #[test]
+    fn view_options_reject_invalid_values_and_ignore_unknown_ones() {
+        let mut query = HashMap::new();
+        query.insert("line_numbers".to_string(), "maybe".to_string());
+        let error = parse_view_options(&query, false).expect_err("a bad boolean must fail");
+        assert!(error.contains("line_numbers"));
+        assert!(error.contains("expected"));
+
+        let mut query = HashMap::new();
+        query.insert("syntax".to_string(), "  ".to_string());
+        let error = parse_view_options(&query, false).expect_err("an empty syntax must fail");
+        assert!(error.contains("syntax"));
+
+        let mut query = HashMap::new();
+        query.insert("unused".to_string(), "value".to_string());
+        let options = parse_view_options(&query, false).expect("unknown parameters must pass");
+        assert_eq!(options.link_query, "");
+    }
+
+    #[test]
+    fn view_options_keep_both_parameters_in_the_links() {
+        let mut query = HashMap::new();
+        query.insert("line_numbers".to_string(), "yes".to_string());
+        query.insert("syntax".to_string(), "rust".to_string());
+        let options = parse_view_options(&query, false).expect("the options must parse");
+        assert_eq!(options.link_query, "?line_numbers=on&syntax=rust");
     }
 }

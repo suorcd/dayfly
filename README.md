@@ -443,7 +443,7 @@ permissions and the lower total cap.
 | `DAYFLY_SHOW_WORDS` | no | `true` | Show the generated word alias in the human UI: create responses, the view page, and the paste list. Display only; the JSON/MCP responses still include `words`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_SHOW_INTERNAL_PATHS` | no | `false` | Show the canonical date and ID under the alias in the human paste list. Off labels the column "Link" and shows only the alias. Display only; view URLs and API responses still accept the canonical ID. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_INLINE_PDF` | no | `true` | Serve a PDF download inline. Set this to `false` on a public instance so a PDF is an attachment. HTML and SVG are always attachments. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
-| `DAYFLY_VIEW_LINE_NUMBERS` | no | `false` | Number the lines of a text paste on the view page. The numbers are presentation only: a CSS counter renders them, they are not selectable, and the Copy button does not include them. Pastes above 5,000 lines render unnumbered. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
+| `DAYFLY_VIEW_LINE_NUMBERS` | no | `false` | Number the lines of a text paste on the view page. The numbers are presentation only: a CSS counter renders them, they are not selectable, and the Copy button does not include them. Pastes above 5,000 lines render unnumbered. The `line_numbers` view query parameter overrides it for one request. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_HTTP_BEARER_TOKEN` | one form | (unset) | Optional bearer token for the binary's own HTTP endpoint (see Access model); set this variable or `DAYFLY_HTTP_BEARER_TOKEN_FILE`. An unset value disables auth; a set empty or whitespace-only value is a startup error |
 | `DAYFLY_HTTP_BEARER_TOKEN_FILE` | one form | (unset) | Path to a file that contains the bearer token; set this variable or `DAYFLY_HTTP_BEARER_TOKEN` |
 | `DAYFLY_MCP_LOCAL_ROOT` | no | (unset) | Directory for the MCP local-path tools. It must exist, or startup fails. When set, `store_file` and `fetch_file` refuse any path outside it, after resolving symlinks. When unset, the stdio transport accepts any readable path and the HTTP transport refuses both tools |
@@ -1400,7 +1400,9 @@ instance.
   source of HTML and SVG, safe images inline, other types via the raw
   link. When `DAYFLY_VIEW_LINE_NUMBERS` is true, text up to 5,000 lines
   gets presentation-only line numbers that the Copy button does not
-  include. The Copy and Copy link buttons appear only when JavaScript
+  include. The `line_numbers` and `syntax` query parameters override
+  the display options for one request; see "View display parameters"
+  below. The Copy and Copy link buttons appear only when JavaScript
   runs.
 - `GET /raw/<id>` — the unformatted bytes. Markup types (`text/html`,
   `application/xhtml+xml`, `image/svg+xml`, and XML) and unknown
@@ -1413,6 +1415,35 @@ instance.
 - `GET /.well-known/security.txt` — the file named by
   `DAYFLY_SECURITY_TXT_PATH`, or 404 when unset. Served as
   `text/plain; charset=utf-8`.
+
+### View display parameters
+
+`GET /view/<id>` accepts two typed display parameters.
+
+| Parameter | Type | Accepted values | Default |
+| --- | --- | --- | --- |
+| `line_numbers` | boolean | `on`, `off`, `1`, `0`, `true`, `false`, `yes`, `no` | `DAYFLY_VIEW_LINE_NUMBERS` |
+| `syntax` | enum | `auto`, `none`, or a language name | `none` |
+
+- A missing parameter uses its default.
+- A valid parameter overrides the default for one response. It does not change the stored paste.
+- `syntax=auto` uses the filename extension.
+- An invalid value returns 400 with the parameter and the accepted values.
+- An unknown parameter is ignored.
+- The Copy link and Raw links keep the recognized parameters.
+- Syntax highlighting applies to text up to 256 KiB and 5,000 lines. A larger text renders as escaped text.
+- Highlighted text keeps the paste text exact. `pre.textContent` and the Copy button return the original bytes.
+- Image, PDF, and other binary views ignore the text display parameters.
+- The highlighter runs on the server. It uses the page palette and adds no CDN or build step.
+
+Examples:
+
+```text
+/view/<id>?line_numbers=on
+/view/<id>?line_numbers=off&syntax=none
+/view/<id>?syntax=rust
+/view/<id>?syntax=auto
+```
 
 Theme: the pages adapt the base look of the user's own site
 stylesheet, https://suorcd.us/style.css (verified live as the site's
@@ -1485,7 +1516,7 @@ credentials. The suite needs no network and no Garage.
 | `tests/common/mod.rs` | The single fake S3 service, request helpers, multipart bodies, temporary files |
 | `tests/store_s3.rs` | `store_text`, `store_file_path`, `store_stream`, multipart abort paths, caps, `head_metadata`, `fetch_text`, `fetch_range_by_key`, `download_file`, `delete`, `list_recent`, error mapping, append and segment reads |
 | `tests/http_routes.rs` | Raw and multipart uploads, bearer and write-only auth, download, `HEAD`, `Range`, metadata, delete, list, append, MCP shared store, failed uploads |
-| `tests/web_handlers.rs` | Index, text submit, upload submit, list, view, delete, auth, error pages |
+| `tests/web_handlers.rs` | Index, text submit, upload submit, list, view display parameters, syntax highlighting, delete, auth, error pages |
 | `tests/cleanup_cli.rs` | `dayfly cleanup` dry-run and live passes against the fake S3 service, no lifecycle rule, per-item failure and exit code |
 | `tests/mcp_stdio.rs` | The real binary over MCP stdio: all tools and their error paths |
 | `tests/config_env.rs` | `Config::from_env` defaults, overrides, and error text |
@@ -1499,7 +1530,8 @@ detection (PNG, JPEG, GIF, WebP, PDF, ZIP, UTF-8 text, binary fallback, curl's
 one, sniffed-signature conflict, extension fallback), peeked-byte forwarding
 (neither lost nor duplicated), streaming part buffering, chunked and
 multi-part-sized uploads, disconnect/part-failure/oversize abort (no URL
-material), empty uploads, HTML escaping, human sizes, and days-remaining math.
+material), empty uploads, HTML escaping, human sizes, days-remaining math,
+view option parsing, syntax highlighter token text, and highlighting caps.
 
 `.github/workflows/ci.yml` runs the fast job (`cargo fmt --check`,
 clippy with warnings denied, `cargo test`, and `cargo build`) on every
