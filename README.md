@@ -418,6 +418,8 @@ permissions and the lower total cap.
 | `DAYFLY_MAX_FILE_BYTES` | no | 1073741824 (1 GiB) | Max file paste size; oversize → 413 with a machine-readable error. A new paste must also fit `DAYFLY_MAX_PASTE_BYTES`, so the lower cap wins. The maximum is 52428800000 bytes: 10,000 parts of 5 MiB. A TTL change on a paste above the 5 GB copy limit fails with `copy_limit`; no object is rewritten |
 | `DAYFLY_MAX_PASTE_BYTES` | no | 1073741824 (1 GiB) | Max total size for one paste, including the base object and every appended segment. A new paste or an append that would exceed the cap fails and writes no object |
 | `DAYFLY_MULTIPART_ABORT_AFTER` | no | 3600 | Age in seconds after which the startup and hourly sweep aborts an incomplete multipart upload under `pastes/`. The manual `cleanup` command uses the same value. Must be positive. The sweep skips an upload that this process still drives. A second process is not visible, so keep this value above the longest upload time when two writers share the bucket |
+| `DAYFLY_CLEANUP_INTERVAL_SECONDS` | no | 0 | Interval in seconds between cleanup passes inside `serve`. `0` disables the loop. A positive value runs the same pass as `dayfly cleanup` on that interval. Enable the loop on exactly one writer per bucket |
+| `DAYFLY_CLEANUP_ON_STARTUP` | no | `false` | Run one cleanup pass shortly after startup. The pass runs only when `DAYFLY_CLEANUP_INTERVAL_SECONDS` is positive |
 | `DAYFLY_SEARCH_MAX_BYTES` | no | 67108864 (64 MiB) | Max bytes that one text search reads. The search returns `truncated` at the cap and the caller resumes with `next_offset`. Must be a positive number of bytes |
 | `DAYFLY_ALIAS_WORDS` | no | 3 | Number of words in a new alias. Allowed range 3 to 6. Resolution accepts 3 words up to this value |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be within `DAYFLY_MIN_TTL_DAYS` (at least 1) and `DAYFLY_MAX_TTL_DAYS` |
@@ -594,8 +596,19 @@ The registry has `dayfly_build_info`, `dayfly_http_requests_total`,
 `dayfly_http_request_bytes_total`, `dayfly_http_response_bytes_total`,
 `dayfly_paste_operations_total`, `dayfly_s3_requests_total`,
 `dayfly_rate_limited_total`, `dayfly_multipart_orphans_aborted_total`,
-and the process metrics. Labels use the route template, not a paste ID or a
-client address. Metrics are per process and reset on restart.
+`dayfly_cleanup_runs_total`, `dayfly_cleanup_pastes_deleted_total`,
+`dayfly_cleanup_aliases_deleted_total`, `dayfly_cleanup_failures_total`,
+`dayfly_cleanup_last_success_timestamp_seconds`, and the process metrics.
+Labels use the route template, not a paste ID or a client address.
+Metrics are per process and reset on restart.
+
+`dayfly_cleanup_runs_total` counts the cleanup passes that the loop
+runs. `dayfly_cleanup_pastes_deleted_total` and
+`dayfly_cleanup_aliases_deleted_total` count the objects that those
+passes delete. `dayfly_cleanup_failures_total` counts failed items,
+plus one for each pass that returns an error. A pass with no failures
+sets `dayfly_cleanup_last_success_timestamp_seconds` to the current
+Unix time.
 
 `dayfly_s3_requests_total` covers each abort outcome. The operation
 label is `abort_multipart_upload`; the outcome label is `ok` or
@@ -1521,6 +1534,7 @@ credentials. The suite needs no network and no Garage.
 | `tests/http_routes.rs` | Raw and multipart uploads, bearer and write-only auth, download, `HEAD`, `Range`, metadata, delete, list, append, MCP shared store, failed uploads |
 | `tests/web_handlers.rs` | Index, text submit, upload submit, list, view display parameters, syntax highlighting, delete, auth, error pages |
 | `tests/cleanup_cli.rs` | `dayfly cleanup` dry-run and live passes against the fake S3 service, no lifecycle rule, per-item failure and exit code |
+| `tests/cleanup_loop.rs` | Periodic cleanup loop in process: expired objects deleted, metrics reported, failed pass survives and recovers, serve keeps answering |
 | `tests/mcp_stdio.rs` | The real binary over MCP stdio: all tools and their error paths |
 | `tests/config_env.rs` | `Config::from_env` defaults, overrides, and error text |
 | `tests/real_garage.rs` | Ignored tests for a disposable real Garage/S3 bucket |
@@ -1760,6 +1774,36 @@ threshold can abort a live upload. Stop the service during cleanup, or
 keep `DAYFLY_MULTIPART_ABORT_AFTER` above the longest upload time. A
 concurrent writer can also add an object during a scan. The next pass
 removes a skipped object.
+
+## Periodic cleanup
+
+`serve` can run the same pass on a schedule. Set
+`DAYFLY_CLEANUP_INTERVAL_SECONDS` to a positive number of seconds, and
+the server runs one pass on that interval. `0` disables the loop and is
+the default. Set `DAYFLY_CLEANUP_ON_STARTUP` to `true` to run one pass
+shortly after startup. The startup pass runs only when the interval is
+positive.
+
+The loop runs on a background task, like the multipart sweep. A failed
+pass logs and the next pass runs on schedule. A failed pass never stops
+`serve`. Each pass logs the same report as the CLI: counts plus one
+line per failed item. The loop also records cleanup metrics; see
+[Access logs and metrics](#access-logs-and-metrics).
+
+**One writer per bucket.** Enable the loop on exactly one writer for
+each bucket. Two loops on one bucket scan the same objects twice, and
+one loop can abort a live upload that the other process still drives.
+For the public bucket, enable the loop on `dayfly-public` only.
+`dayfly-suorcd-us` shares that bucket and must not run a second loop.
+
+**Loop or CronJob.** The loop needs no second workload and no CronJob
+history to manage. The scan runs in the request-serving process. The
+scan is O(n) and reads one HEAD per object, so a large bucket adds S3
+load and CPU and latency contention. The loop also stops when the
+process is down. A CronJob isolates the scan and gives a clear
+per-run success and failure signal. `dayfly cleanup` stays the manual
+and CronJob invocation. The loop is an alternative scheduler, not a
+replacement command.
 
 ## Lifecycle configuration
 

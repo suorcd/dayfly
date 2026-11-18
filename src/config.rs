@@ -108,6 +108,18 @@ pub struct Config {
     /// leave multipart parts that no request completes. The sweep aborts
     /// uploads older than this value. The value must be positive.
     pub multipart_abort_after_seconds: u64,
+    /// Interval in seconds between cleanup passes inside `serve`.
+    ///
+    /// Default: `0`, so the loop is off. A positive value runs
+    /// [`crate::store::Store::cleanup`] on that interval. The pass uses
+    /// [`Self::multipart_abort_after_seconds`] for stale multipart
+    /// uploads. Enable the loop on exactly one writer per bucket.
+    pub cleanup_interval_seconds: u64,
+    /// Whether `serve` runs one cleanup pass shortly after startup.
+    ///
+    /// Default: `false`. The pass runs only when
+    /// [`Self::cleanup_interval_seconds`] is positive.
+    pub cleanup_on_startup: bool,
     /// Maximum bytes that one text search reads. Default: 64 MiB.
     ///
     /// The search returns `truncated` when it reaches this cap. The
@@ -415,6 +427,18 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("3600"),
         required: false,
         help: "Age in seconds after which the sweep aborts an incomplete multipart upload",
+    },
+    ConfigField {
+        name: "DAYFLY_CLEANUP_INTERVAL_SECONDS",
+        value: Some("0"),
+        required: false,
+        help: "Cleanup loop interval in seconds inside serve; 0 disables the loop",
+    },
+    ConfigField {
+        name: "DAYFLY_CLEANUP_ON_STARTUP",
+        value: Some("false"),
+        required: false,
+        help: "Run one cleanup pass shortly after startup",
     },
     ConfigField {
         name: "DAYFLY_SEARCH_MAX_BYTES",
@@ -1923,6 +1947,21 @@ impl Config {
                 "expected a positive number of seconds".to_string(),
             ));
         }
+        let cleanup_interval_seconds = record(
+            &mut faults,
+            optional_u64(
+                &lookup,
+                "DAYFLY_CLEANUP_INTERVAL_SECONDS",
+                field_u64("DAYFLY_CLEANUP_INTERVAL_SECONDS", 0),
+            ),
+            0,
+        );
+        let cleanup_on_startup = record_bool(
+            &mut faults,
+            &lookup,
+            "DAYFLY_CLEANUP_ON_STARTUP",
+            field_default("DAYFLY_CLEANUP_ON_STARTUP") == Some("true"),
+        );
         let retention_by_size = record_bool(
             &mut faults,
             &lookup,
@@ -2062,6 +2101,8 @@ impl Config {
                 max_file_bytes,
                 max_paste_bytes,
                 multipart_abort_after_seconds,
+                cleanup_interval_seconds,
+                cleanup_on_startup,
                 search_max_bytes,
                 alias_words,
                 default_ttl_days: default_ttl_days.unwrap_or(7),
@@ -2167,7 +2208,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} multipart_abort_after_seconds={} search_max_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} write_requires_token={} list_requires_token={} paste_tokens={} expose_creator_addr={} rate_limit_per_minute={} log_format={} metrics_bind={} metrics_allowed_networks={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
+            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} multipart_abort_after_seconds={} cleanup_interval_seconds={} cleanup_on_startup={} search_max_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} write_requires_token={} list_requires_token={} paste_tokens={} expose_creator_addr={} rate_limit_per_minute={} log_format={} metrics_bind={} metrics_allowed_networks={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -2179,6 +2220,8 @@ impl Config {
             self.max_file_bytes,
             self.max_paste_bytes,
             self.multipart_abort_after_seconds,
+            self.cleanup_interval_seconds,
+            self.cleanup_on_startup,
             self.search_max_bytes,
             self.alias_words,
             self.default_ttl_days,
@@ -2541,6 +2584,8 @@ mod tests {
             max_file_bytes,
             max_paste_bytes: 1024 * 1024 * 1024,
             multipart_abort_after_seconds: 3_600,
+            cleanup_interval_seconds: 0,
+            cleanup_on_startup: false,
             search_max_bytes: 64 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,
@@ -2712,6 +2757,79 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn cleanup_interval_rejects_a_negative_value() {
+        let mut pairs = base_env();
+        pairs.push((
+            "DAYFLY_CLEANUP_INTERVAL_SECONDS".to_string(),
+            "-1".to_string(),
+        ));
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        match error {
+            ConfigError::Invalid(name, _) => {
+                assert_eq!(name, "DAYFLY_CLEANUP_INTERVAL_SECONDS");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn cleanup_interval_rejects_a_non_numeric_value() {
+        let mut pairs = base_env();
+        pairs.push((
+            "DAYFLY_CLEANUP_INTERVAL_SECONDS".to_string(),
+            "hourly".to_string(),
+        ));
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        match error {
+            ConfigError::Invalid(name, _) => {
+                assert_eq!(name, "DAYFLY_CLEANUP_INTERVAL_SECONDS");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn cleanup_on_startup_rejects_a_non_boolean() {
+        let mut pairs = base_env();
+        pairs.push(("DAYFLY_CLEANUP_ON_STARTUP".to_string(), "maybe".to_string()));
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        match error {
+            ConfigError::Invalid(name, _) => {
+                assert_eq!(name, "DAYFLY_CLEANUP_ON_STARTUP");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn cleanup_interval_defaults_to_zero_and_startup_defaults_to_false() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert_eq!(config.cleanup_interval_seconds, 0);
+        assert!(!config.cleanup_on_startup);
+    }
+
+    #[test]
+    fn cleanup_interval_accepts_zero_and_a_positive_value() {
+        let mut pairs = base_env();
+        pairs.push((
+            "DAYFLY_CLEANUP_INTERVAL_SECONDS".to_string(),
+            "3600".to_string(),
+        ));
+        pairs.push(("DAYFLY_CLEANUP_ON_STARTUP".to_string(), "true".to_string()));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("cleanup loop config");
+        assert_eq!(config.cleanup_interval_seconds, 3_600);
+        assert!(config.cleanup_on_startup);
+
+        let mut pairs = base_env();
+        pairs.push((
+            "DAYFLY_CLEANUP_INTERVAL_SECONDS".to_string(),
+            "0".to_string(),
+        ));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("disabled loop config");
+        assert_eq!(config.cleanup_interval_seconds, 0);
     }
 
     #[test]
