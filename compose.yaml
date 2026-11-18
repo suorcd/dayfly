@@ -1,0 +1,41 @@
+# Compose file for the Docker path. See "Deployment" in README.md.
+#
+# Before the first start, run the one-time Garage bootstrap in
+# README.md. It creates the bucket and the key, and it fills
+# deploy/dayfly.env with the key values. Do not commit dayfly.env.
+# Do not set S3_FORCE_PATH_STYLE. Garage uses path style by default.
+# S3_REGION must match s3_region in deploy/garage.toml ("garage").
+
+services:
+  garage:
+    image: dxflrs/garage:v2.5.0
+    restart: unless-stopped
+    ports:
+      - "3900:3900"
+    env_file:
+      - deploy/garage.env
+    volumes:
+      - ./deploy/garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    command: ["server"]
+
+  dayfly:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - garage
+    ports:
+      - "8080:8080"
+    env_file:
+      - deploy/dayfly.env
+    environment:
+      S3_ENDPOINT: http://garage:3900
+      S3_REGION: garage
+      DAYFLY_HTTP_BIND: 0.0.0.0:8080
+
+volumes:
+  garage-meta:
+  garage-data:

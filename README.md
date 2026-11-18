@@ -1724,6 +1724,76 @@ Run these checks against a real Garage instance:
   deletes objects past their TTL, plus aborts incomplete
   multipart uploads.
 
+## Deployment
+
+Three paths run dayfly. The Nix flake is the primary build. Docker
+Compose serves operators without Nix. systemd runs the binary
+directly on a host.
+
+### Docker and Compose
+
+`Dockerfile` builds the Rust binary and runs `dayfly serve` as user
+65534:65534. It binds `0.0.0.0:8080`. It matches the flake container
+image: the same entrypoint, the same bind address, and the same user.
+
+`compose.yaml` runs two services: `garage` and `dayfly`. Garage
+uses image `dxflrs/garage:v2.5.0`. Dayfly builds from `Dockerfile`.
+Garage uses path-style addressing by default. Do not set
+`S3_FORCE_PATH_STYLE` in Compose. Issue #224 tracks virtual-hosted
+support.
+
+Before the first start, create the bucket and the key. Copy
+`deploy/garage.env.example` to `deploy/garage.env` and generate
+each value with `openssl rand -hex 32`. Copy
+`deploy/dayfly.env.example` to `deploy/dayfly.env`. Then run the
+bootstrap:
+
+```sh
+docker compose up -d
+docker compose exec garage /garage status
+docker compose exec garage /garage layout assign -z dc1 -c 10G <node-id>
+docker compose exec garage /garage layout apply --version 1
+docker compose exec garage /garage bucket create dayfly
+docker compose exec garage /garage key create dayfly-key
+docker compose exec garage /garage bucket allow --read --write dayfly --key dayfly-key
+```
+
+Copy the key ID and secret into `deploy/dayfly.env`, then start
+dayfly:
+
+```sh
+docker compose up -d dayfly
+```
+
+Test the round trip:
+
+```sh
+printf 'hello\n' | curl --data-binary @- http://127.0.0.1:8080/upload
+```
+
+`S3_REGION` in `deploy/dayfly.env` must match `s3_region` in
+`deploy/garage.toml` (`garage`). Garage rejects the signature when
+the regions differ. Never commit `deploy/dayfly.env` or
+`deploy/garage.env`. Both files hold secrets.
+
+### systemd
+
+`deploy/dayfly.service` runs the binary on a host. It uses
+`EnvironmentFile`, `User=dayfly`, `NoNewPrivileges=true`, and a
+restart policy. Copy the binary to `/usr/local/bin/dayfly`. Copy
+`deploy/dayfly.env.example` to `/etc/dayfly/dayfly.env` and fill
+in the values. Copy the unit to
+`/etc/systemd/system/dayfly.service`, then enable and start it:
+
+```sh
+systemctl daemon-reload
+systemctl enable --now dayfly
+```
+
+The unit confines the service: `PrivateTmp=true`,
+`ProtectSystem=strict`, `ProtectHome=true`, and
+`ReadWritePaths=/var/lib/dayfly`.
+
 ## Manual cleanup
 
 `dayfly cleanup` runs one cleanup pass and exits. The pass does this

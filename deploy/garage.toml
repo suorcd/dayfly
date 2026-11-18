@@ -1,0 +1,16 @@
+# Single-node Garage config for the compose path.
+# Values follow the Garage v2.5 compose guide.
+# s3_region must match S3_REGION in dayfly.env ("garage").
+# rpc_secret and admin_token come from deploy/garage.env as
+# GARAGE_RPC_SECRET and GARAGE_ADMIN_TOKEN. Do not put secrets here.
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+replication_factor = 1
+rpc_bind_addr = "[::]:3901"
+
+[s3_api]
+api_bind_addr = "[::]:3900"
+s3_region = "garage"
+
+[admin]
+api_bind_addr = "[::]:3903"
