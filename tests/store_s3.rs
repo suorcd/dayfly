@@ -5369,3 +5369,35 @@ async fn cleanup_deletes_expired_paste_with_segments_and_alias() {
     assert!(fake.object(fresh_segment).is_some());
     assert!(fake.object(fresh_alias).is_some());
 }
+
+/// The host header of the lifecycle request, or an empty string.
+fn request_host(request: &common::RecordedRequest) -> &str {
+    request
+        .headers
+        .iter()
+        .find(|(name, _)| name == "host")
+        .map(|(_, value)| value.as_str())
+        .unwrap_or("")
+}
+
+#[tokio::test]
+async fn force_path_style_true_keeps_the_bucket_in_the_path() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let _ = store.lifecycle_rules().await;
+    let requests = fake.requests();
+    let lifecycle = requests
+        .iter()
+        .find(|request| request.query.contains("lifecycle"))
+        .expect("the lifecycle call must reach the fake");
+    assert!(
+        lifecycle.path.starts_with("/test-bucket/"),
+        "path style must carry the bucket in the path: {}",
+        lifecycle.path
+    );
+    let host = request_host(lifecycle);
+    assert!(
+        !host.starts_with("test-bucket."),
+        "path style must not use a bucket subdomain: {host}"
+    );
+}

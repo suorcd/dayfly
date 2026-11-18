@@ -1971,7 +1971,7 @@ impl Store {
             .load()
             .await;
         let s3_config = S3ConfigBuilder::from(&sdk_config)
-            .force_path_style(true)
+            .force_path_style(config.s3_force_path_style)
             .build();
         Ok(Self {
             client: Client::from_conf(s3_config),
@@ -5412,5 +5412,94 @@ mod token_tests {
             &[],
         );
         assert!(!meta.contains_key("paste-token-sha256"));
+    }
+
+    /// A virtual-hosted request targets `bucket.endpoint/key`.
+    ///
+    /// The capture runs before signing, after the SDK resolves the
+    /// endpoint, so the test needs no network and no endpoint. The
+    /// endpoint host is unresolvable on purpose: the send fails fast
+    /// after the capture, and the test ignores its result.
+    #[tokio::test]
+    async fn force_path_style_false_uses_a_bucket_subdomain() {
+        let config = Config {
+            endpoint: "http://localhost.invalid:3900".to_string(),
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            s3_force_path_style: false,
+            access_key_id: "test-access-key".to_string(),
+            secret_access_key: "test-secret-key".to_string(),
+            max_text_bytes: 10 * 1024 * 1024,
+            max_file_bytes: 1024 * 1024 * 1024,
+            max_paste_bytes: 1024 * 1024 * 1024,
+            multipart_abort_after_seconds: 3_600,
+            cleanup_interval_seconds: 0,
+            cleanup_on_startup: false,
+            search_max_bytes: 64 * 1024 * 1024,
+            alias_words: 3,
+            default_ttl_days: 7,
+            min_ttl_days: 0,
+            max_ttl_days: 3650,
+            ttl_choices: vec![1, 3, 7, 14, 30, 90],
+            list_default_days: 2,
+            retention_by_size: false,
+            retention_min_days: 30,
+            retention_max_days: 365,
+            http_bind: "127.0.0.1:0".to_string(),
+            log_format: crate::config::LogFormat::Text,
+            metrics_bind: None,
+            metrics_allowed_networks: Vec::new(),
+            trusted_proxies: Vec::new(),
+            show_words: false,
+            show_internal_paths: false,
+            inline_pdf: true,
+            view_line_numbers: false,
+            allow_unauthenticated: false,
+            write_requires_token: false,
+            list_requires_token: false,
+            list_enabled: true,
+            paste_tokens: false,
+            expose_creator_addr: false,
+            rate_limit_per_minute: 0,
+            http_bearer_token: None,
+            mcp_local_root: None,
+            favicon: None,
+            robots_txt: None,
+            security_txt: None,
+            site_name: None,
+            contact: None,
+            aup_url: None,
+        };
+        let store = Store::from_config(config)
+            .await
+            .expect("the store must build without network access");
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&captured);
+        let _ = store
+            .client
+            .get_bucket_lifecycle_configuration()
+            .bucket("test-bucket")
+            .customize()
+            .mutate_request(move |request| {
+                capture
+                    .lock()
+                    .expect("capture lock")
+                    .push(request.uri().to_string());
+            })
+            .send()
+            .await;
+        let uris = captured.lock().expect("capture lock");
+        let uri = uris
+            .first()
+            .expect("the request must be built before transmit");
+        assert!(
+            uris.iter()
+                .all(|uri| uri.starts_with("http://test-bucket.localhost.invalid:3900/")),
+            "virtual-hosted style must use a bucket subdomain: {uri}"
+        );
+        assert!(
+            !uri.contains("/test-bucket/"),
+            "virtual-hosted style must not carry the bucket in the path: {uri}"
+        );
     }
 }
