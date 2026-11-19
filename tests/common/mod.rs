@@ -92,6 +92,10 @@ pub struct FakeState {
     pub multipart_page_size: Option<usize>,
     pub reported_sizes: BTreeMap<String, u64>,
     pub missing_bucket: bool,
+    /// Exact bodies returned by GetObject for one key, whatever the
+    /// requested range is. A test uses this to simulate a backend that
+    /// returns fewer or more bytes than the requested range.
+    pub get_overrides: BTreeMap<String, Vec<u8>>,
     pub lifecycle: Option<String>,
     pub fail_get_lifecycle: bool,
     pub lifecycle_puts: Vec<String>,
@@ -546,6 +550,17 @@ impl FakeS3 {
             .push(prefix.to_string());
     }
 
+    /// Return `body` verbatim for every GetObject on `key`, whatever
+    /// range the client asked for. A test uses a short or long body to
+    /// simulate a backend that returns the wrong number of bytes.
+    pub fn override_get_body(&self, key: &str, body: &[u8]) {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .get_overrides
+            .insert(key.to_string(), body.to_vec());
+    }
+
     /// Make every CopyObject whose destination is `key` fail.
     pub fn fail_copy_key(&self, key: &str) {
         self.state
@@ -645,6 +660,7 @@ impl FakeS3 {
         state.fail_put_prefixes.clear();
         state.fail_put_errors.clear();
         state.fail_get_prefixes.clear();
+        state.get_overrides.clear();
         state.fail_copy_keys.clear();
         state.fail_copy_once_keys.clear();
         state.fail_delete_keys.clear();
@@ -1034,11 +1050,33 @@ fn get_object(
             .copied()
             .unwrap_or(object.body.len() as u64)
     } else {
-        object.body.len() as u64
+        state
+            .get_overrides
+            .get(&key)
+            .map(|body| body.len() as u64)
+            .unwrap_or(object.body.len() as u64)
     };
     let mut resp_headers = object_headers(object, reported_size);
     if is_head {
         return (StatusCode::OK, resp_headers, Body::empty()).into_response();
+    }
+    // An override returns its body verbatim, whatever range the
+    // client asked for, so the client sees the wrong length.
+    if let Some(body) = state.get_overrides.get(&key).cloned() {
+        let length = body.len();
+        resp_headers.insert(
+            header::CONTENT_LENGTH,
+            length
+                .to_string()
+                .parse()
+                .expect("length must be a valid header"),
+        );
+        let status = if range_header.is_some() {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        };
+        return (status, resp_headers, Body::from(body)).into_response();
     }
     let range = range_header.and_then(|value| parse_range(&value, object.body.len() as u64));
     match range {

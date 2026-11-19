@@ -1907,6 +1907,118 @@ async fn fetch_range_by_key_reads_an_exact_window() {
 }
 
 #[tokio::test]
+async fn range_fetch_rejects_a_short_response() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"abcdefghij", None, None, None)
+        .await
+        .expect("text must store");
+    // The range bytes=2-4 asks for 3 bytes; the backend returns 2.
+    fake.override_get_body(&stored.key, b"cd");
+
+    let error = store
+        .fetch_range_by_key(&stored.key, Some((2, 4)))
+        .await
+        .expect_err("a short range response must fail");
+    assert!(
+        matches!(
+            error,
+            StoreError::LengthMismatch {
+                expected: 3,
+                actual: 2
+            }
+        ),
+        "a short range response must be a length mismatch, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn range_fetch_rejects_an_oversized_response() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"abcdefghij", None, None, None)
+        .await
+        .expect("text must store");
+    // The range bytes=2-4 asks for 3 bytes; the backend returns 4.
+    fake.override_get_body(&stored.key, b"cdef");
+
+    let error = store
+        .fetch_range_by_key(&stored.key, Some((2, 4)))
+        .await
+        .expect_err("an oversized range response must fail");
+    assert!(
+        matches!(
+            error,
+            StoreError::LengthMismatch {
+                expected: 3,
+                actual: 4
+            }
+        ),
+        "an oversized range response must be a length mismatch, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn range_fetch_returns_the_metadata_length_on_a_complete_response() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"abcdefghij", None, None, None)
+        .await
+        .expect("text must store");
+    let meta = store
+        .head_metadata(&stored.id)
+        .await
+        .expect("head must succeed");
+
+    let whole = store
+        .fetch_range_by_key(&stored.key, None)
+        .await
+        .expect("whole object fetch must succeed");
+    assert_eq!(whole.len() as u64, meta.size);
+    assert_eq!(whole, b"abcdefghij");
+
+    let window = store
+        .fetch_range_by_key(&stored.key, Some((2, 4)))
+        .await
+        .expect("range fetch must succeed");
+    assert_eq!(window.len(), 3);
+    assert_eq!(window, b"cde");
+}
+
+#[tokio::test]
+async fn download_file_rejects_a_short_range_response() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"abcdefghij", None, None, None)
+        .await
+        .expect("text must store");
+    // The download asks for bytes=2-4; the backend returns 2 bytes.
+    fake.override_get_body(&stored.key, b"cd");
+    let dest = common::temp_path("short-range.bin");
+
+    let error = store
+        .download_file(&stored.id, &dest, Some((2, 4)))
+        .await
+        .expect_err("a short range response must fail the download");
+    assert!(
+        matches!(
+            error,
+            StoreError::LengthMismatch {
+                expected: 3,
+                actual: 2
+            }
+        ),
+        "a short range response must be a length mismatch, got {error:?}"
+    );
+
+    let _ = std::fs::remove_file(dest);
+}
+
+#[tokio::test]
 async fn download_file_writes_whole_and_ranged_content() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
