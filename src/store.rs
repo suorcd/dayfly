@@ -144,6 +144,8 @@ pub enum StoreError {
     AliasUnavailable { attempts: usize },
     #[error("paste has more than {limit} appended segments")]
     TooManySegments { limit: usize },
+    #[error("bare id {0} matches more than one paste: use the full dated id")]
+    AmbiguousId(String),
     #[error("local file access is disabled on this transport: set DAYFLY_MCP_LOCAL_ROOT on the server to allow a directory")]
     LocalFilesDisabled,
     #[error("path outside the allowed root: {0}")]
@@ -187,6 +189,7 @@ impl StoreError {
             StoreError::InvalidLifecycle(_) => "invalid_lifecycle",
             StoreError::AliasUnavailable { .. } => "alias_unavailable",
             StoreError::TooManySegments { .. } => "too_many_segments",
+            StoreError::AmbiguousId(_) => "ambiguous_id",
             StoreError::LocalFilesDisabled => "local_files_disabled",
             StoreError::PathOutsideRoot(_) => "path_outside_root",
             StoreError::InvalidPath(_) => "invalid_path",
@@ -2744,6 +2747,13 @@ impl Store {
     /// alias resolves through its `words/` object. That scan is the cost
     /// of not having an index: clients should keep the full ID returned
     /// at store time.
+    ///
+    /// A bare ID matches only when it equals the whole random component
+    /// of a key (`pastes/<date>/<random>`). A bare ID that matches two
+    /// or more keys is ambiguous, and this method returns
+    /// [`StoreError::AmbiguousId`] instead of the first key scanned.
+    /// The scan reads every page, so a unique match is confirmed and
+    /// not assumed.
     pub async fn resolve_key(&self, id: &str) -> Result<String, StoreError> {
         if let Some(phrase) = self.normalize_alias(id) {
             return self.resolve_alias(&phrase).await;
@@ -2753,7 +2763,7 @@ impl Store {
         if stripped.contains('/') {
             return Ok(format!("pastes/{stripped}"));
         }
-        let suffix = format!("/{stripped}");
+        let mut found: Option<String> = None;
         let mut token: Option<String> = None;
         for _ in 0..LIST_SCAN_MAX_PAGES {
             let mut req = self
@@ -2772,8 +2782,17 @@ impl Store {
                     if !is_paste_key(key) {
                         continue;
                     }
-                    if key.ends_with(&suffix) || key == format!("pastes/{stripped}") {
-                        return Ok(key.to_string());
+                    let Some(rest) = key.strip_prefix("pastes/") else {
+                        continue;
+                    };
+                    let Some((_, random)) = rest.split_once('/') else {
+                        continue;
+                    };
+                    if random == stripped {
+                        if found.is_some() {
+                            return Err(StoreError::AmbiguousId(id.to_string()));
+                        }
+                        found = Some(key.to_string());
                     }
                 }
             }
@@ -2782,7 +2801,10 @@ impl Store {
                 _ => break,
             }
         }
-        Err(StoreError::NotFound(id.to_string()))
+        match found {
+            Some(key) => Ok(key),
+            None => Err(StoreError::NotFound(id.to_string())),
+        }
     }
 
     /// Clamp a TTL to the size curve when `retention_by_size` is on.
