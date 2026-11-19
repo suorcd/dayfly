@@ -246,6 +246,7 @@ impl FakeS3 {
             retention_max_days: 365,
             http_bind: "127.0.0.1:0".to_string(),
             log_format: dayfly::config::LogFormat::Text,
+            log_raw_paste_ids: false,
             metrics_bind: None,
             metrics_allowed_networks: Vec::new(),
             trusted_proxies: Vec::new(),

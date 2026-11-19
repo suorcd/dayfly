@@ -196,6 +196,15 @@ pub struct Config {
     /// line to stderr. A change needs a restart, because the subscriber
     /// is built at startup.
     pub log_format: LogFormat,
+    /// Whether request logs carry raw paste IDs and aliases.
+    ///
+    /// Default: `false`. With the default, a paste ID or alias in a log
+    /// line is a short SHA-256 hash, so a log reader cannot use it to
+    /// read the paste. The hash stays stable for one ID, so log lines
+    /// for the same paste still correlate. Set this to `true` only when
+    /// an operator needs raw IDs to debug a request. A raw ID resolves
+    /// the paste, so treat raw logs as sensitive.
+    pub log_raw_paste_ids: bool,
     /// Optional bind address for the private Prometheus metrics listener.
     ///
     /// Default: unset, so no metrics listener exists. When set, the
@@ -605,6 +614,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("text"),
         required: false,
         help: "Log format: text or json",
+    },
+    ConfigField {
+        name: "DAYFLY_LOG_RAW_PASTE_IDS",
+        value: Some("false"),
+        required: false,
+        help: "Log raw paste IDs and aliases in request logs instead of a short hash",
     },
     ConfigField {
         name: "DAYFLY_METRICS_BIND",
@@ -1822,6 +1837,12 @@ impl Config {
             }
         };
         let log_format = record(&mut faults, log_format(&lookup), LogFormat::Text);
+        let log_raw_paste_ids = record_bool(
+            &mut faults,
+            &lookup,
+            "DAYFLY_LOG_RAW_PASTE_IDS",
+            field_default("DAYFLY_LOG_RAW_PASTE_IDS") == Some("true"),
+        );
         let metrics_bind = record(
             &mut faults,
             optional_socket_addr(&lookup, "DAYFLY_METRICS_BIND"),
@@ -2419,6 +2440,7 @@ impl Config {
                 retention_max_days,
                 http_bind,
                 log_format,
+                log_raw_paste_ids,
                 metrics_bind,
                 metrics_allowed_networks,
                 trusted_proxies,
@@ -2522,7 +2544,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} s3_force_path_style={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} multipart_abort_after_seconds={} cleanup_interval_seconds={} cleanup_on_startup={} search_max_bytes={} search_prefix_max_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} write_requires_token={} list_requires_token={} paste_tokens={} expose_creator_addr={} rate_limit_per_minute={} http_request_timeout_seconds={} http_body_read_timeout_seconds={} http_body_write_timeout_seconds={} http_max_in_flight={} http_max_uploads={} http_max_search_list={} s3_connect_timeout_seconds={} s3_read_timeout_seconds={} s3_operation_timeout_seconds={} log_format={} metrics_bind={} metrics_allowed_networks={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
+            "bucket={} endpoint_scheme={} region={} s3_force_path_style={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} multipart_abort_after_seconds={} cleanup_interval_seconds={} cleanup_on_startup={} search_max_bytes={} search_prefix_max_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} write_requires_token={} list_requires_token={} paste_tokens={} expose_creator_addr={} rate_limit_per_minute={} http_request_timeout_seconds={} http_body_read_timeout_seconds={} http_body_write_timeout_seconds={} http_max_in_flight={} http_max_uploads={} http_max_search_list={} s3_connect_timeout_seconds={} s3_read_timeout_seconds={} s3_operation_timeout_seconds={} log_format={} log_raw_paste_ids={} metrics_bind={} metrics_allowed_networks={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -2565,6 +2587,7 @@ impl Config {
             self.s3_read_timeout_seconds,
             self.s3_operation_timeout_seconds,
             self.log_format.as_str(),
+            self.log_raw_paste_ids,
             self.metrics_bind
                 .as_ref()
                 .map(|bind| bind.to_string())
@@ -2925,6 +2948,7 @@ mod tests {
             retention_max_days: 365,
             http_bind: "127.0.0.1:0".to_string(),
             log_format: LogFormat::Text,
+            log_raw_paste_ids: false,
             metrics_bind: None,
             metrics_allowed_networks: Vec::new(),
             trusted_proxies: Vec::new(),
@@ -3315,6 +3339,34 @@ mod tests {
             ConfigError::Invalid(name, message) => {
                 assert_eq!(name, "DAYFLY_LOG_FORMAT");
                 assert!(message.contains("text or json"), "message: {message}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn log_raw_paste_ids_defaults_to_false_and_accepts_true() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert!(!config.log_raw_paste_ids);
+
+        let mut pairs = base_env();
+        pairs.push(("DAYFLY_LOG_RAW_PASTE_IDS".to_string(), "1".to_string()));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("raw ID config");
+        assert!(config.log_raw_paste_ids);
+    }
+
+    #[test]
+    fn log_raw_paste_ids_rejects_a_non_boolean() {
+        let mut pairs = base_env();
+        pairs.push((
+            "DAYFLY_LOG_RAW_PASTE_IDS".to_string(),
+            "sometimes".to_string(),
+        ));
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        match error {
+            ConfigError::Invalid(name, message) => {
+                assert_eq!(name, "DAYFLY_LOG_RAW_PASTE_IDS");
+                assert!(message.contains("true or false"), "message: {message}");
             }
             other => panic!("unexpected error: {other}"),
         }

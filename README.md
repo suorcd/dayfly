@@ -488,6 +488,7 @@ permissions and the lower total cap.
 | `DAYFLY_RETENTION_MAX_DAYS` | no | 365 | Maximum retention in whole days at zero bytes. Must be at least 1 and at most 3650, and must be at least `DAYFLY_RETENTION_MIN_DAYS` |
 | `DAYFLY_HTTP_BIND` | no | `127.0.0.1:8080` | HTTP bind address |
 | `DAYFLY_LOG_FORMAT` | no | `text` | Log format. `text` keeps the existing output. `json` writes one JSON object per line to stderr. A change needs a restart |
+| `DAYFLY_LOG_RAW_PASTE_IDS` | no | `false` | Log raw paste IDs and aliases in request logs. Off logs a short `sha256:` hash of the ID instead, so a log reader cannot use it to read the paste. On restores raw IDs for debugging; treat raw logs as sensitive. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_METRICS_BIND` | no | (unset) | Private bind address for the Prometheus metrics listener. Unset starts no metrics listener. The public listener never serves `/metrics` |
 | `DAYFLY_METRICS_ALLOWED_NETWORKS` | no | (empty) | Comma-separated CIDR blocks allowed to scrape the metrics listener. A loopback bind needs no list. A non-loopback bind is refused at startup without a list. The check uses the socket peer, not `X-Forwarded-For` |
 | `DAYFLY_TRUSTED_PROXIES` | no | (empty) | Comma-separated CIDR blocks (bare addresses are single hosts) of reverse proxies whose `X-Forwarded-For` header is believed. Empty keeps the socket peer as the client and ignores forwarding headers. The chain is walked from the right; a malformed or over-long chain falls back to the peer with one warning. Set this before any per-client limit behind an ingress |
@@ -604,6 +605,7 @@ first, then the file. These settings take effect on the next request:
   `DAYFLY_SECURITY_TXT_PATH`
 - `DAYFLY_TRUSTED_PROXIES`
 - `DAYFLY_PUBLIC_BASE_URL`
+- `DAYFLY_LOG_RAW_PASTE_IDS`
 - `DAYFLY_METRICS_ALLOWED_NETWORKS`
 - `DAYFLY_WRITE_REQUIRES_TOKEN`
 - `DAYFLY_LIST_ENABLED`
@@ -642,8 +644,13 @@ HTTP mode writes one access log line for each request at `INFO`. The line
 carries `request_id`, `method`, `route`, `status`, `latency_ms`,
 `response_bytes`, and `paste_id`. It carries `client` only when
 `DAYFLY_EXPOSE_CREATOR_ADDR` is on; otherwise the field is empty. The
-route is the template, for example `/v1/pastes/{random}`. The line never
-carries a credential, a paste token, or a query string. The latency stops
+`paste_id` is a short `sha256:` hash of the ID by default, so a log
+reader cannot use it to read the paste; the hash stays stable for one
+ID, so lines for the same paste still correlate. Set
+`DAYFLY_LOG_RAW_PASTE_IDS=true` to log raw IDs for debugging, and treat
+raw logs as sensitive. The route is the template, for example
+`/v1/pastes/{random}`. The line never carries a credential, a paste
+token, or a query string. The latency stops
 when the response starts, so a streamed body can take longer. Set
 `--verbose` or `RUST_LOG=dayfly=info` to see the lines.
 
