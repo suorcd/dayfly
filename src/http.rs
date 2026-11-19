@@ -29,7 +29,7 @@ use axum::http::header::{
     ETAG, HOST, IF_NONE_MATCH, RANGE, RETRY_AFTER,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
-use axum::middleware::{self, Next};
+use axum::middleware::{self, map_response, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -606,7 +606,7 @@ fn upload_response(
     stored: &crate::store::StoredPaste,
 ) -> Response {
     let url = paste_url(headers, &stored.id);
-    if wants_json(headers, query) {
+    let mut response = if wants_json(headers, query) {
         (
             StatusCode::CREATED,
             Json(UploadEnvelope {
@@ -649,7 +649,13 @@ fn upload_response(
             );
         }
         response
-    }
+    };
+    // The token travels in the body or in a header, so no cache may
+    // store this response.
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    response
 }
 
 /// Single upload entry point for POST /upload and POST /v1/pastes.
@@ -1843,6 +1849,18 @@ async fn require_same_origin(request: Request, next: Next) -> Response {
 /// routes accept any `Host`, and a private-network deployment can use a LAN
 /// name, so the endpoint disables that list. The bearer token and the
 /// private network guard the endpoint, as they guard the REST routes.
+/// Add `Cache-Control: private, no-store` to every MCP response.
+///
+/// Tool results can carry a paste token in JSON, and the streamable HTTP
+/// transport is HTTP, so the header applies here. The stdio transport has
+/// no HTTP layer, so it has no header to set.
+async fn no_store_mcp_response(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    response
+}
+
 pub fn mcp_router(state: AppState) -> Router<AppState> {
     let store = state.store_handle();
     let service = StreamableHttpService::new(
@@ -1854,6 +1872,7 @@ pub fn mcp_router(state: AppState) -> Router<AppState> {
         .nest_service("/mcp", service)
         .layer(middleware::from_fn_with_state(state, require_bearer))
         .layer(middleware::from_fn(require_same_origin))
+        .layer(map_response(no_store_mcp_response))
 }
 
 /// The private metrics listener.
@@ -3350,6 +3369,10 @@ mod tests {
         assert!(
             headers.contains_key("mcp-session-id"),
             "initialize must create a session"
+        );
+        assert_eq!(
+            headers[CACHE_CONTROL], "private, no-store",
+            "MCP responses can carry a paste token, so they must not be cached"
         );
     }
 
