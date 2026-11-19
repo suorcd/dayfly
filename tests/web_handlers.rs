@@ -2,8 +2,10 @@
 
 mod common;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::extract::ConnectInfo;
 use axum::http::{header, StatusCode};
 use chrono::{Duration, Utc};
 use common::FakeS3;
@@ -306,8 +308,10 @@ async fn configured_footer_replaces_the_internal_use_text() {
 #[tokio::test]
 async fn index_page_shows_curl_examples_for_the_request_base() {
     let fake = FakeS3::start().await;
-    let app = common::app(fake.store().await);
-    let request = common::request(
+    let mut store = fake.store().await;
+    store.config.trusted_proxies = vec!["10.0.0.0/8".parse().expect("proxy CIDR must parse")];
+    let app = common::app(store);
+    let mut request = common::request(
         "GET",
         "/",
         &[
@@ -316,6 +320,9 @@ async fn index_page_shows_curl_examples_for_the_request_base() {
         ],
         Vec::new(),
     );
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([10, 0, 0, 5], 40000))));
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::OK);
     let page = html_text(&body);
@@ -359,7 +366,8 @@ async fn index_page_shows_curl_examples_for_the_request_base() {
 async fn index_page_curl_examples_carry_the_bearer_placeholder() {
     const TOKEN: &str = "index-page-secret-token";
     let fake = FakeS3::start().await;
-    let config = common::config_with_token(fake.config(), TOKEN);
+    let mut config = common::config_with_token(fake.config(), TOKEN);
+    config.public_base_url = Some("http://dayfly.test".to_string());
     let store = Store::from_config(config)
         .await
         .expect("the store must build without network access");
@@ -390,7 +398,7 @@ async fn index_page_curl_examples_carry_the_bearer_placeholder() {
 }
 
 #[tokio::test]
-async fn index_page_escapes_the_base_url_in_the_curl_examples() {
+async fn index_page_hides_the_curl_examples_from_an_untrusted_peer() {
     let fake = FakeS3::start().await;
     let app = common::app(fake.store().await);
     let request = common::request(
@@ -402,6 +410,41 @@ async fn index_page_escapes_the_base_url_in_the_curl_examples() {
         )],
         Vec::new(),
     );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(
+        !page.contains("evil.example"),
+        "a forged host from an untrusted peer must not reach the page: {page}"
+    );
+    assert!(
+        !page.contains("<details class=\"cli-hint\">"),
+        "the page must show no curl examples without a trusted base: {page}"
+    );
+    assert!(
+        !page.contains("<script>alert(1)</script>"),
+        "the base URL must not inject markup: {page}"
+    );
+}
+
+#[tokio::test]
+async fn index_page_escapes_the_base_url_in_the_curl_examples() {
+    let fake = FakeS3::start().await;
+    let mut store = fake.store().await;
+    store.config.trusted_proxies = vec!["10.0.0.0/8".parse().expect("proxy CIDR must parse")];
+    let app = common::app(store);
+    let mut request = common::request(
+        "GET",
+        "/",
+        &[(
+            "host",
+            "evil.example\"><script>alert(1)</script>".to_string(),
+        )],
+        Vec::new(),
+    );
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([10, 0, 0, 5], 40000))));
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::OK);
     let page = html_text(&body);

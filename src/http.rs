@@ -42,7 +42,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
 use crate::client_addr::{self, ClientAddr};
-use crate::config::TextAsset;
+use crate::config::{Config, TextAsset};
 use crate::content_type::content_disposition;
 use crate::metrics::Metrics;
 use crate::rate_limit::RateLimiter;
@@ -615,12 +615,38 @@ fn wants_json(headers: &HeaderMap, query: &HashMap<String, String>) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the socket peer of `request` is a listed trusted proxy.
+///
+/// The check reads the `ConnectInfo` that the listener attaches, so it
+/// works without the `client_context` middleware. A request with no peer
+/// is untrusted.
+pub(crate) fn peer_is_trusted(request: &Request, config: &Config) -> bool {
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .is_some_and(|peer| client_addr::is_trusted(peer.0.ip(), &config.trusted_proxies))
+}
+
 /// Public base URL for the current request, without a trailing slash.
 ///
-/// The scheme comes from `x-forwarded-proto` when the value is `http`
-/// or `https`; otherwise it is `http`. The host comes from the `Host`
-/// header. A request without a host has no base URL.
-pub(crate) fn public_base(headers: &HeaderMap) -> Option<String> {
+/// The configured [`Config::public_base_url`] wins over every header.
+/// Without it, the base comes from the request only when the socket peer
+/// is a listed trusted proxy: the scheme comes from `x-forwarded-proto`
+/// when the value is `http` or `https`, otherwise it is `http`, and the
+/// host comes from the `Host` header. A request from any other peer, or
+/// one without a host, has no base URL, so the caller returns a relative
+/// URL and a forged header cannot change the returned authority.
+pub(crate) fn public_base(
+    headers: &HeaderMap,
+    config: &Config,
+    peer_trusted: bool,
+) -> Option<String> {
+    if let Some(base) = &config.public_base_url {
+        return Some(base.clone());
+    }
+    if !peer_trusted {
+        return None;
+    }
     let host = header_str(headers, HOST.as_str())?;
     let scheme = headers
         .get("x-forwarded-proto")
@@ -630,9 +656,9 @@ pub(crate) fn public_base(headers: &HeaderMap) -> Option<String> {
     Some(format!("{scheme}://{host}"))
 }
 
-fn paste_url(headers: &HeaderMap, id: &str) -> String {
+fn paste_url(headers: &HeaderMap, config: &Config, peer_trusted: bool, id: &str) -> String {
     let path = format!("/v1/pastes/{id}");
-    match public_base(headers) {
+    match public_base(headers, config, peer_trusted) {
         Some(base) => format!("{base}{path}"),
         None => path,
     }
@@ -641,9 +667,11 @@ fn paste_url(headers: &HeaderMap, id: &str) -> String {
 fn upload_response(
     headers: &HeaderMap,
     query: &HashMap<String, String>,
+    config: &Config,
+    peer_trusted: bool,
     stored: &crate::store::StoredPaste,
 ) -> Response {
-    let url = paste_url(headers, &stored.id);
+    let url = paste_url(headers, config, peer_trusted, &stored.id);
     let mut response = if wants_json(headers, query) {
         (
             StatusCode::CREATED,
@@ -713,6 +741,7 @@ async fn upload_dispatch(
         return forbidden_write();
     }
     let store = state.store();
+    let peer_trusted = peer_is_trusted(&req, &store.config);
     let created_by = req
         .extensions()
         .get::<ClientAddr>()
@@ -720,7 +749,9 @@ async fn upload_dispatch(
     let content_type = header_str(&headers, CONTENT_TYPE.as_str()).unwrap_or_default();
     if content_type.starts_with("multipart/form-data") {
         match Multipart::from_request(req, &()).await {
-            Ok(multipart) => multipart_inner(store, headers, query, multipart, created_by).await,
+            Ok(multipart) => {
+                multipart_inner(store, headers, query, multipart, created_by, peer_trusted).await
+            }
             Err(e) => bad_request(format!("invalid multipart body: {e}")),
         }
     } else {
@@ -772,7 +803,7 @@ async fn upload_dispatch(
             .store_stream_with_fields(Box::pin(stream), &fields, ttl, known_length, max_bytes)
             .await
         {
-            Ok(stored) => upload_response(&headers, &query, &stored),
+            Ok(stored) => upload_response(&headers, &query, &store.config, peer_trusted, &stored),
             Err(e) => upload_error_response(e, text_paste),
         }
     }
@@ -784,6 +815,7 @@ async fn multipart_inner(
     query: HashMap<String, String>,
     mut multipart: Multipart,
     created_by: Option<String>,
+    peer_trusted: bool,
 ) -> Response {
     let max_request = store
         .config
@@ -868,7 +900,9 @@ async fn multipart_inner(
                 .store_stream_with_fields(Box::pin(stream), &fields, ttl, None, max_bytes)
                 .await
             {
-                Ok(stored) => upload_response(&headers, &query, &stored),
+                Ok(stored) => {
+                    upload_response(&headers, &query, &store.config, peer_trusted, &stored)
+                }
                 Err(e) => error_response(e),
             };
         }
@@ -2181,6 +2215,7 @@ async fn append_inner(state: &AppState, headers: &HeaderMap, id: &str, req: Requ
         return forbidden_write();
     }
     let store = state.store();
+    let peer_trusted = peer_is_trusted(&req, &store.config);
     let limit = store.config.max_text_paste_bytes();
     let body_read_timeout = store.config.http_body_read_timeout_seconds;
     let known_length =
@@ -2223,7 +2258,7 @@ async fn append_inner(state: &AppState, headers: &HeaderMap, id: &str, req: Requ
         Ok(appended) => Json(serde_json::json!({
             "id": appended.meta.id,
             "words": appended.meta.words,
-            "url": paste_url(headers, &appended.meta.id),
+            "url": paste_url(headers, &store.config, peer_trusted, &appended.meta.id),
             "appended_bytes": appended.appended_bytes,
             "segment_key": appended.segment_key,
             "size": appended.meta.size,
@@ -2594,6 +2629,7 @@ mod tests {
             metrics_bind: None,
             metrics_allowed_networks: Vec::new(),
             trusted_proxies: Vec::new(),
+            public_base_url: None,
             show_words: false,
             show_internal_paths: false,
             inline_pdf: true,
@@ -2777,6 +2813,78 @@ mod tests {
         )
         .await;
         assert_eq!(client, "10.0.0.5");
+    }
+
+    fn public_base_headers(host: Option<&str>, proto: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(host) = host {
+            headers.insert(HOST, HeaderValue::from_str(host).unwrap());
+        }
+        if let Some(proto) = proto {
+            headers.insert("x-forwarded-proto", HeaderValue::from_str(proto).unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn an_untrusted_peer_gets_no_public_base() {
+        let config = test_config(1024, 1024);
+        let headers = public_base_headers(Some("evil.test"), Some("https"));
+        assert_eq!(public_base(&headers, &config, false), None);
+        assert_eq!(
+            paste_url(&headers, &config, false, "2026-11-19/abc"),
+            "/v1/pastes/2026-11-19/abc"
+        );
+    }
+
+    #[test]
+    fn a_trusted_peer_supplies_the_scheme_and_host() {
+        let config = test_config(1024, 1024);
+        let headers = public_base_headers(Some("dayfly.test"), Some("https"));
+        assert_eq!(
+            public_base(&headers, &config, true),
+            Some("https://dayfly.test".to_string())
+        );
+        let headers = public_base_headers(Some("dayfly.test"), None);
+        assert_eq!(
+            public_base(&headers, &config, true),
+            Some("http://dayfly.test".to_string())
+        );
+        let headers = public_base_headers(None, Some("https"));
+        assert_eq!(public_base(&headers, &config, true), None);
+    }
+
+    #[test]
+    fn a_configured_base_wins_over_spoofed_headers() {
+        let mut config = test_config(1024, 1024);
+        config.public_base_url = Some("https://dayfly.example".to_string());
+        let headers = public_base_headers(Some("evil.test"), Some("http"));
+        assert_eq!(
+            public_base(&headers, &config, false),
+            Some("https://dayfly.example".to_string())
+        );
+        assert_eq!(
+            paste_url(&headers, &config, false, "2026-11-19/abc"),
+            "https://dayfly.example/v1/pastes/2026-11-19/abc"
+        );
+    }
+
+    #[test]
+    fn peer_trust_follows_the_socket_peer_not_the_headers() {
+        let mut config = test_config(1024, 1024);
+        config.trusted_proxies = vec!["10.0.0.0/8".parse().expect("proxy CIDR must parse")];
+        let mut trusted = Request::builder().uri("/").body(Body::empty()).unwrap();
+        trusted
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([10, 0, 0, 5], 40000))));
+        assert!(peer_is_trusted(&trusted, &config));
+        let mut untrusted = Request::builder().uri("/").body(Body::empty()).unwrap();
+        untrusted
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([198, 51, 100, 7], 40000))));
+        assert!(!peer_is_trusted(&untrusted, &config));
+        let no_peer = Request::builder().uri("/").body(Body::empty()).unwrap();
+        assert!(!peer_is_trusted(&no_peer, &config));
     }
 
     async fn state_with_rate_limit(limit: u32) -> AppState {

@@ -38,6 +38,7 @@ fn command() -> Command {
         "DAYFLY_METRICS_BIND",
         "DAYFLY_METRICS_ALLOWED_NETWORKS",
         "DAYFLY_TRUSTED_PROXIES",
+        "DAYFLY_PUBLIC_BASE_URL",
         "DAYFLY_LIST_REQUIRES_TOKEN",
         "DAYFLY_WRITE_REQUIRES_TOKEN",
         "DAYFLY_PASTE_TOKENS",
@@ -294,6 +295,7 @@ fn config_check_accepts_a_generated_file_and_prints_every_name() {
         "S3_SECRET_ACCESS_KEY",
         "S3_REGION",
         "DAYFLY_MAX_TEXT_BYTES",
+        "DAYFLY_PUBLIC_BASE_URL",
         "DAYFLY_SHOW_WORDS",
     ] {
         assert!(stdout.contains(name), "missing {name} in output: {stdout}");
