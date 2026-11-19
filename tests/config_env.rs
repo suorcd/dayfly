@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use dayfly::config::{Config, ConfigError};
 
-const VARS: [&str; 45] = [
+const VARS: [&str; 46] = [
     "S3_ENDPOINT",
     "S3_BUCKET",
     "S3_REGION",
