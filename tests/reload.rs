@@ -100,6 +100,7 @@ async fn reload_swaps_credentials_token_caps_ttl_and_show_words() {
     new_config.retention_min_days = 10;
     new_config.retention_max_days = 90;
     new_config.paste_tokens = true;
+    new_config.public_base_url = Some("https://dayfly.example".to_string());
     new_config.show_words = true;
     new_config.list_requires_token = true;
     new_config.rate_limit_per_minute = 7;
@@ -130,6 +131,7 @@ async fn reload_swaps_credentials_token_caps_ttl_and_show_words() {
         "DAYFLY_RETENTION_MIN_DAYS",
         "DAYFLY_RETENTION_MAX_DAYS",
         "DAYFLY_PASTE_TOKENS",
+        "DAYFLY_PUBLIC_BASE_URL",
         "DAYFLY_SHOW_WORDS",
         "DAYFLY_LIST_REQUIRES_TOKEN",
         "DAYFLY_RATE_LIMIT_PER_MINUTE",

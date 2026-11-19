@@ -5450,6 +5450,7 @@ mod token_tests {
             metrics_bind: None,
             metrics_allowed_networks: Vec::new(),
             trusted_proxies: Vec::new(),
+            public_base_url: None,
             show_words: false,
             show_internal_paths: false,
             inline_pdf: true,

@@ -266,6 +266,9 @@ fn changed_fields(old: &Config, new: &Config) -> Vec<&'static str> {
     if old.trusted_proxies != new.trusted_proxies {
         changed.push("DAYFLY_TRUSTED_PROXIES");
     }
+    if old.public_base_url != new.public_base_url {
+        changed.push("DAYFLY_PUBLIC_BASE_URL");
+    }
     if old.metrics_allowed_networks != new.metrics_allowed_networks {
         changed.push("DAYFLY_METRICS_ALLOWED_NETWORKS");
     }

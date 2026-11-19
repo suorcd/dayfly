@@ -173,7 +173,8 @@ pub fn resolve(
         .ok_or(ForwardedError::NotAttributable)
 }
 
-fn is_trusted(address: IpAddr, trusted: &[Cidr]) -> bool {
+/// Whether `address` is inside one of the trusted proxy blocks.
+pub(crate) fn is_trusted(address: IpAddr, trusted: &[Cidr]) -> bool {
     trusted.iter().any(|block| block.contains(address))
 }
 
