@@ -152,6 +152,8 @@ pub enum StoreError {
     InvalidPath(String),
     #[error("io error: {0}")]
     Io(String),
+    #[error("request timed out: {0}")]
+    RequestTimeout(String),
     #[error("s3 error: {0}")]
     S3(String),
     #[error("bucket storage quota is reached: try again after a paste expires or is deleted")]
@@ -191,6 +193,7 @@ impl StoreError {
             StoreError::PathOutsideRoot(_) => "path_outside_root",
             StoreError::InvalidPath(_) => "invalid_path",
             StoreError::Io(_) => "io_error",
+            StoreError::RequestTimeout(_) => "request_timeout",
             StoreError::S3(_) => "s3_error",
             StoreError::QuotaExceeded => "quota_exceeded",
             StoreError::CopyLimit { .. } => "copy_limit",
@@ -1970,8 +1973,19 @@ impl Store {
             .credentials_provider(credentials)
             .load()
             .await;
+        // A stalled endpoint must fail within the configured deadlines
+        // instead of holding the request task. The operation deadline
+        // covers the whole call including retries. The attempt deadline
+        // matches it, so one slow attempt cannot outlive the operation.
+        let timeout_config = aws_config::timeout::TimeoutConfig::builder()
+            .connect_timeout(Duration::from_secs(config.s3_connect_timeout_seconds))
+            .read_timeout(Duration::from_secs(config.s3_read_timeout_seconds))
+            .operation_timeout(Duration::from_secs(config.s3_operation_timeout_seconds))
+            .operation_attempt_timeout(Duration::from_secs(config.s3_operation_timeout_seconds))
+            .build();
         let s3_config = S3ConfigBuilder::from(&sdk_config)
             .force_path_style(config.s3_force_path_style)
+            .timeout_config(timeout_config)
             .build();
         Ok(Self {
             client: Client::from_conf(s3_config),
@@ -5461,6 +5475,15 @@ mod token_tests {
             paste_tokens: false,
             expose_creator_addr: false,
             rate_limit_per_minute: 0,
+            http_request_timeout_seconds: 600,
+            http_body_read_timeout_seconds: 120,
+            http_body_write_timeout_seconds: 120,
+            http_max_in_flight: 256,
+            http_max_uploads: 32,
+            http_max_search_list: 32,
+            s3_connect_timeout_seconds: 5,
+            s3_read_timeout_seconds: 30,
+            s3_operation_timeout_seconds: 120,
             http_bearer_token: None,
             mcp_local_root: None,
             favicon: None,
