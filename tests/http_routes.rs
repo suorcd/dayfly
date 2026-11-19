@@ -1391,6 +1391,52 @@ async fn inline_text_has_a_sandbox_policy() {
 }
 
 #[tokio::test]
+async fn create_responses_carry_no_store() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store_with_paste_tokens().await);
+
+    let body = b"hello".to_vec();
+    let request = common::request(
+        "POST",
+        "/upload?format=json",
+        &[
+            ("content-type", "text/plain".to_string()),
+            content_length(body.len()),
+        ],
+        body.clone(),
+    );
+    let (status, headers, response) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(headers[header::CACHE_CONTROL], "private, no-store");
+    assert!(
+        common::json_body(&response)["paste_token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty()),
+        "the JSON create response must carry the paste token"
+    );
+
+    let request = common::request(
+        "POST",
+        "/upload",
+        &[
+            ("content-type", "text/plain".to_string()),
+            content_length(body.len()),
+        ],
+        body,
+    );
+    let (status, headers, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(headers[header::CACHE_CONTROL], "private, no-store");
+    assert!(
+        headers
+            .get("x-paste-token")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|token| !token.is_empty()),
+        "the plain create response must carry the paste token header"
+    );
+}
+
+#[tokio::test]
 async fn download_head_and_range_responses_carry_the_right_headers() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
