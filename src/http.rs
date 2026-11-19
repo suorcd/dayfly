@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{
@@ -39,6 +39,7 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
+use tokio::sync::Semaphore;
 
 use crate::client_addr::{self, ClientAddr};
 use crate::config::TextAsset;
@@ -89,16 +90,50 @@ pub(crate) async fn read_metadata_field(
         .map_err(|_| MultipartFieldError::Malformed("multipart field is not UTF-8".to_string()))
 }
 
+/// The in-flight caps for one [`AppState`].
+///
+/// A `None` semaphore means the cap is off (the configured limit is
+/// zero). The semaphores are built at startup from the configuration.
+/// A reload does not resize them: a cap change needs a restart, like
+/// the bind address. The timeouts are read per request instead, so a
+/// reload applies them at once.
+pub struct InFlightLimits {
+    global: Option<Arc<Semaphore>>,
+    uploads: Option<Arc<Semaphore>>,
+    search_list: Option<Arc<Semaphore>>,
+}
+
+/// Build one semaphore, or `None` when the limit disables the cap.
+fn cap_semaphore(limit: u32) -> Option<Arc<Semaphore>> {
+    if limit == 0 {
+        None
+    } else {
+        Some(Arc::new(Semaphore::new(limit as usize)))
+    }
+}
+
+impl InFlightLimits {
+    fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            global: cap_semaphore(config.http_max_in_flight),
+            uploads: cap_semaphore(config.http_max_uploads),
+            search_list: cap_semaphore(config.http_max_search_list),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     store: StoreHandle,
     rate_limiter: Arc<RateLimiter>,
     metrics: Option<Arc<Metrics>>,
+    in_flight: Arc<InFlightLimits>,
 }
 
 impl AppState {
     pub fn new(store: Store) -> Self {
         Self {
+            in_flight: Arc::new(InFlightLimits::from_config(&store.config)),
             store: StoreHandle::new(store),
             rate_limiter: Arc::new(RateLimiter::new()),
             metrics: None,
@@ -108,6 +143,7 @@ impl AppState {
     /// Build a state that records Prometheus metrics.
     pub fn with_metrics(store: Store, metrics: Arc<Metrics>) -> Self {
         Self {
+            in_flight: Arc::new(InFlightLimits::from_config(&store.config)),
             store: StoreHandle::new(store),
             rate_limiter: Arc::new(RateLimiter::new()),
             metrics: Some(metrics),
@@ -341,6 +377,7 @@ pub(crate) fn status_for(e: &StoreError) -> StatusCode {
         StoreError::TooManySegments { .. } => StatusCode::CONFLICT,
         StoreError::CopyLimit { .. } => StatusCode::BAD_REQUEST,
         StoreError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        StoreError::RequestTimeout(_) => StatusCode::REQUEST_TIMEOUT,
         StoreError::S3(_) => StatusCode::BAD_GATEWAY,
         StoreError::QuotaExceeded => StatusCode::INSUFFICIENT_STORAGE,
         StoreError::BucketUnavailable(_) => StatusCode::BAD_GATEWAY,
@@ -703,6 +740,13 @@ async fn upload_dispatch(
         let stream = body
             .into_data_stream()
             .map(|item| item.map_err(|e| StoreError::Io(e.to_string())));
+        // A stalled body fails with 408 instead of holding the upload
+        // task. The timeout stream ends the stream with one error, so
+        // the store writes no object for the stalled upload.
+        let stream = read_timeout_stream(
+            Box::pin(stream),
+            store.config.http_body_read_timeout_seconds,
+        );
         // The Content-Type here is the raw-body type, including curl's
         // --data-binary default, which detection treats as unspecified.
         let explicit = if content_type.is_empty() {
@@ -785,11 +829,25 @@ async fn multipart_inner(
                 filename = field.file_name().map(|s| s.to_string());
             }
             let max_bytes = store.config.max_bytes_for_upload(filename.as_deref());
+            let body_read_timeout = store.config.http_body_read_timeout_seconds;
             let stream = futures::stream::unfold(field, |mut f| async move {
-                match f.chunk().await {
+                let chunk = if body_read_timeout == 0 {
+                    f.chunk().await.map_err(|e| StoreError::Io(e.to_string()))
+                } else {
+                    match tokio::time::timeout(Duration::from_secs(body_read_timeout), f.chunk())
+                        .await
+                    {
+                        Ok(Ok(chunk)) => Ok(chunk),
+                        Ok(Err(e)) => Err(StoreError::Io(e.to_string())),
+                        Err(_) => Err(StoreError::RequestTimeout(
+                            "request body read timed out".to_string(),
+                        )),
+                    }
+                };
+                match chunk {
                     Ok(Some(chunk)) => Some((Ok(chunk), f)),
                     Ok(None) => None,
-                    Err(e) => Some((Err(StoreError::Io(e.to_string())), f)),
+                    Err(e) => Some((Err(e), f)),
                 }
             });
             let fields = PasteFields {
@@ -1114,6 +1172,10 @@ async fn download_response(
     // Stream back in 8 MiB range chunks: the server holds one chunk at
     // a time, never the whole paste. The plan is built once, so each
     // chunk maps to the base object or to the segment that holds it.
+    // A gap between chunks past the body-write deadline aborts the
+    // body stream. The headers are already sent by then, so the client
+    // sees a truncated body and a closed connection, not a 408.
+    let body_write_timeout = store.config.http_body_write_timeout_seconds;
     let plan = meta.plan();
     let stream = futures::stream::unfold(
         (start, end, store, plan),
@@ -1122,7 +1184,22 @@ async fn download_response(
                 return None;
             }
             let chunk_end = (cur + MULTIPART_CHUNK_BYTES as u64 - 1).min(end);
-            match store.fetch_range_with_plan(&plan, cur, chunk_end).await {
+            let fetched = if body_write_timeout == 0 {
+                store.fetch_range_with_plan(&plan, cur, chunk_end).await
+            } else {
+                match tokio::time::timeout(
+                    Duration::from_secs(body_write_timeout),
+                    store.fetch_range_with_plan(&plan, cur, chunk_end),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(StoreError::RequestTimeout(
+                        "response body write timed out".to_string(),
+                    )),
+                }
+            };
+            match fetched {
                 Ok(bytes) => {
                     if bytes.is_empty() {
                         return None;
@@ -1668,6 +1745,149 @@ async fn access_log(State(state): State<AppState>, request: Request, next: Next)
     response
 }
 
+/// The in-flight cap that a request counts against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequestClass {
+    /// Every route counts against the global cap.
+    General,
+    /// An upload route counts against the upload cap too.
+    Upload,
+    /// A search or listing route counts against the search cap too.
+    SearchList,
+}
+
+/// Classify one request for the in-flight caps.
+///
+/// Uploads are the routes that read a request body into the store.
+/// Searches and listings are the routes that scan the bucket. Every
+/// other route counts against the global cap only.
+pub(crate) fn classify_request(method: &str, path: &str) -> RequestClass {
+    match method {
+        "POST"
+            if path == "/upload"
+                || path == "/v1/pastes"
+                || path == "/ui/upload"
+                || path == "/ui/create"
+                || path == "/ui/text"
+                || path.ends_with("/append") =>
+        {
+            RequestClass::Upload
+        }
+        "GET" if path == "/v1/pastes" || path == "/pastes" || path.ends_with("/search") => {
+            RequestClass::SearchList
+        }
+        _ => RequestClass::General,
+    }
+}
+
+/// One 503 response for a request over an in-flight cap.
+fn in_flight_limit_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(RETRY_AFTER, HeaderValue::from_static("1"))],
+        Json(serde_json::json!({
+            "error": "too many requests in flight",
+            "code": "in_flight_limit",
+            "retry_after_seconds": 1,
+        })),
+    )
+        .into_response()
+}
+
+/// Refuse a request when the process already holds too many.
+///
+/// The global cap is tried first, then the cap for the request class,
+/// in a fixed order. A refused request creates no task and reads no
+/// body. A permit is held for the whole request and released when the
+/// handler returns or the request ends.
+async fn in_flight_cap(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let class = classify_request(request.method().as_str(), request.uri().path());
+    let limits = state.in_flight.clone();
+    let mut permits = Vec::new();
+    for semaphore in [
+        limits.global.as_ref(),
+        match class {
+            RequestClass::Upload => limits.uploads.as_ref(),
+            RequestClass::SearchList => limits.search_list.as_ref(),
+            RequestClass::General => None,
+        },
+    ]
+    .into_iter()
+    .flatten()
+    {
+        match semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permits.push(permit),
+            Err(_) => {
+                if let Some(metrics) = state.metrics() {
+                    metrics.count_in_flight_limited();
+                }
+                return in_flight_limit_response();
+            }
+        }
+    }
+    let response = next.run(request).await;
+    drop(permits);
+    response
+}
+
+/// Fail one request past its overall deadline.
+///
+/// The deadline starts when the middleware runs and ends when the
+/// handler returns. A timed-out handler is dropped, so its task ends
+/// and any S3 call it waits on is cancelled. A zero deadline disables
+/// the check. The streamed response body after the handler returns is
+/// not covered here; the body-write deadline bounds that instead.
+async fn request_timeout(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let seconds = state.store().config.http_request_timeout_seconds;
+    if seconds == 0 {
+        return next.run(request).await;
+    }
+    match tokio::time::timeout(Duration::from_secs(seconds), next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => (
+            StatusCode::REQUEST_TIMEOUT,
+            Json(serde_json::json!({
+                "error": "request timed out",
+                "code": "request_timeout",
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Wrap a body stream so a gap between chunks past the deadline fails.
+///
+/// Each chunk must arrive within `seconds`. A gap past the deadline
+/// yields one [`StoreError::RequestTimeout`] and ends the stream, so
+/// the store writes no object for a stalled upload. A zero deadline
+/// passes the stream through unchanged.
+fn read_timeout_stream<S>(
+    stream: S,
+    seconds: u64,
+) -> impl futures::Stream<Item = Result<Bytes, StoreError>>
+where
+    S: futures::Stream<Item = Result<Bytes, StoreError>> + Send + Unpin + 'static,
+{
+    futures::stream::unfold(Some(stream), move |mut state| async move {
+        let mut inner = state.take()?;
+        let item = if seconds == 0 {
+            inner.next().await
+        } else {
+            match tokio::time::timeout(Duration::from_secs(seconds), inner.next()).await {
+                Ok(item) => item,
+                Err(_) => Some(Err(StoreError::RequestTimeout(
+                    "request body read timed out".to_string(),
+                ))),
+            }
+        };
+        match item {
+            Some(Ok(chunk)) => Some((Ok(chunk), Some(inner))),
+            Some(Err(error)) => Some((Err(error), None)),
+            None => None,
+        }
+    })
+}
+
 /// Refuse a client over its request budget.
 ///
 /// This runs inside [`client_context`], so the key is the same resolved
@@ -1732,6 +1952,11 @@ pub fn app_router(state: AppState) -> Router {
             map_method_not_allowed,
         ))
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            request_timeout,
+        ))
+        .layer(middleware::from_fn_with_state(state.clone(), in_flight_cap))
         .layer(middleware::from_fn_with_state(state.clone(), access_log))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1937,6 +2162,7 @@ async fn append_inner(state: &AppState, headers: &HeaderMap, id: &str, req: Requ
     }
     let store = state.store();
     let limit = store.config.max_text_paste_bytes();
+    let body_read_timeout = store.config.http_body_read_timeout_seconds;
     let known_length =
         header_str(headers, CONTENT_LENGTH.as_str()).and_then(|s| s.trim().parse::<u64>().ok());
     if let Some(len) = known_length {
@@ -1946,7 +2172,18 @@ async fn append_inner(state: &AppState, headers: &HeaderMap, id: &str, req: Requ
     }
     let mut stream = req.into_body().into_data_stream();
     let mut bytes = Vec::new();
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = if body_read_timeout == 0 {
+        stream.next().await
+    } else {
+        match tokio::time::timeout(Duration::from_secs(body_read_timeout), stream.next()).await {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                return error_response(StoreError::RequestTimeout(
+                    "request body read timed out".to_string(),
+                ));
+            }
+        }
+    } {
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(e) => return error_response(StoreError::Io(e.to_string())),
@@ -2182,6 +2419,15 @@ pub fn service_info(store: &Store) -> serde_json::Value {
             "max_file_bytes": config.max_file_bytes,
             "max_paste_bytes": config.max_paste_bytes,
             "search_max_bytes": config.search_max_bytes,
+            "http_request_timeout_seconds": config.http_request_timeout_seconds,
+            "http_body_read_timeout_seconds": config.http_body_read_timeout_seconds,
+            "http_body_write_timeout_seconds": config.http_body_write_timeout_seconds,
+            "http_max_in_flight": config.http_max_in_flight,
+            "http_max_uploads": config.http_max_uploads,
+            "http_max_search_list": config.http_max_search_list,
+            "s3_connect_timeout_seconds": config.s3_connect_timeout_seconds,
+            "s3_read_timeout_seconds": config.s3_read_timeout_seconds,
+            "s3_operation_timeout_seconds": config.s3_operation_timeout_seconds,
             "default_ttl_seconds": u64::from(config.default_ttl_days) * 86_400,
             "list_default_days": config.list_default_days,
             "min_ttl_seconds": u64::from(config.min_ttl_days) * 86_400,
@@ -2337,6 +2583,15 @@ mod tests {
             paste_tokens: false,
             expose_creator_addr: false,
             rate_limit_per_minute: 0,
+            http_request_timeout_seconds: 600,
+            http_body_read_timeout_seconds: 120,
+            http_body_write_timeout_seconds: 120,
+            http_max_in_flight: 256,
+            http_max_uploads: 32,
+            http_max_search_list: 32,
+            s3_connect_timeout_seconds: 5,
+            s3_read_timeout_seconds: 30,
+            s3_operation_timeout_seconds: 120,
             http_bearer_token: None,
             mcp_local_root: None,
             favicon: None,
@@ -2613,6 +2868,183 @@ mod tests {
             !polled.load(Ordering::SeqCst),
             "a refused upload must not read its body"
         );
+    }
+
+    async fn state_with_limits(
+        request_timeout: u64,
+        body_read_timeout: u64,
+        body_write_timeout: u64,
+        max_in_flight: u32,
+        max_uploads: u32,
+        max_search_list: u32,
+    ) -> AppState {
+        let mut config = test_config(10 * 1024 * 1024, 1024 * 1024 * 1024);
+        config.http_request_timeout_seconds = request_timeout;
+        config.http_body_read_timeout_seconds = body_read_timeout;
+        config.http_body_write_timeout_seconds = body_write_timeout;
+        config.http_max_in_flight = max_in_flight;
+        config.http_max_uploads = max_uploads;
+        config.http_max_search_list = max_search_list;
+        AppState::new(
+            Store::from_config(config)
+                .await
+                .expect("test S3 config must build without network access"),
+        )
+    }
+
+    /// An upload whose body never yields a chunk.
+    fn pending_upload_request(peer: SocketAddr) -> Request<Body> {
+        let body = Body::from_stream(futures::stream::pending::<Result<Bytes, std::io::Error>>());
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .body(body)
+            .expect("request must build");
+        request.extensions_mut().insert(ConnectInfo(peer));
+        request
+    }
+
+    #[tokio::test]
+    async fn a_stalled_upload_body_fails_with_408_within_the_body_read_deadline() {
+        let state = state_with_limits(0, 1, 0, 0, 0, 0).await;
+        let app = app_router(state);
+        let peer = SocketAddr::from(([198, 51, 100, 7], 40000));
+        let started = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            app.oneshot(pending_upload_request(peer)),
+        )
+        .await
+        .expect("a stalled upload must answer within 10 seconds")
+        .expect("router call must complete");
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a 1 second body-read deadline must fail fast"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_upload_fails_with_408_within_the_overall_deadline() {
+        let state = state_with_limits(1, 0, 0, 0, 0, 0).await;
+        let app = app_router(state);
+        let peer = SocketAddr::from(([198, 51, 100, 7], 40000));
+        let started = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            app.oneshot(pending_upload_request(peer)),
+        )
+        .await
+        .expect("a stalled upload must answer within 10 seconds")
+        .expect("router call must complete");
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a 1 second overall deadline must fail fast"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_upload_over_the_upload_cap_gets_503() {
+        let state = state_with_limits(0, 0, 0, 0, 1, 0).await;
+        let app = app_router(state);
+        let peer = SocketAddr::from(([198, 51, 100, 7], 40000));
+        let first = tokio::spawn(app.clone().oneshot(pending_upload_request(peer)));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            app.oneshot(pending_upload_request(peer)),
+        )
+        .await
+        .expect("a capped upload must answer within 10 seconds")
+        .expect("router call must complete");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("error body must be readable");
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("the error body must be JSON");
+        assert_eq!(value["code"], "in_flight_limit");
+        first.abort();
+    }
+
+    #[tokio::test]
+    async fn a_second_request_over_the_global_cap_gets_503() {
+        let state = state_with_limits(0, 0, 0, 1, 0, 0).await;
+        let app = app_router(state);
+        let peer = SocketAddr::from(([198, 51, 100, 7], 40000));
+        let first = tokio::spawn(app.clone().oneshot(pending_upload_request(peer)));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            app.oneshot(pending_upload_request(peer)),
+        )
+        .await
+        .expect("a capped request must answer within 10 seconds")
+        .expect("router call must complete");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        first.abort();
+    }
+
+    #[test]
+    fn request_classification_puts_uploads_search_and_list_in_their_own_caps() {
+        assert_eq!(classify_request("POST", "/upload"), RequestClass::Upload);
+        assert_eq!(classify_request("POST", "/v1/pastes"), RequestClass::Upload);
+        assert_eq!(
+            classify_request("POST", "/v1/pastes/2026-11-19/abc/append"),
+            RequestClass::Upload
+        );
+        assert_eq!(
+            classify_request("GET", "/v1/pastes"),
+            RequestClass::SearchList
+        );
+        assert_eq!(
+            classify_request("GET", "/v1/pastes/abc/search"),
+            RequestClass::SearchList
+        );
+        assert_eq!(
+            classify_request("GET", "/v1/pastes/abc"),
+            RequestClass::General
+        );
+        assert_eq!(classify_request("GET", "/"), RequestClass::General);
+        assert_eq!(classify_request("POST", "/mcp"), RequestClass::General);
+    }
+
+    #[tokio::test]
+    async fn a_second_search_over_the_search_cap_gets_503() {
+        let state = state_with_limits(0, 0, 0, 0, 0, 1).await;
+        let app = Router::new()
+            .route(
+                "/v1/pastes/{random}/search",
+                get(|| async { futures::future::pending::<Response>().await }),
+            )
+            .layer(middleware::from_fn_with_state(state.clone(), in_flight_cap))
+            .with_state(state);
+        let first = tokio::spawn(
+            app.clone().oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/pastes/abc/search")
+                    .body(Body::empty())
+                    .expect("request must build"),
+            ),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            app.oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/pastes/abc/search")
+                    .body(Body::empty())
+                    .expect("request must build"),
+            ),
+        )
+        .await
+        .expect("a capped search must answer within 10 seconds")
+        .expect("router call must complete");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        first.abort();
     }
 
     #[tokio::test]

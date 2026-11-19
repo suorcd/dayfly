@@ -27,6 +27,12 @@ network or localhost. A public instance needs the changes below.
 | `DAYFLY_LIST_REQUIRES_TOKEN` | `true` if listing stays on | Gates the list when it is on |
 | `DAYFLY_TRUSTED_PROXIES` | The proxy CIDR, for example `10.0.0.0/8` | Makes the per-client limits use the real client |
 | `DAYFLY_RATE_LIMIT_PER_MINUTE` | `60` or your value | Bounds request floods |
+| `DAYFLY_HTTP_MAX_IN_FLIGHT` | The default `256`, or lower | Bounds requests in flight; over the cap the process answers 503 |
+| `DAYFLY_HTTP_MAX_UPLOADS` | The default `32`, or lower | Bounds uploads in flight |
+| `DAYFLY_HTTP_MAX_SEARCH_LIST` | The default `32`, or lower | Bounds searches and listings in flight |
+| `DAYFLY_HTTP_REQUEST_TIMEOUT_SECONDS` | The default `600`, or lower | Bounds one request; past it the process answers 408 |
+| `DAYFLY_HTTP_BODY_READ_TIMEOUT_SECONDS` | The default `120`, or lower | Bounds the gap between upload chunks |
+| `DAYFLY_S3_OPERATION_TIMEOUT_SECONDS` | The default `120`, or lower | Bounds one S3 operation, including retries |
 | `DAYFLY_MAX_TEXT_BYTES` | A small value, for example `1048576` | Bounds one text paste |
 | `DAYFLY_MAX_FILE_BYTES` | A small value, for example `104857600` | Bounds one file paste |
 | `DAYFLY_MAX_PASTE_BYTES` | A small value, for example `104857600` | Bounds the total paste, including appends |
@@ -71,8 +77,15 @@ public instance. Do not leave the list open.
 - Set `client_max_body_size` at or above `DAYFLY_MAX_FILE_BYTES`, plus
   the form overhead.
 - Set `limit_req` and a connection limit. These act before the bytes
-  arrive.
+  arrive. They are defense in depth, not a substitute for the process
+  limits: keep them above the process caps, or the proxy sheds load the
+  process would have served.
 - Set body, header, and read timeouts for the largest upload you allow.
+  Keep the proxy read timeout above `DAYFLY_HTTP_BODY_READ_TIMEOUT_SECONDS`
+  and the proxy client-body timeout above the time a 100 MB upload needs,
+  or the proxy cuts a legal upload before the process limit is reached.
+  The process has no header timeout setting, so the proxy header timeout
+  is the bound for a header stall.
 - Preserve the public `Host` header.
 - Append to `X-Forwarded-For`. Do not replace it.
 - Set `X-Forwarded-Proto` to `https`.
@@ -134,6 +147,8 @@ objects and aliases. Stop the service during the pass, or keep
 - Expiry is read-time. The lifecycle sweep can run later than the TTL.
 - Listing is O(n) in objects scanned. It gets slower as the bucket grows.
 - The rate limiter is per process. A second replica has its own counters.
+- The in-flight caps and the request deadlines are per process too. A
+  second replica has its own caps and deadlines.
 - MCP sessions are in memory. A restart ends them.
 - The write gate is not a per-user identity. Use a proxy with identity if
   you need one.
