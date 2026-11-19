@@ -38,6 +38,7 @@ network or localhost. A public instance needs the changes below.
 | `DAYFLY_MAX_FILE_BYTES` | A small value, for example `104857600` | Bounds one file paste |
 | `DAYFLY_MAX_PASTE_BYTES` | A small value, for example `104857600` | Bounds the total paste, including appends |
 | `DAYFLY_SEARCH_MAX_BYTES` | A small value, for example `8388608` | Bounds one search |
+| `DAYFLY_SEARCH_PREFIX_MAX_BYTES` | A small value, for example `8388608` | Bounds the prefix scan before a search or a line-range read |
 | `DAYFLY_DEFAULT_TTL_DAYS` | A short value, for example `7` | Bounds the default retention |
 | `DAYFLY_MAX_TTL_DAYS` | The longest TTL you allow, for example `30` | Bounds an explicit TTL |
 | `DAYFLY_MIN_TTL_DAYS` | `1` | Rejects a sub-day TTL |

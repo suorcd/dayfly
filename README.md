@@ -476,6 +476,7 @@ permissions and the lower total cap.
 | `DAYFLY_CLEANUP_INTERVAL_SECONDS` | no | 0 | Interval in seconds between cleanup passes inside `serve`. `0` disables the loop. A positive value runs the same pass as `dayfly cleanup` on that interval. Enable the loop on exactly one writer per bucket |
 | `DAYFLY_CLEANUP_ON_STARTUP` | no | `false` | Run one cleanup pass shortly after startup. The pass runs only when `DAYFLY_CLEANUP_INTERVAL_SECONDS` is positive |
 | `DAYFLY_SEARCH_MAX_BYTES` | no | 67108864 (64 MiB) | Max bytes that one text search reads. The search returns `truncated` at the cap and the caller resumes with `next_offset`. Must be a positive number of bytes |
+| `DAYFLY_SEARCH_PREFIX_MAX_BYTES` | no | 67108864 (64 MiB) | Max bytes that a prefix scan reads before a text search or a line-range read. A search counts lines from byte 0 to `after_offset` before it reads the window; a line-range read scans from byte 0 to find the lines. A request past the cap fails with 413 and code `search_prefix_too_large`. Must be a positive number of bytes |
 | `DAYFLY_ALIAS_WORDS` | no | 3 | Number of words in a new alias. Allowed range 3 to 6. Resolution accepts 3 words up to this value |
 | `DAYFLY_DEFAULT_TTL_DAYS` | no | 7 | Default TTL in positive whole days when a request does not set a TTL. Must be within `DAYFLY_MIN_TTL_DAYS` (at least 1) and `DAYFLY_MAX_TTL_DAYS` |
 | `DAYFLY_MIN_TTL_DAYS` | no | 0 | Minimum TTL in whole days for an explicit TTL. `0` allows a TTL shorter than one day. A shorter value is rejected with 400 and `the minimum TTL is N days` |
@@ -1105,7 +1106,13 @@ The search response carries `hits`, `scanned_bytes`, `truncated`, and
 of the matching line), `preview` (the line with optional context, at
 most 4 KiB), and `ranges` (match byte ranges within the preview). The
 search is line-oriented: a match cannot span two lines. It reads at
-most `DAYFLY_SEARCH_MAX_BYTES` per call. When `truncated` is true, send
+most `DAYFLY_SEARCH_MAX_BYTES` per call. Before the window, it counts
+lines from byte 0 to `after_offset`. That prefix scan reads at most
+`DAYFLY_SEARCH_PREFIX_MAX_BYTES` (default 64 MiB). A request with
+`after_offset` past the cap returns 413 with code
+`search_prefix_too_large` and reads no prefix bytes. The same cap
+bounds a line-range read, which scans from byte 0 to find the lines.
+When `truncated` is true, send
 `next_offset` as `after_offset` to read the next page. The search uses
 no index and is O(bytes read). A binary paste returns 415 with code
 `not_text`. An invalid regular expression returns 400 with code
@@ -1132,7 +1139,7 @@ Every HTTP error carries a stable `code`. The current values are:
 `invalid_path`, `path_outside_root`, `local_files_disabled`,
 `alias_unavailable`, `io_error`, `s3_error`, `quota_exceeded`,
 `copy_limit`, `bucket_unavailable`, `partial_update`, `rate_limited`,
-and `method_not_allowed`. Do not parse the `error` text; branch on the
+`search_prefix_too_large`, and `method_not_allowed`. Do not parse the `error` text; branch on the
 `code`.
 
 The MCP tools use the same codes. A domain error returns a tool result
@@ -2019,8 +2026,10 @@ recorded here so readers can plan around them.
   network.
 - **Search is line-oriented and has no index.** A match cannot span two
   lines. One call reads at most `DAYFLY_SEARCH_MAX_BYTES`; a larger paste
-  needs `next_offset` pages. A long line is cut at the 4 KiB preview
-  limit, and its match range can be omitted.
+  needs `next_offset` pages. The prefix scan before the window and the
+  scan behind a line-range read each stop at
+  `DAYFLY_SEARCH_PREFIX_MAX_BYTES` (default 64 MiB). A long line is cut
+  at the 4 KiB preview limit, and its match range can be omitted.
 - **A title and tags use S3 user metadata.** Keep them small: 200 bytes
   for the title and 512 bytes for tags. AWS-compatible stores cap user
   metadata at 2 KB per object; verify the limit on your Garage build.

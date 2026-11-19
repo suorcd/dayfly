@@ -132,6 +132,16 @@ pub struct Config {
     /// The search returns `truncated` when it reaches this cap. The
     /// caller resumes with `next_offset`.
     pub search_max_bytes: u64,
+    /// Maximum bytes that a prefix scan reads before a text search or
+    /// a line-range read. Default: 64 MiB.
+    ///
+    /// A search counts newlines from byte 0 to `after_offset` before
+    /// it reads the search window. A line-range read scans from byte 0
+    /// to find the lines. Both scans stop at this cap and fail with
+    /// `search_prefix_too_large` instead of reading further. The cap
+    /// bounds S3 traffic per request: one search reads at most this
+    /// cap plus [`Self::search_max_bytes`].
+    pub search_prefix_max_bytes: u64,
     /// Number of words in a new alias. The allowed range is 3 to 6.
     /// Resolution accepts 3 words up to this value. Default: 3.
     pub alias_words: u8,
@@ -523,6 +533,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("67108864"),
         required: false,
         help: "Maximum bytes that one text search reads",
+    },
+    ConfigField {
+        name: "DAYFLY_SEARCH_PREFIX_MAX_BYTES",
+        value: Some("67108864"),
+        required: false,
+        help: "Maximum bytes that a prefix scan reads before a search or a line-range read",
     },
     ConfigField {
         name: "DAYFLY_ALIAS_WORDS",
@@ -1994,6 +2010,21 @@ impl Config {
                 "expected a positive number of bytes".to_string(),
             ));
         }
+        let search_prefix_max_bytes = record(
+            &mut faults,
+            optional_u64(
+                &lookup,
+                "DAYFLY_SEARCH_PREFIX_MAX_BYTES",
+                field_u64("DAYFLY_SEARCH_PREFIX_MAX_BYTES", 64 * 1024 * 1024),
+            ),
+            64 * 1024 * 1024,
+        );
+        if search_prefix_max_bytes == 0 {
+            faults.push(ConfigError::Invalid(
+                "DAYFLY_SEARCH_PREFIX_MAX_BYTES".to_string(),
+                "expected a positive number of bytes".to_string(),
+            ));
+        }
         let alias_words = record(
             &mut faults,
             optional_u32(
@@ -2376,6 +2407,7 @@ impl Config {
                 cleanup_interval_seconds,
                 cleanup_on_startup,
                 search_max_bytes,
+                search_prefix_max_bytes,
                 alias_words,
                 default_ttl_days: default_ttl_days.unwrap_or(7),
                 min_ttl_days,
@@ -2490,7 +2522,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} s3_force_path_style={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} multipart_abort_after_seconds={} cleanup_interval_seconds={} cleanup_on_startup={} search_max_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} write_requires_token={} list_requires_token={} paste_tokens={} expose_creator_addr={} rate_limit_per_minute={} http_request_timeout_seconds={} http_body_read_timeout_seconds={} http_body_write_timeout_seconds={} http_max_in_flight={} http_max_uploads={} http_max_search_list={} s3_connect_timeout_seconds={} s3_read_timeout_seconds={} s3_operation_timeout_seconds={} log_format={} metrics_bind={} metrics_allowed_networks={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
+            "bucket={} endpoint_scheme={} region={} s3_force_path_style={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} multipart_abort_after_seconds={} cleanup_interval_seconds={} cleanup_on_startup={} search_max_bytes={} search_prefix_max_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} write_requires_token={} list_requires_token={} paste_tokens={} expose_creator_addr={} rate_limit_per_minute={} http_request_timeout_seconds={} http_body_read_timeout_seconds={} http_body_write_timeout_seconds={} http_max_in_flight={} http_max_uploads={} http_max_search_list={} s3_connect_timeout_seconds={} s3_read_timeout_seconds={} s3_operation_timeout_seconds={} log_format={} metrics_bind={} metrics_allowed_networks={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -2506,6 +2538,7 @@ impl Config {
             self.cleanup_interval_seconds,
             self.cleanup_on_startup,
             self.search_max_bytes,
+            self.search_prefix_max_bytes,
             self.alias_words,
             self.default_ttl_days,
             self.list_default_days,
@@ -2880,6 +2913,7 @@ mod tests {
             cleanup_interval_seconds: 0,
             cleanup_on_startup: false,
             search_max_bytes: 64 * 1024 * 1024,
+            search_prefix_max_bytes: 64 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,
             min_ttl_days: 0,

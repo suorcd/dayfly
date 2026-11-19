@@ -2205,6 +2205,36 @@ async fn search_route_returns_hits_and_rejects_binary_and_bad_patterns() {
 }
 
 #[tokio::test]
+async fn search_route_rejects_after_offset_past_prefix_bound() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.search_prefix_max_bytes = 1024;
+    let store = Store::from_config(config)
+        .await
+        .expect("the test store must build");
+    let stored = store
+        .store_text(
+            "0123456789abcdef0123456789abcde\n".repeat(128).as_bytes(),
+            None,
+            Some("text/plain"),
+            None,
+        )
+        .await
+        .expect("the text must store");
+    let app = common::app(store);
+
+    let request = common::request(
+        "GET",
+        &format!("/v1/pastes/{}/search?q=abcde&after_offset=2048", stored.id),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(common::json_body(&body)["code"], "search_prefix_too_large");
+}
+
+#[tokio::test]
 async fn upload_accepts_a_title_and_tags_and_list_filters_on_them() {
     let fake = FakeS3::start().await;
     let app = common::app(fake.store().await);
@@ -4120,6 +4150,7 @@ async fn well_known_service_description_reports_live_limits_without_auth() {
     assert_eq!(json["limits"]["max_file_bytes"], 5_678);
     assert_eq!(json["limits"]["max_paste_bytes"], 1024 * 1024 * 1024);
     assert_eq!(json["limits"]["search_max_bytes"], 64 * 1024 * 1024);
+    assert_eq!(json["limits"]["search_prefix_max_bytes"], 64 * 1024 * 1024);
     assert_eq!(json["limits"]["default_ttl_seconds"], 7 * 86_400);
     assert_eq!(json["limits"]["list_default_days"], 2);
     assert_eq!(json["limits"]["max_ttl_seconds"], 3_650 * 86_400);

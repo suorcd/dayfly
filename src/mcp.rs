@@ -243,6 +243,7 @@ fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> 
         StoreError::NotFound(_)
         | StoreError::Expired(_)
         | StoreError::TooLarge { .. }
+        | StoreError::SearchPrefixTooLarge { .. }
         | StoreError::TooManySegments { .. }
         | StoreError::AmbiguousId(_)
         | StoreError::NotText(_)
@@ -677,7 +678,7 @@ impl Pastebin {
     }
 
     #[tool(
-        description = "Search one text paste by id or word alias. Returns matching lines with a 1-based line number, the byte offset of the line, a preview with optional context, and match byte ranges in the preview. Set regex for a regular expression and ignore_case for case-insensitive matching. The scan is bounded by DAYFLY_SEARCH_MAX_BYTES; when truncated is true, pass next_offset as after_offset to read the next page."
+        description = "Search one text paste by id or word alias. Returns matching lines with a 1-based line number, the byte offset of the line, a preview with optional context, and match byte ranges in the preview. Set regex for a regular expression and ignore_case for case-insensitive matching. The prefix scan is bounded by DAYFLY_SEARCH_PREFIX_MAX_BYTES and the window by DAYFLY_SEARCH_MAX_BYTES; when truncated is true, pass next_offset as after_offset to read the next page."
     )]
     async fn search_text(
         &self,
