@@ -2024,6 +2024,8 @@ mod tests {
             max_file_bytes: 1024 * 1024 * 1024,
             max_paste_bytes: 1024 * 1024 * 1024,
             multipart_abort_after_seconds: 3_600,
+            cleanup_interval_seconds: 0,
+            cleanup_on_startup: false,
             search_max_bytes: 64 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,

@@ -26,6 +26,11 @@ pub struct Metrics {
     s3_requests: IntCounterVec,
     rate_limited: IntCounter,
     multipart_orphans: IntCounter,
+    cleanup_runs: IntCounter,
+    cleanup_pastes_deleted: IntCounter,
+    cleanup_aliases_deleted: IntCounter,
+    cleanup_failures: IntCounter,
+    cleanup_last_success: IntGauge,
 }
 
 impl Metrics {
@@ -120,6 +125,36 @@ impl Metrics {
         )
         .expect("multipart orphan counter must be valid");
 
+        let cleanup_runs = IntCounter::new(
+            "dayfly_cleanup_runs_total",
+            "Cleanup passes run by the periodic cleanup loop.",
+        )
+        .expect("cleanup run counter must be valid");
+
+        let cleanup_pastes_deleted = IntCounter::new(
+            "dayfly_cleanup_pastes_deleted_total",
+            "Expired pastes deleted by the periodic cleanup loop.",
+        )
+        .expect("cleanup paste counter must be valid");
+
+        let cleanup_aliases_deleted = IntCounter::new(
+            "dayfly_cleanup_aliases_deleted_total",
+            "Expired aliases deleted by the periodic cleanup loop.",
+        )
+        .expect("cleanup alias counter must be valid");
+
+        let cleanup_failures = IntCounter::new(
+            "dayfly_cleanup_failures_total",
+            "Failed cleanup items counted by the periodic cleanup loop, plus one for each pass that returns an error.",
+        )
+        .expect("cleanup failure counter must be valid");
+
+        let cleanup_last_success = IntGauge::new(
+            "dayfly_cleanup_last_success_timestamp_seconds",
+            "Unix time of the last cleanup pass that finished with no failures.",
+        )
+        .expect("cleanup success gauge must be valid");
+
         let collectors: Vec<Box<dyn prometheus::core::Collector>> = vec![
             Box::new(build_info),
             Box::new(http_requests.clone()),
@@ -131,6 +166,11 @@ impl Metrics {
             Box::new(s3_requests.clone()),
             Box::new(rate_limited.clone()),
             Box::new(multipart_orphans.clone()),
+            Box::new(cleanup_runs.clone()),
+            Box::new(cleanup_pastes_deleted.clone()),
+            Box::new(cleanup_aliases_deleted.clone()),
+            Box::new(cleanup_failures.clone()),
+            Box::new(cleanup_last_success.clone()),
         ];
         for collector in collectors {
             registry
@@ -154,6 +194,11 @@ impl Metrics {
             s3_requests,
             rate_limited,
             multipart_orphans,
+            cleanup_runs,
+            cleanup_pastes_deleted,
+            cleanup_aliases_deleted,
+            cleanup_failures,
+            cleanup_last_success,
         }
     }
 
@@ -220,6 +265,31 @@ impl Metrics {
     /// Record one stale multipart upload that the sweep aborted.
     pub fn count_multipart_orphan(&self) {
         self.multipart_orphans.inc();
+    }
+
+    /// Record one cleanup pass that returned a report.
+    ///
+    /// A pass with no failures updates the last-success timestamp. A
+    /// pass with failures counts each failed item and leaves the
+    /// timestamp alone.
+    pub fn observe_cleanup_pass(&self, pastes_deleted: u64, aliases_deleted: u64, failures: u64) {
+        self.cleanup_runs.inc();
+        self.cleanup_pastes_deleted.inc_by(pastes_deleted);
+        self.cleanup_aliases_deleted.inc_by(aliases_deleted);
+        self.cleanup_failures.inc_by(failures);
+        if failures == 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|age| age.as_secs() as i64)
+                .unwrap_or(0);
+            self.cleanup_last_success.set(now);
+        }
+    }
+
+    /// Record one cleanup pass that returned an error before it reported.
+    pub fn observe_cleanup_pass_error(&self) {
+        self.cleanup_runs.inc();
+        self.cleanup_failures.inc();
     }
 }
 

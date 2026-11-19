@@ -441,6 +441,34 @@ fn spawn_multipart_sweeper(handle: StoreHandle) {
     });
 }
 
+/// Start the periodic cleanup loop when the interval is positive.
+///
+/// The first pass runs shortly after startup when
+/// `DAYFLY_CLEANUP_ON_STARTUP` is set, or after one interval
+/// otherwise. A zero interval leaves the loop off. The loop is an
+/// alternative scheduler, not a replacement for `dayfly cleanup`.
+fn maybe_spawn_cleanup_loop(handle: StoreHandle, metrics: Option<Arc<Metrics>>, config: &Config) {
+    if config.cleanup_interval_seconds == 0 {
+        if config.cleanup_on_startup {
+            tracing::warn!(
+                "DAYFLY_CLEANUP_ON_STARTUP is set but DAYFLY_CLEANUP_INTERVAL_SECONDS is 0; the cleanup loop stays off"
+            );
+        }
+        return;
+    }
+    let first_pass_delay = if config.cleanup_on_startup {
+        dayfly::cleanup_loop::CLEANUP_STARTUP_DELAY
+    } else {
+        Duration::from_secs(config.cleanup_interval_seconds)
+    };
+    dayfly::cleanup_loop::spawn_cleanup_loop(handle, metrics, first_pass_delay);
+    tracing::info!(
+        "cleanup loop: interval {} seconds, startup pass {}",
+        config.cleanup_interval_seconds,
+        config.cleanup_on_startup
+    );
+}
+
 /// Print one line per cleanup item and a final count line.
 fn print_cleanup_report(report: &CleanupReport, dry_run: bool) {
     for item in &report.multipart.aborted {
@@ -579,11 +607,13 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Serve { bind }) => {
             let bind_addr = serve_bind.unwrap_or(bind.unwrap_or_else(|| config.http_bind.clone()));
+            let cleanup_metrics = metrics.clone();
             let state = match metrics {
                 Some(metrics) => AppState::with_metrics(store, metrics),
                 None => AppState::new(store),
             };
             spawn_multipart_sweeper(state.store_handle());
+            maybe_spawn_cleanup_loop(state.store_handle(), cleanup_metrics, &config);
             // Report the bucket lifecycle rules once. The check is best
             // effort and does not delay the listener.
             let lifecycle_state = state.clone();
