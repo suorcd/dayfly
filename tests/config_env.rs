@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use dayfly::config::{Config, ConfigError};
 
-const VARS: [&str; 44] = [
+const VARS: [&str; 45] = [
     "S3_ENDPOINT",
     "S3_BUCKET",
     "S3_REGION",
@@ -32,6 +32,7 @@ const VARS: [&str; 44] = [
     "DAYFLY_METRICS_BIND",
     "DAYFLY_METRICS_ALLOWED_NETWORKS",
     "DAYFLY_TRUSTED_PROXIES",
+    "DAYFLY_PUBLIC_BASE_URL",
     "DAYFLY_LIST_REQUIRES_TOKEN",
     "DAYFLY_WRITE_REQUIRES_TOKEN",
     "DAYFLY_PASTE_TOKENS",
@@ -137,8 +138,33 @@ fn minimal_environment_applies_documented_defaults() {
     assert!(config.security_txt.is_none());
     assert!(!config.view_line_numbers);
     assert!(config.inline_pdf);
+    assert_eq!(config.public_base_url, None);
     assert_eq!(config.http_bearer_token, None);
     assert_eq!(config.mcp_local_root, None);
+}
+
+#[test]
+fn public_base_url_parses_and_rejects_a_non_http_url() {
+    let _guard = lock_env();
+    clear_env();
+    set_required();
+    env::set_var("DAYFLY_PUBLIC_BASE_URL", "https://dayfly.example/");
+    let config = Config::from_env().expect("a base URL must parse");
+    assert_eq!(
+        config.public_base_url.as_deref(),
+        Some("https://dayfly.example")
+    );
+
+    for value in ["ftp://dayfly.example", "dayfly.example", "https://"] {
+        env::set_var("DAYFLY_PUBLIC_BASE_URL", value);
+        let error = Config::from_env()
+            .err()
+            .expect("a non-HTTP base URL must fail");
+        assert!(
+            error.to_string().contains("DAYFLY_PUBLIC_BASE_URL"),
+            "got: {error}"
+        );
+    }
 }
 
 #[test]

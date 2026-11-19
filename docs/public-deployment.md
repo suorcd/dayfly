@@ -26,6 +26,7 @@ network or localhost. A public instance needs the changes below.
 | `DAYFLY_LIST_ENABLED` | `false` | Turns off every listing route |
 | `DAYFLY_LIST_REQUIRES_TOKEN` | `true` if listing stays on | Gates the list when it is on |
 | `DAYFLY_TRUSTED_PROXIES` | The proxy CIDR, for example `10.0.0.0/8` | Makes the per-client limits use the real client |
+| `DAYFLY_PUBLIC_BASE_URL` | Your public base URL, for example `https://dayfly.example` | Returned paste URLs use this base, not the request headers |
 | `DAYFLY_RATE_LIMIT_PER_MINUTE` | `60` or your value | Bounds request floods |
 | `DAYFLY_HTTP_MAX_IN_FLIGHT` | The default `256`, or lower | Bounds requests in flight; over the cap the process answers 503 |
 | `DAYFLY_HTTP_MAX_UPLOADS` | The default `32`, or lower | Bounds uploads in flight |
@@ -89,6 +90,9 @@ public instance. Do not leave the list open.
 - Preserve the public `Host` header.
 - Append to `X-Forwarded-For`. Do not replace it.
 - Set `X-Forwarded-Proto` to `https`.
+- Set `DAYFLY_PUBLIC_BASE_URL` to the public base URL. Without it, the
+  service returns relative paste URLs unless the proxy is listed in
+  `DAYFLY_TRUSTED_PROXIES`.
 - Do not expose the metrics listener through the proxy.
 - Do not cache a paste response.
 

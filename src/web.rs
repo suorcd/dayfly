@@ -40,7 +40,7 @@ use std::collections::HashMap;
 
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 
-use axum::extract::{DefaultBodyLimit, Extension, Multipart, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Extension, Multipart, Path, Query, Request, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN, REFERER};
 use axum::http::uri::{Authority, Uri};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -54,9 +54,9 @@ use serde::Deserialize;
 use crate::client_addr::ClientAddr;
 use crate::config::{parse_bool_flag, Config, LISTING_DISABLED_MESSAGE};
 use crate::http::{
-    check_auth, check_list_access, check_paste_control, check_read_auth, public_base,
-    read_metadata_field, split_tags, status_for, AppState, ListAccessError, MultipartFieldError,
-    MULTIPART_METADATA_MAX_BYTES,
+    check_auth, check_list_access, check_paste_control, check_read_auth, peer_is_trusted,
+    public_base, read_metadata_field, split_tags, status_for, AppState, ListAccessError,
+    MultipartFieldError, MULTIPART_METADATA_MAX_BYTES,
 };
 use crate::store::{
     default_list_window, parse_list_window_request, ListWindowRequest, PasteFields, PasteSummary,
@@ -566,8 +566,9 @@ fn filename_cell(filename: Option<&str>) -> String {
 
 /// Shell examples for the new-paste page.
 ///
-/// The base URL comes from the request, so the examples use the scheme
-/// and host that the reader used. The bearer value stays an environment
+/// The base URL is the configured public base, or the request base when
+/// the request came through a trusted proxy. Without either, the page
+/// shows no examples. The bearer value stays an environment
 /// placeholder: the configured token never appears in the page.
 fn curl_hint(base: &str, bearer: bool) -> String {
     let auth = if bearer {
@@ -744,11 +745,16 @@ fn forbidden_page() -> Response {
     response
 }
 
-async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn index_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    req: Request,
+) -> Response {
     if let Err(resp) = check_read_auth(&state, &headers) {
         return resp;
     }
     let store = state.store();
+    let peer_trusted = peer_is_trusted(&req, &store.config);
     let footer = Footer::from_config(&store.config);
     let default_ttl = store.config.default_ttl_days;
     let max_file_bytes = store.config.max_file_paste_bytes();
@@ -783,7 +789,7 @@ async fn index_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
         ttl_options(&store.config, default_ttl),
     );
     body.push_str(DROPZONE_SCRIPT);
-    if let Some(base) = public_base(&headers) {
+    if let Some(base) = public_base(&headers, &store.config, peer_trusted) {
         body.push_str(&curl_hint(&base, store.config.http_bearer_token.is_some()));
     }
     page(&footer, "New paste", Some("/"), false, &body).into_response()
@@ -2054,6 +2060,7 @@ mod tests {
             metrics_bind: None,
             metrics_allowed_networks: Vec::new(),
             trusted_proxies: Vec::new(),
+            public_base_url: None,
             show_words: false,
             show_internal_paths: false,
             inline_pdf: true,

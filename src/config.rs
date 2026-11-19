@@ -209,6 +209,18 @@ pub struct Config {
     /// that is not a listed proxy is the client. See "Access model" in the
     /// README.
     pub trusted_proxies: Vec<Cidr>,
+    /// Optional public base URL for paste URLs in API responses and for
+    /// the curl examples on the home page.
+    ///
+    /// Default: unset. When set, it must use `http://` or `https://`,
+    /// with no trailing slash, and it wins over every request header.
+    /// When unset, a paste URL is relative unless the socket peer is a
+    /// listed [`Self::trusted_proxies`] entry, in which case the `Host`
+    /// header and `X-Forwarded-Proto` supply the base. A request from
+    /// any other peer gets a relative URL, so a forged `Host` header
+    /// cannot change the authority of a returned URL. See "Access model"
+    /// in the README.
+    pub public_base_url: Option<String>,
     /// Whether a non-loopback bind may run without a bearer token.
     ///
     /// Default: `false`. With the default, `serve` refuses a bind address
@@ -404,6 +416,8 @@ const MAX_SITE_NAME_CHARS: usize = 80;
 const MAX_CONTACT_CHARS: usize = 200;
 /// Maximum characters in `DAYFLY_AUP_URL`.
 const MAX_AUP_URL_CHARS: usize = 500;
+/// Maximum characters in `DAYFLY_PUBLIC_BASE_URL`.
+const MAX_PUBLIC_BASE_URL_CHARS: usize = 500;
 
 /// A favicon image loaded at startup.
 #[derive(Clone, PartialEq, Eq)]
@@ -593,6 +607,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some(""),
         required: false,
         help: "Comma-separated CIDRs of proxies whose X-Forwarded-For is trusted, for example 10.0.0.0/8",
+    },
+    ConfigField {
+        name: "DAYFLY_PUBLIC_BASE_URL",
+        value: None,
+        required: false,
+        help: "Optional public base URL for paste URLs, for example https://dayfly.example",
     },
     ConfigField {
         name: "DAYFLY_ALLOW_UNAUTHENTICATED",
@@ -2098,6 +2118,31 @@ impl Config {
             field_default("DAYFLY_HTTP_BIND").unwrap_or("127.0.0.1:8080"),
         );
         let trusted_proxies = record(&mut faults, trusted_proxies(&lookup), Vec::new());
+        let public_base_url =
+            match optional_url(&lookup, "DAYFLY_PUBLIC_BASE_URL", MAX_PUBLIC_BASE_URL_CHARS) {
+                Ok(Some(value)) => {
+                    let mut value = value;
+                    while value.len() > 8 && value.ends_with('/') {
+                        value.pop();
+                    }
+                    let host_start = if value.starts_with("https://") { 8 } else { 7 };
+                    let host = value[host_start..].split('/').next().unwrap_or("");
+                    if host.is_empty() {
+                        faults.push(ConfigError::Invalid(
+                            "DAYFLY_PUBLIC_BASE_URL".to_string(),
+                            "expected an http:// or https:// URL with a host".to_string(),
+                        ));
+                        None
+                    } else {
+                        Some(value)
+                    }
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    faults.push(error);
+                    None
+                }
+            };
         let show_words = record_bool(
             &mut faults,
             &lookup,
@@ -2345,6 +2390,7 @@ impl Config {
                 metrics_bind,
                 metrics_allowed_networks,
                 trusted_proxies,
+                public_base_url,
                 show_words,
                 show_internal_paths,
                 inline_pdf,
@@ -2848,6 +2894,7 @@ mod tests {
             metrics_bind: None,
             metrics_allowed_networks: Vec::new(),
             trusted_proxies: Vec::new(),
+            public_base_url: None,
             show_words: true,
             show_internal_paths: false,
             inline_pdf: true,
@@ -3420,6 +3467,42 @@ mod tests {
             30 * 86_400,
             "a paste above the cap must get the minimum"
         );
+    }
+
+    #[test]
+    fn public_base_url_defaults_to_unset() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert_eq!(config.public_base_url, None);
+    }
+
+    #[test]
+    fn public_base_url_parses_and_drops_a_trailing_slash() {
+        let mut pairs = base_env();
+        pairs.push((
+            "DAYFLY_PUBLIC_BASE_URL".to_string(),
+            "https://dayfly.example/".to_string(),
+        ));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("base URL config");
+        assert_eq!(
+            config.public_base_url.as_deref(),
+            Some("https://dayfly.example")
+        );
+    }
+
+    #[test]
+    fn public_base_url_rejects_a_non_http_url() {
+        for value in ["ftp://dayfly.example", "dayfly.example", "https://"] {
+            let mut pairs = base_env();
+            pairs.push(("DAYFLY_PUBLIC_BASE_URL".to_string(), value.to_string()));
+            let error = Config::from_lookup(lookup_from(&pairs))
+                .err()
+                .expect("a non-HTTP base URL must be refused");
+            let message = error.to_string();
+            assert!(
+                message.contains("DAYFLY_PUBLIC_BASE_URL"),
+                "the error must name the setting: {message}"
+            );
+        }
     }
 
     #[test]

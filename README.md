@@ -199,6 +199,15 @@ front this service, and do not leave a path around them: a direct
 connection from an unlisted address is attributed to that address. This
 setting is what makes a per-client limit meaningful behind an ingress.
 
+`DAYFLY_PUBLIC_BASE_URL` sets the public base for paste URLs in API
+responses and for the curl examples on the home page. When it is set,
+it wins over every request header. When it is unset, the service builds
+the base from the `Host` header and `X-Forwarded-Proto` only when the
+socket peer is a listed `DAYFLY_TRUSTED_PROXIES` entry. A request from
+any other peer gets a relative URL, so a forged `Host` header cannot
+change the authority of a returned URL. Set the variable on a public
+instance, or list the proxy, so clients get usable absolute URLs.
+
 `DAYFLY_LIST_ENABLED` turns listing off for every transport. With the
 default `true`, listing works. With `false`, the human `/pastes` page,
 `GET /v1/pastes`, and the MCP `list_recent` tool all refuse with 403 and
@@ -481,6 +490,7 @@ permissions and the lower total cap.
 | `DAYFLY_METRICS_BIND` | no | (unset) | Private bind address for the Prometheus metrics listener. Unset starts no metrics listener. The public listener never serves `/metrics` |
 | `DAYFLY_METRICS_ALLOWED_NETWORKS` | no | (empty) | Comma-separated CIDR blocks allowed to scrape the metrics listener. A loopback bind needs no list. A non-loopback bind is refused at startup without a list. The check uses the socket peer, not `X-Forwarded-For` |
 | `DAYFLY_TRUSTED_PROXIES` | no | (empty) | Comma-separated CIDR blocks (bare addresses are single hosts) of reverse proxies whose `X-Forwarded-For` header is believed. Empty keeps the socket peer as the client and ignores forwarding headers. The chain is walked from the right; a malformed or over-long chain falls back to the peer with one warning. Set this before any per-client limit behind an ingress |
+| `DAYFLY_PUBLIC_BASE_URL` | no | (unset) | Optional public base URL for paste URLs in API responses and the curl examples on the home page, for example `https://dayfly.example`. It must use `http://` or `https://`. When set, it wins over every request header. When unset, the `Host` header and `X-Forwarded-Proto` supply the base only when the socket peer is a listed `DAYFLY_TRUSTED_PROXIES` entry; any other peer gets a relative URL |
 | `DAYFLY_RATE_LIMIT_PER_MINUTE` | no | 0 | Maximum requests per client per minute. 0 disables the limiter and allocates no counters. The burst is this value, and the bucket refills at this rate. Over the limit → 429 with `Retry-After`. Keyed on the resolved client address, so set `DAYFLY_TRUSTED_PROXIES` behind an ingress. Per process; resets on restart |
 | `DAYFLY_HTTP_REQUEST_TIMEOUT_SECONDS` | no | 600 | Longest time in seconds for one HTTP request, from headers to the end of the handler. Past it → 408 and the handler task ends. 0 disables the deadline |
 | `DAYFLY_HTTP_BODY_READ_TIMEOUT_SECONDS` | no | 120 | Longest gap in seconds between two chunks of one request body. A stalled upload → 408 and writes no object. 0 disables the deadline |
@@ -592,6 +602,7 @@ first, then the file. These settings take effect on the next request:
 - `DAYFLY_FAVICON_PATH`, `DAYFLY_ROBOTS_TXT_PATH`, and
   `DAYFLY_SECURITY_TXT_PATH`
 - `DAYFLY_TRUSTED_PROXIES`
+- `DAYFLY_PUBLIC_BASE_URL`
 - `DAYFLY_METRICS_ALLOWED_NETWORKS`
 - `DAYFLY_WRITE_REQUIRES_TOKEN`
 - `DAYFLY_LIST_ENABLED`

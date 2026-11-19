@@ -77,11 +77,12 @@ fn multipart_headers(boundary: &str) -> Vec<(&'static str, String)> {
 #[tokio::test]
 async fn raw_text_upload_returns_plain_url_or_json() {
     let fake = FakeS3::start().await;
-    let store = fake.store().await;
+    let mut store = fake.store().await;
+    store.config.trusted_proxies = vec!["10.0.0.0/8".parse().expect("proxy CIDR must parse")];
     let app = common::app(store);
 
     let body = b"hello".to_vec();
-    let request = common::request(
+    let mut request = common::request(
         "POST",
         "/upload",
         &[
@@ -92,6 +93,9 @@ async fn raw_text_upload_returns_plain_url_or_json() {
         ],
         body,
     );
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([10, 0, 0, 5], 40000))));
     let (status, headers, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::CREATED);
     assert!(headers
@@ -108,7 +112,7 @@ async fn raw_text_upload_returns_plain_url_or_json() {
     assert!(fake.object(&format!("pastes/{id}")).is_some());
 
     let body = b"json body".to_vec();
-    let request = common::request(
+    let mut request = common::request(
         "POST",
         "/v1/pastes?format=json",
         &[
@@ -118,6 +122,9 @@ async fn raw_text_upload_returns_plain_url_or_json() {
         ],
         body,
     );
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([10, 0, 0, 5], 40000))));
     let (status, _, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::CREATED);
     let json = common::json_body(&body);
@@ -134,9 +141,131 @@ async fn raw_text_upload_returns_plain_url_or_json() {
 }
 
 #[tokio::test]
-async fn plain_upload_response_exposes_the_id_and_the_alias_in_headers() {
+async fn a_spoofed_host_and_proto_do_not_change_the_returned_paste_url() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
+    let app = common::app(store);
+
+    let body = b"spoof me".to_vec();
+    let request = common::request(
+        "POST",
+        "/upload",
+        &[
+            ("host", "evil.test".to_string()),
+            ("x-forwarded-proto", "https".to_string()),
+            ("content-type", "text/plain".to_string()),
+            content_length(body.len()),
+        ],
+        body,
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let text = String::from_utf8(body).expect("plain response must be UTF-8");
+    assert!(
+        text.starts_with("/v1/pastes/"),
+        "an untrusted peer must get a relative URL, got: {text}"
+    );
+    assert!(
+        !text.contains("evil.test"),
+        "the spoofed host must not reach the response: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_configured_public_base_wins_over_spoofed_headers() {
+    let fake = FakeS3::start().await;
+    let mut store = fake.store().await;
+    store.config.public_base_url = Some("https://dayfly.example".to_string());
+    let app = common::app(store);
+
+    let body = b"configured base".to_vec();
+    let request = common::request(
+        "POST",
+        "/upload?format=json",
+        &[
+            ("host", "evil.test".to_string()),
+            ("x-forwarded-proto", "http".to_string()),
+            ("content-type", "text/plain".to_string()),
+            content_length(body.len()),
+        ],
+        body,
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let json = common::json_body(&body);
+    assert_eq!(
+        json["url"],
+        format!(
+            "https://dayfly.example/v1/pastes/{}",
+            json["id"].as_str().unwrap()
+        ),
+        "the configured base must win over the spoofed host and scheme"
+    );
+
+    let body = b"appended".to_vec();
+    let request = common::request(
+        "POST",
+        &format!("/v1/pastes/{}/append", json["id"].as_str().unwrap()),
+        &[
+            ("host", "evil.test".to_string()),
+            ("content-type", "text/plain".to_string()),
+            content_length(body.len()),
+        ],
+        body,
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let json = common::json_body(&body);
+    assert_eq!(
+        json["url"],
+        format!(
+            "https://dayfly.example/v1/pastes/{}",
+            json["id"].as_str().unwrap()
+        ),
+        "the append response must use the same configured base"
+    );
+}
+
+#[tokio::test]
+async fn a_trusted_proxy_forwarded_proto_sets_the_returned_scheme() {
+    let fake = FakeS3::start().await;
+    let mut store = fake.store().await;
+    store.config.trusted_proxies = vec!["10.0.0.0/8".parse().expect("proxy CIDR must parse")];
+    let app = common::app(store);
+
+    let body = b"trusted proxy".to_vec();
+    let mut request = common::request(
+        "POST",
+        "/upload?format=json",
+        &[
+            ("host", "dayfly.test".to_string()),
+            ("x-forwarded-proto", "https".to_string()),
+            ("content-type", "text/plain".to_string()),
+            content_length(body.len()),
+        ],
+        body,
+    );
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([10, 0, 0, 5], 40000))));
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let json = common::json_body(&body);
+    assert_eq!(
+        json["url"],
+        format!(
+            "https://dayfly.test/v1/pastes/{}",
+            json["id"].as_str().unwrap()
+        ),
+        "a trusted proxy may supply the scheme"
+    );
+}
+
+#[tokio::test]
+async fn plain_upload_response_exposes_the_id_and_the_alias_in_headers() {
+    let fake = FakeS3::start().await;
+    let mut store = fake.store().await;
+    store.config.public_base_url = Some("http://dayfly.test".to_string());
     let app = common::app(store);
 
     let body = b"header paste".to_vec();
@@ -188,7 +317,8 @@ async fn plain_upload_response_exposes_the_id_and_the_alias_in_headers() {
 #[tokio::test]
 async fn json_upload_response_keeps_its_fields_and_has_no_plain_headers() {
     let fake = FakeS3::start().await;
-    let store = fake.store().await;
+    let mut store = fake.store().await;
+    store.config.public_base_url = Some("http://dayfly.test".to_string());
     let app = common::app(store);
 
     let body = b"json fields".to_vec();
