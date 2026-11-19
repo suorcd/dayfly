@@ -38,6 +38,7 @@ use futures::StreamExt;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
@@ -263,7 +264,12 @@ pub(crate) async fn check_paste_control(
             return Ok(());
         }
         if paste_token.is_some() {
-            tracing::warn!(id = %id, "paste token check failed");
+            // The offered token is never logged. The ID is logged only
+            // as a short hash unless the operator opted into raw IDs.
+            tracing::warn!(
+                paste_id = %log_paste_id(id, store.config.log_raw_paste_ids),
+                "paste token check failed"
+            );
         }
         return Err(unauthorized_response());
     }
@@ -1560,8 +1566,11 @@ async fn delete_bare(
 /// reads the same value. An unusable chain falls back to the socket peer
 /// with one warning.
 ///
-/// The method, path, and resolved address are safe to log. Never log the
-/// offered credential or the expected credential.
+/// The method and resolved address are safe to log. Never log the
+/// offered credential or the expected credential. Never log a raw paste
+/// ID or a full paste path: a bare ID resolves the paste, so log the
+/// short hash from [`log_paste_id`] unless the operator opted into raw
+/// IDs. Never log the query string.
 async fn client_context(
     State(state): State<AppState>,
     mut request: Request,
@@ -1571,11 +1580,12 @@ async fn client_context(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|info| info.0);
-    let (trusted, expose_creator_addr) = {
+    let (trusted, expose_creator_addr, log_raw_paste_ids) = {
         let store = state.store();
         (
             store.config.trusted_proxies.clone(),
             store.config.expose_creator_addr,
+            store.config.log_raw_paste_ids,
         )
     };
     let client =
@@ -1592,7 +1602,7 @@ async fn client_context(
                         peer = %peer_label,
                         reason = %reason,
                         method = %request.method(),
-                        path = %request.uri().path(),
+                        paste_id = %log_paste_id_from_path(request.uri().path(), log_raw_paste_ids),
                         "ignoring an unusable X-Forwarded-For chain"
                     );
                     peer.ip()
@@ -1603,7 +1613,7 @@ async fn client_context(
         request.extensions_mut().insert(ClientAddr(address));
     }
     let method = request.method().clone();
-    let path = request.uri().path().to_string();
+    let paste_id = log_paste_id_from_path(request.uri().path(), log_raw_paste_ids);
     let response = next.run(request).await;
     if response.status() == StatusCode::UNAUTHORIZED {
         let client_label = if expose_creator_addr {
@@ -1613,7 +1623,7 @@ async fn client_context(
         } else {
             String::new()
         };
-        tracing::warn!(%method, %path, client = %client_label, "auth check failed");
+        tracing::warn!(%method, paste_id = %paste_id, client = %client_label, "auth check failed");
     }
     response
 }
@@ -1636,8 +1646,9 @@ fn route_template(request: &Request) -> String {
 
 /// The paste ID or alias in an API path, when the path has one.
 ///
-/// The value is a name, not a credential. It is safe to log. The query
-/// string is never read.
+/// A bare ID resolves the paste, so the value is a capability, not a
+/// plain name. Never log it raw: pass it through [`log_paste_id`]
+/// first. The query string is never read.
 fn paste_id_from_path(path: &str) -> Option<&str> {
     let rest = path
         .strip_prefix("/v1/pastes/")
@@ -1663,6 +1674,43 @@ fn paste_id_from_path(path: &str) -> Option<&str> {
 fn is_date_component(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 10 && bytes[4] == b'-' && bytes[7] == b'-'
+}
+
+/// A short, stable hash of a paste ID or alias for log lines.
+///
+/// The first 8 hex characters of the SHA-256 of the ID, prefixed with
+/// `sha256:`. The hash stays stable for one ID, so log lines for the
+/// same paste still correlate. Eight hex characters (32 bits) are
+/// enough to correlate log lines and short enough to read, and a hash
+/// does not resolve the paste.
+pub(crate) fn redact_paste_id(id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(id.as_bytes());
+    let digest = hasher.finalize();
+    format!(
+        "sha256:{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3]
+    )
+}
+
+/// The paste ID as it may appear in a log line: the raw ID only when
+/// the operator opted in with `DAYFLY_LOG_RAW_PASTE_IDS`, else the
+/// short hash from [`redact_paste_id`].
+fn log_paste_id(id: &str, log_raw: bool) -> String {
+    if log_raw {
+        id.to_string()
+    } else {
+        redact_paste_id(id)
+    }
+}
+
+/// The log form of the paste ID in `path`: the raw ID only when the
+/// operator opted in, else its short hash, else an empty string when
+/// the path carries no paste ID.
+fn log_paste_id_from_path(path: &str, log_raw: bool) -> String {
+    paste_id_from_path(path)
+        .map(|id| log_paste_id(id, log_raw))
+        .unwrap_or_default()
 }
 
 /// The paste API operation that a route performs.
@@ -1722,9 +1770,8 @@ async fn access_log(State(state): State<AppState>, request: Request, next: Next)
     let started = Instant::now();
     let method = request.method().as_str().to_string();
     let route = route_template(&request);
-    let paste_id = paste_id_from_path(request.uri().path())
-        .unwrap_or("")
-        .to_string();
+    let log_raw_paste_ids = state.store().config.log_raw_paste_ids;
+    let paste_id = log_paste_id_from_path(request.uri().path(), log_raw_paste_ids);
     let client = if state.store().config.expose_creator_addr {
         request
             .extensions()
@@ -2626,6 +2673,7 @@ mod tests {
             retention_max_days: 365,
             http_bind: "127.0.0.1:0".to_string(),
             log_format: crate::config::LogFormat::Text,
+            log_raw_paste_ids: false,
             metrics_bind: None,
             metrics_allowed_networks: Vec::new(),
             trusted_proxies: Vec::new(),
@@ -3758,6 +3806,51 @@ mod tests {
         );
         assert_eq!(paste_id_from_path("/v1/pastes"), None);
         assert_eq!(paste_id_from_path("/v1/pastes/"), None);
+    }
+
+    #[test]
+    fn redacted_paste_id_is_a_stable_short_hash_without_the_raw_id() {
+        let first = redact_paste_id("AbC123dEf456GhI789jKlM");
+        let second = redact_paste_id("AbC123dEf456GhI789jKlM");
+        assert_eq!(first, second, "the hash must stay stable for one ID");
+        assert!(first.starts_with("sha256:"), "hash: {first}");
+        assert_eq!(first.len(), "sha256:".len() + 8, "hash: {first}");
+        assert!(
+            first["sha256:".len()..]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit()),
+            "hash: {first}"
+        );
+        assert!(
+            !first.contains("AbC123dEf456GhI789jKlM"),
+            "the hash must not carry the raw ID: {first}"
+        );
+    }
+
+    #[test]
+    fn redacted_paste_id_differs_between_ids() {
+        assert_ne!(
+            redact_paste_id("AbC123dEf456GhI789jKlM"),
+            redact_paste_id("ZzY987xWv654UtS321rQpO")
+        );
+    }
+
+    #[test]
+    fn log_paste_id_returns_the_raw_id_only_when_the_opt_in_is_on() {
+        assert_eq!(
+            log_paste_id("AbC123dEf456GhI789jKlM", true),
+            "AbC123dEf456GhI789jKlM"
+        );
+        assert_eq!(
+            log_paste_id("AbC123dEf456GhI789jKlM", false),
+            redact_paste_id("AbC123dEf456GhI789jKlM")
+        );
+        assert_eq!(log_paste_id_from_path("/v1/pastes", false), "");
+        assert!(
+            log_paste_id_from_path("/v1/pastes/AbC123dEf456GhI789jKlM", false)
+                .starts_with("sha256:"),
+            "a paste path must hash by default"
+        );
     }
 
     #[test]

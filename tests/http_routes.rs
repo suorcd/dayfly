@@ -2650,7 +2650,7 @@ async fn cross_origin_api_upload_is_forbidden() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn failed_bearer_check_logs_method_path_and_client() {
+async fn failed_bearer_check_logs_method_paste_hash_and_client() {
     let fake = FakeS3::start().await;
     let mut store = fake.store().await;
     store.config.http_bearer_token = Some("correct-horse-battery-staple".to_string());
@@ -2684,7 +2684,18 @@ async fn failed_bearer_check_logs_method_path_and_client() {
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).expect("logs must be UTF-8");
     assert!(logs.contains("WARN"), "expected one warning, got: {logs}");
     assert!(logs.contains("method=GET"), "got: {logs}");
-    assert!(logs.contains("path=/v1/pastes/example"), "got: {logs}");
+    assert!(
+        logs.contains("paste_id=sha256:"),
+        "the auth failure must carry the ID hash, got: {logs}"
+    );
+    assert!(
+        !logs.contains("/v1/pastes/example"),
+        "the raw paste path must not be logged, got: {logs}"
+    );
+    assert!(
+        !logs.contains("example"),
+        "the raw alias must not appear in any log line, got: {logs}"
+    );
     assert!(logs.contains("client=127.0.0.1"), "got: {logs}");
     assert!(
         !logs.contains("127.0.0.1:4567"),
