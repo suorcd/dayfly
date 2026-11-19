@@ -2302,6 +2302,7 @@ mod tests {
             endpoint: endpoint.to_string(),
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
+            s3_force_path_style: true,
             access_key_id: "test-access-key".to_string(),
             secret_access_key: "test-secret-key".to_string(),
             max_text_bytes,

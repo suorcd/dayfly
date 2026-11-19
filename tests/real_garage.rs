@@ -11,6 +11,9 @@
 //! cargo test --test real_garage -- --ignored --test-threads=1
 //! ```
 //!
+//! Set `DAYFLY_TEST_S3_FORCE_PATH_STYLE=false` to run the same tests
+//! against a virtual-hosted endpoint. The default is path style.
+//!
 //! The default `cargo test` run never reaches a network service.
 
 use std::path::Path;
@@ -32,10 +35,15 @@ fn test_config() -> Config {
         .unwrap_or_else(|_| panic!("set DAYFLY_TEST_S3_ACCESS_KEY_ID"));
     let secret_access_key = std::env::var("DAYFLY_TEST_S3_SECRET_ACCESS_KEY")
         .unwrap_or_else(|_| panic!("set DAYFLY_TEST_S3_SECRET_ACCESS_KEY"));
+    let s3_force_path_style = std::env::var("DAYFLY_TEST_S3_FORCE_PATH_STYLE")
+        .ok()
+        .and_then(|value| dayfly::config::parse_bool_flag(&value))
+        .unwrap_or(true);
     Config {
         endpoint,
         bucket,
         region: std::env::var("DAYFLY_TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
+        s3_force_path_style,
         access_key_id,
         secret_access_key,
         max_text_bytes: 10 * 1024 * 1024,

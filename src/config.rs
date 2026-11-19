@@ -86,6 +86,13 @@ pub struct Config {
     pub endpoint: String,
     pub bucket: String,
     pub region: String,
+    /// Whether the S3 client uses path-style addressing.
+    ///
+    /// Default: `true`. With the default, a request targets
+    /// `endpoint/bucket/key`. When this is `false`, a request targets
+    /// `bucket.endpoint/key`. Garage uses the default. Set this to
+    /// `false` only for an endpoint that accepts virtual-hosted style.
+    pub s3_force_path_style: bool,
     pub access_key_id: String,
     pub secret_access_key: String,
     /// Maximum size, in bytes, for a text paste. Enforced by the MCP
@@ -403,6 +410,12 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("us-east-1"),
         required: false,
         help: "Signing region for Garage",
+    },
+    ConfigField {
+        name: "S3_FORCE_PATH_STYLE",
+        value: Some("true"),
+        required: false,
+        help: "Use path-style S3 addressing; false uses virtual-hosted addressing",
     },
     ConfigField {
         name: "DAYFLY_MAX_TEXT_BYTES",
@@ -1901,6 +1914,12 @@ impl Config {
             "S3_REGION",
             field_default("S3_REGION").unwrap_or("us-east-1"),
         );
+        let s3_force_path_style = record_bool(
+            &mut faults,
+            &lookup,
+            "S3_FORCE_PATH_STYLE",
+            field_default("S3_FORCE_PATH_STYLE") == Some("true"),
+        );
         let access_key_id = record(
             &mut faults,
             credential(&lookup, "S3_ACCESS_KEY_ID"),
@@ -2095,6 +2114,7 @@ impl Config {
                 endpoint,
                 bucket,
                 region,
+                s3_force_path_style,
                 access_key_id,
                 secret_access_key,
                 max_text_bytes,
@@ -2208,7 +2228,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} multipart_abort_after_seconds={} cleanup_interval_seconds={} cleanup_on_startup={} search_max_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} write_requires_token={} list_requires_token={} paste_tokens={} expose_creator_addr={} rate_limit_per_minute={} log_format={} metrics_bind={} metrics_allowed_networks={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
+            "bucket={} endpoint_scheme={} region={} s3_force_path_style={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} multipart_abort_after_seconds={} cleanup_interval_seconds={} cleanup_on_startup={} search_max_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} write_requires_token={} list_requires_token={} paste_tokens={} expose_creator_addr={} rate_limit_per_minute={} log_format={} metrics_bind={} metrics_allowed_networks={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -2216,6 +2236,7 @@ impl Config {
                 "http"
             },
             self.region,
+            self.s3_force_path_style,
             self.max_text_bytes,
             self.max_file_bytes,
             self.max_paste_bytes,
@@ -2578,6 +2599,7 @@ mod tests {
             endpoint: "http://127.0.0.1:1".to_string(),
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
+            s3_force_path_style: true,
             access_key_id: "test-access-key".to_string(),
             secret_access_key: "test-secret-key".to_string(),
             max_text_bytes,
@@ -2951,6 +2973,52 @@ mod tests {
         assert!(!config.retention_by_size);
         assert_eq!(config.retention_min_days, 30);
         assert_eq!(config.retention_max_days, 365);
+    }
+
+    #[test]
+    fn s3_force_path_style_defaults_to_true() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert!(config.s3_force_path_style);
+        assert!(
+            config.safe_summary().contains("s3_force_path_style=true"),
+            "the startup summary must name the path style: {}",
+            config.safe_summary()
+        );
+    }
+
+    #[test]
+    fn s3_force_path_style_accepts_false_spellings() {
+        for value in ["false", "0", "no", "off"] {
+            let mut pairs = base_env();
+            pairs.push(("S3_FORCE_PATH_STYLE".to_string(), value.to_string()));
+            let config = Config::from_lookup(lookup_from(&pairs)).expect("path style config");
+            assert!(
+                !config.s3_force_path_style,
+                "value {value} must disable path style"
+            );
+            assert!(
+                config.safe_summary().contains("s3_force_path_style=false"),
+                "the startup summary must name the path style: {}",
+                config.safe_summary()
+            );
+        }
+    }
+
+    #[test]
+    fn s3_force_path_style_rejects_invalid_values() {
+        let mut pairs = base_env();
+        pairs.push(("S3_FORCE_PATH_STYLE".to_string(), "maybe".to_string()));
+        let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+        match error {
+            ConfigError::Invalid(name, message) => {
+                assert_eq!(name, "S3_FORCE_PATH_STYLE");
+                assert!(
+                    message.contains("true or false"),
+                    "message must name the accepted values: {message}"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]
