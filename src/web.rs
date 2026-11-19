@@ -393,13 +393,20 @@ const COPY_LINK_SCRIPT: &str = r#"<script>
 })();
 </script>"#;
 
+/// Build one page. `active` names the nav href for the current page, and
+/// `show_heading` controls the `<h1>`. Pages that repeat a nav label keep
+/// the heading off.
+///
+/// Every page carries `Cache-Control: private, no-store`. Pages render
+/// paste content, and some show a one-time paste token, so no cache may
+/// store them.
 fn page(
     footer: &Footer,
     title: &str,
     active: Option<&str>,
     show_heading: bool,
     body: &str,
-) -> Html<String> {
+) -> Response {
     let title = html_escape(title);
     let nav: String = NAV_ITEMS
         .iter()
@@ -411,9 +418,14 @@ fn page(
         String::new()
     };
     let footer = footer.render();
-    Html(format!(
+    let mut response = Html(format!(
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title} — dayfly</title>\n<style>{CSS}</style>\n</head>\n<body>\n<header><nav><span class=\"prompt\">~/dayfly $</span>{nav}</nav></header>\n{heading}{body}\n<footer>{footer}</footer>\n</body>\n</html>\n"
     ))
+    .into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    response
 }
 
 /// Footer content derived from the active configuration.
@@ -476,7 +488,7 @@ fn nav_link(href: &str, label: &str, active: Option<&str>) -> String {
 }
 
 /// A themed 404 page for a path that matches no route.
-pub(crate) fn not_found_page(footer: &Footer, path: &str) -> Html<String> {
+pub(crate) fn not_found_page(footer: &Footer, path: &str) -> Response {
     let path = html_escape(path);
     let body = format!(
         "<div class=\"not-found\">\
@@ -500,7 +512,7 @@ pub(crate) fn not_found_page(footer: &Footer, path: &str) -> Html<String> {
 }
 
 /// A styled 405 page for a path that does not accept the method.
-pub(crate) fn method_not_allowed_page(footer: &Footer, path: &str) -> Html<String> {
+pub(crate) fn method_not_allowed_page(footer: &Footer, path: &str) -> Response {
     page(
         footer,
         "Method not allowed",
@@ -722,11 +734,15 @@ pub(crate) fn api_write_allowed(headers: &HeaderMap) -> bool {
 }
 
 fn forbidden_page() -> Response {
-    (
+    let mut response = (
         StatusCode::FORBIDDEN,
         Html("<p>Forbidden: the request origin does not match the Host header.</p>".to_string()),
     )
-        .into_response()
+        .into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    response
 }
 
 async fn index_handler(
@@ -918,11 +934,7 @@ fn created_response(stored: &StoredPaste, store: &Store, footer: &Footer) -> Res
          <input type=\"hidden\" name=\"paste_token\" value=\"{token}\">\
          <button type=\"submit\">Delete this paste</button></form>"
     );
-    let mut response = page(footer, "Paste created", None, true, &body).into_response();
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response
+    page(footer, "Paste created", None, true, &body)
 }
 
 /// Reject an obviously oversized multipart request from its Content-Length
@@ -2060,6 +2072,15 @@ mod tests {
             paste_tokens: false,
             expose_creator_addr: false,
             rate_limit_per_minute: 0,
+            http_request_timeout_seconds: 600,
+            http_body_read_timeout_seconds: 120,
+            http_body_write_timeout_seconds: 120,
+            http_max_in_flight: 256,
+            http_max_uploads: 32,
+            http_max_search_list: 32,
+            s3_connect_timeout_seconds: 5,
+            s3_read_timeout_seconds: 30,
+            s3_operation_timeout_seconds: 120,
             http_bearer_token: None,
             mcp_local_root: None,
             favicon: None,
@@ -2422,16 +2443,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn page_escapes_the_title() {
-        let rendered = page(
+    /// Read a response body as text.
+    async fn response_body(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body must read");
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn page_escapes_the_title() {
+        let response = page(
             &Footer::default(),
             "<script>alert(1)</script>",
             None,
             true,
             "",
-        )
-        .0;
+        );
+        let rendered = response_body(response).await;
         assert!(
             rendered.contains("<title>&lt;script&gt;alert(1)&lt;/script&gt; — dayfly</title>"),
             "the title tag must be escaped: {rendered}"
@@ -2443,9 +2472,25 @@ mod tests {
         assert!(!rendered.contains("<script>alert(1)</script>"));
     }
 
-    #[test]
-    fn footer_defaults_to_internal_use() {
-        let rendered = page(&Footer::default(), "Home", None, true, "").0;
+    #[tokio::test]
+    async fn page_carries_no_store() {
+        let response = page(&Footer::default(), "Home", None, true, "");
+        assert_eq!(
+            response.headers()[CACHE_CONTROL],
+            "private, no-store",
+            "a dynamic page must not be cached"
+        );
+        let rendered = response_body(response).await;
+        assert!(
+            rendered.contains("<footer>dayfly — internal use only · &copy; 2026 suorcd</footer>"),
+            "the default footer must keep the internal-use text: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn footer_defaults_to_internal_use() {
+        let response = page(&Footer::default(), "Home", None, true, "");
+        let rendered = response_body(response).await;
         assert!(
             rendered.contains("<footer>dayfly — internal use only · &copy; 2026 suorcd</footer>"),
             "the default footer must keep the internal-use text: {rendered}"

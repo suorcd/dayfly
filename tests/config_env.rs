@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use dayfly::config::{Config, ConfigError};
 
-const VARS: [&str; 36] = [
+const VARS: [&str; 45] = [
     "S3_ENDPOINT",
     "S3_BUCKET",
     "S3_REGION",
@@ -38,6 +38,15 @@ const VARS: [&str; 36] = [
     "DAYFLY_PASTE_TOKENS",
     "DAYFLY_EXPOSE_CREATOR_ADDR",
     "DAYFLY_RATE_LIMIT_PER_MINUTE",
+    "DAYFLY_HTTP_REQUEST_TIMEOUT_SECONDS",
+    "DAYFLY_HTTP_BODY_READ_TIMEOUT_SECONDS",
+    "DAYFLY_HTTP_BODY_WRITE_TIMEOUT_SECONDS",
+    "DAYFLY_HTTP_MAX_IN_FLIGHT",
+    "DAYFLY_HTTP_MAX_UPLOADS",
+    "DAYFLY_HTTP_MAX_SEARCH_LIST",
+    "DAYFLY_S3_CONNECT_TIMEOUT_SECONDS",
+    "DAYFLY_S3_READ_TIMEOUT_SECONDS",
+    "DAYFLY_S3_OPERATION_TIMEOUT_SECONDS",
     "DAYFLY_SHOW_WORDS",
     "DAYFLY_SHOW_INTERNAL_PATHS",
     "DAYFLY_INLINE_PDF",
@@ -112,6 +121,15 @@ fn minimal_environment_applies_documented_defaults() {
     assert_eq!(config.retention_min_days, 30);
     assert_eq!(config.retention_max_days, 365);
     assert!(!config.paste_tokens);
+    assert_eq!(config.http_request_timeout_seconds, 600);
+    assert_eq!(config.http_body_read_timeout_seconds, 120);
+    assert_eq!(config.http_body_write_timeout_seconds, 120);
+    assert_eq!(config.http_max_in_flight, 256);
+    assert_eq!(config.http_max_uploads, 32);
+    assert_eq!(config.http_max_search_list, 32);
+    assert_eq!(config.s3_connect_timeout_seconds, 5);
+    assert_eq!(config.s3_read_timeout_seconds, 30);
+    assert_eq!(config.s3_operation_timeout_seconds, 120);
     assert_eq!(config.http_bind, "127.0.0.1:8080");
     assert!(config.show_words);
     assert!(!config.show_internal_paths);

@@ -3,11 +3,13 @@
 mod common;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::extract::ConnectInfo;
 use axum::http::{header, StatusCode};
 use chrono::{Duration, Utc};
 use common::FakeS3;
+use dayfly::config::{Favicon, TextAsset};
 use dayfly::http::MULTIPART_METADATA_MAX_BYTES;
 use dayfly::store::Store;
 
@@ -1721,7 +1723,7 @@ async fn assert_token_result_page(
         response_headers
             .get(header::CACHE_CONTROL)
             .and_then(|value| value.to_str().ok()),
-        Some("no-store"),
+        Some("private, no-store"),
         "{route} must not cache the token page"
     );
     assert!(
@@ -2397,4 +2399,65 @@ async fn list_page_uses_the_same_body_width_as_the_paste_page() {
         !view.contains("class=\"wide\""),
         "the paste page must not widen the body"
     );
+}
+
+#[tokio::test]
+async fn dynamic_pages_carry_no_store() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"hello", None, None, None)
+        .await
+        .expect("text must store");
+    let app = common::app(store);
+
+    for uri in [
+        "/".to_string(),
+        format!("/view/{}", stored.id),
+        "/pastes".to_string(),
+    ] {
+        let request = common::request("GET", &uri, &[], Vec::new());
+        let (status, headers, _) = common::send(&app, request).await;
+        assert_eq!(status, StatusCode::OK, "{uri} must render");
+        assert_eq!(
+            headers[header::CACHE_CONTROL],
+            "private, no-store",
+            "{uri} must not be cached"
+        );
+    }
+}
+
+#[tokio::test]
+async fn static_assets_stay_cacheable() {
+    let fake = FakeS3::start().await;
+    let mut config = fake.config();
+    config.favicon = Some(Favicon {
+        bytes: Arc::from(b"fake-png".as_slice()),
+        content_type: "image/png",
+    });
+    config.robots_txt = Some(TextAsset {
+        bytes: Arc::from(b"User-agent: *\n".as_slice()),
+    });
+    config.security_txt = Some(TextAsset {
+        bytes: Arc::from(b"Contact: mailto:security@example.com\n".as_slice()),
+    });
+    let store = Store::from_config(config)
+        .await
+        .expect("the asset store must build");
+    let app = common::app(store);
+
+    for (uri, cache) in [
+        ("/favicon.ico", "public, max-age=86400"),
+        ("/robots.txt", "public, max-age=3600"),
+        ("/.well-known/security.txt", "public, max-age=3600"),
+    ] {
+        let request = common::request("GET", uri, &[], Vec::new());
+        let (status, headers, _) = common::send(&app, request).await;
+        assert_eq!(status, StatusCode::OK, "{uri} must serve");
+        assert_eq!(
+            headers[header::CACHE_CONTROL],
+            cache,
+            "{uri} must keep its cache policy"
+        );
+    }
 }

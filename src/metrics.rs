@@ -25,6 +25,7 @@ pub struct Metrics {
     paste_operations: IntCounterVec,
     s3_requests: IntCounterVec,
     rate_limited: IntCounter,
+    in_flight_limited: IntCounter,
     multipart_orphans: IntCounter,
     cleanup_runs: IntCounter,
     cleanup_pastes_deleted: IntCounter,
@@ -119,6 +120,12 @@ impl Metrics {
         )
         .expect("rate limit counter must be valid");
 
+        let in_flight_limited = IntCounter::new(
+            "dayfly_in_flight_limited_total",
+            "Requests refused by the in-flight cap.",
+        )
+        .expect("in-flight limit counter must be valid");
+
         let multipart_orphans = IntCounter::new(
             "dayfly_multipart_orphans_aborted_total",
             "Incomplete multipart uploads aborted by the stale-upload sweep.",
@@ -165,6 +172,7 @@ impl Metrics {
             Box::new(paste_operations.clone()),
             Box::new(s3_requests.clone()),
             Box::new(rate_limited.clone()),
+            Box::new(in_flight_limited.clone()),
             Box::new(multipart_orphans.clone()),
             Box::new(cleanup_runs.clone()),
             Box::new(cleanup_pastes_deleted.clone()),
@@ -193,6 +201,7 @@ impl Metrics {
             paste_operations,
             s3_requests,
             rate_limited,
+            in_flight_limited,
             multipart_orphans,
             cleanup_runs,
             cleanup_pastes_deleted,
@@ -260,6 +269,11 @@ impl Metrics {
     /// Record one request refused by the rate limiter.
     pub fn count_rate_limited(&self) {
         self.rate_limited.inc();
+    }
+
+    /// Record one request refused by the in-flight cap.
+    pub fn count_in_flight_limited(&self) {
+        self.in_flight_limited.inc();
     }
 
     /// Record one stale multipart upload that the sweep aborted.

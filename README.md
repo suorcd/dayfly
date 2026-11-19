@@ -247,6 +247,51 @@ a client that can change its address gets a fresh one. Set
 `DAYFLY_TRUSTED_PROXIES` first, or every request is attributed to the
 ingress and shares one bucket.
 
+### Request deadlines and in-flight caps
+
+A slow client or a stalled S3 endpoint must not hold a task forever.
+Four settings bound the HTTP side. `DAYFLY_HTTP_REQUEST_TIMEOUT_SECONDS`
+(default 600) bounds one request from headers to the end of the handler;
+past it the response is 408 and the handler task ends. A zero value
+disables the deadline. `DAYFLY_HTTP_BODY_READ_TIMEOUT_SECONDS` (default
+120) bounds the gap between two chunks of one request body; a stalled
+upload fails with 408 and writes no object. `DAYFLY_HTTP_BODY_WRITE_TIMEOUT_SECONDS`
+(default 120) bounds the gap between two chunks of one response body; a
+stalled download aborts its body stream. The body deadlines are per
+chunk, not per body, so a slow but steady 100 MB upload still fits
+inside the overall deadline. The header read has no setting here:
+`axum::serve` exposes no header timeout, so a header stall is bounded
+only by the connection handling below it. A proxy in front of the
+service can bound it instead; see below.
+
+Three settings cap in-flight work. `DAYFLY_HTTP_MAX_IN_FLIGHT` (default
+256) caps every request at once. `DAYFLY_HTTP_MAX_UPLOADS` (default 32)
+caps uploads: `POST /upload`, `POST /v1/pastes`, appends, and the human
+upload routes. `DAYFLY_HTTP_MAX_SEARCH_LIST` (default 32) caps searches
+and listings. A request above a cap gets 503 with `Retry-After: 1` and
+creates no task. A zero value disables that cap. The caps are set at
+startup: a reload reports a cap change and warns that a restart is
+needed. The timeouts apply on reload. The service document reports all
+nine values under `limits`. The metrics listener counts refused
+requests as `dayfly_in_flight_limited_total`.
+
+Three settings bound the S3 client. `DAYFLY_S3_CONNECT_TIMEOUT_SECONDS`
+(default 5) bounds the connect. `DAYFLY_S3_READ_TIMEOUT_SECONDS`
+(default 30) bounds the gap between two reads of one S3 response.
+`DAYFLY_S3_OPERATION_TIMEOUT_SECONDS` (default 120) bounds one S3
+operation including retries. A zero value is a startup error: a
+stalled endpoint must fail, not hold the request task. The S3 timeouts
+apply on reload with the new store.
+
+A reverse proxy adds defense in depth, not a substitute for these
+process limits. Set a proxy read timeout above the body-read deadline
+and a proxy client-body timeout above the time a 100 MB upload needs,
+or the proxy will cut a legal upload before the process limit is
+reached. Keep the proxy connection and request limits above the process
+caps, or the proxy sheds load the process would have served. The
+process limits still apply to a direct connection that bypasses the
+proxy, so do not leave a direct path around it.
+
 `DAYFLY_RETENTION_BY_SIZE` bounds storage cost over time without a
 database. It shortens the expiry of a large paste. A public instance
 should set it, because a request limit does not bound the bytes that one
@@ -447,6 +492,15 @@ permissions and the lower total cap.
 | `DAYFLY_TRUSTED_PROXIES` | no | (empty) | Comma-separated CIDR blocks (bare addresses are single hosts) of reverse proxies whose `X-Forwarded-For` header is believed. Empty keeps the socket peer as the client and ignores forwarding headers. The chain is walked from the right; a malformed or over-long chain falls back to the peer with one warning. Set this before any per-client limit behind an ingress |
 | `DAYFLY_PUBLIC_BASE_URL` | no | (unset) | Optional public base URL for paste URLs in API responses and the curl examples on the home page, for example `https://dayfly.example`. It must use `http://` or `https://`. When set, it wins over every request header. When unset, the `Host` header and `X-Forwarded-Proto` supply the base only when the socket peer is a listed `DAYFLY_TRUSTED_PROXIES` entry; any other peer gets a relative URL |
 | `DAYFLY_RATE_LIMIT_PER_MINUTE` | no | 0 | Maximum requests per client per minute. 0 disables the limiter and allocates no counters. The burst is this value, and the bucket refills at this rate. Over the limit → 429 with `Retry-After`. Keyed on the resolved client address, so set `DAYFLY_TRUSTED_PROXIES` behind an ingress. Per process; resets on restart |
+| `DAYFLY_HTTP_REQUEST_TIMEOUT_SECONDS` | no | 600 | Longest time in seconds for one HTTP request, from headers to the end of the handler. Past it → 408 and the handler task ends. 0 disables the deadline |
+| `DAYFLY_HTTP_BODY_READ_TIMEOUT_SECONDS` | no | 120 | Longest gap in seconds between two chunks of one request body. A stalled upload → 408 and writes no object. 0 disables the deadline |
+| `DAYFLY_HTTP_BODY_WRITE_TIMEOUT_SECONDS` | no | 120 | Longest gap in seconds between two chunks of one response body. A stalled download aborts its body stream. 0 disables the deadline |
+| `DAYFLY_HTTP_MAX_IN_FLIGHT` | no | 256 | Maximum HTTP requests in flight at once. Over the cap → 503 with `Retry-After: 1`. 0 disables the cap. A change needs a restart |
+| `DAYFLY_HTTP_MAX_UPLOADS` | no | 32 | Maximum uploads in flight at once (`POST /upload`, `POST /v1/pastes`, appends, human upload routes). Over the cap → 503. 0 disables the cap. A change needs a restart |
+| `DAYFLY_HTTP_MAX_SEARCH_LIST` | no | 32 | Maximum searches and listings in flight at once. Over the cap → 503. 0 disables the cap. A change needs a restart |
+| `DAYFLY_S3_CONNECT_TIMEOUT_SECONDS` | no | 5 | Longest time in seconds to connect to the S3 endpoint. Must be positive |
+| `DAYFLY_S3_READ_TIMEOUT_SECONDS` | no | 30 | Longest gap in seconds between two reads of one S3 response. Must be positive |
+| `DAYFLY_S3_OPERATION_TIMEOUT_SECONDS` | no | 120 | Longest time in seconds for one S3 operation including retries. Must be positive |
 | `DAYFLY_ALLOW_UNAUTHENTICATED` | no | `false` | Accept a non-loopback bind with no bearer token. Startup refuses that bind without this value, and with it the service writes one warning. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_WRITE_REQUIRES_TOKEN` | no | `false` | Require the bearer token for writes while reads stay anonymous. It requires `DAYFLY_HTTP_BEARER_TOKEN`. Uploads, appends, deletes, expiry changes, the human write routes, and `/mcp` require the token. Downloads, metadata, search, `/raw`, the human index and view pages, and listing stay anonymous unless `DAYFLY_LIST_REQUIRES_TOKEN` gates the list. A paste token still authorizes its own delete, patch, and append. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_LIST_ENABLED` | no | `true` | Allow listing on every transport. `false` makes `/pastes`, `GET /v1/pastes`, and the MCP `list_recent` tool return 403 with "Listing is turned off on this instance." It wins over `DAYFLY_LIST_REQUIRES_TOKEN`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |

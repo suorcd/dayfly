@@ -50,6 +50,7 @@ use crate::config::{
     Config, DEFAULT_ALIAS_WORDS, MAX_ALIAS_WORDS, MAX_TTL_DAYS, MAX_TTL_SECONDS, MIN_ALIAS_WORDS,
 };
 use crate::content_type::{detect_content_type, detect_content_type_sample, Detection, PEEK_BYTES};
+use crate::localfs::{LocalFsError, TempDest};
 use crate::metrics::Metrics;
 
 /// Await one S3 request and record its operation and outcome.
@@ -144,6 +145,8 @@ pub enum StoreError {
     AliasUnavailable { attempts: usize },
     #[error("paste has more than {limit} appended segments")]
     TooManySegments { limit: usize },
+    #[error("bare id {0} matches more than one paste: use the full dated id")]
+    AmbiguousId(String),
     #[error("local file access is disabled on this transport: set DAYFLY_MCP_LOCAL_ROOT on the server to allow a directory")]
     LocalFilesDisabled,
     #[error("path outside the allowed root: {0}")]
@@ -152,6 +155,8 @@ pub enum StoreError {
     InvalidPath(String),
     #[error("io error: {0}")]
     Io(String),
+    #[error("request timed out: {0}")]
+    RequestTimeout(String),
     #[error("s3 error: {0}")]
     S3(String),
     #[error("bucket storage quota is reached: try again after a paste expires or is deleted")]
@@ -187,10 +192,12 @@ impl StoreError {
             StoreError::InvalidLifecycle(_) => "invalid_lifecycle",
             StoreError::AliasUnavailable { .. } => "alias_unavailable",
             StoreError::TooManySegments { .. } => "too_many_segments",
+            StoreError::AmbiguousId(_) => "ambiguous_id",
             StoreError::LocalFilesDisabled => "local_files_disabled",
             StoreError::PathOutsideRoot(_) => "path_outside_root",
             StoreError::InvalidPath(_) => "invalid_path",
             StoreError::Io(_) => "io_error",
+            StoreError::RequestTimeout(_) => "request_timeout",
             StoreError::S3(_) => "s3_error",
             StoreError::QuotaExceeded => "quota_exceeded",
             StoreError::CopyLimit { .. } => "copy_limit",
@@ -202,6 +209,14 @@ impl StoreError {
 impl From<std::io::Error> for StoreError {
     fn from(e: std::io::Error) -> Self {
         StoreError::Io(e.to_string())
+    }
+}
+
+/// Map a race-safe local-file error to a store error for `path`.
+fn map_localfs_error(error: LocalFsError, path: &Path) -> StoreError {
+    match error {
+        LocalFsError::OutsideRoot => StoreError::PathOutsideRoot(path.display().to_string()),
+        LocalFsError::Io(error) => StoreError::Io(error.to_string()),
     }
 }
 
@@ -1970,8 +1985,19 @@ impl Store {
             .credentials_provider(credentials)
             .load()
             .await;
+        // A stalled endpoint must fail within the configured deadlines
+        // instead of holding the request task. The operation deadline
+        // covers the whole call including retries. The attempt deadline
+        // matches it, so one slow attempt cannot outlive the operation.
+        let timeout_config = aws_config::timeout::TimeoutConfig::builder()
+            .connect_timeout(Duration::from_secs(config.s3_connect_timeout_seconds))
+            .read_timeout(Duration::from_secs(config.s3_read_timeout_seconds))
+            .operation_timeout(Duration::from_secs(config.s3_operation_timeout_seconds))
+            .operation_attempt_timeout(Duration::from_secs(config.s3_operation_timeout_seconds))
+            .build();
         let s3_config = S3ConfigBuilder::from(&sdk_config)
             .force_path_style(config.s3_force_path_style)
+            .timeout_config(timeout_config)
             .build();
         Ok(Self {
             client: Client::from_conf(s3_config),
@@ -2744,6 +2770,13 @@ impl Store {
     /// alias resolves through its `words/` object. That scan is the cost
     /// of not having an index: clients should keep the full ID returned
     /// at store time.
+    ///
+    /// A bare ID matches only when it equals the whole random component
+    /// of a key (`pastes/<date>/<random>`). A bare ID that matches two
+    /// or more keys is ambiguous, and this method returns
+    /// [`StoreError::AmbiguousId`] instead of the first key scanned.
+    /// The scan reads every page, so a unique match is confirmed and
+    /// not assumed.
     pub async fn resolve_key(&self, id: &str) -> Result<String, StoreError> {
         if let Some(phrase) = self.normalize_alias(id) {
             return self.resolve_alias(&phrase).await;
@@ -2753,7 +2786,7 @@ impl Store {
         if stripped.contains('/') {
             return Ok(format!("pastes/{stripped}"));
         }
-        let suffix = format!("/{stripped}");
+        let mut found: Option<String> = None;
         let mut token: Option<String> = None;
         for _ in 0..LIST_SCAN_MAX_PAGES {
             let mut req = self
@@ -2772,8 +2805,17 @@ impl Store {
                     if !is_paste_key(key) {
                         continue;
                     }
-                    if key.ends_with(&suffix) || key == format!("pastes/{stripped}") {
-                        return Ok(key.to_string());
+                    let Some(rest) = key.strip_prefix("pastes/") else {
+                        continue;
+                    };
+                    let Some((_, random)) = rest.split_once('/') else {
+                        continue;
+                    };
+                    if random == stripped {
+                        if found.is_some() {
+                            return Err(StoreError::AmbiguousId(id.to_string()));
+                        }
+                        found = Some(key.to_string());
                     }
                 }
             }
@@ -2782,7 +2824,10 @@ impl Store {
                 _ => break,
             }
         }
-        Err(StoreError::NotFound(id.to_string()))
+        match found {
+            Some(key) => Ok(key),
+            None => Err(StoreError::NotFound(id.to_string())),
+        }
     }
 
     /// Clamp a TTL to the size curve when `retention_by_size` is on.
@@ -2948,6 +2993,10 @@ impl Store {
     }
 
     /// Store a local file with optional title and tags.
+    ///
+    /// With a configured root, the open verifies the opened descriptor
+    /// stays under the root, so a symlink swap between the path check
+    /// and the open cannot escape it.
     pub async fn store_file_path_with_fields(
         &self,
         path: &Path,
@@ -2958,7 +3007,14 @@ impl Store {
         let content_type = fields.content_type.as_deref();
         let title = normalize_title(fields.title.as_deref())?;
         let tags = normalize_tags(&fields.tags)?;
-        let mut file = File::open(path).await?;
+        let mut file = match self.config.mcp_local_root.as_deref() {
+            Some(root) => {
+                let std_file = crate::localfs::open_read_under_root(root, path)
+                    .map_err(|e| map_localfs_error(e, path))?;
+                File::from_std(std_file)
+            }
+            None => File::open(path).await?,
+        };
         // Metadata from the handle, not the path: one file, one view.
         let file_meta = file.metadata().await?;
         if !file_meta.is_file() {
@@ -4245,6 +4301,14 @@ impl Store {
     ///
     /// The plan keeps each read inside one object, so a segment is never
     /// fetched as part of the base object.
+    ///
+    /// The download writes a temporary file next to the destination and
+    /// renames it onto the destination only after a successful flush.
+    /// A failed download leaves no partial file, and an existing
+    /// destination is never truncated before the download succeeds.
+    /// With a configured root, the temporary file is created inside the
+    /// parent directory opened under that root, so a symlink swap of
+    /// the parent cannot move the file outside the root.
     pub async fn download_file(
         &self,
         id: &str,
@@ -4269,27 +4333,41 @@ impl Store {
             }
             None => (0, meta.size.saturating_sub(1)),
         };
+        let root = self.config.mcp_local_root.as_deref();
         if meta.size == 0 {
-            tokio::fs::write(dest, b"").await?;
+            let (_file, guard) =
+                TempDest::create(root, dest).map_err(|e| map_localfs_error(e, dest))?;
+            guard.commit().map_err(|e| map_localfs_error(e, dest))?;
             return Ok(meta);
         }
         let plan = meta.plan();
-        let mut file = File::create(dest).await?;
-        for (key, local_start, local_end) in plan.object_ranges(start, end) {
-            let mut cur = local_start;
-            while cur <= local_end {
-                let chunk_end = (cur + MULTIPART_CHUNK_BYTES as u64 - 1).min(local_end);
-                let bytes = self
-                    .fetch_object_range(&key, Some((cur, chunk_end)))
-                    .await?;
-                if bytes.is_empty() {
-                    break;
+        let (std_file, guard) =
+            TempDest::create(root, dest).map_err(|e| map_localfs_error(e, dest))?;
+        let mut file = File::from_std(std_file);
+        let written = async {
+            for (key, local_start, local_end) in plan.object_ranges(start, end) {
+                let mut cur = local_start;
+                while cur <= local_end {
+                    let chunk_end = (cur + MULTIPART_CHUNK_BYTES as u64 - 1).min(local_end);
+                    let bytes = self
+                        .fetch_object_range(&key, Some((cur, chunk_end)))
+                        .await?;
+                    if bytes.is_empty() {
+                        break;
+                    }
+                    file.write_all(&bytes).await?;
+                    cur = chunk_end + 1;
                 }
-                file.write_all(&bytes).await?;
-                cur = chunk_end + 1;
             }
+            file.flush().await?;
+            Ok::<(), StoreError>(())
         }
-        file.flush().await?;
+        .await;
+        // On failure the guard drops and removes the temporary file,
+        // so the destination is never touched.
+        written?;
+        drop(file);
+        guard.commit().map_err(|e| map_localfs_error(e, dest))?;
         Ok(meta)
     }
 
@@ -5462,6 +5540,15 @@ mod token_tests {
             paste_tokens: false,
             expose_creator_addr: false,
             rate_limit_per_minute: 0,
+            http_request_timeout_seconds: 600,
+            http_body_read_timeout_seconds: 120,
+            http_body_write_timeout_seconds: 120,
+            http_max_in_flight: 256,
+            http_max_uploads: 32,
+            http_max_search_list: 32,
+            s3_connect_timeout_seconds: 5,
+            s3_read_timeout_seconds: 30,
+            s3_operation_timeout_seconds: 120,
             http_bearer_token: None,
             mcp_local_root: None,
             favicon: None,

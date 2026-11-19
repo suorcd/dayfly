@@ -104,6 +104,15 @@ async fn reload_swaps_credentials_token_caps_ttl_and_show_words() {
     new_config.show_words = true;
     new_config.list_requires_token = true;
     new_config.rate_limit_per_minute = 7;
+    new_config.http_request_timeout_seconds = 30;
+    new_config.http_body_read_timeout_seconds = 10;
+    new_config.http_body_write_timeout_seconds = 10;
+    new_config.http_max_in_flight = 10;
+    new_config.http_max_uploads = 2;
+    new_config.http_max_search_list = 2;
+    new_config.s3_connect_timeout_seconds = 2;
+    new_config.s3_read_timeout_seconds = 10;
+    new_config.s3_operation_timeout_seconds = 60;
     new_config.multipart_abort_after_seconds = 120;
     new_config.show_internal_paths = true;
     new_config.view_line_numbers = true;
@@ -135,6 +144,12 @@ async fn reload_swaps_credentials_token_caps_ttl_and_show_words() {
         "DAYFLY_SHOW_WORDS",
         "DAYFLY_LIST_REQUIRES_TOKEN",
         "DAYFLY_RATE_LIMIT_PER_MINUTE",
+        "DAYFLY_HTTP_REQUEST_TIMEOUT_SECONDS",
+        "DAYFLY_HTTP_BODY_READ_TIMEOUT_SECONDS",
+        "DAYFLY_HTTP_BODY_WRITE_TIMEOUT_SECONDS",
+        "DAYFLY_S3_CONNECT_TIMEOUT_SECONDS",
+        "DAYFLY_S3_READ_TIMEOUT_SECONDS",
+        "DAYFLY_S3_OPERATION_TIMEOUT_SECONDS",
         "DAYFLY_MULTIPART_ABORT_AFTER",
         "DAYFLY_SHOW_INTERNAL_PATHS",
         "DAYFLY_VIEW_LINE_NUMBERS",
@@ -420,6 +435,9 @@ async fn reload_ignores_the_bind_and_other_startup_only_settings() {
     new_config.http_bind = "0.0.0.0:9999".to_string();
     new_config.allow_unauthenticated = !old.allow_unauthenticated;
     new_config.mcp_local_root = Some(std::env::temp_dir());
+    new_config.http_max_in_flight = 10;
+    new_config.http_max_uploads = 2;
+    new_config.http_max_search_list = 2;
 
     let report = reload_with_config(&state, new_config, "127.0.0.1:8080")
         .await
@@ -428,6 +446,9 @@ async fn reload_ignores_the_bind_and_other_startup_only_settings() {
         "DAYFLY_HTTP_BIND",
         "DAYFLY_ALLOW_UNAUTHENTICATED",
         "DAYFLY_MCP_LOCAL_ROOT",
+        "DAYFLY_HTTP_MAX_IN_FLIGHT",
+        "DAYFLY_HTTP_MAX_UPLOADS",
+        "DAYFLY_HTTP_MAX_SEARCH_LIST",
     ] {
         assert!(
             report
@@ -444,6 +465,15 @@ async fn reload_ignores_the_bind_and_other_startup_only_settings() {
         old.allow_unauthenticated
     );
     assert_eq!(state.store().config.mcp_local_root, old.mcp_local_root);
+    assert_eq!(
+        state.store().config.http_max_in_flight,
+        old.http_max_in_flight
+    );
+    assert_eq!(state.store().config.http_max_uploads, old.http_max_uploads);
+    assert_eq!(
+        state.store().config.http_max_search_list,
+        old.http_max_search_list
+    );
 }
 
 #[tokio::test]
