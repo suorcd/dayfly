@@ -1391,6 +1391,52 @@ async fn inline_text_has_a_sandbox_policy() {
 }
 
 #[tokio::test]
+async fn create_responses_carry_no_store() {
+    let fake = FakeS3::start().await;
+    let app = common::app(fake.store_with_paste_tokens().await);
+
+    let body = b"hello".to_vec();
+    let request = common::request(
+        "POST",
+        "/upload?format=json",
+        &[
+            ("content-type", "text/plain".to_string()),
+            content_length(body.len()),
+        ],
+        body.clone(),
+    );
+    let (status, headers, response) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(headers[header::CACHE_CONTROL], "private, no-store");
+    assert!(
+        common::json_body(&response)["paste_token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty()),
+        "the JSON create response must carry the paste token"
+    );
+
+    let request = common::request(
+        "POST",
+        "/upload",
+        &[
+            ("content-type", "text/plain".to_string()),
+            content_length(body.len()),
+        ],
+        body,
+    );
+    let (status, headers, _) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(headers[header::CACHE_CONTROL], "private, no-store");
+    assert!(
+        headers
+            .get("x-paste-token")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|token| !token.is_empty()),
+        "the plain create response must carry the paste token header"
+    );
+}
+
+#[tokio::test]
 async fn download_head_and_range_responses_carry_the_right_headers() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
@@ -1579,6 +1625,31 @@ async fn metadata_and_delete_routes_work_for_dated_and_bare_ids() {
     );
     let (status, _, _) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn ambiguous_bare_id_returns_conflict_on_metadata() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    for date in ["2026-10-28", "2026-10-29"] {
+        let metadata = common::stored_metadata(
+            &(Utc::now() + Duration::days(1)).to_rfc3339(),
+            "text/plain",
+            8,
+            "abc",
+        );
+        fake.seed(
+            &format!("pastes/{date}/dup123"),
+            b"dup body",
+            "text/plain",
+            &common::metadata_refs(&metadata),
+        );
+    }
+    let app = common::app(store);
+    let request = common::request("GET", "/v1/pastes/dup123/meta", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(common::json_body(&body)["code"], "ambiguous_id");
 }
 
 #[tokio::test]

@@ -275,6 +275,57 @@ pub struct Config {
     /// limiter is per process and resets on restart. See "Access model" in
     /// the README.
     pub rate_limit_per_minute: u32,
+    /// Longest time, in seconds, for one HTTP request from headers to the
+    /// end of the handler. Zero disables the deadline. Default: 600.
+    ///
+    /// A request past the deadline fails with 408 and its task ends, so
+    /// a slow client cannot hold a task forever. The deadline covers the
+    /// handler only, not the streamed response body after the handler
+    /// returns; [`Self::http_body_write_timeout_seconds`] bounds that.
+    pub http_request_timeout_seconds: u64,
+    /// Longest gap, in seconds, between two chunks of one request body.
+    /// Zero disables the deadline. Default: 120.
+    ///
+    /// A stalled upload fails with 408. The gap is per chunk, not the
+    /// whole body, so a slow but steady 100 MB upload still fits inside
+    /// [`Self::http_request_timeout_seconds`].
+    pub http_body_read_timeout_seconds: u64,
+    /// Longest gap, in seconds, between two chunks of one response body.
+    /// Zero disables the deadline. Default: 120.
+    ///
+    /// A stalled download aborts its body stream. The gap is per chunk,
+    /// not the whole body.
+    pub http_body_write_timeout_seconds: u64,
+    /// Maximum HTTP requests in flight at once. Zero disables the cap.
+    /// Default: 256.
+    ///
+    /// A request above the cap fails with 503 and creates no task. The
+    /// cap counts every route, including `/mcp` and the human pages.
+    pub http_max_in_flight: u32,
+    /// Maximum uploads in flight at once. Zero disables the cap.
+    /// Default: 32.
+    ///
+    /// An upload is `POST /upload`, `POST /v1/pastes`, or an append.
+    /// A request above the cap fails with 503.
+    pub http_max_uploads: u32,
+    /// Maximum searches and listings in flight at once. Zero disables
+    /// the cap. Default: 32.
+    ///
+    /// A search is a `GET .../search` route. A listing is
+    /// `GET /v1/pastes`. A request above the cap fails with 503.
+    pub http_max_search_list: u32,
+    /// Longest time, in seconds, to open a connection to the S3
+    /// endpoint. Must be positive. Default: 5.
+    pub s3_connect_timeout_seconds: u64,
+    /// Longest gap, in seconds, between two reads of one S3 response.
+    /// Must be positive. Default: 30.
+    pub s3_read_timeout_seconds: u64,
+    /// Longest time, in seconds, for one S3 operation including retries.
+    /// Must be positive. Default: 120.
+    ///
+    /// A stalled endpoint fails within this deadline and releases the
+    /// request task that waits on it.
+    pub s3_operation_timeout_seconds: u64,
     /// Whether the human web UI shows the generated aliases.
     ///
     /// Default: `true`. This is a display setting only: aliases are still
@@ -600,6 +651,60 @@ pub const CONFIG_FIELDS: &[ConfigField] = &[
         value: Some("0"),
         required: false,
         help: "Maximum requests per client per minute; 0 disables the limiter",
+    },
+    ConfigField {
+        name: "DAYFLY_HTTP_REQUEST_TIMEOUT_SECONDS",
+        value: Some("600"),
+        required: false,
+        help: "Longest time in seconds for one HTTP request; 0 disables the deadline",
+    },
+    ConfigField {
+        name: "DAYFLY_HTTP_BODY_READ_TIMEOUT_SECONDS",
+        value: Some("120"),
+        required: false,
+        help: "Longest gap in seconds between two chunks of one request body; 0 disables the deadline",
+    },
+    ConfigField {
+        name: "DAYFLY_HTTP_BODY_WRITE_TIMEOUT_SECONDS",
+        value: Some("120"),
+        required: false,
+        help: "Longest gap in seconds between two chunks of one response body; 0 disables the deadline",
+    },
+    ConfigField {
+        name: "DAYFLY_HTTP_MAX_IN_FLIGHT",
+        value: Some("256"),
+        required: false,
+        help: "Maximum HTTP requests in flight at once; 0 disables the cap",
+    },
+    ConfigField {
+        name: "DAYFLY_HTTP_MAX_UPLOADS",
+        value: Some("32"),
+        required: false,
+        help: "Maximum uploads in flight at once; 0 disables the cap",
+    },
+    ConfigField {
+        name: "DAYFLY_HTTP_MAX_SEARCH_LIST",
+        value: Some("32"),
+        required: false,
+        help: "Maximum searches and listings in flight at once; 0 disables the cap",
+    },
+    ConfigField {
+        name: "DAYFLY_S3_CONNECT_TIMEOUT_SECONDS",
+        value: Some("5"),
+        required: false,
+        help: "Longest time in seconds to connect to the S3 endpoint",
+    },
+    ConfigField {
+        name: "DAYFLY_S3_READ_TIMEOUT_SECONDS",
+        value: Some("30"),
+        required: false,
+        help: "Longest gap in seconds between two reads of one S3 response",
+    },
+    ConfigField {
+        name: "DAYFLY_S3_OPERATION_TIMEOUT_SECONDS",
+        value: Some("120"),
+        required: false,
+        help: "Longest time in seconds for one S3 operation including retries",
     },
     ConfigField {
         name: "DAYFLY_SHOW_WORDS",
@@ -2087,6 +2192,108 @@ impl Config {
             ),
             0,
         );
+        let http_request_timeout_seconds = record(
+            &mut faults,
+            optional_u64(
+                &lookup,
+                "DAYFLY_HTTP_REQUEST_TIMEOUT_SECONDS",
+                field_u64("DAYFLY_HTTP_REQUEST_TIMEOUT_SECONDS", 600),
+            ),
+            600,
+        );
+        let http_body_read_timeout_seconds = record(
+            &mut faults,
+            optional_u64(
+                &lookup,
+                "DAYFLY_HTTP_BODY_READ_TIMEOUT_SECONDS",
+                field_u64("DAYFLY_HTTP_BODY_READ_TIMEOUT_SECONDS", 120),
+            ),
+            120,
+        );
+        let http_body_write_timeout_seconds = record(
+            &mut faults,
+            optional_u64(
+                &lookup,
+                "DAYFLY_HTTP_BODY_WRITE_TIMEOUT_SECONDS",
+                field_u64("DAYFLY_HTTP_BODY_WRITE_TIMEOUT_SECONDS", 120),
+            ),
+            120,
+        );
+        let http_max_in_flight = record(
+            &mut faults,
+            optional_u32(
+                &lookup,
+                "DAYFLY_HTTP_MAX_IN_FLIGHT",
+                field_u32("DAYFLY_HTTP_MAX_IN_FLIGHT", 256),
+            ),
+            256,
+        );
+        let http_max_uploads = record(
+            &mut faults,
+            optional_u32(
+                &lookup,
+                "DAYFLY_HTTP_MAX_UPLOADS",
+                field_u32("DAYFLY_HTTP_MAX_UPLOADS", 32),
+            ),
+            32,
+        );
+        let http_max_search_list = record(
+            &mut faults,
+            optional_u32(
+                &lookup,
+                "DAYFLY_HTTP_MAX_SEARCH_LIST",
+                field_u32("DAYFLY_HTTP_MAX_SEARCH_LIST", 32),
+            ),
+            32,
+        );
+        // An S3 timeout of zero would disable a bound that must stay on:
+        // a stalled endpoint must fail instead of holding a task. A zero
+        // value is a fault, not a disable switch.
+        let s3_connect_timeout_seconds = record(
+            &mut faults,
+            optional_u64(
+                &lookup,
+                "DAYFLY_S3_CONNECT_TIMEOUT_SECONDS",
+                field_u64("DAYFLY_S3_CONNECT_TIMEOUT_SECONDS", 5),
+            ),
+            5,
+        );
+        if s3_connect_timeout_seconds == 0 {
+            faults.push(ConfigError::Invalid(
+                "DAYFLY_S3_CONNECT_TIMEOUT_SECONDS".to_string(),
+                "expected a positive number of seconds".to_string(),
+            ));
+        }
+        let s3_read_timeout_seconds = record(
+            &mut faults,
+            optional_u64(
+                &lookup,
+                "DAYFLY_S3_READ_TIMEOUT_SECONDS",
+                field_u64("DAYFLY_S3_READ_TIMEOUT_SECONDS", 30),
+            ),
+            30,
+        );
+        if s3_read_timeout_seconds == 0 {
+            faults.push(ConfigError::Invalid(
+                "DAYFLY_S3_READ_TIMEOUT_SECONDS".to_string(),
+                "expected a positive number of seconds".to_string(),
+            ));
+        }
+        let s3_operation_timeout_seconds = record(
+            &mut faults,
+            optional_u64(
+                &lookup,
+                "DAYFLY_S3_OPERATION_TIMEOUT_SECONDS",
+                field_u64("DAYFLY_S3_OPERATION_TIMEOUT_SECONDS", 120),
+            ),
+            120,
+        );
+        if s3_operation_timeout_seconds == 0 {
+            faults.push(ConfigError::Invalid(
+                "DAYFLY_S3_OPERATION_TIMEOUT_SECONDS".to_string(),
+                "expected a positive number of seconds".to_string(),
+            ));
+        }
         let mcp_local_root = match local_root(lookup("DAYFLY_MCP_LOCAL_ROOT")) {
             Ok(value) => value,
             Err(error) => {
@@ -2181,6 +2388,15 @@ impl Config {
                 paste_tokens,
                 expose_creator_addr,
                 rate_limit_per_minute,
+                http_request_timeout_seconds,
+                http_body_read_timeout_seconds,
+                http_body_write_timeout_seconds,
+                http_max_in_flight,
+                http_max_uploads,
+                http_max_search_list,
+                s3_connect_timeout_seconds,
+                s3_read_timeout_seconds,
+                s3_operation_timeout_seconds,
                 http_bearer_token,
                 mcp_local_root,
                 favicon,
@@ -2260,7 +2476,7 @@ impl Config {
     /// A log-safe summary: endpoint host scheme and bucket only, never keys.
     pub fn safe_summary(&self) -> String {
         format!(
-            "bucket={} endpoint_scheme={} region={} s3_force_path_style={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} multipart_abort_after_seconds={} cleanup_interval_seconds={} cleanup_on_startup={} search_max_bytes={} search_prefix_max_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} write_requires_token={} list_requires_token={} paste_tokens={} expose_creator_addr={} rate_limit_per_minute={} log_format={} metrics_bind={} metrics_allowed_networks={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
+            "bucket={} endpoint_scheme={} region={} s3_force_path_style={} max_text_bytes={} max_file_bytes={} max_paste_bytes={} multipart_abort_after_seconds={} cleanup_interval_seconds={} cleanup_on_startup={} search_max_bytes={} search_prefix_max_bytes={} alias_words={} default_ttl_days={} list_default_days={} retention_by_size={} retention_min_days={} retention_max_days={} show_words={} show_internal_paths={} inline_pdf={} view_line_numbers={} trusted_proxies={} write_requires_token={} list_requires_token={} paste_tokens={} expose_creator_addr={} rate_limit_per_minute={} http_request_timeout_seconds={} http_body_read_timeout_seconds={} http_body_write_timeout_seconds={} http_max_in_flight={} http_max_uploads={} http_max_search_list={} s3_connect_timeout_seconds={} s3_read_timeout_seconds={} s3_operation_timeout_seconds={} log_format={} metrics_bind={} metrics_allowed_networks={} mcp_local_root={} favicon={} robots_txt={} security_txt={}",
             self.bucket,
             if self.endpoint.starts_with("https://") {
                 "https"
@@ -2293,6 +2509,15 @@ impl Config {
             self.paste_tokens,
             self.expose_creator_addr,
             self.rate_limit_per_minute,
+            self.http_request_timeout_seconds,
+            self.http_body_read_timeout_seconds,
+            self.http_body_write_timeout_seconds,
+            self.http_max_in_flight,
+            self.http_max_uploads,
+            self.http_max_search_list,
+            self.s3_connect_timeout_seconds,
+            self.s3_read_timeout_seconds,
+            self.s3_operation_timeout_seconds,
             self.log_format.as_str(),
             self.metrics_bind
                 .as_ref()
@@ -2668,6 +2893,15 @@ mod tests {
             paste_tokens: false,
             expose_creator_addr: false,
             rate_limit_per_minute: 0,
+            http_request_timeout_seconds: 600,
+            http_body_read_timeout_seconds: 120,
+            http_body_write_timeout_seconds: 120,
+            http_max_in_flight: 256,
+            http_max_uploads: 32,
+            http_max_search_list: 32,
+            s3_connect_timeout_seconds: 5,
+            s3_read_timeout_seconds: 30,
+            s3_operation_timeout_seconds: 120,
             http_bearer_token: None,
             mcp_local_root: None,
             favicon: None,
@@ -2785,6 +3019,104 @@ mod tests {
         ));
         let config = Config::from_lookup(lookup_from(&pairs)).expect("rate limit config");
         assert_eq!(config.rate_limit_per_minute, 120);
+    }
+
+    #[test]
+    fn request_timeouts_default_to_documented_values() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert_eq!(config.http_request_timeout_seconds, 600);
+        assert_eq!(config.http_body_read_timeout_seconds, 120);
+        assert_eq!(config.http_body_write_timeout_seconds, 120);
+    }
+
+    #[test]
+    fn request_timeouts_accept_values_and_zero_disables() {
+        let mut pairs = base_env();
+        pairs.push((
+            "DAYFLY_HTTP_REQUEST_TIMEOUT_SECONDS".to_string(),
+            "30".to_string(),
+        ));
+        pairs.push((
+            "DAYFLY_HTTP_BODY_READ_TIMEOUT_SECONDS".to_string(),
+            "0".to_string(),
+        ));
+        pairs.push((
+            "DAYFLY_HTTP_BODY_WRITE_TIMEOUT_SECONDS".to_string(),
+            "45".to_string(),
+        ));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("timeout config");
+        assert_eq!(config.http_request_timeout_seconds, 30);
+        assert_eq!(config.http_body_read_timeout_seconds, 0);
+        assert_eq!(config.http_body_write_timeout_seconds, 45);
+    }
+
+    #[test]
+    fn in_flight_caps_default_to_documented_values() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert_eq!(config.http_max_in_flight, 256);
+        assert_eq!(config.http_max_uploads, 32);
+        assert_eq!(config.http_max_search_list, 32);
+    }
+
+    #[test]
+    fn in_flight_caps_accept_values_and_zero_disables() {
+        let mut pairs = base_env();
+        pairs.push(("DAYFLY_HTTP_MAX_IN_FLIGHT".to_string(), "10".to_string()));
+        pairs.push(("DAYFLY_HTTP_MAX_UPLOADS".to_string(), "0".to_string()));
+        pairs.push(("DAYFLY_HTTP_MAX_SEARCH_LIST".to_string(), "4".to_string()));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("cap config");
+        assert_eq!(config.http_max_in_flight, 10);
+        assert_eq!(config.http_max_uploads, 0);
+        assert_eq!(config.http_max_search_list, 4);
+    }
+
+    #[test]
+    fn s3_timeouts_default_to_documented_values() {
+        let config = Config::from_lookup(lookup_from(&base_env())).expect("default config");
+        assert_eq!(config.s3_connect_timeout_seconds, 5);
+        assert_eq!(config.s3_read_timeout_seconds, 30);
+        assert_eq!(config.s3_operation_timeout_seconds, 120);
+    }
+
+    #[test]
+    fn s3_timeouts_accept_values() {
+        let mut pairs = base_env();
+        pairs.push((
+            "DAYFLY_S3_CONNECT_TIMEOUT_SECONDS".to_string(),
+            "2".to_string(),
+        ));
+        pairs.push((
+            "DAYFLY_S3_READ_TIMEOUT_SECONDS".to_string(),
+            "10".to_string(),
+        ));
+        pairs.push((
+            "DAYFLY_S3_OPERATION_TIMEOUT_SECONDS".to_string(),
+            "60".to_string(),
+        ));
+        let config = Config::from_lookup(lookup_from(&pairs)).expect("S3 timeout config");
+        assert_eq!(config.s3_connect_timeout_seconds, 2);
+        assert_eq!(config.s3_read_timeout_seconds, 10);
+        assert_eq!(config.s3_operation_timeout_seconds, 60);
+    }
+
+    #[test]
+    fn s3_timeouts_reject_zero() {
+        for name in [
+            "DAYFLY_S3_CONNECT_TIMEOUT_SECONDS",
+            "DAYFLY_S3_READ_TIMEOUT_SECONDS",
+            "DAYFLY_S3_OPERATION_TIMEOUT_SECONDS",
+        ] {
+            let mut pairs = base_env();
+            pairs.push((name.to_string(), "0".to_string()));
+            let error = expect_error(Config::from_lookup(lookup_from(&pairs)));
+            match error {
+                ConfigError::Invalid(field, message) => {
+                    assert_eq!(field, name);
+                    assert!(message.contains("positive"), "message: {message}");
+                }
+                other => panic!("unexpected error: {other}"),
+            }
+        }
     }
 
     #[test]

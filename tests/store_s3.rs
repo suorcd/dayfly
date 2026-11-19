@@ -1969,6 +1969,187 @@ async fn download_file_rejects_a_reversed_range_without_touching_the_destination
 }
 
 #[tokio::test]
+async fn download_file_failure_creates_no_destination_and_leaves_no_temporary_file() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"abcdefghij", None, None, None)
+        .await
+        .expect("text must store");
+    fake.fail_get_prefix("pastes/");
+
+    let dir = common::temp_path("failed-download-dir");
+    std::fs::create_dir_all(&dir).expect("test directory must be creatable");
+    let dest = dir.join("out.bin");
+    let error = store
+        .download_file(&stored.id, &dest, None)
+        .await
+        .expect_err("a failed GetObject must fail the download");
+    assert!(
+        matches!(error, StoreError::S3(_)),
+        "a failed GetObject must surface as an S3 error, got {error:?}"
+    );
+    assert!(
+        !dest.exists(),
+        "a failed download must not create the destination"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .expect("test directory must be readable")
+        .map(|entry| entry.expect("entry must be readable").file_name())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a failed download must leave no temporary file, found {leftovers:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn download_file_failure_keeps_an_existing_destination() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"abcdefghij", None, None, None)
+        .await
+        .expect("text must store");
+    fake.fail_get_prefix("pastes/");
+
+    let dir = common::temp_path("failed-download-keep-dir");
+    std::fs::create_dir_all(&dir).expect("test directory must be creatable");
+    let dest = dir.join("out.bin");
+    std::fs::write(&dest, b"keep me").expect("destination sentinel must be writable");
+    let error = store
+        .download_file(&stored.id, &dest, None)
+        .await
+        .expect_err("a failed GetObject must fail the download");
+    assert!(
+        matches!(error, StoreError::S3(_)),
+        "a failed GetObject must surface as an S3 error, got {error:?}"
+    );
+    assert_eq!(
+        std::fs::read(&dest).expect("destination must still exist"),
+        b"keep me",
+        "a failed download must not truncate the destination"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .expect("test directory must be readable")
+        .map(|entry| entry.expect("entry must be readable").file_name())
+        .collect();
+    assert_eq!(
+        leftovers,
+        vec![std::ffi::OsString::from("out.bin")],
+        "a failed download must leave no temporary file, found {leftovers:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn download_file_empty_paste_replaces_an_existing_destination() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let empty = stream::iter(Vec::<Result<Bytes, StoreError>>::new());
+    let stored = store
+        .store_stream(empty, None, None, None, Some(0), 1024)
+        .await
+        .expect("an empty upload must store");
+    assert_eq!(stored.size, 0);
+
+    let path = common::temp_path("empty-replace.bin");
+    std::fs::write(&path, b"old content").expect("destination sentinel must be writable");
+    let meta = store
+        .download_file(&stored.id, &path, None)
+        .await
+        .expect("empty download must succeed");
+    assert_eq!(meta.size, 0);
+    assert_eq!(
+        std::fs::metadata(&path).expect("file must exist").len(),
+        0,
+        "an empty download replaces the destination with an empty file"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn store_file_path_under_a_root_refuses_a_symlink_swap_to_outside() {
+    let fake = FakeS3::start().await;
+    let root = common::temp_path("rooted-read-dir");
+    std::fs::create_dir_all(&root).expect("test directory must be creatable");
+    let outside = common::temp_path("rooted-read-outside");
+    std::fs::create_dir_all(&outside).expect("test directory must be creatable");
+    let secret = outside.join("secret.txt");
+    std::fs::write(&secret, b"secret").expect("test file must be writable");
+
+    let mut config = fake.config();
+    config.mcp_local_root = Some(
+        root.canonicalize()
+            .expect("the root must exist before the store is built"),
+    );
+    let store = Store::from_config(config)
+        .await
+        .expect("a store with a root must build");
+
+    // The path checks out while it names a real file under the root.
+    let inner = root.join("note.txt");
+    std::fs::write(&inner, b"inside").expect("test file must be writable");
+    let resolved = std::fs::canonicalize(&inner).expect("the file must resolve");
+    assert!(resolved.starts_with(root.canonicalize().expect("root must resolve")));
+
+    // The file is then swapped for a symlink out of the root, between
+    // the check and the open.
+    std::fs::remove_file(&inner).expect("the file must be removable");
+    std::os::unix::fs::symlink(&secret, &inner).expect("symlink must be creatable");
+    let error = store
+        .store_file_path(&inner, None, None, None)
+        .await
+        .expect_err("a swapped symlink out of the root must fail");
+    assert!(
+        matches!(error, StoreError::PathOutsideRoot(_)),
+        "a swapped symlink must be refused as outside the root, got {error:?}"
+    );
+    assert!(
+        fake.puts().is_empty(),
+        "no out-of-root file may reach the bucket"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[tokio::test]
+async fn download_file_under_a_root_writes_inside_the_root() {
+    let fake = FakeS3::start().await;
+    let root = common::temp_path("rooted-download-dir");
+    std::fs::create_dir_all(&root).expect("test directory must be creatable");
+    let mut config = fake.config();
+    config.mcp_local_root = Some(
+        root.canonicalize()
+            .expect("the root must exist before the store is built"),
+    );
+    let store = Store::from_config(config)
+        .await
+        .expect("a store with a root must build");
+    let stored = store
+        .store_text(b"rooted payload", None, None, None)
+        .await
+        .expect("text must store");
+
+    let dest = root.join("out.bin");
+    let meta = store
+        .download_file(&stored.id, &dest, None)
+        .await
+        .expect("a download under the root must succeed");
+    assert_eq!(meta.size, 14);
+    assert_eq!(
+        std::fs::read(&dest).expect("downloaded file must be readable"),
+        b"rooted payload"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn download_file_streams_multiple_s3_chunks() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
@@ -3531,6 +3712,54 @@ async fn bare_id_resolution_skips_segment_keys() {
         matches!(result, Err(StoreError::NotFound(_))),
         "a segment key must not resolve as a bare paste id: {result:?}"
     );
+}
+
+#[tokio::test]
+async fn bare_c_does_not_resolve_to_a_paste_whose_random_is_zzabc() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    fake.seed(
+        "pastes/2026-10-28/zzabc",
+        b"zzabc body",
+        "text/plain",
+        &common::metadata_refs(&future_metadata(10)),
+    );
+    for bare in ["c", "bc", "zabc"] {
+        let result = store.resolve_key(bare).await;
+        assert!(
+            matches!(result, Err(StoreError::NotFound(_))),
+            "bare {bare:?} must not resolve to zzabc: {result:?}"
+        );
+    }
+    let key = store
+        .resolve_key("zzabc")
+        .await
+        .expect("the exact bare random must resolve");
+    assert_eq!(key, "pastes/2026-10-28/zzabc");
+}
+
+#[tokio::test]
+async fn bare_id_under_two_dates_is_ambiguous() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    for date in ["2026-10-28", "2026-10-29"] {
+        fake.seed(
+            &format!("pastes/{date}/dup123"),
+            b"dup body",
+            "text/plain",
+            &common::metadata_refs(&future_metadata(8)),
+        );
+    }
+    let result = store.resolve_key("dup123").await;
+    assert!(
+        matches!(result, Err(StoreError::AmbiguousId(_))),
+        "a bare id under two dates must be an ambiguity error: {result:?}"
+    );
+    let key = store
+        .resolve_key("2026-10-29/dup123")
+        .await
+        .expect("a full dated id must resolve");
+    assert_eq!(key, "pastes/2026-10-29/dup123");
 }
 
 #[tokio::test]

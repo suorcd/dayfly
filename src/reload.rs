@@ -85,6 +85,22 @@ pub async fn reload_with_config(
         warnings.push("DAYFLY_METRICS_BIND changed. A restart is necessary.".to_string());
         new_config.metrics_bind = old.config.metrics_bind;
     }
+    // The in-flight semaphores are built at startup. A reload keeps the
+    // old caps and reports the change, like the bind address. The
+    // timeouts are read per request and the S3 timeouts ride with the
+    // new store, so those apply at once.
+    if new_config.http_max_in_flight != old.config.http_max_in_flight {
+        warnings.push("DAYFLY_HTTP_MAX_IN_FLIGHT changed. A restart is necessary.".to_string());
+        new_config.http_max_in_flight = old.config.http_max_in_flight;
+    }
+    if new_config.http_max_uploads != old.config.http_max_uploads {
+        warnings.push("DAYFLY_HTTP_MAX_UPLOADS changed. A restart is necessary.".to_string());
+        new_config.http_max_uploads = old.config.http_max_uploads;
+    }
+    if new_config.http_max_search_list != old.config.http_max_search_list {
+        warnings.push("DAYFLY_HTTP_MAX_SEARCH_LIST changed. A restart is necessary.".to_string());
+        new_config.http_max_search_list = old.config.http_max_search_list;
+    }
 
     // A token removal on a reachable listener needs the same guard as
     // startup. The new store is not built when this check fails.
@@ -265,6 +281,24 @@ fn changed_fields(old: &Config, new: &Config) -> Vec<&'static str> {
     }
     if old.rate_limit_per_minute != new.rate_limit_per_minute {
         changed.push("DAYFLY_RATE_LIMIT_PER_MINUTE");
+    }
+    if old.http_request_timeout_seconds != new.http_request_timeout_seconds {
+        changed.push("DAYFLY_HTTP_REQUEST_TIMEOUT_SECONDS");
+    }
+    if old.http_body_read_timeout_seconds != new.http_body_read_timeout_seconds {
+        changed.push("DAYFLY_HTTP_BODY_READ_TIMEOUT_SECONDS");
+    }
+    if old.http_body_write_timeout_seconds != new.http_body_write_timeout_seconds {
+        changed.push("DAYFLY_HTTP_BODY_WRITE_TIMEOUT_SECONDS");
+    }
+    if old.s3_connect_timeout_seconds != new.s3_connect_timeout_seconds {
+        changed.push("DAYFLY_S3_CONNECT_TIMEOUT_SECONDS");
+    }
+    if old.s3_read_timeout_seconds != new.s3_read_timeout_seconds {
+        changed.push("DAYFLY_S3_READ_TIMEOUT_SECONDS");
+    }
+    if old.s3_operation_timeout_seconds != new.s3_operation_timeout_seconds {
+        changed.push("DAYFLY_S3_OPERATION_TIMEOUT_SECONDS");
     }
     if old.trusted_proxies != new.trusted_proxies {
         changed.push("DAYFLY_TRUSTED_PROXIES");
