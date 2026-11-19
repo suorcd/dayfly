@@ -1,0 +1,21 @@
+[Unit]
+Description=dayfly pastebin service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dayfly
+Group=dayfly
+EnvironmentFile=/etc/dayfly/dayfly.env
+ExecStart=/usr/local/bin/dayfly serve
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/dayfly
+
+[Install]
+WantedBy=multi-user.target
