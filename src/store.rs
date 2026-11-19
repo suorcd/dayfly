@@ -3930,6 +3930,13 @@ impl Store {
 
     /// Fetch one object's byte range. This is the only method that issues
     /// a GET against a single key.
+    ///
+    /// A range request must return exactly the bytes it asked for. A
+    /// short or oversized body returns [`StoreError::LengthMismatch`]
+    /// instead of a partial or padded result, so no caller can mistake
+    /// it for a complete read. A full-object request has no planned
+    /// length, so it checks the body against the `Content-Length` the
+    /// backend reported, when the backend reported one.
     async fn fetch_object_range(
         &self,
         key: &str,
@@ -3941,12 +3948,20 @@ impl Store {
         }
         let out =
             s3_call!(self.metrics, "get_object", req.send()).map_err(|e| map_sdk_error(e, key))?;
+        let expected = range.map(|(start, end)| end.saturating_sub(start).saturating_add(1));
+        let reported = u64::try_from(out.content_length().unwrap_or(-1)).ok();
         let bytes = out
             .body
             .collect()
             .await
             .map_err(|e| s3_failure("cannot read the object body", e))?
             .to_vec();
+        let actual = bytes.len() as u64;
+        if let Some(expected) = expected.or(reported) {
+            if actual != expected {
+                return Err(StoreError::LengthMismatch { expected, actual });
+            }
+        }
         Ok(bytes)
     }
 
