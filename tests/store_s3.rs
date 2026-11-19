@@ -3587,6 +3587,54 @@ async fn bare_id_resolution_skips_segment_keys() {
 }
 
 #[tokio::test]
+async fn bare_c_does_not_resolve_to_a_paste_whose_random_is_zzabc() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    fake.seed(
+        "pastes/2026-10-28/zzabc",
+        b"zzabc body",
+        "text/plain",
+        &common::metadata_refs(&future_metadata(10)),
+    );
+    for bare in ["c", "bc", "zabc"] {
+        let result = store.resolve_key(bare).await;
+        assert!(
+            matches!(result, Err(StoreError::NotFound(_))),
+            "bare {bare:?} must not resolve to zzabc: {result:?}"
+        );
+    }
+    let key = store
+        .resolve_key("zzabc")
+        .await
+        .expect("the exact bare random must resolve");
+    assert_eq!(key, "pastes/2026-10-28/zzabc");
+}
+
+#[tokio::test]
+async fn bare_id_under_two_dates_is_ambiguous() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    for date in ["2026-10-28", "2026-10-29"] {
+        fake.seed(
+            &format!("pastes/{date}/dup123"),
+            b"dup body",
+            "text/plain",
+            &common::metadata_refs(&future_metadata(8)),
+        );
+    }
+    let result = store.resolve_key("dup123").await;
+    assert!(
+        matches!(result, Err(StoreError::AmbiguousId(_))),
+        "a bare id under two dates must be an ambiguity error: {result:?}"
+    );
+    let key = store
+        .resolve_key("2026-10-29/dup123")
+        .await
+        .expect("a full dated id must resolve");
+    assert_eq!(key, "pastes/2026-10-29/dup123");
+}
+
+#[tokio::test]
 async fn delete_removes_the_base_object_and_every_segment() {
     let fake = FakeS3::start().await;
     let store = fake.store_with_caps(1024, 1024 * 1024).await;

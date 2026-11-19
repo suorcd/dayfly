@@ -374,7 +374,7 @@ pub(crate) fn status_for(e: &StoreError) -> StatusCode {
         StoreError::NotText(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
         StoreError::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
         StoreError::AliasUnavailable { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-        StoreError::TooManySegments { .. } => StatusCode::CONFLICT,
+        StoreError::TooManySegments { .. } | StoreError::AmbiguousId(_) => StatusCode::CONFLICT,
         StoreError::CopyLimit { .. } => StatusCode::BAD_REQUEST,
         StoreError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         StoreError::RequestTimeout(_) => StatusCode::REQUEST_TIMEOUT,

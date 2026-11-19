@@ -1628,6 +1628,31 @@ async fn metadata_and_delete_routes_work_for_dated_and_bare_ids() {
 }
 
 #[tokio::test]
+async fn ambiguous_bare_id_returns_conflict_on_metadata() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    for date in ["2026-10-28", "2026-10-29"] {
+        let metadata = common::stored_metadata(
+            &(Utc::now() + Duration::days(1)).to_rfc3339(),
+            "text/plain",
+            8,
+            "abc",
+        );
+        fake.seed(
+            &format!("pastes/{date}/dup123"),
+            b"dup body",
+            "text/plain",
+            &common::metadata_refs(&metadata),
+        );
+    }
+    let app = common::app(store);
+    let request = common::request("GET", "/v1/pastes/dup123/meta", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(common::json_body(&body)["code"], "ambiguous_id");
+}
+
+#[tokio::test]
 async fn word_alias_works_on_fetch_metadata_append_delete_and_list() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;

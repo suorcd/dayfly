@@ -244,6 +244,7 @@ fn store_error_result(e: StoreError) -> Result<CallToolResult, rmcp::ErrorData> 
         | StoreError::Expired(_)
         | StoreError::TooLarge { .. }
         | StoreError::TooManySegments { .. }
+        | StoreError::AmbiguousId(_)
         | StoreError::NotText(_)
         | StoreError::RequestTimeout(_)
         | StoreError::RangeNotSatisfiable
