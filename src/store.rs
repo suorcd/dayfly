@@ -50,6 +50,7 @@ use crate::config::{
     Config, DEFAULT_ALIAS_WORDS, MAX_ALIAS_WORDS, MAX_TTL_DAYS, MAX_TTL_SECONDS, MIN_ALIAS_WORDS,
 };
 use crate::content_type::{detect_content_type, detect_content_type_sample, Detection, PEEK_BYTES};
+use crate::localfs::{LocalFsError, TempDest};
 use crate::metrics::Metrics;
 
 /// Await one S3 request and record its operation and outcome.
@@ -205,6 +206,14 @@ impl StoreError {
 impl From<std::io::Error> for StoreError {
     fn from(e: std::io::Error) -> Self {
         StoreError::Io(e.to_string())
+    }
+}
+
+/// Map a race-safe local-file error to a store error for `path`.
+fn map_localfs_error(error: LocalFsError, path: &Path) -> StoreError {
+    match error {
+        LocalFsError::OutsideRoot => StoreError::PathOutsideRoot(path.display().to_string()),
+        LocalFsError::Io(error) => StoreError::Io(error.to_string()),
     }
 }
 
@@ -2962,6 +2971,10 @@ impl Store {
     }
 
     /// Store a local file with optional title and tags.
+    ///
+    /// With a configured root, the open verifies the opened descriptor
+    /// stays under the root, so a symlink swap between the path check
+    /// and the open cannot escape it.
     pub async fn store_file_path_with_fields(
         &self,
         path: &Path,
@@ -2972,7 +2985,14 @@ impl Store {
         let content_type = fields.content_type.as_deref();
         let title = normalize_title(fields.title.as_deref())?;
         let tags = normalize_tags(&fields.tags)?;
-        let mut file = File::open(path).await?;
+        let mut file = match self.config.mcp_local_root.as_deref() {
+            Some(root) => {
+                let std_file = crate::localfs::open_read_under_root(root, path)
+                    .map_err(|e| map_localfs_error(e, path))?;
+                File::from_std(std_file)
+            }
+            None => File::open(path).await?,
+        };
         // Metadata from the handle, not the path: one file, one view.
         let file_meta = file.metadata().await?;
         if !file_meta.is_file() {
@@ -4259,6 +4279,14 @@ impl Store {
     ///
     /// The plan keeps each read inside one object, so a segment is never
     /// fetched as part of the base object.
+    ///
+    /// The download writes a temporary file next to the destination and
+    /// renames it onto the destination only after a successful flush.
+    /// A failed download leaves no partial file, and an existing
+    /// destination is never truncated before the download succeeds.
+    /// With a configured root, the temporary file is created inside the
+    /// parent directory opened under that root, so a symlink swap of
+    /// the parent cannot move the file outside the root.
     pub async fn download_file(
         &self,
         id: &str,
@@ -4283,27 +4311,41 @@ impl Store {
             }
             None => (0, meta.size.saturating_sub(1)),
         };
+        let root = self.config.mcp_local_root.as_deref();
         if meta.size == 0 {
-            tokio::fs::write(dest, b"").await?;
+            let (_file, guard) =
+                TempDest::create(root, dest).map_err(|e| map_localfs_error(e, dest))?;
+            guard.commit().map_err(|e| map_localfs_error(e, dest))?;
             return Ok(meta);
         }
         let plan = meta.plan();
-        let mut file = File::create(dest).await?;
-        for (key, local_start, local_end) in plan.object_ranges(start, end) {
-            let mut cur = local_start;
-            while cur <= local_end {
-                let chunk_end = (cur + MULTIPART_CHUNK_BYTES as u64 - 1).min(local_end);
-                let bytes = self
-                    .fetch_object_range(&key, Some((cur, chunk_end)))
-                    .await?;
-                if bytes.is_empty() {
-                    break;
+        let (std_file, guard) =
+            TempDest::create(root, dest).map_err(|e| map_localfs_error(e, dest))?;
+        let mut file = File::from_std(std_file);
+        let written = async {
+            for (key, local_start, local_end) in plan.object_ranges(start, end) {
+                let mut cur = local_start;
+                while cur <= local_end {
+                    let chunk_end = (cur + MULTIPART_CHUNK_BYTES as u64 - 1).min(local_end);
+                    let bytes = self
+                        .fetch_object_range(&key, Some((cur, chunk_end)))
+                        .await?;
+                    if bytes.is_empty() {
+                        break;
+                    }
+                    file.write_all(&bytes).await?;
+                    cur = chunk_end + 1;
                 }
-                file.write_all(&bytes).await?;
-                cur = chunk_end + 1;
             }
+            file.flush().await?;
+            Ok::<(), StoreError>(())
         }
-        file.flush().await?;
+        .await;
+        // On failure the guard drops and removes the temporary file,
+        // so the destination is never touched.
+        written?;
+        drop(file);
+        guard.commit().map_err(|e| map_localfs_error(e, dest))?;
         Ok(meta)
     }
 

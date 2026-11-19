@@ -76,7 +76,9 @@ impl LocalFiles {
 /// Resolve a path that a tool will read.
 ///
 /// A canonical root compares real paths, so a symlink that points away
-/// from the root is refused instead of followed.
+/// from the root is refused instead of followed. The store opens the
+/// path again and verifies the opened descriptor, so a symlink swap
+/// after this check cannot escape the root.
 async fn local_read_path(local: &LocalFiles, requested: &str) -> Result<PathBuf, StoreError> {
     match local {
         LocalFiles::Open => Ok(PathBuf::from(requested)),
@@ -99,7 +101,9 @@ async fn local_read_path(local: &LocalFiles, requested: &str) -> Result<PathBuf,
 /// A destination that does not exist yet is resolved through its parent,
 /// because the file cannot be canonicalized before it exists. An
 /// existing destination is canonicalized, so a symlink that points
-/// outside the root is refused.
+/// outside the root is refused. The store writes a temporary file and
+/// renames it onto the destination, so a symlink swap after this check
+/// cannot move the file outside the root.
 async fn local_write_path(local: &LocalFiles, requested: &str) -> Result<PathBuf, StoreError> {
     match local {
         LocalFiles::Open => Ok(PathBuf::from(requested)),
