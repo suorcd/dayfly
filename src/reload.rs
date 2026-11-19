@@ -215,6 +215,9 @@ fn changed_fields(old: &Config, new: &Config) -> Vec<&'static str> {
     if old.search_max_bytes != new.search_max_bytes {
         changed.push("DAYFLY_SEARCH_MAX_BYTES");
     }
+    if old.search_prefix_max_bytes != new.search_prefix_max_bytes {
+        changed.push("DAYFLY_SEARCH_PREFIX_MAX_BYTES");
+    }
     if old.alias_words != new.alias_words {
         changed.push("DAYFLY_ALIAS_WORDS");
     }

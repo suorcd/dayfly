@@ -321,6 +321,7 @@ pub(crate) fn status_for(e: &StoreError) -> StatusCode {
         StoreError::NotFound(_) => StatusCode::NOT_FOUND,
         StoreError::Expired(_) => StatusCode::GONE,
         StoreError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+        StoreError::SearchPrefixTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
         StoreError::InvalidId(_)
         | StoreError::InvalidDate(_)
         | StoreError::InvalidRange(_)
@@ -2182,6 +2183,7 @@ pub fn service_info(store: &Store) -> serde_json::Value {
             "max_file_bytes": config.max_file_bytes,
             "max_paste_bytes": config.max_paste_bytes,
             "search_max_bytes": config.search_max_bytes,
+            "search_prefix_max_bytes": config.search_prefix_max_bytes,
             "default_ttl_seconds": u64::from(config.default_ttl_days) * 86_400,
             "list_default_days": config.list_default_days,
             "min_ttl_seconds": u64::from(config.min_ttl_days) * 86_400,
@@ -2312,6 +2314,7 @@ mod tests {
             cleanup_interval_seconds: 0,
             cleanup_on_startup: false,
             search_max_bytes: 64 * 1024 * 1024,
+            search_prefix_max_bytes: 64 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,
             min_ttl_days: 0,

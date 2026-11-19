@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use dayfly::config::{Config, ConfigError};
 
-const VARS: [&str; 35] = [
+const VARS: [&str; 36] = [
     "S3_ENDPOINT",
     "S3_BUCKET",
     "S3_REGION",
@@ -21,6 +21,7 @@ const VARS: [&str; 35] = [
     "DAYFLY_MAX_FILE_BYTES",
     "DAYFLY_MAX_PASTE_BYTES",
     "DAYFLY_SEARCH_MAX_BYTES",
+    "DAYFLY_SEARCH_PREFIX_MAX_BYTES",
     "DAYFLY_ALIAS_WORDS",
     "DAYFLY_DEFAULT_TTL_DAYS",
     "DAYFLY_LIST_DEFAULT_DAYS",
@@ -105,6 +106,7 @@ fn minimal_environment_applies_documented_defaults() {
     assert_eq!(config.max_file_bytes, 1024 * 1024 * 1024);
     assert_eq!(config.max_paste_bytes, 1024 * 1024 * 1024);
     assert_eq!(config.search_max_bytes, 64 * 1024 * 1024);
+    assert_eq!(config.search_prefix_max_bytes, 64 * 1024 * 1024);
     assert_eq!(config.alias_words, 3);
     assert_eq!(config.default_ttl_days, 7);
     assert!(!config.retention_by_size);
@@ -139,6 +141,26 @@ fn search_max_bytes_parses_and_rejects_zero() {
     };
     assert!(
         error.to_string().contains("DAYFLY_SEARCH_MAX_BYTES"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn search_prefix_max_bytes_parses_and_rejects_zero() {
+    let _guard = lock_env();
+    clear_env();
+    set_required();
+    env::set_var("DAYFLY_SEARCH_PREFIX_MAX_BYTES", "1234");
+    let config = Config::from_env().expect("the prefix cap must parse");
+    assert_eq!(config.search_prefix_max_bytes, 1234);
+
+    env::set_var("DAYFLY_SEARCH_PREFIX_MAX_BYTES", "0");
+    let error = match Config::from_env() {
+        Ok(_) => panic!("zero must fail"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("DAYFLY_SEARCH_PREFIX_MAX_BYTES"),
         "got: {error}"
     );
 }

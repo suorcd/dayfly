@@ -230,6 +230,7 @@ impl FakeS3 {
             cleanup_interval_seconds: 0,
             cleanup_on_startup: false,
             search_max_bytes: 64 * 1024 * 1024,
+            search_prefix_max_bytes: 64 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,
             min_ttl_days: 0,

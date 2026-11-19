@@ -2417,6 +2417,134 @@ async fn search_text_rejects_binary_and_invalid_regex() {
     assert!(matches!(error, StoreError::InvalidSearch(_)));
 }
 
+/// Bytes that ranged GetObject calls read, from the fake S3 log.
+fn range_bytes_read(gets: &[(String, Option<String>)]) -> u64 {
+    let mut total = 0u64;
+    for (_, range) in gets {
+        let range = range.as_deref().expect("test reads must use a range");
+        let rest = range
+            .strip_prefix("bytes=")
+            .expect("range must start with bytes=");
+        let (start, end) = rest.split_once('-').expect("range must have start and end");
+        let start: u64 = start.parse().expect("range start must parse");
+        let end: u64 = end.parse().expect("range end must parse");
+        total += end - start + 1;
+    }
+    total
+}
+
+/// A store whose prefix scan cap is `bound` bytes.
+async fn store_with_prefix_bound(fake: &FakeS3, bound: u64) -> Store {
+    let mut config = fake.config();
+    config.search_prefix_max_bytes = bound;
+    Store::from_config(config)
+        .await
+        .expect("fake S3 config must build without network access")
+}
+
+/// 128 lines of 32 bytes: line N starts at byte (N - 1) * 32.
+fn numbered_lines() -> Vec<u8> {
+    "0123456789abcdef0123456789abcde\n".repeat(128).into_bytes()
+}
+
+#[tokio::test]
+async fn search_text_rejects_after_offset_past_prefix_bound() {
+    let fake = FakeS3::start().await;
+    let store = store_with_prefix_bound(&fake, 1024).await;
+    let stored = store
+        .store_text(&numbered_lines(), None, Some("text/plain"), None)
+        .await
+        .expect("the text must store");
+    let before = fake.gets().len();
+    let error = store
+        .search_text(
+            &stored.id,
+            "abcde",
+            SearchOptions {
+                after_offset: 2048,
+                ..SearchOptions::default()
+            },
+        )
+        .await
+        .expect_err("a search past the prefix bound must fail");
+    assert!(
+        matches!(error, StoreError::SearchPrefixTooLarge { limit: 1024 }),
+        "got: {error:?}"
+    );
+    assert_eq!(error.code(), "search_prefix_too_large");
+    assert_eq!(
+        range_bytes_read(&fake.gets()[before..]),
+        0,
+        "the rejected search must read no prefix bytes"
+    );
+}
+
+#[tokio::test]
+async fn search_text_with_after_offset_inside_prefix_bound_succeeds() {
+    let fake = FakeS3::start().await;
+    let store = store_with_prefix_bound(&fake, 1024).await;
+    let stored = store
+        .store_text(&numbered_lines(), None, Some("text/plain"), None)
+        .await
+        .expect("the text must store");
+    let result = store
+        .search_text(
+            &stored.id,
+            "abcde",
+            SearchOptions {
+                after_offset: 512,
+                ..SearchOptions::default()
+            },
+        )
+        .await
+        .expect("a search inside the prefix bound must succeed");
+    assert!(!result.hits.is_empty());
+    assert_eq!(result.hits[0].line, 17);
+    assert_eq!(result.hits[0].byte_offset, 512);
+}
+
+#[tokio::test]
+async fn fetch_text_lines_rejects_line_range_past_prefix_bound() {
+    let fake = FakeS3::start().await;
+    let store = store_with_prefix_bound(&fake, 1024).await;
+    let stored = store
+        .store_text(&numbered_lines(), None, Some("text/plain"), None)
+        .await
+        .expect("the text must store");
+    let before = fake.gets().len();
+    let error = store
+        .fetch_text_lines(&stored.id, 100, 100)
+        .await
+        .expect_err("a line range past the prefix bound must fail");
+    assert!(
+        matches!(error, StoreError::SearchPrefixTooLarge { limit: 1024 }),
+        "got: {error:?}"
+    );
+    assert_eq!(error.code(), "search_prefix_too_large");
+    let read = range_bytes_read(&fake.gets()[before..]);
+    assert!(
+        read <= 1024,
+        "the rejected line scan read {read} bytes, past the 1024 byte bound"
+    );
+}
+
+#[tokio::test]
+async fn fetch_text_lines_inside_prefix_bound_succeeds() {
+    let fake = FakeS3::start().await;
+    let store = store_with_prefix_bound(&fake, 1024).await;
+    let stored = store
+        .store_text(&numbered_lines(), None, Some("text/plain"), None)
+        .await
+        .expect("the text must store");
+    let lines = store
+        .fetch_text_lines(&stored.id, 30, 31)
+        .await
+        .expect("a line range inside the prefix bound must read");
+    let one_line = "0123456789abcdef0123456789abcde\n";
+    assert_eq!(lines.text, format!("{one_line}{one_line}"));
+    assert_eq!(lines.total_bytes, 4096);
+}
+
 #[tokio::test]
 async fn fetch_text_tail_and_line_range_return_the_requested_slice() {
     let fake = FakeS3::start().await;

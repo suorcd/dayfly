@@ -33,6 +33,7 @@ fn cleanup_command(fake: &FakeS3) -> Command {
         "DAYFLY_MAX_PASTE_BYTES",
         "DAYFLY_MULTIPART_ABORT_AFTER",
         "DAYFLY_SEARCH_MAX_BYTES",
+        "DAYFLY_SEARCH_PREFIX_MAX_BYTES",
         "DAYFLY_ALIAS_WORDS",
         "DAYFLY_DEFAULT_TTL_DAYS",
         "DAYFLY_MIN_TTL_DAYS",

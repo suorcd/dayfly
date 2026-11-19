@@ -132,6 +132,8 @@ pub enum StoreError {
     InvalidTags(String),
     #[error("invalid search: {0}")]
     InvalidSearch(String),
+    #[error("search prefix too large: limit is {limit} bytes")]
+    SearchPrefixTooLarge { limit: u64 },
     #[error("paste is not text: {0}")]
     NotText(String),
     #[error("range not satisfiable")]
@@ -181,6 +183,7 @@ impl StoreError {
             StoreError::InvalidTitle(_) => "invalid_title",
             StoreError::InvalidTags(_) => "invalid_tags",
             StoreError::InvalidSearch(_) => "invalid_search",
+            StoreError::SearchPrefixTooLarge { .. } => "search_prefix_too_large",
             StoreError::NotText(_) => "not_text",
             StoreError::RangeNotSatisfiable => "range_not_satisfiable",
             StoreError::TtlOutOfRange(_) => "invalid_ttl",
@@ -4052,6 +4055,12 @@ impl Store {
     /// `after_offset`. It scans the base object and every segment through
     /// the existing segment plan. A line is the unit of a hit. The scan is
     /// O(bytes read), and it uses no index.
+    ///
+    /// The search first counts newlines from byte 0 to `after_offset`.
+    /// That prefix scan reads at most
+    /// [`Config::search_prefix_max_bytes`]. A request with `after_offset`
+    /// past the cap fails with [`StoreError::SearchPrefixTooLarge`]
+    /// before it reads any prefix bytes.
     pub async fn search_text(
         &self,
         id: &str,
@@ -4086,6 +4095,12 @@ impl Store {
         let total = meta.size;
         let after = options.after_offset.min(total);
         let scan_end = total.min(after.saturating_add(self.config.search_max_bytes));
+        let prefix_limit = self.config.search_prefix_max_bytes;
+        if after > prefix_limit {
+            return Err(StoreError::SearchPrefixTooLarge {
+                limit: prefix_limit,
+            });
+        }
         let prefix_newlines = self.count_newlines(&meta.plan(), 0, after).await?;
         let bytes = if after < scan_end {
             self.fetch_range_with_plan(&meta.plan(), after, scan_end - 1)
@@ -4158,6 +4173,9 @@ impl Store {
     ///
     /// The method scans the paste to find the byte offsets of the lines.
     /// The returned slice is still capped by [`MAX_FETCH_TEXT_BYTES`].
+    /// The scan reads at most [`Config::search_prefix_max_bytes`]. A
+    /// request for lines past the cap fails with
+    /// [`StoreError::SearchPrefixTooLarge`] instead of reading further.
     pub async fn fetch_text_lines(
         &self,
         id: &str,
@@ -4179,7 +4197,9 @@ impl Store {
             .await
     }
 
-    /// Count newlines in `start..end`.
+    /// Count newlines in `start..end`. The caller bounds the range:
+    /// [`Self::search_text`] rejects an `after_offset` past
+    /// [`Config::search_prefix_max_bytes`] before it calls this.
     async fn count_newlines(
         &self,
         plan: &SegmentPlan,
@@ -4198,6 +4218,10 @@ impl Store {
     }
 
     /// Find the byte offsets of an inclusive line range.
+    ///
+    /// The scan reads at most [`Config::search_prefix_max_bytes`]. It
+    /// fails with [`StoreError::SearchPrefixTooLarge`] when the wanted
+    /// lines lie past the cap.
     async fn line_range_offsets(
         &self,
         plan: &SegmentPlan,
@@ -4205,12 +4229,18 @@ impl Store {
         line_start: u64,
         line_end: u64,
     ) -> Result<(u64, u64), StoreError> {
+        let limit = self.config.search_prefix_max_bytes;
         let mut line = 1u64;
         let mut start = 0u64;
         let mut wanted_start = None;
         let mut cur = 0u64;
         while cur < total {
-            let chunk_end = (cur + MULTIPART_CHUNK_BYTES as u64 - 1).min(total - 1);
+            if cur >= limit {
+                return Err(StoreError::SearchPrefixTooLarge { limit });
+            }
+            let chunk_end = (cur + MULTIPART_CHUNK_BYTES as u64 - 1)
+                .min(total - 1)
+                .min(limit - 1);
             let bytes = self.fetch_range_with_plan(plan, cur, chunk_end).await?;
             for (index, byte) in bytes.iter().enumerate() {
                 if *byte != b'\n' {
@@ -5436,6 +5466,7 @@ mod token_tests {
             cleanup_interval_seconds: 0,
             cleanup_on_startup: false,
             search_max_bytes: 64 * 1024 * 1024,
+            search_prefix_max_bytes: 64 * 1024 * 1024,
             alias_words: 3,
             default_ttl_days: 7,
             min_ttl_days: 0,
