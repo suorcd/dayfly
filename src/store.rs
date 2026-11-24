@@ -555,6 +555,35 @@ fn inclusive_dates(start: NaiveDate, end: NaiveDate) -> impl Iterator<Item = Nai
     })
 }
 
+/// A short, stable hash of a paste ID, key, or alias for log lines.
+///
+/// The first 8 hex characters of the SHA-256 of the value, prefixed with
+/// `sha256:`. The hash stays stable for one value, so log lines for the
+/// same paste still correlate. Eight hex characters (32 bits) are
+/// enough to correlate log lines and short enough to read, and a hash
+/// does not resolve the paste.
+pub(crate) fn redact_paste_id(id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(id.as_bytes());
+    let digest = hasher.finalize();
+    format!(
+        "sha256:{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3]
+    )
+}
+
+/// A paste ID, key, or alias as it may appear in a log line: the raw
+/// value only when the operator opted in with
+/// `DAYFLY_LOG_RAW_PASTE_IDS`, else the short hash from
+/// [`redact_paste_id`].
+pub(crate) fn log_paste_id(id: &str, log_raw: bool) -> String {
+    if log_raw {
+        id.to_string()
+    } else {
+        redact_paste_id(id)
+    }
+}
+
 /// Map an AWS SDK error to a [`StoreError`] using the typed error metadata
 /// rather than substring matching on the debug representation.
 ///
@@ -562,14 +591,17 @@ fn inclusive_dates(start: NaiveDate, end: NaiveDate) -> impl Iterator<Item = Nai
 /// bucket is an operator misconfiguration, and folding it into `NotFound` made
 /// a wrong `S3_BUCKET` look like every paste had been deleted, while also
 /// reporting a failed upload as "paste not found".
-pub fn map_sdk_error<E, R>(err: SdkError<E, R>, id: &str) -> StoreError
+pub fn map_sdk_error<E, R>(err: SdkError<E, R>, id: &str, log_raw: bool) -> StoreError
 where
     E: ProvideErrorMetadata + std::fmt::Debug,
     R: std::fmt::Debug,
 {
     if let SdkError::ServiceError(ctx) = &err {
         if is_quota_error(ctx.err().code(), ctx.err().message()) {
-            tracing::warn!(bucket_object = id, "bucket storage quota is reached");
+            tracing::warn!(
+                bucket_object = %log_paste_id(id, log_raw),
+                "bucket storage quota is reached"
+            );
             return StoreError::QuotaExceeded;
         }
         match ctx.err().code() {
@@ -1803,16 +1835,17 @@ impl StoreHandle {
 
 /// Abort one multipart upload with retries.
 ///
-/// The function tries [`ABORT_ATTEMPTS`] times. It logs the key and the
-/// upload ID when every attempt fails, so an orphan is visible in the
-/// server log. A missing upload counts as success. The caller keeps its
-/// original upload error.
+/// The function tries [`ABORT_ATTEMPTS`] times. It logs the key hash
+/// and the upload ID when every attempt fails, so an orphan is visible
+/// in the server log. A missing upload counts as success. The caller
+/// keeps its original upload error.
 async fn abort_multipart_with_retry(
     client: &Client,
     bucket: &str,
     key: &str,
     upload_id: &str,
     metrics: Option<&Arc<Metrics>>,
+    log_raw: bool,
 ) -> Result<(), StoreError> {
     let mut last_error = None;
     for attempt in 1..=ABORT_ATTEMPTS {
@@ -1834,7 +1867,7 @@ async fn abort_multipart_with_retry(
                         return Ok(());
                     }
                 }
-                last_error = Some(map_sdk_error(error, key));
+                last_error = Some(map_sdk_error(error, key, log_raw));
                 if attempt < ABORT_ATTEMPTS {
                     tokio::time::sleep(ABORT_BACKOFF * attempt as u32).await;
                 }
@@ -1843,7 +1876,7 @@ async fn abort_multipart_with_retry(
     }
     let error = last_error.unwrap_or_else(|| StoreError::S3("multipart abort failed".into()));
     tracing::error!(
-        key = %key,
+        key = %log_paste_id(key, log_raw),
         upload_id = %upload_id,
         error = %error,
         "cannot abort multipart upload after {ABORT_ATTEMPTS} attempts"
@@ -1863,6 +1896,7 @@ struct AwsUploadSink {
     metrics: Option<Arc<Metrics>>,
     active_uploads: Arc<Mutex<HashSet<String>>>,
     current_upload: Option<String>,
+    log_raw: bool,
 }
 
 impl Drop for AwsUploadSink {
@@ -1896,7 +1930,7 @@ impl crate::stream::UploadSink for AwsUploadSink {
                 .set_metadata(Some(meta))
                 .send()
         )
-        .map_err(|e| map_sdk_error(e, &self.key))?;
+        .map_err(|e| map_sdk_error(e, &self.key, self.log_raw))?;
         Ok(())
     }
 
@@ -1912,7 +1946,7 @@ impl crate::stream::UploadSink for AwsUploadSink {
                 .set_metadata(Some(self.metadata.clone()))
                 .send()
         )
-        .map_err(|e| map_sdk_error(e, &self.key))?;
+        .map_err(|e| map_sdk_error(e, &self.key, self.log_raw))?;
         let id = out.upload_id().unwrap_or("").to_string();
         if id.is_empty() {
             return Err(StoreError::S3(
@@ -1945,7 +1979,7 @@ impl crate::stream::UploadSink for AwsUploadSink {
                 .body(ByteStream::from(bytes))
                 .send()
         )
-        .map_err(|e| map_sdk_error(e, &self.key))?;
+        .map_err(|e| map_sdk_error(e, &self.key, self.log_raw))?;
         Ok(out.e_tag().unwrap_or("").to_string())
     }
 
@@ -1973,7 +2007,7 @@ impl crate::stream::UploadSink for AwsUploadSink {
                 .multipart_upload(completed)
                 .send()
         )
-        .map_err(|e| map_sdk_error(e, &self.key))?;
+        .map_err(|e| map_sdk_error(e, &self.key, self.log_raw))?;
         self.current_upload = None;
         self.active_uploads
             .lock()
@@ -1994,6 +2028,7 @@ impl crate::stream::UploadSink for AwsUploadSink {
             &self.key,
             upload_id,
             self.metrics.as_ref(),
+            self.log_raw,
         )
         .await;
     }
@@ -2090,7 +2125,11 @@ impl Store {
                 if absent {
                     Ok(Vec::new())
                 } else {
-                    Err(map_sdk_error(error, &self.bucket))
+                    Err(map_sdk_error(
+                        error,
+                        &self.bucket,
+                        self.config.log_raw_paste_ids,
+                    ))
                 }
             }
         }
@@ -2112,7 +2151,7 @@ impl Store {
                 .lifecycle_configuration(configuration)
                 .send()
         )
-        .map_err(|error| map_sdk_error(error, &self.bucket))?;
+        .map_err(|error| map_sdk_error(error, &self.bucket, self.config.log_raw_paste_ids))?;
         Ok(())
     }
 
@@ -2203,7 +2242,7 @@ impl Store {
                 request = request.upload_id_marker(marker);
             }
             let output = s3_call!(self.metrics, "list_multipart_uploads", request.send())
-                .map_err(|error| map_sdk_error(error, "pastes/"))?;
+                .map_err(|error| map_sdk_error(error, "pastes/", self.config.log_raw_paste_ids))?;
             for upload in output.uploads() {
                 let Some(key) = upload.key() else { continue };
                 let Some(upload_id) = upload.upload_id() else {
@@ -2237,6 +2276,7 @@ impl Store {
                     key,
                     upload_id,
                     self.metrics.as_ref(),
+                    self.config.log_raw_paste_ids,
                 )
                 .await
                 {
@@ -2248,7 +2288,7 @@ impl Store {
                     }
                     Err(error) => {
                         tracing::warn!(
-                            key = %key,
+                            key = %log_paste_id(key, self.config.log_raw_paste_ids),
                             upload_id = %upload_id,
                             "cannot abort a stale multipart upload: {error}"
                         );
@@ -2390,7 +2430,7 @@ impl Store {
                 request = request.continuation_token(token);
             }
             let output = s3_call!(self.metrics, "list_objects_v2", request.send())
-                .map_err(|error| map_sdk_error(error, prefix))?;
+                .map_err(|error| map_sdk_error(error, prefix, self.config.log_raw_paste_ids))?;
             keys.extend(
                 output
                     .contents()
@@ -2421,7 +2461,7 @@ impl Store {
                 .key(key)
                 .send()
         )
-        .map_err(|error| map_sdk_error(error, key))
+        .map_err(|error| map_sdk_error(error, key, self.config.log_raw_paste_ids))
         {
             Ok(output) => Ok(output
                 .metadata()
@@ -2462,7 +2502,7 @@ impl Store {
                 .key(&key)
                 .send()
         )
-        .map_err(|e| map_sdk_error(e, &key))
+        .map_err(|e| map_sdk_error(e, &key, self.config.log_raw_paste_ids))
         {
             Ok(out) => {
                 let expires_at = out
@@ -2537,7 +2577,7 @@ impl Store {
                 .set_metadata(Some(meta))
                 .send()
         )
-        .map_err(|e| map_sdk_error(e, &key))?;
+        .map_err(|e| map_sdk_error(e, &key, self.config.log_raw_paste_ids))?;
         Ok(())
     }
 
@@ -2575,7 +2615,7 @@ impl Store {
                 .key(&key)
                 .send()
         )
-        .map_err(|e| map_sdk_error(e, &key))?;
+        .map_err(|e| map_sdk_error(e, &key, self.config.log_raw_paste_ids))?;
         Ok(())
     }
 
@@ -2583,7 +2623,7 @@ impl Store {
     async fn cleanup_failed_store(&self, base_key: &str, phrase: &str) {
         if let Err(error) = self.delete_alias_if_target(phrase, base_key).await {
             tracing::warn!(
-                key = %alias_key(phrase),
+                key = %log_paste_id(&alias_key(phrase), self.config.log_raw_paste_ids),
                 error = ?error,
                 "cannot delete the alias object of a failed store"
             );
@@ -2606,10 +2646,12 @@ impl Store {
                 .key(&key)
                 .send()
         )
-        .map_err(|e| match map_sdk_error(e, &key) {
-            StoreError::NotFound(_) => StoreError::NotFound(phrase.to_string()),
-            other => other,
-        })?;
+        .map_err(
+            |e| match map_sdk_error(e, &key, self.config.log_raw_paste_ids) {
+                StoreError::NotFound(_) => StoreError::NotFound(phrase.to_string()),
+                other => other,
+            },
+        )?;
         let meta = out.metadata().cloned().unwrap_or_default();
         let bytes = out
             .body
@@ -2691,7 +2733,7 @@ impl Store {
                 .key(key)
                 .send()
         )
-        .map_err(|e| map_sdk_error(e, key))
+        .map_err(|e| map_sdk_error(e, key, self.config.log_raw_paste_ids))
         {
             Ok(out) => out,
             Err(StoreError::NotFound(_)) => return Ok(None),
@@ -2715,7 +2757,7 @@ impl Store {
                 .key(key)
                 .send()
         )
-        .map_err(|e| map_sdk_error(e, key))?;
+        .map_err(|e| map_sdk_error(e, key, self.config.log_raw_paste_ids))?;
         Ok(())
     }
 
@@ -2731,7 +2773,7 @@ impl Store {
             Ok(segments) => segments,
             Err(error) => {
                 tracing::warn!(
-                    key = %base_key,
+                    key = %log_paste_id(base_key, self.config.log_raw_paste_ids),
                     error = ?error,
                     "cannot list segments for delete"
                 );
@@ -2740,7 +2782,7 @@ impl Store {
         };
         if let Err(error) = self.delete_object_key(base_key).await {
             tracing::warn!(
-                key = %base_key,
+                key = %log_paste_id(base_key, self.config.log_raw_paste_ids),
                 error = ?error,
                 "cannot delete object"
             );
@@ -2750,7 +2792,7 @@ impl Store {
         for (key, _) in segments {
             if let Err(error) = self.delete_object_key(&key).await {
                 tracing::warn!(
-                    key = %key,
+                    key = %log_paste_id(&key, self.config.log_raw_paste_ids),
                     error = ?error,
                     "cannot delete object"
                 );
@@ -2762,7 +2804,7 @@ impl Store {
                 Ok(remaining) => remaining,
                 Err(error) => {
                     tracing::warn!(
-                        key = %base_key,
+                        key = %log_paste_id(base_key, self.config.log_raw_paste_ids),
                         error = ?error,
                         "cannot list segments for delete"
                     );
@@ -2780,7 +2822,7 @@ impl Store {
             for (key, _) in remaining {
                 if let Err(error) = self.delete_object_key(&key).await {
                     tracing::warn!(
-                        key = %key,
+                        key = %log_paste_id(&key, self.config.log_raw_paste_ids),
                         error = ?error,
                         "cannot delete object"
                     );
@@ -2839,7 +2881,7 @@ impl Store {
                 req = req.continuation_token(t);
             }
             let out = s3_call!(self.metrics, "list_objects_v2", req.send())
-                .map_err(|e| map_sdk_error(e, id))?;
+                .map_err(|e| map_sdk_error(e, id, self.config.log_raw_paste_ids))?;
             for obj in out.contents() {
                 if let Some(key) = obj.key() {
                     if !is_paste_key(key) {
@@ -2984,7 +3026,7 @@ impl Store {
                 .send()
         ) {
             self.cleanup_failed_store(&key, &words).await;
-            return Err(map_sdk_error(e, &key));
+            return Err(map_sdk_error(e, &key, self.config.log_raw_paste_ids));
         }
         if let Err(e) = self.verify_alias(&words, &key).await {
             if Self::alias_is_lost(&e) {
@@ -3147,7 +3189,7 @@ impl Store {
                         .send()
                 ) {
                     self.cleanup_failed_store(&key, &claimed).await;
-                    return Err(map_sdk_error(e, &key));
+                    return Err(map_sdk_error(e, &key, self.config.log_raw_paste_ids));
                 }
                 if let Err(e) = self.verify_alias(&claimed, &key).await {
                     if Self::alias_is_lost(&e) {
@@ -3273,6 +3315,7 @@ impl Store {
             metrics: self.metrics.clone(),
             active_uploads: Arc::clone(&self.active_uploads),
             current_upload: None,
+            log_raw: self.config.log_raw_paste_ids,
         };
         let outcome = match crate::stream::run_streaming_upload(
             Box::pin(file_stream(file)),
@@ -3457,6 +3500,7 @@ impl Store {
             metrics: self.metrics.clone(),
             active_uploads: Arc::clone(&self.active_uploads),
             current_upload: None,
+            log_raw: self.config.log_raw_paste_ids,
         };
         let outcome =
             match crate::stream::run_streaming_upload(wrapped, &mut sink, known_length, max_bytes)
@@ -3513,7 +3557,7 @@ impl Store {
                 req = req.continuation_token(t);
             }
             let out = s3_call!(self.metrics, "list_objects_v2", req.send())
-                .map_err(|e| map_sdk_error(e, base_key))?;
+                .map_err(|e| map_sdk_error(e, base_key, self.config.log_raw_paste_ids))?;
             for obj in out.contents() {
                 if let Some(key) = obj.key() {
                     entries.push((
@@ -3653,7 +3697,7 @@ impl Store {
                 .set_metadata(Some(object_meta))
                 .send()
         ) {
-            tracing::warn!(key = %key, error = ?error, "append segment write failed");
+            tracing::warn!(key = %log_paste_id(&key, self.config.log_raw_paste_ids), error = ?error, "append segment write failed");
             return Err(StoreError::PartialUpdate {
                 step: "new segment",
                 key,
@@ -3679,7 +3723,7 @@ impl Store {
                 .key(&meta.key)
                 .send()
         ) {
-            let mapped = map_sdk_error(error, &meta.key);
+            let mapped = map_sdk_error(error, &meta.key, self.config.log_raw_paste_ids);
             let mut removed = false;
             for _ in 0..MULTI_STEP_ATTEMPTS {
                 if self.delete_object_key(&key).await.is_ok() {
@@ -3689,7 +3733,7 @@ impl Store {
             }
             if !removed {
                 tracing::warn!(
-                    key = %key,
+                    key = %log_paste_id(&key, self.config.log_raw_paste_ids),
                     "cannot remove the segment after the base disappeared"
                 );
             }
@@ -3777,7 +3821,7 @@ impl Store {
                 .key(key)
                 .send()
         )
-        .map_err(|e| map_sdk_error(e, id))?;
+        .map_err(|e| map_sdk_error(e, id, self.config.log_raw_paste_ids))?;
         let meta = out.metadata().cloned().unwrap_or_default();
         let created_at = meta.get("created-at").and_then(|s| parse_rfc3339(s));
         let expires_at = meta.get("expires-at").and_then(|s| parse_rfc3339(s));
@@ -3877,7 +3921,7 @@ impl Store {
                 .key(key)
                 .send()
         )
-        .map_err(|e| map_sdk_error(e, key))?;
+        .map_err(|e| map_sdk_error(e, key, self.config.log_raw_paste_ids))?;
         let size = u64::try_from(out.content_length().unwrap_or(0)).unwrap_or(0);
         if copy_object_too_large(size) {
             return Err(StoreError::CopyLimit {
@@ -3909,7 +3953,7 @@ impl Store {
                 .set_metadata(Some(meta))
                 .send()
         )
-        .map_err(|e| map_sdk_error(e, key))?;
+        .map_err(|e| map_sdk_error(e, key, self.config.log_raw_paste_ids))?;
         Ok(())
     }
 
@@ -4042,8 +4086,8 @@ impl Store {
         if let Some((start, end)) = range {
             req = req.range(format!("bytes={start}-{end}"));
         }
-        let out =
-            s3_call!(self.metrics, "get_object", req.send()).map_err(|e| map_sdk_error(e, key))?;
+        let out = s3_call!(self.metrics, "get_object", req.send())
+            .map_err(|e| map_sdk_error(e, key, self.config.log_raw_paste_ids))?;
         let expected = range.map(|(start, end)| end.saturating_sub(start).saturating_add(1));
         let reported = u64::try_from(out.content_length().unwrap_or(-1)).ok();
         let bytes = out
@@ -4111,7 +4155,7 @@ impl Store {
                 .key(key)
                 .send()
         )
-        .map_err(|e| map_sdk_error(e, key))?;
+        .map_err(|e| map_sdk_error(e, key, self.config.log_raw_paste_ids))?;
         let base_size = u64::try_from(out.content_length().unwrap_or(0)).unwrap_or(0);
         let plan = self.load_plan(key, base_size).await?;
         match range {
@@ -4594,7 +4638,7 @@ impl Store {
                         req = req.start_after(key);
                     }
                     let out = s3_call!(self.metrics, "list_objects_v2", req.send())
-                        .map_err(|e| map_sdk_error(e, &date_str))?;
+                        .map_err(|e| map_sdk_error(e, &date_str, self.config.log_raw_paste_ids))?;
                     pages += 1;
                     for obj in out.contents() {
                         let Some(key) = obj.key() else { continue };

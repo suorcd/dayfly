@@ -5517,7 +5517,7 @@ async fn an_active_multipart_upload_is_not_swept() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn a_persistent_abort_failure_logs_the_key_and_upload_id() {
+async fn a_persistent_abort_failure_logs_the_key_hash_and_upload_id() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
     fake.fail_abort_always("upload-1");
@@ -5556,8 +5556,12 @@ async fn a_persistent_abort_failure_logs_the_key_and_upload_id() {
         "the failed abort must be logged: {logs}"
     );
     assert!(
-        logs.contains("key=pastes/"),
-        "the key must be logged: {logs}"
+        logs.contains("key=sha256:"),
+        "the key must be logged as a hash: {logs}"
+    );
+    assert!(
+        !logs.contains("key=pastes/"),
+        "the raw key must not be logged: {logs}"
     );
     assert!(
         logs.contains("upload_id=upload-1"),
@@ -5566,7 +5570,7 @@ async fn a_persistent_abort_failure_logs_the_key_and_upload_id() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn failed_cleanup_deletes_log_the_key() {
+async fn failed_cleanup_deletes_log_the_key_hash() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
     fake.fail_delete_prefix("pastes/");
@@ -5599,8 +5603,12 @@ async fn failed_cleanup_deletes_log_the_key() {
     );
     let logs = captured.text();
     assert!(
-        logs.contains("key=pastes/"),
-        "the failed cleanup delete must log the key: {logs}"
+        logs.contains("key=sha256:"),
+        "the failed cleanup delete must log the key as a hash: {logs}"
+    );
+    assert!(
+        !logs.contains("key=pastes/"),
+        "the raw key must not be logged: {logs}"
     );
 }
 
