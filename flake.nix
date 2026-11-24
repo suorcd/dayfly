@@ -45,8 +45,13 @@
             inherit version;
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
-            # No system libraries are needed: TLS goes through Rust crates
-            # (rustls), not OpenSSL, and no C build steps exist.
+            # nixpkgs' cargo setup hook exports AWS_LC_SYS_USE_SYSTEM=1,
+            # so aws-lc-sys links the system AWS-LC instead of building
+            # it from source. Give the build that library and pkg-config,
+            # the same inputs the nixpkgs crate override uses for the
+            # per-crate build.
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = [ pkgs.aws-lc ];
           };
           # Local cleanup for the current checkout. It removes the result
           # symlinks, target/, and .direnv/; --rust-cache also clears the
