@@ -442,6 +442,10 @@ pub enum ListWindowRequest {
     Date(String),
     /// Inclusive start and end dates.
     Range { start: String, end: String },
+    /// Inclusive start date. The range ends today in UTC.
+    RangeFrom { start: String },
+    /// Inclusive end date. The range starts 365 days before the end.
+    RangeTo { end: String },
     /// The default window: the last `DAYFLY_LIST_DEFAULT_DAYS` days,
     /// ending today in UTC.
     Default,
@@ -450,14 +454,18 @@ pub enum ListWindowRequest {
 /// Parse a date, a range, or a default request into a
 /// [`ListWindowRequest`].
 ///
-/// A date takes precedence over a range. A range must supply both dates and
-/// the start date must not be after the end date. A malformed or inverted
-/// range returns [`StoreError::InvalidDate`].
+/// A date takes precedence over a range. An empty value counts as absent.
+/// A range with only a start ends today in UTC. A range with only an end
+/// starts 365 days before the end. A range with both dates must not be
+/// inverted. A malformed or inverted range returns [`StoreError::InvalidDate`].
 pub fn parse_list_window_request(
     date: Option<&str>,
     start: Option<&str>,
     end: Option<&str>,
 ) -> Result<ListWindowRequest, StoreError> {
+    let date = present_date(date);
+    let start = present_date(start);
+    let end = present_date(end);
     if let Some(date) = date {
         parse_list_date(date)?;
         return Ok(ListWindowRequest::Date(date.to_string()));
@@ -477,10 +485,25 @@ pub fn parse_list_window_request(
                 end: end.to_string(),
             })
         }
-        _ => Err(StoreError::InvalidDate(
-            "supply both start and end, or neither".to_string(),
-        )),
+        (Some(start), None) => {
+            parse_list_date(start)?;
+            Ok(ListWindowRequest::RangeFrom {
+                start: start.to_string(),
+            })
+        }
+        (None, Some(end)) => {
+            parse_list_date(end)?;
+            Ok(ListWindowRequest::RangeTo {
+                end: end.to_string(),
+            })
+        }
     }
+}
+
+/// Treat a blank value as absent. A form sends an empty value for a
+/// blank field, so the parser must not read it as a date.
+fn present_date(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn parse_list_date(value: &str) -> Result<NaiveDate, StoreError> {
@@ -501,8 +524,22 @@ fn resolve_list_window(
             (day, day)
         }
         ListWindowRequest::Range { start, end } => (parse_list_date(start)?, parse_list_date(end)?),
+        ListWindowRequest::RangeFrom { start } => (parse_list_date(start)?, now.date_naive()),
+        ListWindowRequest::RangeTo { end } => {
+            let end_date = parse_list_date(end)?;
+            let span = chrono::Duration::days(LIST_WINDOW_MAX_DAYS as i64 - 1);
+            let start_date = end_date.checked_sub_signed(span).ok_or_else(|| {
+                StoreError::InvalidDate(format!("end {end} is too early for a range"))
+            })?;
+            (start_date, end_date)
+        }
         ListWindowRequest::Default => default_list_window(now, default_days),
     };
+    if start > end {
+        return Err(StoreError::InvalidDate(format!(
+            "start {start} is after end {end}"
+        )));
+    }
     let days = (end - start).num_days() + 1;
     if days > LIST_WINDOW_MAX_DAYS as i64 {
         return Err(StoreError::InvalidDate(format!(
@@ -4995,13 +5032,60 @@ mod tests {
     }
 
     #[test]
-    fn one_sided_range_is_rejected() {
+    fn empty_date_values_are_absent() {
+        assert_eq!(
+            parse_list_window_request(Some(""), None, None).unwrap(),
+            ListWindowRequest::Default
+        );
+        assert_eq!(
+            parse_list_window_request(Some("   "), None, None).unwrap(),
+            ListWindowRequest::Default
+        );
+        let now = Utc.with_ymd_and_hms(2026, 10, 29, 3, 0, 0).unwrap();
+        let request = parse_list_window_request(None, Some(""), Some("2026-10-29")).unwrap();
+        let (start, end) = resolve_list_window(&request, now, 2).unwrap();
+        assert_eq!(start, NaiveDate::from_ymd_opt(2025, 10, 29).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 10, 29).unwrap());
+        let request = parse_list_window_request(None, Some("2026-10-28"), Some("")).unwrap();
+        let (start, end) = resolve_list_window(&request, now, 2).unwrap();
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 10, 28).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 10, 29).unwrap());
+    }
+
+    #[test]
+    fn one_sided_start_ends_today() {
+        let request = parse_list_window_request(None, Some("2026-10-28"), None).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 10, 29, 3, 0, 0).unwrap();
+        let (start, end) = resolve_list_window(&request, now, 2).unwrap();
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 10, 28).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 10, 29).unwrap());
+    }
+
+    #[test]
+    fn one_sided_end_starts_365_days_before_the_end() {
+        let request = parse_list_window_request(None, None, Some("2026-10-29")).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 10, 29, 3, 0, 0).unwrap();
+        let (start, end) = resolve_list_window(&request, now, 2).unwrap();
+        assert_eq!(start, NaiveDate::from_ymd_opt(2025, 10, 29).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 10, 29).unwrap());
+    }
+
+    #[test]
+    fn one_sided_start_after_today_is_rejected() {
+        let request = parse_list_window_request(None, Some("2026-10-30"), None).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 10, 29, 3, 0, 0).unwrap();
         assert!(matches!(
-            parse_list_window_request(None, Some("2026-10-28"), None),
+            resolve_list_window(&request, now, 2),
             Err(StoreError::InvalidDate(_))
         ));
+    }
+
+    #[test]
+    fn one_sided_start_over_the_window_limit_is_rejected() {
+        let request = parse_list_window_request(None, Some("2025-01-01"), None).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 10, 29, 3, 0, 0).unwrap();
         assert!(matches!(
-            parse_list_window_request(None, None, Some("2026-10-28")),
+            resolve_list_window(&request, now, 2),
             Err(StoreError::InvalidDate(_))
         ));
     }

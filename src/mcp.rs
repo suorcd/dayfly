@@ -434,9 +434,10 @@ pub struct DeleteParams {
 pub struct ListRecentParams {
     /// Single date, YYYY-MM-DD. Takes precedence over start and end.
     pub date: Option<String>,
-    /// Inclusive window start, YYYY-MM-DD. Requires end.
+    /// Inclusive window start, YYYY-MM-DD. Without end, the range ends today.
     pub start: Option<String>,
-    /// Inclusive window end, YYYY-MM-DD. Requires start.
+    /// Inclusive window end, YYYY-MM-DD. Without start, the range starts
+    /// 365 days before the end.
     pub end: Option<String>,
     /// Keep only items whose ID, alias, title, or filename contains
     /// this text. The match ignores case.
@@ -794,7 +795,7 @@ impl Pastebin {
     }
 
     #[tool(
-        description = "List current pastes for one date or an inclusive date range. date=YYYY-MM-DD takes precedence over start and end. A range needs both start and end (YYYY-MM-DD), and start must be <= end. With no dates, the window is the last DAYFLY_LIST_DEFAULT_DAYS days, ending today in UTC (2 days by default). Optional q matches the ID, alias, title, or filename, and the match ignores case. Optional tag matches one normalized tag. Both filters apply to the returned page and do not change truncated or next. A filtered page can be empty while next is set, so follow the cursor. The result reports truncated and next. Pass next.date as after_date and next.start_after as after_key to read the next page. This scans the bucket directly (ListObjectsV2 + HeadObject per key) and filters expired objects; it is prefix listing, not search or sort, and is O(n) in objects scanned."
+        description = "List current pastes for one date or an inclusive date range. date=YYYY-MM-DD takes precedence over start and end. A range takes start and end (YYYY-MM-DD), and start must be <= end. A range with only start ends today in UTC. A range with only end starts 365 days before the end. With no dates, the window is the last DAYFLY_LIST_DEFAULT_DAYS days, ending today in UTC (2 days by default). Optional q matches the ID, alias, title, or filename, and the match ignores case. Optional tag matches one normalized tag. Both filters apply to the returned page and do not change truncated or next. A filtered page can be empty while next is set, so follow the cursor. The result reports truncated and next. Pass next.date as after_date and next.start_after as after_key to read the next page. This scans the bucket directly (ListObjectsV2 + HeadObject per key) and filters expired objects; it is prefix listing, not search or sort, and is O(n) in objects scanned."
     )]
     async fn list_recent(
         &self,
@@ -840,6 +841,20 @@ impl Pastebin {
                 try_store!(
                     store
                         .list_window_page(Some(start), Some(end), limit, cursor.as_ref())
+                        .await
+                )
+            }
+            ListWindowRequest::RangeFrom { start } => {
+                try_store!(
+                    store
+                        .list_window_page(Some(start), None, limit, cursor.as_ref())
+                        .await
+                )
+            }
+            ListWindowRequest::RangeTo { end } => {
+                try_store!(
+                    store
+                        .list_window_page(None, Some(end), limit, cursor.as_ref())
                         .await
                 )
             }
@@ -1153,15 +1168,33 @@ mod tests {
     }
 
     #[test]
-    fn list_params_reject_a_one_sided_range() {
-        assert!(matches!(
-            list_request(&params(None, Some("2026-10-28"), None)),
-            Err(StoreError::InvalidDate(_))
-        ));
-        assert!(matches!(
-            list_request(&params(None, None, Some("2026-10-28"))),
-            Err(StoreError::InvalidDate(_))
-        ));
+    fn list_params_accept_a_one_sided_range() {
+        assert_eq!(
+            list_request(&params(None, Some("2026-10-28"), None)).unwrap(),
+            ListWindowRequest::RangeFrom {
+                start: "2026-10-28".to_string(),
+            }
+        );
+        assert_eq!(
+            list_request(&params(None, None, Some("2026-10-28"))).unwrap(),
+            ListWindowRequest::RangeTo {
+                end: "2026-10-28".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn list_params_treat_empty_dates_as_absent() {
+        assert_eq!(
+            list_request(&params(None, Some(""), Some("2026-10-28"))).unwrap(),
+            ListWindowRequest::RangeTo {
+                end: "2026-10-28".to_string(),
+            }
+        );
+        assert_eq!(
+            list_request(&params(Some(""), None, None)).unwrap(),
+            ListWindowRequest::Default
+        );
     }
 
     #[test]
