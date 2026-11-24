@@ -261,6 +261,176 @@ async fn sdk_failure_debug_text_does_not_carry_the_key() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn delete_list_failure_logs_the_error_hash_not_the_key() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"delete me", None, None, Some(Ttl::days(1)))
+        .await
+        .expect("store_text must succeed against the fake");
+    fake.fail_list_prefix(
+        &format!("{}/", stored.key),
+        StatusCode::NOT_FOUND,
+        "NoSuchBucket",
+    );
+    let (captured, _guard) = capture_logs();
+    let _ = store.delete(&stored.id).await;
+    let logs = captured.text();
+    assert!(
+        logs.contains("cannot list segments for delete"),
+        "the failed segment list must be logged: {logs}"
+    );
+    assert!(
+        !logs.contains(&stored.key),
+        "the raw key must not appear in default logs: {logs}"
+    );
+    assert!(
+        !logs.contains(random_part(&stored.id)),
+        "the raw random ID must not appear in default logs: {logs}"
+    );
+    assert!(
+        logs.contains("key=sha256:"),
+        "the key must still be logged as a hash: {logs}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn delete_base_failure_logs_the_error_hash_not_the_key() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"delete me", None, None, Some(Ttl::days(1)))
+        .await
+        .expect("store_text must succeed against the fake");
+    fake.fail_delete_with(
+        "pastes/",
+        StatusCode::NOT_FOUND,
+        "NoSuchBucket",
+        "the bucket does not exist",
+    );
+    let (captured, _guard) = capture_logs();
+    let _ = store.delete(&stored.id).await;
+    let logs = captured.text();
+    assert!(
+        logs.contains("cannot delete object"),
+        "the failed delete must be logged: {logs}"
+    );
+    assert!(
+        !logs.contains(&stored.key),
+        "the raw key must not appear in default logs: {logs}"
+    );
+    assert!(
+        !logs.contains(random_part(&stored.id)),
+        "the raw random ID must not appear in default logs: {logs}"
+    );
+    assert!(
+        logs.contains("key=sha256:"),
+        "the key must still be logged as a hash: {logs}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn delete_segment_failure_logs_the_error_hash_not_the_key() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"base", None, None, Some(Ttl::days(1)))
+        .await
+        .expect("store_text must succeed against the fake");
+    store
+        .append_text(&stored.id, b"more")
+        .await
+        .expect("append must succeed against the fake");
+    fake.fail_delete_with(
+        &format!("{}/", stored.key),
+        StatusCode::NOT_FOUND,
+        "NoSuchBucket",
+        "the bucket does not exist",
+    );
+    let (captured, _guard) = capture_logs();
+    let _ = store.delete(&stored.id).await;
+    let logs = captured.text();
+    assert!(
+        logs.contains("cannot delete object"),
+        "the failed segment delete must be logged: {logs}"
+    );
+    assert!(
+        !logs.contains(&stored.key),
+        "the raw key must not appear in default logs: {logs}"
+    );
+    assert!(
+        !logs.contains(random_part(&stored.id)),
+        "the raw random ID must not appear in default logs: {logs}"
+    );
+    assert!(
+        logs.contains("key=sha256:"),
+        "the key must still be logged as a hash: {logs}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stale_abort_warning_logs_the_error_hash_not_the_key() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let past = (Utc::now() - Duration::hours(2)).to_rfc3339();
+    fake.seed_multipart("pastes/2026-01-01/bad", "upload-bad", &past);
+    fake.fail_abort_with(
+        "upload-bad",
+        StatusCode::NOT_FOUND,
+        "NoSuchBucket",
+        "the bucket does not exist",
+    );
+    let (captured, _guard) = capture_logs();
+    let _ = store
+        .abort_stale_multipart_uploads_with_report(std::time::Duration::from_secs(3_600), false)
+        .await;
+    let logs = captured.text();
+    assert!(
+        logs.contains("cannot abort a stale multipart upload"),
+        "the failed abort must be logged: {logs}"
+    );
+    assert!(
+        !logs.contains("pastes/2026-01-01/bad"),
+        "the raw key must not appear in default logs: {logs}"
+    );
+    assert!(
+        logs.contains("key=sha256:"),
+        "the key must still be logged as a hash: {logs}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn persistent_abort_failure_logs_the_error_hash_not_the_key() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let past = (Utc::now() - Duration::hours(2)).to_rfc3339();
+    fake.seed_multipart("pastes/2026-01-01/bad", "upload-bad", &past);
+    fake.fail_abort_with(
+        "upload-bad",
+        StatusCode::NOT_FOUND,
+        "NoSuchBucket",
+        "the bucket does not exist",
+    );
+    let (captured, _guard) = capture_logs();
+    let _ = store
+        .abort_stale_multipart_uploads_with_report(std::time::Duration::from_secs(3_600), false)
+        .await;
+    let logs = captured.text();
+    assert!(
+        logs.contains("cannot abort multipart upload after"),
+        "the persistent abort failure must be logged: {logs}"
+    );
+    assert!(
+        !logs.contains("pastes/2026-01-01/bad"),
+        "the raw key must not appear in default logs: {logs}"
+    );
+    assert!(
+        logs.contains("key=sha256:"),
+        "the key must still be logged as a hash: {logs}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn cleanup_alias_failure_logs_the_alias_hash_not_the_alias() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
@@ -291,5 +461,108 @@ async fn cleanup_alias_failure_logs_the_alias_hash_not_the_alias() {
     assert!(
         logs.contains("key=sha256:"),
         "the alias key must still be logged as a hash: {logs}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cleanup_alias_failure_logs_the_error_hash_not_the_alias() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    fake.fail_delete_prefix("pastes/");
+    fake.fail_delete_with(
+        "words/",
+        StatusCode::NOT_FOUND,
+        "NoSuchBucket",
+        "the bucket does not exist",
+    );
+    let (captured, _guard) = capture_logs();
+    let items: Vec<Result<Bytes, StoreError>> =
+        vec![Ok(Bytes::from(common::pattern_bytes(6 * 1024 * 1024)))];
+    let _ = store
+        .store_stream(
+            stream::iter(items),
+            Some("large.bin"),
+            None,
+            None,
+            None,
+            5 * 1024 * 1024,
+        )
+        .await;
+    let logs = captured.text();
+    assert!(
+        logs.contains("cannot delete the alias object of a failed store"),
+        "the failed alias cleanup must be logged: {logs}"
+    );
+    assert!(
+        !logs.contains("words/"),
+        "the raw word alias must not appear in default logs: {logs}"
+    );
+    assert!(
+        logs.contains("key=sha256:"),
+        "the alias key must still be logged as a hash: {logs}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn append_segment_write_failure_logs_no_sdk_debug_dump() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    let stored = store
+        .store_text(b"base", None, None, Some(Ttl::days(1)))
+        .await
+        .expect("store_text must succeed against the fake");
+    fake.fail_put_with(
+        &format!("{}/", stored.key),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "InternalError",
+        "injected segment failure",
+    );
+    let (captured, _guard) = capture_logs();
+    let _ = store.append_text(&stored.id, b"more").await;
+    let logs = captured.text();
+    let line = logs
+        .lines()
+        .find(|line| line.contains("append segment write failed"))
+        .unwrap_or_else(|| panic!("no segment failure line in: {logs}"));
+    assert!(
+        line.contains("InternalError"),
+        "the failure line must name the error code: {line}"
+    );
+    assert!(
+        !line.contains("RequestId"),
+        "the failure line must not carry the SDK debug dump: {line}"
+    );
+    assert!(
+        !line.contains(&stored.key),
+        "the raw key must not appear in the failure line: {line}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sdk_failure_line_logs_the_code_not_the_debug_dump() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    fake.fail_put_with(
+        "pastes/",
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "InternalError",
+        "injected put failure",
+    );
+    let (captured, _guard) = capture_logs();
+    let _ = store
+        .store_text(b"quota", None, None, Some(Ttl::days(1)))
+        .await;
+    let logs = captured.text();
+    let line = logs
+        .lines()
+        .find(|line| line.contains("an object store request failed"))
+        .unwrap_or_else(|| panic!("no S3 failure line in: {logs}"));
+    assert!(
+        line.contains("InternalError"),
+        "the failure line must name the error code: {line}"
+    );
+    assert!(
+        !line.contains("RequestId"),
+        "the failure line must not carry the SDK debug dump: {line}"
     );
 }

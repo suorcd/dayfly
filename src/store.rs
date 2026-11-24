@@ -584,6 +584,63 @@ pub(crate) fn log_paste_id(id: &str, log_raw: bool) -> String {
     }
 }
 
+/// A store error as it may appear in a log line.
+///
+/// Variants that carry a paste ID, a key, or an alias use the short
+/// hash from [`log_paste_id`], unless the operator opted in with
+/// `DAYFLY_LOG_RAW_PASTE_IDS`. Other variants use their normal
+/// message. The client-facing message (`Display` for [`StoreError`])
+/// stays unchanged.
+pub(crate) fn log_store_error(error: &StoreError, log_raw: bool) -> String {
+    match error {
+        StoreError::NotFound(id) => {
+            format!("paste not found: {}", log_paste_id(id, log_raw))
+        }
+        StoreError::BucketUnavailable(id) => format!(
+            "bucket unavailable or misconfigured: {}",
+            log_paste_id(id, log_raw)
+        ),
+        StoreError::Expired(id) => {
+            format!("paste expired: {}", log_paste_id(id, log_raw))
+        }
+        StoreError::InvalidId(id) => {
+            format!("invalid id: {}", log_paste_id(id, log_raw))
+        }
+        StoreError::InvalidCursor(payload) => {
+            format!("invalid list cursor: {}", log_paste_id(payload, log_raw))
+        }
+        StoreError::NotText(id) => {
+            format!("paste is not text: {}", log_paste_id(id, log_raw))
+        }
+        StoreError::AmbiguousId(id) => format!(
+            "bare id {} matches more than one paste: use the full dated id",
+            log_paste_id(id, log_raw)
+        ),
+        StoreError::PartialUpdate { step, key } => format!(
+            "multi-object update failed at the {step} step for {}",
+            log_paste_id(key, log_raw)
+        ),
+        other => other.to_string(),
+    }
+}
+
+/// A short summary of an SDK error for a log line.
+///
+/// A service error yields its code and message from the typed
+/// metadata. Any other error yields the static SDK label. The
+/// summary never holds the debug dump, so it never holds the raw
+/// response body or the request URI.
+fn sdk_error_summary<E, R>(error: &SdkError<E, R>) -> String
+where
+    E: ProvideErrorMetadata + std::fmt::Debug,
+    R: std::fmt::Debug,
+{
+    match error.code() {
+        Some(code) => format!("{code}: {}", error.message().unwrap_or("")),
+        None => error.to_string(),
+    }
+}
+
 /// Map an AWS SDK error to a [`StoreError`] using the typed error metadata
 /// rather than substring matching on the debug representation.
 ///
@@ -614,7 +671,23 @@ where
             _ => {}
         }
     }
-    s3_failure("an object store request failed", err)
+    s3_service_failure("an object store request failed", &err)
+}
+
+/// Log an object store failure and return a client-safe error.
+///
+/// The log line carries the error code and message from the typed
+/// metadata, not the SDK debug dump. The dump holds the raw response,
+/// and a response body can carry an object key. The client gets one
+/// fixed message, so a bucket name, an error code, or an internal
+/// host does not reach the response.
+fn s3_service_failure<E, R>(message: &str, error: &SdkError<E, R>) -> StoreError
+where
+    E: ProvideErrorMetadata + std::fmt::Debug,
+    R: std::fmt::Debug,
+{
+    tracing::warn!("{message}: {}", sdk_error_summary(error));
+    StoreError::S3(message.to_string())
 }
 
 /// Whether an S3 error reports a bucket quota limit.
@@ -630,12 +703,12 @@ fn is_quota_error(code: Option<&str>, message: Option<&str>) -> bool {
     code == Some("Forbidden") && message.is_some_and(|message| message.contains("quota is reached"))
 }
 
-/// Log an object store failure and return a client-safe error.
+/// Log an object body read failure and return a client-safe error.
 ///
-/// The AWS SDK debug text can contain the endpoint, the response headers,
-/// and the response body. Keep that text in the server log. The client
-/// gets one fixed message, so a bucket name, an error code, or an internal
-/// host does not reach the response.
+/// The callers pass byte-stream errors. Their debug text holds stream
+/// state, not object data, so it cannot carry a paste ID or a key.
+/// The client gets one fixed message, so a bucket name, an error code,
+/// or an internal host does not reach the response.
 fn s3_failure(message: &str, error: impl std::fmt::Debug) -> StoreError {
     tracing::warn!("{message}: {error:?}");
     StoreError::S3(message.to_string())
@@ -1878,7 +1951,7 @@ async fn abort_multipart_with_retry(
     tracing::error!(
         key = %log_paste_id(key, log_raw),
         upload_id = %upload_id,
-        error = %error,
+        error = %log_store_error(&error, log_raw),
         "cannot abort multipart upload after {ABORT_ATTEMPTS} attempts"
     );
     Err(error)
@@ -2290,12 +2363,13 @@ impl Store {
                         tracing::warn!(
                             key = %log_paste_id(key, self.config.log_raw_paste_ids),
                             upload_id = %upload_id,
-                            "cannot abort a stale multipart upload: {error}"
+                            "cannot abort a stale multipart upload: {}",
+                            log_store_error(&error, self.config.log_raw_paste_ids)
                         );
                         report.failed.push(MultipartAbortFailure {
                             key: key.to_string(),
                             upload_id: upload_id.to_string(),
-                            message: error.to_string(),
+                            message: log_store_error(&error, self.config.log_raw_paste_ids),
                         });
                     }
                 }
@@ -2338,7 +2412,7 @@ impl Store {
             Err(error) => {
                 report.pastes_failed.push(CleanupFailure {
                     key: "pastes/".to_string(),
-                    message: error.to_string(),
+                    message: log_store_error(&error, self.config.log_raw_paste_ids),
                 });
                 Vec::new()
             }
@@ -2352,7 +2426,7 @@ impl Store {
                 Err(error) => {
                     report.pastes_failed.push(CleanupFailure {
                         key: key.clone(),
-                        message: error.to_string(),
+                        message: log_store_error(&error, self.config.log_raw_paste_ids),
                     });
                     continue;
                 }
@@ -2368,7 +2442,7 @@ impl Store {
                 Ok(()) => report.pastes_deleted.push(key),
                 Err(error) => report.pastes_failed.push(CleanupFailure {
                     key: key.clone(),
-                    message: error.to_string(),
+                    message: log_store_error(&error, self.config.log_raw_paste_ids),
                 }),
             }
         }
@@ -2377,7 +2451,7 @@ impl Store {
             Err(error) => {
                 report.aliases_failed.push(CleanupFailure {
                     key: ALIAS_PREFIX.to_string(),
-                    message: error.to_string(),
+                    message: log_store_error(&error, self.config.log_raw_paste_ids),
                 });
                 Vec::new()
             }
@@ -2388,7 +2462,7 @@ impl Store {
                 Err(error) => {
                     report.aliases_failed.push(CleanupFailure {
                         key: key.clone(),
-                        message: error.to_string(),
+                        message: log_store_error(&error, self.config.log_raw_paste_ids),
                     });
                     continue;
                 }
@@ -2404,7 +2478,7 @@ impl Store {
                 Ok(()) => report.aliases_deleted.push(key),
                 Err(error) => report.aliases_failed.push(CleanupFailure {
                     key: key.clone(),
-                    message: error.to_string(),
+                    message: log_store_error(&error, self.config.log_raw_paste_ids),
                 }),
             }
         }
@@ -2624,7 +2698,7 @@ impl Store {
         if let Err(error) = self.delete_alias_if_target(phrase, base_key).await {
             tracing::warn!(
                 key = %log_paste_id(&alias_key(phrase), self.config.log_raw_paste_ids),
-                error = ?error,
+                error = %log_store_error(&error, self.config.log_raw_paste_ids),
                 "cannot delete the alias object of a failed store"
             );
         }
@@ -2774,7 +2848,7 @@ impl Store {
             Err(error) => {
                 tracing::warn!(
                     key = %log_paste_id(base_key, self.config.log_raw_paste_ids),
-                    error = ?error,
+                    error = %log_store_error(&error, self.config.log_raw_paste_ids),
                     "cannot list segments for delete"
                 );
                 return Err(partial_update_error("segment list", base_key, error));
@@ -2783,7 +2857,7 @@ impl Store {
         if let Err(error) = self.delete_object_key(base_key).await {
             tracing::warn!(
                 key = %log_paste_id(base_key, self.config.log_raw_paste_ids),
-                error = ?error,
+                error = %log_store_error(&error, self.config.log_raw_paste_ids),
                 "cannot delete object"
             );
             return Err(partial_update_error("base delete", base_key, error));
@@ -2793,7 +2867,7 @@ impl Store {
             if let Err(error) = self.delete_object_key(&key).await {
                 tracing::warn!(
                     key = %log_paste_id(&key, self.config.log_raw_paste_ids),
-                    error = ?error,
+                    error = %log_store_error(&error, self.config.log_raw_paste_ids),
                     "cannot delete object"
                 );
                 first_error.get_or_insert(partial_update_error("segment delete", &key, error));
@@ -2805,7 +2879,7 @@ impl Store {
                 Err(error) => {
                     tracing::warn!(
                         key = %log_paste_id(base_key, self.config.log_raw_paste_ids),
-                        error = ?error,
+                        error = %log_store_error(&error, self.config.log_raw_paste_ids),
                         "cannot list segments for delete"
                     );
                     first_error.get_or_insert(partial_update_error(
@@ -2823,7 +2897,7 @@ impl Store {
                 if let Err(error) = self.delete_object_key(&key).await {
                     tracing::warn!(
                         key = %log_paste_id(&key, self.config.log_raw_paste_ids),
-                        error = ?error,
+                        error = %log_store_error(&error, self.config.log_raw_paste_ids),
                         "cannot delete object"
                     );
                     first_error.get_or_insert(partial_update_error("segment delete", &key, error));
@@ -3697,7 +3771,7 @@ impl Store {
                 .set_metadata(Some(object_meta))
                 .send()
         ) {
-            tracing::warn!(key = %log_paste_id(&key, self.config.log_raw_paste_ids), error = ?error, "append segment write failed");
+            tracing::warn!(key = %log_paste_id(&key, self.config.log_raw_paste_ids), error = %sdk_error_summary(&error), "append segment write failed");
             return Err(StoreError::PartialUpdate {
                 step: "new segment",
                 key,
@@ -4867,6 +4941,81 @@ mod tests {
             Some("the bucket is full")
         ));
         assert!(is_quota_error(Some("QuotaExceeded"), None));
+    }
+
+    #[test]
+    fn log_store_error_hashes_id_carrying_variants() {
+        let key = "pastes/2026-11-24/abcdefghijklmnopqrstuv";
+        let cases = [
+            StoreError::NotFound(key.to_string()),
+            StoreError::NotFound("words/dolly-dusk-circulate".to_string()),
+            StoreError::BucketUnavailable(key.to_string()),
+            StoreError::Expired(key.to_string()),
+            StoreError::InvalidId("abcdefghijklmnopqrstuv".to_string()),
+            StoreError::InvalidCursor(format!("key {key} does not belong to date 2026-11-24")),
+            StoreError::NotText(key.to_string()),
+            StoreError::AmbiguousId("abcdefghijklmnopqrstuv".to_string()),
+            StoreError::PartialUpdate {
+                step: "base delete",
+                key: key.to_string(),
+            },
+        ];
+        for error in cases {
+            let logged = log_store_error(&error, false);
+            assert!(
+                !logged.contains(key),
+                "the raw key must not appear: {logged}"
+            );
+            assert!(
+                !logged.contains("abcdefghijklmnopqrstuv"),
+                "the raw random ID must not appear: {logged}"
+            );
+            assert!(
+                !logged.contains("dolly-dusk-circulate"),
+                "the raw alias must not appear: {logged}"
+            );
+            assert!(
+                logged.contains("sha256:"),
+                "the log form must name the object as a hash: {logged}"
+            );
+        }
+    }
+
+    #[test]
+    fn log_store_error_restores_raw_values_when_the_opt_in_is_on() {
+        let key = "pastes/2026-11-24/abcdefghijklmnopqrstuv";
+        let logged = log_store_error(&StoreError::NotFound(key.to_string()), true);
+        assert!(
+            logged.contains(key),
+            "the raw key must appear when the opt-in is on: {logged}"
+        );
+    }
+
+    #[test]
+    fn log_store_error_keeps_other_variants_unchanged() {
+        let error = StoreError::TooLarge { limit: 1024 };
+        assert_eq!(log_store_error(&error, false), error.to_string());
+        let error = StoreError::QuotaExceeded;
+        assert_eq!(log_store_error(&error, false), error.to_string());
+    }
+
+    #[test]
+    fn sdk_error_summary_uses_static_labels_for_transport_errors() {
+        let timeout: SdkError<aws_sdk_s3::operation::get_object::GetObjectError, ()> =
+            SdkError::timeout_error(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out",
+            ));
+        assert_eq!(sdk_error_summary(&timeout), "request has timed out");
+        let construction: SdkError<aws_sdk_s3::operation::get_object::GetObjectError, ()> =
+            SdkError::construction_failure(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bad request",
+            ));
+        assert_eq!(
+            sdk_error_summary(&construction),
+            "failed to construct request"
+        );
     }
 
     #[test]

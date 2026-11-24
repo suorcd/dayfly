@@ -87,8 +87,10 @@ pub struct FakeState {
     pub fail_copy_once_keys: Vec<String>,
     pub fail_delete_keys: Vec<String>,
     pub fail_delete_prefixes: Vec<String>,
+    pub fail_delete_errors: Vec<(String, StatusCode, String, String)>,
     pub fail_abort_once: Vec<String>,
     pub fail_abort_always: Vec<String>,
+    pub fail_abort_errors: Vec<(String, StatusCode, String, String)>,
     pub multipart_page_size: Option<usize>,
     pub reported_sizes: BTreeMap<String, u64>,
     pub missing_bucket: bool,
@@ -598,6 +600,21 @@ impl FakeS3 {
             .push(prefix.to_string());
     }
 
+    /// Make every DeleteObject whose key starts with `prefix` fail
+    /// with the given status, code, and message.
+    pub fn fail_delete_with(&self, prefix: &str, status: StatusCode, code: &str, message: &str) {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .fail_delete_errors
+            .push((
+                prefix.to_string(),
+                status,
+                code.to_string(),
+                message.to_string(),
+            ));
+    }
+
     /// Make one AbortMultipartUpload for `upload_id` fail.
     pub fn fail_abort_once(&self, upload_id: &str) {
         self.state
@@ -614,6 +631,21 @@ impl FakeS3 {
             .expect("fake state lock")
             .fail_abort_always
             .push(upload_id.to_string());
+    }
+
+    /// Make every AbortMultipartUpload for `upload_id` fail with the
+    /// given status, code, and message.
+    pub fn fail_abort_with(&self, upload_id: &str, status: StatusCode, code: &str, message: &str) {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .fail_abort_errors
+            .push((
+                upload_id.to_string(),
+                status,
+                code.to_string(),
+                message.to_string(),
+            ));
     }
 
     /// Insert an incomplete multipart upload directly, bypassing the store.
@@ -666,8 +698,10 @@ impl FakeS3 {
         state.fail_copy_once_keys.clear();
         state.fail_delete_keys.clear();
         state.fail_delete_prefixes.clear();
+        state.fail_delete_errors.clear();
         state.fail_abort_once.clear();
         state.fail_abort_always.clear();
+        state.fail_abort_errors.clear();
     }
 
     pub fn drop_upload(&self, upload_id: &str) {
@@ -1139,6 +1173,13 @@ fn parse_range(value: &str, size: u64) -> Option<(u64, u64)> {
 fn delete_object(state: &Arc<Mutex<FakeState>>, key: Option<String>) -> Response {
     let mut state = state.lock().expect("fake state lock");
     if let Some(key) = key.as_deref() {
+        if let Some((_, status, code, message)) = state
+            .fail_delete_errors
+            .iter()
+            .find(|(prefix, _, _, _)| key.starts_with(prefix.as_str()))
+        {
+            return s3_error(*status, code, message);
+        }
         if state.fail_delete_keys.iter().any(|failed| failed == key)
             || state
                 .fail_delete_prefixes
@@ -1367,6 +1408,13 @@ fn complete_multipart(state: &Arc<Mutex<FakeState>>, key: Option<String>, uri: &
 fn abort_multipart(state: &Arc<Mutex<FakeState>>, uri: &Uri) -> Response {
     let upload_id = query_param(uri, "uploadId").unwrap_or_default();
     let mut state = state.lock().expect("fake state lock");
+    if let Some((_, status, code, message)) = state
+        .fail_abort_errors
+        .iter()
+        .find(|(failed, _, _, _)| failed == &upload_id)
+    {
+        return s3_error(*status, code, message);
+    }
     if state
         .fail_abort_always
         .iter()
