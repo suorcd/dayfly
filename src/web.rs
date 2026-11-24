@@ -1539,6 +1539,8 @@ async fn list_handler(
         ListWindowRequest::Range { start, end } => {
             store.list_window(Some(start), Some(end), 1000).await
         }
+        ListWindowRequest::RangeFrom { start } => store.list_window(Some(start), None, 1000).await,
+        ListWindowRequest::RangeTo { end } => store.list_window(None, Some(end), 1000).await,
         ListWindowRequest::Default => store.list_window(None, None, 1000).await,
     };
     let mut items = match items {
@@ -1651,7 +1653,7 @@ async fn list_handler(
         Some("/pastes"),
         false,
         &format!(
-            r#"<div class="list-panel"><form method="get" action="/pastes"><p><label>Start <input type="date" name="start" value="{}"></label> <label>End <input type="date" name="end" value="{}"></label> <label>Search <input type="search" name="q" value="{}"></label> <label>Tag <input type="text" name="tag" value="{}"></label> <button type="submit">Show range</button> <span class="hint" title="Dates are UTC. With no dates, the page shows the last {default_days} days, ending today in UTC. Set DAYFLY_LIST_DEFAULT_DAYS to change that. Built from a direct bucket scan (ListObjectsV2 for each date prefix, plus HeadObject per paste). No database. Listing is O(n) in objects scanned and gets slower as the bucket grows — that slowdown is the trigger for adding a database later.">i</span></p></form>
+            r#"<div class="list-panel"><form method="get" action="/pastes"><p><label>Start <input type="date" name="start" value="{}"></label> <label>End <input type="date" name="end" value="{}"></label> <label>Search <input type="search" name="q" value="{}"></label> <label>Tag <input type="text" name="tag" value="{}"></label> <button type="submit">Show range</button> <span class="hint" title="Dates are UTC. With no dates, the page shows the last {default_days} days, ending today in UTC. Set DAYFLY_LIST_DEFAULT_DAYS to change that. A blank start shows pastes up to the end. A blank end shows pastes from the start. Built from a direct bucket scan (ListObjectsV2 for each date prefix, plus HeadObject per paste). No database. Listing is O(n) in objects scanned and gets slower as the bucket grows — that slowdown is the trigger for adding a database later.">i</span></p></form>
 {token_note}<div class="table-wrap"><table><colgroup><col class="col-link"><col class="col-title"><col class="col-filename"><col class="col-content-type"><col class="col-size"><col class="col-created"><col class="col-ttl"><col class="col-action"></colgroup><thead><tr><th>{link_header}</th><th>Title</th><th>Filename</th><th>Content-Type</th><th>{size_header}</th><th>{created_header}</th><th class="ttl-header" title="days">TTL</th><th>Action</th></tr></thead><tbody>{}</tbody></table></div></div>"#,
             html_escape(&start_value),
             html_escape(&end_value),

@@ -1079,8 +1079,9 @@ the transport has a client address. `GET .../meta` returns it as
 same gate. The stdio MCP transport has no client address, so it stores no
 key.
 
-`date` takes precedence over `start` and `end`. Supply both `start` and
-`end` for a range; a one-sided range returns 400. Results are in date
+`date` takes precedence over `start` and `end`. A blank value counts as
+absent. A range with only `start` ends today in UTC. A range with only
+`end` starts 365 days before the end. Results are in date
 order, then in S3 key order within each date. The limit applies to the
 newest dates first, then to key order within a date. Key order is not
 creation order because IDs are random. An older date can be omitted.

@@ -1291,6 +1291,52 @@ async fn list_page_shows_current_pastes_and_hides_expired_ones() {
 }
 
 #[tokio::test]
+async fn list_page_treats_blank_dates_as_an_open_ended_range() {
+    let fake = FakeS3::start().await;
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let yesterday = (Utc::now() - Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    let valid = future_metadata(5);
+    fake.seed(
+        &format!("pastes/{today}/visible"),
+        b"abcde",
+        "text/plain",
+        &common::metadata_refs(&valid),
+    );
+    fake.seed(
+        &format!("pastes/{yesterday}/visible"),
+        b"abcde",
+        "text/plain",
+        &common::metadata_refs(&valid),
+    );
+    let app = common::app(fake.store().await);
+
+    let request = common::request(
+        "GET",
+        &format!("/pastes?start=&end={today}&q=&tag="),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(page.contains(&format!("{today}/visible")));
+
+    let request = common::request(
+        "GET",
+        &format!("/pastes?start={yesterday}&end=&q=&tag="),
+        &[],
+        Vec::new(),
+    );
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    assert!(page.contains(&format!("{yesterday}/visible")));
+    assert!(page.contains(&format!("{today}/visible")));
+}
+
+#[tokio::test]
 async fn list_page_middle_truncates_long_filenames_with_a_title() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;

@@ -1275,7 +1275,8 @@ async fn download_response(
 }
 
 /// Parse the listing query. `date` takes precedence over `start` and `end`.
-/// A range must supply both dates, and the range must not be inverted.
+/// A blank value counts as absent. A range with one date is open-ended,
+/// and the range must not be inverted.
 fn parse_list_query(query: &HashMap<String, String>) -> Result<ListWindowRequest, StoreError> {
     parse_list_window_request(
         query.get("date").map(String::as_str),
@@ -1339,6 +1340,16 @@ async fn list_handler(
         ListWindowRequest::Range { start, end } => {
             store
                 .list_window_page(Some(start), Some(end), limit, cursor.as_ref())
+                .await
+        }
+        ListWindowRequest::RangeFrom { start } => {
+            store
+                .list_window_page(Some(start), None, limit, cursor.as_ref())
+                .await
+        }
+        ListWindowRequest::RangeTo { end } => {
+            store
+                .list_window_page(None, Some(end), limit, cursor.as_ref())
                 .await
         }
         ListWindowRequest::Default => {
@@ -3546,15 +3557,39 @@ mod tests {
     }
 
     #[test]
-    fn list_query_rejects_a_one_sided_range() {
-        assert!(matches!(
-            parse_list_query(&query(&[("start", "2026-10-28")])),
-            Err(StoreError::InvalidDate(_))
-        ));
-        assert!(matches!(
-            parse_list_query(&query(&[("end", "2026-10-28")])),
-            Err(StoreError::InvalidDate(_))
-        ));
+    fn list_query_accepts_a_one_sided_range() {
+        assert_eq!(
+            parse_list_query(&query(&[("start", "2026-10-28")])).unwrap(),
+            ListWindowRequest::RangeFrom {
+                start: "2026-10-28".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_list_query(&query(&[("end", "2026-10-28")])).unwrap(),
+            ListWindowRequest::RangeTo {
+                end: "2026-10-28".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn list_query_treats_empty_dates_as_absent() {
+        assert_eq!(
+            parse_list_query(&query(&[("start", ""), ("end", "2026-10-28")])).unwrap(),
+            ListWindowRequest::RangeTo {
+                end: "2026-10-28".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_list_query(&query(&[("start", "2026-10-28"), ("end", "")])).unwrap(),
+            ListWindowRequest::RangeFrom {
+                start: "2026-10-28".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_list_query(&query(&[("date", "")])).unwrap(),
+            ListWindowRequest::Default
+        );
     }
 
     #[test]
@@ -3581,8 +3616,6 @@ mod tests {
         let app = api_router().with_state(state);
 
         for uri in [
-            "/v1/pastes?start=2026-10-28",
-            "/v1/pastes?end=2026-10-28",
             "/v1/pastes?start=2026-10-29&end=2026-10-28",
             "/v1/pastes?start=2026-13-01&end=2026-12-01",
         ] {
@@ -3599,6 +3632,32 @@ mod tests {
                 resp.status(),
                 StatusCode::BAD_REQUEST,
                 "{uri} must be a 400"
+            );
+        }
+    }
+
+    /// A one-sided range is valid now: the request passes validation and
+    /// reaches the unreachable test S3 endpoint, which returns 502. A
+    /// validation failure would return 400 instead.
+    #[tokio::test]
+    async fn list_endpoint_accepts_one_sided_ranges_past_validation() {
+        let state = test_state(10 * 1024 * 1024, 1024 * 1024 * 1024).await;
+        let app = api_router().with_state(state);
+
+        for uri in ["/v1/pastes?start=2026-10-28", "/v1/pastes?end=2026-10-28"] {
+            let req = Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request must build");
+            let resp = app
+                .clone()
+                .oneshot(req)
+                .await
+                .expect("router call must complete");
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_GATEWAY,
+                "{uri} must reach the store"
             );
         }
     }
