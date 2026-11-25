@@ -38,7 +38,6 @@ use futures::StreamExt;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
@@ -48,8 +47,8 @@ use crate::content_type::content_disposition;
 use crate::metrics::Metrics;
 use crate::rate_limit::RateLimiter;
 use crate::store::{
-    parse_list_window_request, parse_range_header, ListCursor, ListWindowRequest, PasteFields,
-    PasteMetadata, SearchOptions, Store, StoreError, StoreHandle, Ttl, TtlParseError,
+    log_paste_id, parse_list_window_request, parse_range_header, ListCursor, ListWindowRequest,
+    PasteFields, PasteMetadata, SearchOptions, Store, StoreError, StoreHandle, Ttl, TtlParseError,
     MULTIPART_CHUNK_BYTES,
 };
 use crate::web::{api_write_allowed, Footer};
@@ -1687,34 +1686,6 @@ fn is_date_component(value: &str) -> bool {
     bytes.len() == 10 && bytes[4] == b'-' && bytes[7] == b'-'
 }
 
-/// A short, stable hash of a paste ID or alias for log lines.
-///
-/// The first 8 hex characters of the SHA-256 of the ID, prefixed with
-/// `sha256:`. The hash stays stable for one ID, so log lines for the
-/// same paste still correlate. Eight hex characters (32 bits) are
-/// enough to correlate log lines and short enough to read, and a hash
-/// does not resolve the paste.
-pub(crate) fn redact_paste_id(id: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(id.as_bytes());
-    let digest = hasher.finalize();
-    format!(
-        "sha256:{:02x}{:02x}{:02x}{:02x}",
-        digest[0], digest[1], digest[2], digest[3]
-    )
-}
-
-/// The paste ID as it may appear in a log line: the raw ID only when
-/// the operator opted in with `DAYFLY_LOG_RAW_PASTE_IDS`, else the
-/// short hash from [`redact_paste_id`].
-fn log_paste_id(id: &str, log_raw: bool) -> String {
-    if log_raw {
-        id.to_string()
-    } else {
-        redact_paste_id(id)
-    }
-}
-
 /// The log form of the paste ID in `path`: the raw ID only when the
 /// operator opted in, else its short hash, else an empty string when
 /// the path carries no paste ID.
@@ -2648,6 +2619,7 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
+    use crate::store::redact_paste_id;
 
     type McpClient = Client<HttpConnector, Full<Bytes>>;
 
