@@ -307,11 +307,11 @@ base object stores only the SHA-256 of the token. The meta route and the
 MCP metadata tool do not return it. Treat the token as a credential and
 do not put it in a URL. A lost token means lost control of that paste;
 there is no recovery. A paste created before the setting was enabled has
-no token: on an instance with no bearer token configured, it stays deletable,
-appendable, and re-expirable by anyone who holds its link, until that paste
-expires. The setting is not retroactive, so treat every link issued before it
-was enabled as mutable; only a bearer token can change such a paste. A token for one paste
-cannot change another paste. The human create result page includes the
+no token. On an instance with no bearer token configured, no HTTP client
+can delete, append to, or change the expiry of such a paste. It stays
+readable until it expires. On an instance with a bearer token, only the
+bearer token can change it. The setting is not retroactive. A token for
+one paste cannot change another paste. The human create result page includes the
 token in its delete form. The view page has a token field in its delete
 form. The delete form on each list row has no token field, so it needs
 the bearer token or a proxy that authenticates.
