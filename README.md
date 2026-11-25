@@ -306,9 +306,12 @@ bearer token remains a universal key. The
 base object stores only the SHA-256 of the token. The meta route and the
 MCP metadata tool do not return it. Treat the token as a credential and
 do not put it in a URL. A lost token means lost control of that paste;
-there is no recovery. A paste created before the setting has
-no token; only a bearer token can change it. A token for one paste
-cannot change another paste. The human create result page includes the
+there is no recovery. A paste created before the setting was enabled has
+no token. On an instance with no bearer token configured, no HTTP client
+can delete, append to, or change the expiry of such a paste. It stays
+readable until it expires. On an instance with a bearer token, only the
+bearer token can change it. The setting is not retroactive. A token for
+one paste cannot change another paste. The human create result page includes the
 token in its delete form. The view page has a token field in its delete
 form. The delete form on each list row has no token field, so it needs
 the bearer token or a proxy that authenticates.
@@ -507,7 +510,7 @@ permissions and the lower total cap.
 | `DAYFLY_WRITE_REQUIRES_TOKEN` | no | `false` | Require the bearer token for writes while reads stay anonymous. It requires `DAYFLY_HTTP_BEARER_TOKEN`. Uploads, appends, deletes, expiry changes, the human write routes, and `/mcp` require the token. Downloads, metadata, search, `/raw`, the human index and view pages, and listing stay anonymous unless `DAYFLY_LIST_REQUIRES_TOKEN` gates the list. A paste token still authorizes its own delete, patch, and append. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_LIST_ENABLED` | no | `true` | Allow listing on every transport. `false` makes `/pastes`, `GET /v1/pastes`, and the MCP `list_recent` tool return 403 with "Listing is turned off on this instance." It wins over `DAYFLY_LIST_REQUIRES_TOKEN`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_LIST_REQUIRES_TOKEN` | no | `false` | Require the bearer token for `GET /v1/pastes`, the human `/pastes` page, and the MCP `list_recent` tool even when reads are anonymous. With this on and no token configured, all three refuse: there is nothing to check. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
-| `DAYFLY_PASTE_TOKENS` | no | `false` | Return a 128-bit management token at creation. The JSON store response carries `paste_token`; the plain response carries `X-Paste-Token`; the human create result page shows the token once. The token authorizes `DELETE` and `PATCH` for that paste. Only its SHA-256 is stored. The bearer token remains universal. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
+| `DAYFLY_PASTE_TOKENS` | no | `false` | Return a 128-bit management token at creation. The JSON store response carries `paste_token`; the plain response carries `X-Paste-Token`; the human create result page shows the token once. The token authorizes `DELETE` and `PATCH` for that paste. Only its SHA-256 is stored. The bearer token remains universal. Not retroactive: a paste stored before the setting was enabled has no token, so no HTTP client can change it without a bearer token. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_EXPOSE_CREATOR_ADDR` | no | `false` | Return the stored `created-by` address in the meta route, the `X-Created-By` header on `HEAD`, and the MCP `fetch_metadata` tool. The access log includes the client address only when this is on. An address is personal data, so the default hides it. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_SHOW_WORDS` | no | `true` | Show the generated word alias in the human UI: create responses, the view page, and the paste list. Display only; the JSON/MCP responses still include `words`. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
 | `DAYFLY_SHOW_INTERNAL_PATHS` | no | `false` | Show the canonical date and ID under the alias in the human paste list. Off labels the column "Link" and shows only the alias. Display only; view URLs and API responses still accept the canonical ID. Accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
