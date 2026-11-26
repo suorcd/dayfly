@@ -81,15 +81,16 @@ h2{font-size:1.3rem;text-transform:lowercase;color:#ea00d9;border-bottom:1px dot
 hr{border:none;border-top:1px dashed #0abdc6;margin:1.5rem 0;opacity:.6}
 a{color:#ea00d9;text-decoration:none}
 a:hover{text-decoration:underline;text-shadow:0 0 8px rgba(234,0,217,.8)}
-table{border-collapse:collapse;width:auto;table-layout:fixed} th,td{text-align:left;padding:.35rem .4rem;border:1px dashed #0abdc6;vertical-align:top}
-.col-link{width:31ch}
-.col-filename{width:28ch}
-.col-content-type{width:9rem}
-.col-size{width:11ch}
+table{border-collapse:collapse;width:100%;table-layout:fixed} th,td{text-align:left;padding:.35rem .4rem;border:1px dashed #0abdc6;vertical-align:top}
+.col-link{width:26ch}
+.col-title{width:13ch}
+.col-filename{width:22ch}
+.col-content-type{width:6rem}
+.col-size{width:8ch}
 .col-created{width:22ch}
-.col-ttl{width:5ch}
-.col-action{width:12ch}
-.content-type-cell{display:block;max-width:calc(8rem - 1ch);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.col-ttl{width:4ch}
+.col-action{width:9ch}
+.content-type-cell{display:block;max-width:calc(5rem - 1ch);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .size-cell{text-align:right;white-space:nowrap}
 .size-unit{display:inline-block;min-width:3ch;text-align:left;margin-left:.4ch}
 th:nth-child(4){text-align:center}
@@ -128,7 +129,7 @@ a.button:hover{text-decoration:none;box-shadow:0 0 10px rgba(10,189,198,.4)}
 .table-wrap{overflow-x:auto}
 .list-panel{width:max-content;max-width:100%}
 .list-panel form{margin-bottom:1rem}
-.filename-cell{white-space:nowrap}
+.filename-cell{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 th:first-child,td:first-child{white-space:nowrap}
 td:first-child{overflow:hidden;text-overflow:ellipsis}
 th:nth-child(4),td:nth-child(4){white-space:nowrap}

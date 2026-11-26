@@ -2448,6 +2448,70 @@ async fn list_page_uses_the_same_body_width_as_the_paste_page() {
 }
 
 #[tokio::test]
+async fn list_page_table_fits_the_body_width() {
+    let fake = FakeS3::start().await;
+    let store = fake.store().await;
+    store
+        .store_text(b"layout", None, None, None)
+        .await
+        .expect("the paste must store");
+    let app = common::app(store);
+
+    let request = common::request("GET", "/pastes", &[], Vec::new());
+    let (status, _, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = html_text(&body);
+    let style_start = page
+        .find("<style>")
+        .expect("the page must carry a style block");
+    let style_end = page[style_start..]
+        .find("</style>")
+        .expect("the style block must close")
+        + style_start;
+    let css = &page[style_start + "<style>".len()..style_end];
+
+    // The table must fill the body, not size to its content.
+    assert!(
+        css.contains("table{border-collapse:collapse;width:100%"),
+        "the table must use the full body width: {css}"
+    );
+
+    // Convert each column width to pixels. One ch is 0.6em in the
+    // monospace body font, and the body font size is 16px.
+    let width_px = |selector: &str| -> f64 {
+        let marker = format!(".{selector}{{width:");
+        let start = css
+            .find(&marker)
+            .unwrap_or_else(|| panic!("the CSS must set {selector}"));
+        let rest = &css[start + marker.len()..];
+        let end = rest.find('}').expect("the rule must close");
+        let value = &rest[..end];
+        if let Some(number) = value.strip_suffix("ch") {
+            number.parse::<f64>().expect("the ch width must parse") * 9.6
+        } else if let Some(number) = value.strip_suffix("rem") {
+            number.parse::<f64>().expect("the rem width must parse") * 16.0
+        } else {
+            panic!("the {selector} width must use ch or rem: {value}");
+        }
+    };
+    let columns = [
+        "col-link",
+        "col-title",
+        "col-filename",
+        "col-content-type",
+        "col-size",
+        "col-created",
+        "col-ttl",
+        "col-action",
+    ];
+    let total: f64 = columns.iter().map(|name| width_px(name)).sum::<f64>() + 9.0;
+    assert!(
+        total <= 1180.0,
+        "the eight columns plus borders must fit the 1200px body: {total}px"
+    );
+}
+
+#[tokio::test]
 async fn dynamic_pages_carry_no_store() {
     let fake = FakeS3::start().await;
     let store = fake.store().await;
