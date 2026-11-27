@@ -172,6 +172,11 @@ form > p:last-child{margin-bottom:0}
 .form-actions .dropzone.compact{justify-content:center}
 .form-actions button[type=button]{align-self:center}
 .form-actions button[type=submit]{margin-left:auto}
+.upload-loading{display:flex;align-items:center;gap:.5rem;margin-top:1rem}
+.upload-loading[hidden]{display:none}
+.spinner{width:1rem;height:1rem;border:2px solid #0abdc6;border-top-color:#ea00d9;border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.spinner{animation:none}}
 textarea{width:100%;min-height:12rem;box-sizing:border-box;font-family:"Source Code Pro",Hack,ui-monospace,Menlo,Consolas,monospace;background:#133e7c;color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px;padding:.5rem}
 input,select{font-size:1rem;padding:.3rem .5rem;background:#133e7c;color:#e3e8fc;border:1px dashed #0abdc6;border-radius:4px}
 textarea:disabled,input:disabled{opacity:.45;background:#0d2447;color:#9aa6c4;border-color:#4a5568;cursor:not-allowed}
@@ -189,7 +194,9 @@ footer{text-align:center;font-size:.85rem;margin-top:2rem;padding-top:1rem;borde
 /// Progressive enhancement for the combined new-paste form. Without JS the
 /// file input and the textarea both work; with JS, dropping or pasting a file
 /// fills the input and disables the text fields so the file is what gets
-/// submitted. A plain text paste keeps the browser default.
+/// submitted. A plain text paste keeps the browser default. On a file
+/// submit, the script shows a loading indicator and disables the submit
+/// button, so the page does not look idle during the upload.
 const DROPZONE_SCRIPT: &str = r#"<script>
 (() => {
   const zone = document.getElementById('dropzone');
@@ -199,8 +206,11 @@ const DROPZONE_SCRIPT: &str = r#"<script>
   const text = document.getElementById('text');
   const filename = document.getElementById('filename');
   const precedence = document.getElementById('file-precedence');
+  const submit = document.getElementById('create-submit');
+  const loading = document.getElementById('upload-loading');
+  const loadingText = document.getElementById('upload-loading-text');
   const form = document.querySelector('form[action="/ui/create"]');
-  if (!form || !zone || !input || !status || !clear || !text || !filename || !precedence) return;
+  if (!form || !zone || !input || !status || !clear || !text || !filename || !precedence || !submit || !loading || !loadingText) return;
 
   const maxBytes = Number(form.dataset.maxFileBytes) || 0;
   const humanSize = (bytes) => {
@@ -297,6 +307,16 @@ const DROPZONE_SCRIPT: &str = r#"<script>
       precedence.hidden = true;
       text.disabled = false;
       filename.disabled = false;
+      return;
+    }
+    if (file) {
+      // Show the loading indicator and block a second submit. Only the
+      // submit and clear buttons are disabled: a disabled file input
+      // would drop the file from the submission.
+      loadingText.textContent = 'Uploading ' + file.name + ' (' + humanSize(file.size) + ')…';
+      loading.hidden = false;
+      submit.disabled = true;
+      clear.disabled = true;
     }
   });
 
@@ -784,8 +804,9 @@ async fn index_handler(
 <span class="muted dropzone-limit">Max file size: {max_file_human}.</span>
 </label>
 <button type="button" id="clear-file" hidden>Remove file</button>
-<button type="submit">Create paste</button>
+<button type="submit" id="create-submit">Create paste</button>
 </div>
+<p class="upload-loading" id="upload-loading" hidden><span class="spinner" aria-hidden="true"></span><span id="upload-loading-text" aria-live="polite">Uploading…</span></p>
 </form>"#,
         ttl_options(&store.config, default_ttl),
     );
@@ -2251,6 +2272,55 @@ mod tests {
                 "{uri}"
             );
         }
+    }
+
+    /// The create page must show a loading indicator for a file upload.
+    ///
+    /// The page serves the indicator hidden. The submit script shows it
+    /// and disables the submit button when a file upload starts.
+    #[tokio::test]
+    async fn ui_create_page_shows_upload_loading_indicator() {
+        let state = test_state(None).await;
+        let app = ui_router(state.clone()).with_state(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request must build"),
+            )
+            .await
+            .expect("router call must complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("response body must be readable");
+        let body = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            body.contains("id=\"upload-loading\""),
+            "the page must render the loading element"
+        );
+        assert!(
+            body.contains("id=\"upload-loading-text\""),
+            "the page must render the loading text element"
+        );
+        assert!(
+            body.contains("class=\"spinner\""),
+            "the page must render the spinner graphic"
+        );
+        assert!(
+            body.contains("id=\"create-submit\""),
+            "the submit button must have an id for the script"
+        );
+        assert!(
+            body.contains("loading.hidden = false"),
+            "the submit script must show the loading element"
+        );
+        assert!(
+            body.contains("submit.disabled = true"),
+            "the submit script must disable the submit button"
+        );
     }
 
     fn summary(
