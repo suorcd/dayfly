@@ -16,6 +16,8 @@ info come from scanning the bucket directly. Listing uses ListObjectsV2
 for each UTC date in the window, then HeadObject per key where metadata
 is needed. See "No database in v1" below.
 
+See [CHANGELOG.md](CHANGELOG.md) for release history.
+
 ## What it is
 
 - One base S3 object per paste/file. Key layout:
